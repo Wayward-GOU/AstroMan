@@ -1,0 +1,41 @@
+[package]
+name = "finkmeter"
+version = "1.0.0"
+description = "FinkMeter - 本地 API 调试与压测工具"
+edition = "2021"
+
+[lib]
+name = "finkmeter_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = [
+  "json", "rustls-tls", "gzip", "cookies", "stream"
+] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.25"
+parking_lot = "0.12"
+uuid = { version = "1", features = ["v4"] }
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+tokio = { version = "1", features = ["time", "sync", "rt"] }
+md-5 = "0.10"
+sha1 = "0.10"
+sha2 = "0.10"
+hmac = "0.12"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

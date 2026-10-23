@@ -8,6 +8,8 @@ pub mod report;
 pub mod request;
 pub mod run;
 pub mod stress;
+pub mod storage;
 pub mod system;
 pub mod tools;
 pub mod transfer;
+pub mod winstats;

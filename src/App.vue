@@ -7,7 +7,9 @@ import {
   FundProjectionScreenOutlined,
   SettingOutlined,
   SafetyCertificateOutlined,
+  LineChartOutlined,
   ToolOutlined,
+  ThunderboltOutlined,
 } from '@ant-design/icons-vue'
 import AppLogo from '@/components/AppLogo.vue'
 import { currentTheme } from '@/stores/theme'
@@ -16,14 +18,18 @@ const route = useRoute()
 
 const navs = [
   { key: 'home', label: '工作台', hint: '项目与请求调试', to: '/', icon: AppstoreOutlined },
+  { key: 'stress', label: '压测', hint: '选择接口发起压测', to: '/stress', icon: ThunderboltOutlined },
   { key: 'reports', label: '压测报告', hint: '历史压测结果', to: '/reports', icon: FundProjectionScreenOutlined },
+  { key: 'monitor', label: '系统监视', hint: 'CPU · 内存 · 磁盘 · 网络', to: '/monitor', icon: LineChartOutlined },
   { key: 'tools', label: '工具箱', hint: 'JSON · 加解密 · 时间戳', to: '/tools', icon: ToolOutlined },
   { key: 'settings', label: '设置', hint: '应用与数据', to: '/settings', icon: SettingOutlined },
 ]
 
 const activeKey = computed(() => {
   const path = route.path
+  if (path.startsWith('/stress')) return 'stress'
   if (path.startsWith('/reports')) return 'reports'
+  if (path.startsWith('/monitor')) return 'monitor'
   if (path.startsWith('/tools')) return 'tools'
   if (path === '/settings') return 'settings'
   return 'home'

@@ -7,12 +7,15 @@ import type {
   HistoryItem,
   HttpRequestDetail,
   HttpResult,
+  MonitorProcess,
+  MonitorSnapshot,
   Project,
   ReportDetail,
   RequestRun,
   RequestSearchHit,
   RequestSummary,
   SendRequestPayload,
+  StorageInfo,
   StressConfig,
   StressReport,
 } from '@/types/models'
@@ -39,6 +42,9 @@ export const requestGet = (id: number) => invoke<HttpRequestDetail>('request_get
 
 export const requestSearch = (projectId: number, keyword: string) =>
   invoke<RequestSearchHit[]>('request_search', { projectId, keyword })
+
+export const requestOptions = (projectId: number) =>
+  invoke<RequestSearchHit[]>('request_options', { projectId })
 
 export const requestSave = (request: HttpRequestDetail) =>
   invoke<HttpRequestDetail>('request_save', { request })
@@ -103,3 +109,21 @@ export const toolHash = (text: string, algorithm: string) =>
 
 export const toolHmac = (text: string, key: string, algorithm: string) =>
   invoke<string>('tool_hmac', { text, key, algorithm })
+
+// 系统监视
+export const winstatsSnapshot = () => invoke<MonitorSnapshot>('winstats_snapshot')
+
+export const winstatsProcesses = (limit = 12, byMemory = false) =>
+  invoke<MonitorProcess[]>('winstats_processes', { limit, byMemory })
+
+// 数据存储位置
+export const storageInfo = () => invoke<StorageInfo>('storage_info')
+
+export const storageSet = (path: string, migrate: boolean) =>
+  invoke<StorageInfo>('storage_set', { path, migrate })
+
+export const storageReset = () => invoke<StorageInfo>('storage_reset')
+
+export const storageOpen = (path: string) => invoke<void>('storage_open', { path })
+
+export const appRestart = () => invoke<void>('app_restart')

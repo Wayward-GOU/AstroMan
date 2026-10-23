@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
-import { message } from 'ant-design-vue'
+import { computed, onMounted, ref } from 'vue'
+import { message, Modal } from 'ant-design-vue'
+import { open } from '@tauri-apps/plugin-dialog'
 import {
   DatabaseOutlined,
   SafetyCertificateOutlined,
@@ -9,17 +10,25 @@ import {
   LaptopOutlined,
   BgColorsOutlined,
   CheckOutlined,
+  FolderOpenOutlined,
+  ReloadOutlined,
+  LoginOutlined,
+  SwapOutlined,
 } from '@ant-design/icons-vue'
 import PageHeader from '@/components/PageHeader.vue'
 import * as api from '@/api'
 import { themes, currentThemeId, setTheme } from '@/stores/theme'
-import type { AppInfo } from '@/types/models'
+import type { AppInfo, StorageInfo } from '@/types/models'
 
 const info = ref<AppInfo | null>(null)
+const storage = ref<StorageInfo | null>(null)
+const storageLoading = ref(false)
 
 onMounted(async () => {
   try {
-    info.value = await api.appInfo()
+    const [app, dir] = await Promise.all([api.appInfo(), api.storageInfo()])
+    info.value = app
+    storage.value = dir
   } catch (e) {
     message.error(String(e))
   }
@@ -32,6 +41,119 @@ async function copy(text?: string) {
     message.success('已复制')
   } catch {
     message.warning('当前环境不允许访问剪贴板')
+  }
+}
+
+const storageSize = computed(() => {
+  if (!storage.value) return '-'
+  return fmtSize(storage.value.dbSize + storage.value.walSize)
+})
+
+function fmtSize(bytes: number) {
+  if (!bytes) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB']
+  let value = bytes
+  let index = 0
+  while (value >= 1024 && index < units.length - 1) {
+    value /= 1024
+    index += 1
+  }
+  return `${value.toFixed(index === 0 ? 0 : 1)} ${units[index]}`
+}
+
+async function changeStorage() {
+  let picked: string | null = null
+  try {
+    const result = await open({
+      directory: true,
+      multiple: false,
+      title: '选择数据存储目录',
+      defaultPath: storage.value?.dataDir,
+    })
+    picked = typeof result === 'string' ? result : null
+  } catch (e) {
+    message.error(String(e))
+    return
+  }
+  if (!picked) return
+
+  Modal.confirm({
+    title: '如何切换数据目录？',
+    content:
+      '「迁移数据」会把当前数据库复制到新目录，原目录文件保留；「仅切换」则新目录从空白数据开始。切换后需要重启应用才能生效。',
+    okText: '迁移数据并切换',
+    cancelText: '仅切换',
+    keyboard: false,
+    async onOk() {
+      await applyStorage(picked as string, true)
+    },
+    async onCancel() {
+      await applyStorage(picked as string, false)
+    },
+  })
+}
+
+async function applyStorage(path: string, migrate: boolean) {
+  storageLoading.value = true
+  try {
+    storage.value = await api.storageSet(path, migrate)
+    Modal.confirm({
+      title: '存储位置已更新',
+      content: '重启应用后生效，重启前仍使用原目录。是否立即重启？',
+      okText: '立即重启',
+      cancelText: '稍后手动重启',
+      async onOk() {
+        await api.appRestart()
+      },
+    })
+  } catch (e) {
+    message.error(String(e))
+  } finally {
+    storageLoading.value = false
+  }
+}
+
+async function resetStorage() {
+  Modal.confirm({
+    title: '恢复默认存储位置？',
+    content: '恢复后将使用应用默认数据目录，自定义目录中的文件不会被删除。需要重启应用生效。',
+    okText: '恢复默认',
+    async onOk() {
+      storageLoading.value = true
+      try {
+        storage.value = await api.storageReset()
+        Modal.confirm({
+          title: '已恢复默认位置',
+          content: '是否立即重启应用？',
+          okText: '立即重启',
+          cancelText: '稍后',
+          async onOk() {
+            await api.appRestart()
+          },
+        })
+      } catch (e) {
+        message.error(String(e))
+      } finally {
+        storageLoading.value = false
+      }
+    },
+  })
+}
+
+async function openStorageDir(path?: string) {
+  if (!path) return
+  try {
+    await api.storageOpen(path)
+  } catch (e) {
+    message.error(String(e))
+  }
+}
+
+async function restartApp() {
+  try {
+    await api.appRestart()
+  } catch (e) {
+    message.error(String(e))
   }
 }
 </script>
@@ -74,6 +196,73 @@ async function copy(text?: string) {
             <CheckOutlined v-if="currentThemeId === item.id" class="theme-check" />
           </button>
         </div>
+      </div>
+
+      <div class="fm-card block storage-block">
+        <div class="block-head">
+          <span class="block-icon blue"><DatabaseOutlined /></span>
+          <div>
+            <div class="block-title">数据存储位置</div>
+            <div class="block-desc">自定义 SQLite 数据文件存放目录，可迁移现有数据</div>
+          </div>
+          <span class="storage-mode" :class="{ custom: storage?.isCustom }">
+            {{ storage?.isCustom ? '自定义目录' : '默认目录' }}
+          </span>
+        </div>
+
+        <a-spin :spinning="storageLoading">
+          <div class="rows">
+            <div class="row">
+              <span class="label">数据目录</span>
+              <span class="value mono path">{{ storage?.dataDir || '-' }}</span>
+              <a-button type="text" size="small" class="copy" title="复制路径" @click="copy(storage?.dataDir)">
+                <template #icon><CopyOutlined /></template>
+              </a-button>
+            </div>
+            <div class="row">
+              <span class="label">数据库文件</span>
+              <span class="value mono path">{{ storage?.dbPath || '-' }}</span>
+              <a-button type="text" size="small" class="copy" title="复制路径" @click="copy(storage?.dbPath)">
+                <template #icon><CopyOutlined /></template>
+              </a-button>
+            </div>
+            <div class="row">
+              <span class="label">占用空间</span>
+              <span class="value mono">{{ storageSize }}</span>
+            </div>
+            <div class="row">
+              <span class="label">默认目录</span>
+              <span class="value mono path muted">{{ storage?.defaultDir || '-' }}</span>
+            </div>
+            <div v-if="storage?.pendingDir" class="row">
+              <span class="label">待生效</span>
+              <span class="value mono path pending">{{ storage.pendingDir }}</span>
+              <a-button type="link" size="small" class="copy" @click="restartApp">立即重启</a-button>
+            </div>
+          </div>
+
+          <div class="storage-actions">
+            <a-button type="primary" :loading="storageLoading" @click="changeStorage">
+              <template #icon><SwapOutlined /></template>
+              更改位置
+            </a-button>
+            <a-button :disabled="!storage?.dataDir" @click="openStorageDir(storage?.dataDir)">
+              <template #icon><FolderOpenOutlined /></template>
+              打开目录
+            </a-button>
+            <a-button :disabled="!storage?.isCustom && !storage?.pendingDir" @click="resetStorage">
+              <template #icon><ReloadOutlined /></template>
+              恢复默认
+            </a-button>
+          </div>
+
+          <div class="storage-tip">
+            <LoginOutlined />
+            <span>
+              更改位置后需要重启应用生效；选择「迁移数据」会把当前数据库完整复制到新目录，原目录文件保留，确认数据无误后可自行删除。
+            </span>
+          </div>
+        </a-spin>
       </div>
 
       <div class="fm-card block">
@@ -420,5 +609,61 @@ kbd {
   font-family: 'JetBrains Mono', Consolas, monospace;
   font-size: 10px;
   color: var(--fm-text-2);
+}
+
+/* ---------- 数据存储位置 ---------- */
+.storage-block {
+  grid-column: 1 / -1;
+}
+
+.storage-mode {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--fm-muted);
+  background: var(--fm-surface-alt);
+  border: 1px solid var(--fm-border);
+  padding: 2px 10px;
+  border-radius: 999px;
+  flex-shrink: 0;
+}
+
+.storage-mode.custom {
+  color: var(--fm-primary);
+  background: var(--fm-primary-soft);
+  border-color: transparent;
+}
+
+.value.muted {
+  color: var(--fm-muted);
+}
+
+.value.pending {
+  color: var(--fm-warning);
+}
+
+.storage-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.storage-tip {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 14px;
+  padding: 10px 12px;
+  border-radius: 9px;
+  background: var(--fm-surface-alt);
+  border: 1px dashed var(--fm-border-strong);
+  font-size: 11px;
+  line-height: 1.7;
+  color: var(--fm-muted);
+}
+
+.storage-tip > :first-child {
+  margin-top: 2px;
+  flex-shrink: 0;
 }
 </style>

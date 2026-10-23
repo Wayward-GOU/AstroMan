@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
@@ -10,13 +10,17 @@ import {
   PlayCircleOutlined,
   FileTextOutlined,
   InfoCircleOutlined,
+  PlusOutlined,
+  FolderOpenOutlined,
 } from '@ant-design/icons-vue'
 import PageHeader from '@/components/PageHeader.vue'
 import LineChart from '@/components/LineChart.vue'
+import { useProjectStore } from '@/stores/project'
 import * as api from '@/api'
 import type {
   Environment,
   HttpRequestDetail,
+  RequestSearchHit,
   StressDone,
   StressProgress,
   StressStage,
@@ -24,6 +28,7 @@ import type {
 
 const route = useRoute()
 const router = useRouter()
+const projectStore = useProjectStore()
 
 const requestId = computed(() => Number(route.query.requestId || 0))
 const projectId = computed(() => Number(route.query.projectId || 0))
@@ -32,6 +37,106 @@ const request = ref<HttpRequestDetail | null>(null)
 const environments = ref<Environment[]>([])
 const envId = ref<number | null>(null)
 const loading = ref(true)
+
+/* ---------- 新建压测弹窗 ---------- */
+const configOpen = ref(false)
+const targetProjectId = ref<number | null>(null)
+const targetRequestId = ref<number | null>(null)
+const choices = ref<RequestSearchHit[]>([])
+const choicesLoading = ref(false)
+const preparing = ref(false)
+const activeProjectId = ref<number | null>(null)
+const modalEnvironments = ref<Environment[]>([])
+const modalEnvId = ref<number | null>(null)
+
+const projectOptions = computed(() =>
+  projectStore.projects.map((item) => ({ value: item.id, label: item.name })),
+)
+
+const requestSelectOptions = computed(() =>
+  choices.value.map((item) => ({
+    value: item.id,
+    label: `${item.method}  ${item.name}  ·  ${item.url}`,
+  })),
+)
+
+const selectedChoice = computed(
+  () => choices.value.find((item) => item.id === targetRequestId.value) ?? null,
+)
+
+const currentProject = computed(
+  () => projectStore.projects.find((item) => item.id === (targetProjectId.value ?? activeProjectId.value)) ?? null,
+)
+
+async function openConfig() {
+  if (running.value) {
+    message.warning('压测进行中，请先停止当前压测')
+    return
+  }
+  if (!projectStore.projects.length) {
+    try {
+      await projectStore.loadProjects()
+    } catch (e) {
+      message.error(String(e))
+      return
+    }
+  }
+  targetProjectId.value = projectStore.projects[0]?.id ?? null
+  targetRequestId.value = null
+  configOpen.value = true
+}
+
+watch(targetProjectId, async (id) => {
+  targetRequestId.value = null
+  choices.value = []
+  modalEnvironments.value = []
+  modalEnvId.value = null
+  if (!id) return
+  choicesLoading.value = true
+  try {
+    const [list, envs] = await Promise.all([api.requestOptions(id), api.envList(id)])
+    choices.value = list
+    modalEnvironments.value = envs
+    const active = envs.find((env) => env.isActive) ?? envs[0]
+    modalEnvId.value = active?.id ?? null
+  } catch (e) {
+    message.error(String(e))
+  } finally {
+    choicesLoading.value = false
+  }
+})
+
+async function startFromConfig() {
+  if (!targetProjectId.value) {
+    message.warning('请先选择项目')
+    return
+  }
+  if (!targetRequestId.value) {
+    message.warning('请选择要压测的接口')
+    return
+  }
+  preparing.value = true
+  try {
+    const detail = await api.requestGet(targetRequestId.value)
+    if (!detail.url.trim()) {
+      message.warning('该接口还没有填写 URL，请先到请求编辑器补全')
+      return
+    }
+    request.value = detail
+    activeProjectId.value = targetProjectId.value
+    environments.value = modalEnvironments.value
+    envId.value = modalEnvId.value
+    configOpen.value = false
+    done.value = null
+    progress.value = null
+    await start()
+  } catch (e) {
+    message.error(String(e))
+  } finally {
+    preparing.value = false
+  }
+}
+
 
 const settings = reactive({
   mode: 'fixed' as 'fixed' | 'stages',
@@ -97,6 +202,7 @@ onMounted(async () => {
       return
     }
     if (projectId.value) {
+      activeProjectId.value = projectId.value
       environments.value = await api.envList(projectId.value)
       const active = environments.value.find((env) => env.isActive) ?? environments.value[0]
       envId.value = active?.id ?? null
@@ -276,7 +382,7 @@ function backToRequest() {
   router.push({
     name: 'request',
     params: { id: request.value.id },
-    query: { projectId: projectId.value || undefined },
+    query: { projectId: activeProjectId.value || undefined },
   })
 }
 </script>
@@ -286,8 +392,12 @@ function backToRequest() {
     <PageHeader
       eyebrow="Stress Test"
       title="接口压测"
-      subtitle="在本地发起真实并发请求，结束后自动生成可回溯的压测报告"
+      subtitle="选择项目与接口、配置压测参数，在本地发起真实并发请求"
     >
+      <a-button type="primary" :disabled="running" @click="openConfig">
+        <template #icon><PlusOutlined /></template>
+        新建压测
+      </a-button>
       <a-button @click="backToRequest">
         <template #icon><ArrowLeftOutlined /></template>
         返回请求
@@ -299,14 +409,17 @@ function backToRequest() {
     </PageHeader>
 
     <a-spin :spinning="loading">
-      <div v-if="!requestId" class="fm-card guide-empty">
+      <div v-if="!request && !requestId" class="fm-card guide-empty">
         <div class="empty-icon-wrap"><ThunderboltOutlined /></div>
-        <div class="empty-title">从请求进入压测</div>
+        <div class="empty-title">选择一个接口开始压测</div>
         <div class="empty-desc">
-          请先在项目里打开一个请求，点击编辑器右上角的「压测」按钮，
-          FinkMeter 会自动带入 URL、Headers、Body 和环境变量。
+          点击「新建压测」，先选择项目与接口，再填写并发、时长、限速与 SLA 阈值，
+          确认后立即在本地发起真实压测并自动生成报告。
         </div>
-        <a-button type="primary" @click="router.push('/')">去工作台</a-button>
+        <a-button type="primary" size="large" @click="openConfig">
+          <template #icon><PlusOutlined /></template>
+          新建压测
+        </a-button>
       </div>
 
       <div v-else-if="request" class="layout">
@@ -590,9 +703,195 @@ function backToRequest() {
       <div v-else-if="!loading" class="fm-card guide-empty">
         <div class="empty-title">没有找到这个请求</div>
         <div class="empty-desc">请求可能已经被删除，请回到项目重新选择。</div>
-        <a-button type="primary" @click="router.push('/')">返回工作台</a-button>
+        <a-button type="primary" @click="openConfig">重新选择接口</a-button>
       </div>
     </a-spin>
+
+    <a-modal
+      v-model:open="configOpen"
+      title="新建压测"
+      :width="680"
+      :mask-closable="false"
+      ok-text="开始压测"
+      cancel-text="取消"
+      :confirm-loading="preparing"
+      @ok="startFromConfig"
+    >
+      <div class="modal-body">
+        <div class="modal-section">
+          <div class="section-title"><span class="step">1</span>选择目标接口</div>
+          <div class="picker-grid">
+            <div class="field">
+              <div class="label">项目</div>
+              <a-select
+                v-model:value="targetProjectId"
+                :options="projectOptions"
+                placeholder="选择项目"
+                show-search
+                option-filter-prop="label"
+              />
+            </div>
+            <div class="field">
+              <div class="label">接口</div>
+              <a-select
+                v-model:value="targetRequestId"
+                :options="requestSelectOptions"
+                :loading="choicesLoading"
+                placeholder="选择要压测的接口"
+                show-search
+                option-filter-prop="label"
+                :not-found-content="choicesLoading ? '加载中…' : '该项目下暂无接口'"
+              />
+            </div>
+          </div>
+          <div v-if="selectedChoice" class="target-preview">
+            <div class="target-preview-top">
+              <span class="method-tag" :class="`method-${selectedChoice.method}`">{{ selectedChoice.method }}</span>
+              <span class="target-preview-name">{{ selectedChoice.name }}</span>
+              <span class="target-preview-collection">{{ selectedChoice.collectionName }}</span>
+            </div>
+            <div class="target-url mono">{{ selectedChoice.url }}</div>
+          </div>
+          <div v-else-if="currentProject" class="hint">
+            {{ currentProject.name }} · 共 {{ choices.length }} 个接口，选择后自动带入 Headers、Body 与环境变量
+          </div>
+        </div>
+
+        <div class="modal-section">
+          <div class="section-title"><span class="step">2</span>配置压测参数</div>
+          <div class="modal-fields">
+            <div class="field">
+              <div class="label">加压模式</div>
+              <a-segmented
+                v-model:value="settings.mode"
+                :options="[
+                  { label: '固定并发', value: 'fixed' },
+                  { label: '阶梯加压', value: 'stages' },
+                ]"
+                block
+              />
+              <div class="hint">
+                {{ settings.mode === 'fixed'
+                  ? '固定并发持续压测，适合验证稳定吞吐'
+                  : '按阶段逐步提升并发，用于寻找性能拐点' }}
+              </div>
+            </div>
+
+            <template v-if="settings.mode === 'fixed'">
+              <div class="field">
+                <div class="label">并发数</div>
+                <a-input-number v-model:value="settings.concurrent" :min="1" :max="500" style="width: 100%" />
+                <div class="hint">同一时刻同时执行的请求数量，建议从 10～30 起步</div>
+              </div>
+              <div class="field-row">
+                <div class="field">
+                  <div class="label">压测时长（秒）</div>
+                  <a-input-number v-model:value="settings.durationSec" :min="1" :max="3600" style="width: 100%" />
+                </div>
+                <div class="field">
+                  <div class="label">预热时长（秒）</div>
+                  <a-input-number v-model:value="settings.rampUpSec" :min="0" :max="600" style="width: 100%" />
+                </div>
+              </div>
+            </template>
+
+            <template v-else>
+              <div class="field">
+                <div class="label stage-label">
+                  <span>加压阶段</span>
+                  <a-button size="small" type="link" @click="addStage">+ 添加阶段</a-button>
+                </div>
+                <div class="stage-list">
+                  <div class="stage-row stage-header">
+                    <span />
+                    <span>并发数</span>
+                    <span>时长（秒）</span>
+                    <span />
+                  </div>
+                  <div v-for="(stage, index) in stages" :key="index" class="stage-row">
+                    <span class="stage-index">{{ index + 1 }}</span>
+                    <a-input-number v-model:value="stage.concurrent" :min="1" :max="500" size="small" />
+                    <a-input-number v-model:value="stage.durationSec" :min="1" :max="3600" size="small" />
+                    <a-button size="small" type="text" danger :disabled="stages.length <= 1" @click="removeStage(index)">
+                      移除
+                    </a-button>
+                  </div>
+                </div>
+                <div class="hint">共 {{ totalSeconds }} 秒，峰值并发 {{ peakConcurrent }}</div>
+              </div>
+            </template>
+
+            <div class="field-row">
+              <div class="field">
+                <div class="label">思考时间（毫秒）</div>
+                <a-input-number v-model:value="settings.thinkTimeMs" :min="0" :max="60000" :step="100" style="width: 100%" />
+              </div>
+              <div class="field">
+                <div class="label">超时（毫秒）</div>
+                <a-input-number v-model:value="settings.timeoutMs" :min="500" :max="120000" :step="1000" style="width: 100%" />
+              </div>
+            </div>
+
+            <div class="field">
+              <div class="label">目标 RPS 限速</div>
+              <a-input-number v-model:value="settings.targetRps" :min="0" :max="100000" :step="10" style="width: 100%" />
+              <div class="hint">0 表示不限速；设置后每秒最多发出该数量的请求</div>
+            </div>
+
+            <div class="field">
+              <div class="label">环境</div>
+              <a-select v-model:value="modalEnvId" allow-clear placeholder="不使用环境变量" style="width: 100%">
+                <a-select-option v-for="env in modalEnvironments" :key="env.id" :value="env.id">
+                  {{ env.name }}
+                </a-select-option>
+              </a-select>
+            </div>
+
+            <a-checkbox v-model:checked="settings.insecure">忽略证书校验（自签证书）</a-checkbox>
+
+            <div class="sla-block">
+              <div class="sla-head">
+                <a-checkbox v-model:checked="settings.slaEnabled">设置 SLA 验收阈值</a-checkbox>
+              </div>
+              <div v-if="settings.slaEnabled" class="sla-grid">
+                <div class="field">
+                  <div class="label">P95 ≤（ms）</div>
+                  <a-input-number v-model:value="settings.slaP95" :min="0" :max="120000" size="small" style="width: 100%" />
+                </div>
+                <div class="field">
+                  <div class="label">P99 ≤（ms）</div>
+                  <a-input-number v-model:value="settings.slaP99" :min="0" :max="120000" size="small" style="width: 100%" />
+                </div>
+                <div class="field">
+                  <div class="label">错误率 ≤（%）</div>
+                  <a-input-number v-model:value="settings.slaErrorRate" :min="0" :max="100" :step="0.5" size="small" style="width: 100%" />
+                </div>
+                <div class="field">
+                  <div class="label">平均 RPS ≥</div>
+                  <a-input-number v-model:value="settings.slaMinRps" :min="0" :max="100000" size="small" style="width: 100%" />
+                </div>
+              </div>
+              <div v-if="settings.slaEnabled" class="hint">报告生成时会逐项判定并给出是否达标</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <template #footer>
+        <div class="modal-foot">
+          <span class="modal-foot-hint">
+            <InfoCircleOutlined /> 开始后立即进入实时监控，离开本页会自动停止压测
+          </span>
+          <div class="modal-foot-actions">
+            <a-button @click="configOpen = false">取消</a-button>
+            <a-button type="primary" :loading="preparing" @click="startFromConfig">
+              <template #icon><PlayCircleOutlined /></template>
+              开始压测
+            </a-button>
+          </div>
+        </div>
+      </template>
+    </a-modal>
   </div>
 </template>
 
@@ -1063,6 +1362,114 @@ function backToRequest() {
   font-size: 12px;
   line-height: 1.8;
   color: var(--fm-muted);
+}
+
+/* ---------- 新建压测弹窗 ---------- */
+.modal-body {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  max-height: 62vh;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.modal-section {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.section-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.step {
+  width: 18px;
+  height: 18px;
+  border-radius: 6px;
+  background: var(--fm-primary-soft);
+  color: var(--fm-primary);
+  font-size: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.picker-grid {
+  display: grid;
+  grid-template-columns: 200px minmax(0, 1fr);
+  gap: 12px;
+}
+
+.target-preview {
+  padding: 12px;
+  border: 1px solid var(--fm-border);
+  border-radius: 10px;
+  background: var(--fm-surface-alt);
+}
+
+.target-preview-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.target-preview-name {
+  font-size: 12px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.target-preview-collection {
+  margin-left: auto;
+  flex-shrink: 0;
+  font-size: 10px;
+  color: var(--fm-muted);
+}
+
+.modal-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.modal-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.modal-foot-hint {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  color: var(--fm-muted);
+}
+
+.modal-foot-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+@media (max-width: 720px) {
+  .picker-grid {
+    grid-template-columns: 1fr;
+  }
+  .modal-foot {
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 8px;
+  }
 }
 
 @media (max-width: 1080px) {

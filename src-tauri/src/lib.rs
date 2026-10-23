@@ -1,6 +1,7 @@
 mod commands;
 mod db;
 mod models;
+mod netinfo;
 mod state;
 mod util;
 
@@ -15,6 +16,7 @@ pub fn run() {
             let state = state::AppState::new(app.handle())?;
             log::info!("FinkMeter 数据目录: {:?}", state.data_dir);
             app.manage(state);
+            app.manage(commands::winstats::WinStatsState::new());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -29,6 +31,7 @@ pub fn run() {
             commands::collection::collection_delete,
             commands::request::request_list,
             commands::request::request_search,
+            commands::request::request_options,
             commands::request::request_get,
             commands::request::request_save,
             commands::request::request_delete,
@@ -53,6 +56,13 @@ pub fn run() {
             commands::transfer::project_import,
             commands::tools::tool_hash,
             commands::tools::tool_hmac,
+            commands::winstats::winstats_snapshot,
+            commands::winstats::winstats_processes,
+            commands::storage::storage_info,
+            commands::storage::storage_set,
+            commands::storage::storage_reset,
+            commands::storage::storage_open,
+            commands::storage::app_restart,
         ])
         .run(tauri::generate_context!())
         .expect("启动 FinkMeter 失败");

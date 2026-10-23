@@ -242,7 +242,7 @@ pub fn project_export(
         .map_err(err)?;
 
     // 让父集合先出现，子集合按 sort_order 归组
-    collection_rows.sort_by_key(|(id, parent, _, sort)| (parent.unwrap_or(0), *sort, *id));
+    collection_rows.sort_by_key(|(id, parent, _, sort)| (parent.unwrap_or(0), sort.clone(), *id));
 
     let bundle = ExportBundle {
         format: FORMAT.to_string(),

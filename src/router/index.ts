@@ -11,6 +11,7 @@ const router = createRouter({
     { path: '/reports', name: 'reports', component: () => import('@/views/Reports.vue') },
     { path: '/reports/:id', name: 'report-detail', component: () => import('@/views/ReportDetail.vue') },
     { path: '/tools', name: 'tools', component: () => import('@/views/Tools.vue') },
+    { path: '/monitor', name: 'monitor', component: () => import('@/views/SystemMonitor.vue') },
     { path: '/settings', name: 'settings', component: () => import('@/views/Settings.vue') },
   ],
 })

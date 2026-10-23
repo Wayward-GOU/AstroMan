@@ -316,3 +316,110 @@ export interface StressDone {
   elapsedSec: number
   message?: string | null
 }
+
+/* ---------- 系统监视（winstats 风格） ---------- */
+
+export interface MonitorSystemInfo {
+  name: string
+  osVersion: string
+  kernelVersion: string
+  hostName: string
+  uptimeSec: number
+  physicalCores: number
+  logicalCores: number
+}
+
+export interface MonitorCpu {
+  total: number
+  brand: string
+  vendor: string
+  frequencyMhz: number
+  cores: number[]
+}
+
+export interface MonitorMemory {
+  total: number
+  used: number
+  available: number
+  percent: number
+}
+
+export interface MonitorSwap {
+  total: number
+  used: number
+  percent: number
+}
+
+export interface MonitorDisk {
+  name: string
+  mount: string
+  fileSystem: string
+  total: number
+  available: number
+  percent: number
+  readPerSec: number
+  writePerSec: number
+  removable: boolean
+}
+
+export interface MonitorNetwork {
+  name: string
+  receivedPerSec: number
+  transmittedPerSec: number
+  totalReceived: number
+  totalTransmitted: number
+  mac: string
+  ipv4: string[]
+  ipv6: string[]
+  gateway: string[]
+}
+
+export interface MonitorLocalIp {
+  adapter: string
+  address: string
+  family: string
+  gateway: string
+  primary: boolean
+}
+
+export interface StorageInfo {
+  dataDir: string
+  dbPath: string
+  defaultDir: string
+  isCustom: boolean
+  dbSize: number
+  walSize: number
+  pendingDir?: string | null
+}
+
+export interface MonitorBattery {
+  present: boolean
+  onAc: boolean
+  percent: number
+  minutesLeft: number
+}
+
+export interface MonitorGpu {
+  name: string
+  usage: number
+}
+
+export interface MonitorSnapshot {
+  timestamp: number
+  system: MonitorSystemInfo
+  cpu: MonitorCpu
+  memory: MonitorMemory
+  swap?: MonitorSwap | null
+  disks: MonitorDisk[]
+  networks: MonitorNetwork[]
+  ips: MonitorLocalIp[]
+  battery?: MonitorBattery | null
+  gpus: MonitorGpu[]
+}
+
+export interface MonitorProcess {
+  pid: number
+  name: string
+  cpu: number
+  memory: number
+}

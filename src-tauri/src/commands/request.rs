@@ -116,6 +116,34 @@ pub fn request_search(
 }
 
 #[tauri::command]
+pub fn request_options(state: State<'_, AppState>, project_id: i64) -> Result<Vec<RequestSearchHit>, String> {
+    let conn = state.pool.get().map_err(err)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT r.id, r.collection_id, c.name, r.name, r.method, r.url, r.updated_at
+             FROM requests r
+             JOIN collections c ON c.id = r.collection_id
+             WHERE c.project_id = ?1
+             ORDER BY c.sort_order ASC, c.id ASC, r.sort_order ASC, r.id ASC",
+        )
+        .map_err(err)?;
+    let rows = stmt
+        .query_map(params![project_id], |row| {
+            Ok(RequestSearchHit {
+                id: row.get(0)?,
+                collection_id: row.get(1)?,
+                collection_name: row.get(2)?,
+                name: row.get(3)?,
+                method: row.get(4)?,
+                url: row.get(5)?,
+                updated_at: row.get(6)?,
+            })
+        })
+        .map_err(err)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(err)
+}
+
+#[tauri::command]
 pub fn request_get(state: State<'_, AppState>, id: i64) -> Result<HttpRequestDetail, String> {
     let conn = state.pool.get().map_err(err)?;
     find_request(&conn, id)

@@ -1,0 +1,75 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            args: '--bundles nsis'
+          - platform: macos-latest
+            args: '--target universal-apple-darwin --bundles dmg'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add macOS universal targets
+        if: matrix.platform == 'macos-latest'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Cache Rust
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build and upload to release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'FinkMeter ${{ github.ref_name }}'
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
+          releaseBody: |
+            FinkMeter ${{ github.ref_name }} — 纯本地运行的 API 调试、压测与开发工具箱。
+
+            ### 下载
+            - Windows 10/11（x64）：`FinkMeter_*_x64-setup.exe`
+            - macOS 11+（Apple Silicon / Intel 通用包）：`FinkMeter_*_universal.dmg`
+
+            ### 安装说明
+            - Windows：双击安装，可选语言与安装目录，当前用户安装无需管理员权限；缺少 WebView2 时安装器会自动联网安装
+            - macOS：首次打开被 Gatekeeper 拦截时，右键应用选择「打开」，或执行 `xattr -dr com.apple.quarantine /Applications/FinkMeter.app`
+            - 安装包未签名，SmartScreen / Gatekeeper 提示属正常现象
+
+            ### 主要功能
+            - 项目 / 集合 / 接口管理与 cURL 导入、项目导入导出、接口全局搜索
+            - HTTP 调试：Params / Headers / Body、环境变量、前置与后置脚本、断言测试
+            - 本地压测：固定并发与阶梯加压、RPS 限速、SLA 验收、逐请求明细与 JSON / HTML / Excel 报告导出
+            - 系统监控与开发工具箱（8 大类 72 个工具）

@@ -578,6 +578,238 @@ function formatSql(sql: string): string {
     .join('\n')
 }
 
+/* ---------- MyBatis 日志回填 ---------- */
+
+export interface LogParam {
+  /** 参数原始文本（不含类型括号） */
+  value: string
+  /** 日志中的 Java 类型，如 Integer、String */
+  type: string
+  /** 填充进 SQL 的字面量 */
+  literal: string
+}
+
+export interface LogStatement {
+  sql: string
+  params: LogParam[]
+  mapper: string
+  time: string
+  total?: number
+  updates?: number
+}
+
+export interface LogParseResult {
+  statements: LogStatement[]
+  warnings: string[]
+}
+
+const LOG_TIMESTAMP_RE = /^\s*\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?/
+const LOG_MAPPER_RE = /([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+)\s+\d+\s+\w+\s+-\s+==>/
+const LOG_PARAM_TYPE_RE = /\(([A-Za-z0-9_$.]+)\)$/
+
+const NUMERIC_TYPES = new Set([
+  'INTEGER',
+  'INT',
+  'BIGINT',
+  'LONG',
+  'SHORT',
+  'SMALLINT',
+  'TINYINT',
+  'BYTE',
+  'DOUBLE',
+  'FLOAT',
+  'DECIMAL',
+  'NUMERIC',
+  'BIGDECIMAL',
+  'BIGINTEGER',
+  'NUMBER',
+])
+
+function sqlQuote(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`
+}
+
+function toLogParam(raw: string): LogParam {
+  const text = raw.trim()
+  const nullMatch = /^(?:null|NULL)(?:\(([A-Za-z0-9_$.]+)\))?$/.exec(text)
+  if (nullMatch) {
+    return { value: 'NULL', type: nullMatch[1] ?? '', literal: 'NULL' }
+  }
+  const match = /^([\s\S]*)\(([A-Za-z0-9_$.]+)\)$/.exec(text)
+  const body = match ? match[1] : text
+  const rawType = match ? match[2] : ''
+  const type = rawType.includes('.') ? rawType.slice(rawType.lastIndexOf('.') + 1) : rawType
+  const upper = type.toUpperCase()
+  if (NUMERIC_TYPES.has(upper) && /^-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(body)) {
+    return { value: body, type, literal: body }
+  }
+  if (upper === 'BOOLEAN' || upper === 'BOOL') {
+    return { value: body, type, literal: body.toLowerCase() === 'true' ? 'TRUE' : 'FALSE' }
+  }
+  return { value: body, type, literal: sqlQuote(body) }
+}
+
+function parseLogParams(text: string): LogParam[] {
+  const source = text.trim()
+  if (!source) return []
+  const segments: string[] = []
+  let buffer = ''
+  for (const part of source.split(/,\s*/)) {
+    buffer = buffer ? `${buffer}, ${part}` : part
+    if (LOG_PARAM_TYPE_RE.test(buffer) || buffer === 'null' || buffer === 'NULL') {
+      segments.push(buffer)
+      buffer = ''
+    }
+  }
+  if (buffer) segments.push(buffer)
+  return segments.map(toLogParam)
+}
+
+/** 解析 MyBatis DEBUG 日志中的 Preparing / Parameters / Total 信息 */
+export function parseMybatisLog(text: string): LogParseResult {
+  const statements: LogStatement[] = []
+  const warnings: string[] = []
+  const lines = text.split(/\r?\n/)
+  const isMarker = (line: string): boolean =>
+    LOG_TIMESTAMP_RE.test(line) ||
+    line.includes('Preparing:') ||
+    line.includes('Parameters:') ||
+    line.includes('<==') ||
+    line.includes('==>')
+
+  let i = 0
+  while (i < lines.length) {
+    const line = lines[i]
+    const prepIndex = line.indexOf('Preparing:')
+    if (prepIndex === -1) {
+      i += 1
+      continue
+    }
+    let sql = line.slice(prepIndex + 'Preparing:'.length).trim()
+    const mapperMatch = LOG_MAPPER_RE.exec(line.slice(0, prepIndex))
+    const timeMatch = /^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)/.exec(line)
+    i += 1
+
+    while (i < lines.length) {
+      const next = lines[i]
+      if (!next.trim()) {
+        i += 1
+        continue
+      }
+      if (isMarker(next)) break
+      sql += ` ${next.trim()}`
+      i += 1
+    }
+
+    let params: LogParam[] = []
+    if (i < lines.length && lines[i].includes('Parameters:')) {
+      const paramIndex = lines[i].indexOf('Parameters:')
+      let paramText = lines[i].slice(paramIndex + 'Parameters:'.length)
+      i += 1
+      while (i < lines.length) {
+        const next = lines[i]
+        if (!next.trim()) {
+          i += 1
+          continue
+        }
+        if (isMarker(next)) break
+        paramText += ` ${next.trim()}`
+        i += 1
+      }
+      params = parseLogParams(paramText)
+    }
+
+    let total: number | undefined
+    let updates: number | undefined
+    for (let k = i; k < Math.min(i + 3, lines.length); k += 1) {
+      const totalMatch = /<==\s+Total:\s*(\d+)/.exec(lines[k])
+      if (totalMatch) total = Number(totalMatch[1])
+      const updateMatch = /<==\s+Updates:\s*(\d+)/.exec(lines[k])
+      if (updateMatch) updates = Number(updateMatch[1])
+    }
+
+    statements.push({
+      sql: sql.trim(),
+      params,
+      mapper: mapperMatch?.[1] ?? '',
+      time: timeMatch?.[1] ?? '',
+      total,
+      updates,
+    })
+  }
+
+  if (!statements.length) warnings.push('未找到 "Preparing:" 日志行，请确认日志级别为 DEBUG')
+  return { statements, warnings }
+}
+
+/** 把 Preparing 语句中的 ? 按 Parameters 顺序替换为字面量 */
+export function fillLogSql(statement: LogStatement, pretty: boolean): MybatisResult {
+  const warnings: string[] = []
+  const params: SqlParam[] = statement.params.map((param, index) => ({
+    index: index + 1,
+    name: `?${index + 1}`,
+    value: param.value,
+    jdbcType: param.type.toUpperCase(),
+    missing: false,
+  }))
+
+  let used = 0
+  let placeholders = 0
+  let out = ''
+  let quote: string | null = null
+  const sql = statement.sql
+  for (let i = 0; i < sql.length; i += 1) {
+    const ch = sql[i]
+    if (quote) {
+      out += ch
+      if (ch === quote) {
+        if (ch === "'" && sql[i + 1] === "'") {
+          out += sql[i + 1]
+          i += 1
+          continue
+        }
+        quote = null
+      }
+      continue
+    }
+    if (ch === "'" || ch === '"' || ch === '`') {
+      quote = ch
+      out += ch
+      continue
+    }
+    if (ch === '?') {
+      placeholders += 1
+      const param = statement.params[used]
+      if (param) {
+        out += param.literal
+        used += 1
+      } else {
+        out += '?'
+      }
+      continue
+    }
+    out += ch
+  }
+
+  if (placeholders > statement.params.length) {
+    warnings.push(
+      `SQL 有 ${placeholders} 个占位符，日志仅提供 ${statement.params.length} 个参数，缺失部分保留 ?`,
+    )
+  }
+  if (used < statement.params.length) {
+    warnings.push(
+      `日志包含 ${statement.params.length} 个参数，SQL 只有 ${used} 个占位符，多余参数已忽略`,
+    )
+  }
+
+  const cleaned = tidy(out)
+  return {
+    sql: pretty ? formatSql(cleaned) : cleaned,
+    params,
+    warnings,
+  }
+}
+
 export function renderMybatis(
   template: string,
   rawParams: unknown,

@@ -1,7 +1,8 @@
-//! 本机网卡与 IP 地址采集（Windows / 其他平台回退）
+//! 本机网卡与 IP 地址采集
 //!
-//! Windows 下通过 `GetAdaptersAddresses` 读取每个网卡的 IPv4 / IPv6 / 网关，
-//! 其他平台返回空列表，由前端做降级展示。
+//! - Windows：通过 `GetAdaptersAddresses` 读取每个网卡的 IPv4 / IPv6 / 网关
+//! - macOS / Linux：通过 `getifaddrs` 读取地址与 MAC，并从系统路由表补齐默认网关
+//! - 其他平台：返回空列表，由前端做降级展示
 
 use serde::Serialize;
 
@@ -24,17 +25,27 @@ pub fn adapters() -> Vec<AdapterIp> {
     #[cfg(windows)]
     {
         let mut list = unsafe { windows_adapters() };
-        list.sort_by(|a, b| {
-            b.up.cmp(&a.up)
-                .then(b.ipv4.len().cmp(&a.ipv4.len()))
-                .then(a.name.cmp(&b.name))
-        });
+        sort_adapters(&mut list);
         list
     }
-    #[cfg(not(windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        unix::adapters()
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         Vec::new()
     }
+}
+
+/// 已连接的网卡优先，其次地址多的优先
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+fn sort_adapters(list: &mut [AdapterIp]) {
+    list.sort_by(|a, b| {
+        b.up.cmp(&a.up)
+            .then(b.ipv4.len().cmp(&a.ipv4.len()))
+            .then(a.name.cmp(&b.name))
+    });
 }
 
 #[cfg(windows)]
@@ -213,7 +224,7 @@ fn format_ipv6(segments: &[u16; 8]) -> String {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 fn format_mac(bytes: &[u8]) -> String {
     if bytes.len() != 6 || bytes.iter().all(|b| *b == 0) {
         return String::new();
@@ -239,5 +250,199 @@ fn wide_to_string(ptr: *const u16) -> String {
             }
         }
         String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
+    }
+}
+
+/// macOS / Linux：`getifaddrs` + 系统路由表
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod unix {
+    use super::{format_mac, sort_adapters, AdapterIp};
+    use std::collections::HashMap;
+    use std::ffi::CStr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    pub fn adapters() -> Vec<AdapterIp> {
+        let mut map: HashMap<String, AdapterIp> = HashMap::new();
+
+        unsafe {
+            let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+            if libc::getifaddrs(&mut head) != 0 {
+                return Vec::new();
+            }
+
+            let mut cursor = head;
+            while !cursor.is_null() {
+                let entry = &*cursor;
+                let name = CStr::from_ptr(entry.ifa_name).to_string_lossy().to_string();
+                let up = entry.ifa_flags & libc::IFF_UP as u32 != 0;
+
+                let item = map.entry(name.clone()).or_insert_with(|| AdapterIp {
+                    name: name.clone(),
+                    mac: String::new(),
+                    ipv4: Vec::new(),
+                    ipv6: Vec::new(),
+                    gateway: Vec::new(),
+                    up,
+                });
+                if up {
+                    item.up = true;
+                }
+
+                if !entry.ifa_addr.is_null() {
+                    let family = (*entry.ifa_addr).sa_family as i32;
+                    match family {
+                        libc::AF_INET => {
+                            if let Some(address) = ipv4(entry.ifa_addr) {
+                                if !item.ipv4.contains(&address) {
+                                    item.ipv4.push(address);
+                                }
+                            }
+                        }
+                        libc::AF_INET6 => {
+                            if let Some(address) = ipv6(entry.ifa_addr) {
+                                if !item.ipv6.contains(&address) {
+                                    item.ipv6.push(address);
+                                }
+                            }
+                        }
+                        #[cfg(target_os = "macos")]
+                        libc::AF_LINK => {
+                            if item.mac.is_empty() {
+                                item.mac = link_mac(entry.ifa_addr);
+                            }
+                        }
+                        #[cfg(target_os = "linux")]
+                        libc::AF_PACKET => {
+                            if item.mac.is_empty() {
+                                item.mac = packet_mac(entry.ifa_addr);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                cursor = entry.ifa_next;
+            }
+            libc::freeifaddrs(head);
+        }
+
+        let gateways = default_gateways();
+        let mut list: Vec<AdapterIp> = map
+            .into_values()
+            .filter(|item| !item.ipv4.is_empty() || !item.ipv6.is_empty())
+            .map(|mut item| {
+                if let Some(gateway) = gateways.get(&item.name) {
+                    item.gateway.push(gateway.clone());
+                }
+                item
+            })
+            .collect();
+        sort_adapters(&mut list);
+        list
+    }
+
+    unsafe fn ipv4(addr: *const libc::sockaddr) -> Option<String> {
+        let raw = (*(addr as *const libc::sockaddr_in)).sin_addr.s_addr;
+        Some(Ipv4Addr::from(u32::from_be(raw)).to_string())
+    }
+
+    unsafe fn ipv6(addr: *const libc::sockaddr) -> Option<String> {
+        let raw = (*(addr as *const libc::sockaddr_in6)).sin6_addr.s6_addr;
+        Some(Ipv6Addr::from(raw).to_string())
+    }
+
+    /// macOS 的 MAC 地址挂在 AF_LINK 的 sockaddr_dl 上：LLADDR(s) = sdl_data + sdl_nlen
+    #[cfg(target_os = "macos")]
+    unsafe fn link_mac(addr: *const libc::sockaddr) -> String {
+        let link = addr as *const libc::sockaddr_dl;
+        let name_len = (*link).sdl_nlen as usize;
+        let addr_len = (*link).sdl_alen as usize;
+        if addr_len != 6 {
+            return String::new();
+        }
+        let base = (*link).sdl_data.as_ptr() as *const u8;
+        format_mac(std::slice::from_raw_parts(base.add(name_len), addr_len))
+    }
+
+    /// Linux 的 MAC 地址挂在 AF_PACKET 的 sockaddr_ll 上
+    #[cfg(target_os = "linux")]
+    unsafe fn packet_mac(addr: *const libc::sockaddr) -> String {
+        let link = addr as *const libc::sockaddr_ll;
+        if (*link).sll_halen as usize != 6 {
+            return String::new();
+        }
+        format_mac(&(*link).sll_addr[..6])
+    }
+
+    /// 默认网关变化不频繁，30 秒内复用上一次的系统路由查询结果
+    fn default_gateways() -> HashMap<String, String> {
+        use std::sync::{Mutex, OnceLock};
+        use std::time::{Duration, Instant};
+
+        static CACHE: OnceLock<Mutex<Option<(Instant, HashMap<String, String>)>>> = OnceLock::new();
+        let cache = CACHE.get_or_init(|| Mutex::new(None));
+        let mut guard = cache.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some((at, gateways)) = guard.as_ref() {
+            if at.elapsed() < Duration::from_secs(30) {
+                return gateways.clone();
+            }
+        }
+        let gateways = query_gateways();
+        *guard = Some((Instant::now(), gateways.clone()));
+        gateways
+    }
+
+    #[cfg(target_os = "macos")]
+    fn query_gateways() -> HashMap<String, String> {
+        let mut map: HashMap<String, String> = HashMap::new();
+        for family in ["inet", "inet6"] {
+            let output = match std::process::Command::new("netstat")
+                .args(["-rn", "-f", family])
+                .output()
+            {
+                Ok(output) => output,
+                Err(_) => continue,
+            };
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                let cols: Vec<&str> = line.split_whitespace().collect();
+                // Destination  Gateway  Flags  Netif
+                if cols.len() < 4 || cols[0] != "default" {
+                    continue;
+                }
+                let gateway = cols[1].split('%').next().unwrap_or_default();
+                if gateway.is_empty() || gateway.starts_with("link#") {
+                    continue;
+                }
+                map.entry(cols[3].to_string())
+                    .or_insert_with(|| gateway.to_string());
+            }
+        }
+        map
+    }
+
+    #[cfg(target_os = "linux")]
+    fn query_gateways() -> HashMap<String, String> {
+        let mut map: HashMap<String, String> = HashMap::new();
+        if let Ok(output) = std::process::Command::new("ip")
+            .args(["route", "show", "default"])
+            .output()
+        {
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                // default via 192.168.1.1 dev eth0 ...
+                let tokens: Vec<&str> = line.split_whitespace().collect();
+                let gateway = tokens
+                    .iter()
+                    .position(|token| *token == "via")
+                    .and_then(|index| tokens.get(index + 1));
+                let iface = tokens
+                    .iter()
+                    .position(|token| *token == "dev")
+                    .and_then(|index| tokens.get(index + 1));
+                if let (Some(gateway), Some(iface)) = (gateway, iface) {
+                    map.entry(iface.to_string())
+                        .or_insert_with(|| gateway.to_string());
+                }
+            }
+        }
+        map
     }
 }

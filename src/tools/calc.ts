@@ -455,3 +455,108 @@ export const KEY_CODES: KeyCodeItem[] = [
   { key: '/', code: 'Slash', keyCode: 191 },
   { key: '`', code: 'Backquote', keyCode: 192 },
 ]
+
+/* ---------------- 日期计算 ---------------- */
+
+function parseDateToken(token: string): Date {
+  const raw = token.trim()
+  const date = /^\d{10}$/.test(raw)
+    ? new Date(Number(raw) * 1000)
+    : /^\d{13}$/.test(raw)
+      ? new Date(Number(raw))
+      : new Date(raw.replace(/-/g, '/'))
+  if (Number.isNaN(date.getTime())) throw new Error(`无法识别日期：${token}`)
+  return date
+}
+
+function formatDate(date: Date): string {
+  const pad = (value: number) => String(value).padStart(2, '0')
+  const week = ['日', '一', '二', '三', '四', '五', '六'][date.getDay()]
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} 星期${week}`
+}
+
+export function dateCalc(input: string, mode: 'diff' | 'add' | 'workdays' = 'diff'): string {
+  const tokens = input.split(/[,\s]+/).filter(Boolean)
+  if (!tokens.length) throw new Error('请输入日期，例如 2024-01-01 2024-03-15')
+  const start = parseDateToken(tokens[0])
+
+  if (mode === 'add') {
+    const days = Number(tokens[1] ?? '')
+    if (!Number.isFinite(days)) throw new Error('第二个值需要填写天数，例如 30 或 -7')
+    const result = new Date(start.getTime() + days * 86400000)
+    return [
+      `起始日期：${formatDate(start)}`,
+      `偏移天数：${days > 0 ? `+${days}` : days} 天`,
+      `计算结果：${formatDate(result)}`,
+      `毫秒时间戳：${result.getTime()}`,
+      `秒级时间戳：${Math.floor(result.getTime() / 1000)}`,
+    ].join('\n')
+  }
+
+  if (tokens.length < 2) throw new Error('需要输入两个日期，用空格或逗号分隔')
+  const end = parseDateToken(tokens[1])
+  const diffMs = end.getTime() - start.getTime()
+
+  if (mode === 'workdays') {
+    const begin = new Date(start.getFullYear(), start.getMonth(), start.getDate())
+    const finish = new Date(end.getFullYear(), end.getMonth(), end.getDate())
+    const step = diffMs >= 0 ? 1 : -1
+    let workdays = 0
+    let total = 0
+    const cursor = new Date(begin)
+    while (true) {
+      const day = cursor.getDay()
+      if (day !== 0 && day !== 6) workdays += 1
+      total += 1
+      if (cursor.getTime() === finish.getTime()) break
+      if (total > 365 * 200) throw new Error('日期跨度过大，请缩小范围')
+      cursor.setDate(cursor.getDate() + step)
+    }
+    return [
+      `起始日期：${formatDate(start)}`,
+      `结束日期：${formatDate(end)}`,
+      `自然日：${total} 天（含两端）`,
+      `工作日：${workdays} 天（周一至周五，含两端）`,
+      `休息日：${total - workdays} 天`,
+    ].join('\n')
+  }
+
+  const days = Math.abs(diffMs) / 86400000
+  return [
+    `起始日期：${formatDate(start)}`,
+    `结束日期：${formatDate(end)}`,
+    `相差天数：${Math.round(days)} 天`,
+    `相差周数：${(days / 7).toFixed(2)} 周`,
+    `相差小时：${Math.round(Math.abs(diffMs) / 3600000)} 小时`,
+    `相差分钟：${Math.round(Math.abs(diffMs) / 60000)} 分钟`,
+    `相差秒数：${Math.round(Math.abs(diffMs) / 1000)} 秒`,
+    `方向：${diffMs === 0 ? '同一天' : diffMs > 0 ? '结束日期在后' : '结束日期在前'}`,
+  ].join('\n')
+}
+
+/* ---------------- px / rem 换算 ---------------- */
+
+export function pxRem(input: string, base = 16, direction: 'px2rem' | 'rem2px' = 'px2rem'): string {
+  const tokens = input
+    .split(/[\s,，;；]+/)
+    .map((token) => token.replace(/(px|rem)$/i, '').trim())
+    .filter(Boolean)
+  if (!tokens.length) throw new Error('请输入需要换算的数值，多个值用空格分隔')
+  const size = Math.min(Math.max(base, 1), 100)
+  if (direction === 'rem2px') {
+    return tokens
+      .map((token) => {
+        const value = Number(token)
+        if (!Number.isFinite(value)) throw new Error(`无法识别数值：${token}`)
+        return `${token}rem = ${Number((value * size).toFixed(4))}px`
+      })
+      .join('\n')
+  }
+  return tokens
+    .map((token) => {
+      const value = Number(token)
+      if (!Number.isFinite(value)) throw new Error(`无法识别数值：${token}`)
+      return `${token}px = ${Number((value / size).toFixed(4))}rem`
+    })
+    .join('\n')
+}

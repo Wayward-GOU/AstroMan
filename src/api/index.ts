@@ -7,10 +7,12 @@ import type {
   HistoryItem,
   HttpRequestDetail,
   HttpResult,
+  IpLookupInfo,
   MonitorProcess,
   MonitorSnapshot,
   Project,
   ReportDetail,
+  ReportRequestsPage,
   RequestRun,
   RequestSearchHit,
   RequestSummary,
@@ -18,9 +20,13 @@ import type {
   StorageInfo,
   StressConfig,
   StressReport,
+  WorkspaceStats,
 } from '@/types/models'
 
 export { appInfo, projectList, projectCreate, projectUpdate, projectDelete } from './project'
+
+// 工作台总览
+export const workspaceStats = () => invoke<WorkspaceStats>('workspace_stats')
 
 // 集合
 export const collectionTree = (projectId: number) =>
@@ -79,6 +85,10 @@ export const historyList = (limit = 100) => invoke<HistoryItem[]>('history_list'
 
 export const historyClear = () => invoke<void>('history_clear')
 
+// 工具箱
+export const ipLookup = (ip?: string) =>
+  invoke<IpLookupInfo>('ip_lookup', { ip: ip?.trim() || null })
+
 // 压测
 export const stressStart = (config: StressConfig) => invoke<void>('stress_start', { config })
 
@@ -93,6 +103,12 @@ export const reportDelete = (id: number) => invoke<void>('report_delete', { id }
 
 export const reportExport = (id: number, path: string) =>
   invoke<void>('report_export', { id, path })
+
+export const reportWriteFile = (path: string, data: number[]) =>
+  invoke<void>('report_write_file', { path, data })
+
+export const reportRequests = (id: number, page = 1, pageSize = 50, success?: boolean | null) =>
+  invoke<ReportRequestsPage>('report_requests', { id, page, pageSize, success: success ?? null })
 
 // cURL 导入
 export const curlParse = (text: string) => invoke<CurlParsed>('curl_parse', { text })

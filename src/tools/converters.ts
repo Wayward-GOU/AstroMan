@@ -456,6 +456,114 @@ export function csvToJson(text: string, delimiter = ','): string {
   return stringifyJson(list, 2)
 }
 
+/* ---------------- JSON ↔ SQL / Markdown / JSON Lines ---------------- */
+
+function sqlIdentifier(name: string): string {
+  const cleaned = name.trim().replace(/[^\w$]/g, '_')
+  if (!cleaned) throw new Error('表名不能为空')
+  if (/^\d/.test(cleaned)) return `\`t_${cleaned}\``
+  return `\`${cleaned}\``
+}
+
+function sqlValue(value: unknown): string {
+  if (value === null || value === undefined) return 'NULL'
+  if (typeof value === 'number') return Number.isFinite(value) ? String(value) : 'NULL'
+  if (typeof value === 'boolean') return value ? '1' : '0'
+  const text = typeof value === 'object' ? JSON.stringify(value) : String(value)
+  return `'${text.replace(/\\/g, '\\\\').replace(/'/g, "''")}'`
+}
+
+export function jsonToSql(text: string, table: string, mode: 'single' | 'batch' = 'single'): string {
+  const parsed = parseJson(text)
+  const rows = (Array.isArray(parsed) ? parsed : [parsed]).filter(
+    (item) => item !== null && typeof item === 'object' && !Array.isArray(item),
+  ) as Record<string, unknown>[]
+  if (!rows.length) throw new Error('需要对象或对象数组才能生成 SQL')
+  const columns: string[] = []
+  rows.forEach((row) => {
+    Object.keys(row).forEach((key) => {
+      if (!columns.includes(key)) columns.push(key)
+    })
+  })
+  const name = sqlIdentifier(table)
+  const columnSql = columns.map((column) => sqlIdentifier(column)).join(', ')
+  const lines =
+    mode === 'batch'
+      ? [
+          `INSERT INTO ${name} (${columnSql}) VALUES`,
+          `${rows
+            .map((row) => `  (${columns.map((column) => sqlValue(row[column])).join(', ')})`)
+            .join(',\n')};`,
+        ]
+      : rows.map(
+          (row) =>
+            `INSERT INTO ${name} (${columnSql}) VALUES (${columns
+              .map((column) => sqlValue(row[column]))
+              .join(', ')});`,
+        )
+  return lines.join('\n')
+}
+
+export function jsonToMarkdown(text: string): string {
+  const parsed = parseJson(text)
+  const escape = (cell: unknown): string => {
+    const value = cell === null || cell === undefined ? '' : String(cell)
+    return value.replace(/\|/g, '\\|').replace(/\r?\n/g, '<br>')
+  }
+  if (Array.isArray(parsed)) {
+    if (!parsed.length) throw new Error('JSON 数组为空')
+    const objects = parsed.filter(
+      (item) => item !== null && typeof item === 'object' && !Array.isArray(item),
+    ) as Record<string, unknown>[]
+    if (!objects.length) {
+      return parsed.map((item) => `- ${escape(item)}`).join('\n')
+    }
+    const columns: string[] = []
+    objects.forEach((row) => {
+      Object.keys(row).forEach((key) => {
+        if (!columns.includes(key)) columns.push(key)
+      })
+    })
+    const head = `| ${columns.map(escape).join(' | ')} |`
+    const divider = `| ${columns.map(() => '---').join(' | ')} |`
+    const body = objects.map(
+      (row) => `| ${columns.map((column) => escape(row[column])).join(' | ')} |`,
+    )
+    return [head, divider, ...body].join('\n')
+  }
+  if (parsed !== null && typeof parsed === 'object') {
+    const entries = Object.entries(parsed as Record<string, unknown>)
+    return [
+      '| 字段 | 值 |',
+      '| --- | --- |',
+      ...entries.map(([key, value]) => `| ${escape(key)} | ${escape(value)} |`),
+    ].join('\n')
+  }
+  return String(parsed)
+}
+
+export function jsonToJsonl(text: string): string {
+  const parsed = parseJson(text)
+  if (!Array.isArray(parsed)) throw new Error('需要 JSON 数组才能转换为 JSON Lines')
+  return parsed.map((item) => JSON.stringify(item)).join('\n')
+}
+
+export function jsonlToJson(text: string): string {
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+  if (!lines.length) throw new Error('JSON Lines 内容为空')
+  const items = lines.map((line, index) => {
+    try {
+      return JSON.parse(line)
+    } catch {
+      throw new Error(`第 ${index + 1} 行不是合法的 JSON`)
+    }
+  })
+  return stringifyJson(items, 2)
+}
+
 export function jsonToCsv(text: string, delimiter = ','): string {
   const value = parseJson(text)
   if (!Array.isArray(value)) throw new Error('需要 JSON 数组（每项为对象）才能转换为 CSV')

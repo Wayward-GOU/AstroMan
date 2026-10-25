@@ -2,10 +2,12 @@
 import { computed, ref } from 'vue'
 import { message } from 'ant-design-vue'
 import { CopyOutlined } from '@ant-design/icons-vue'
-import { ASCII_ROWS, HEADER_ROWS, HTTP_STATUS_ROWS, MIME_ROWS } from '@/tools/reference'
+import { ASCII_ROWS, DOCKER_ROWS, GIT_ROWS, HEADER_ROWS, HTTP_STATUS_ROWS, MIME_ROWS, REGEX_ROWS } from '@/tools/reference'
 import { COMMON_PORTS } from '@/tools/network'
 
-const props = defineProps<{ kind: 'ascii' | 'http' | 'mime' | 'headers' | 'ports' }>()
+const props = defineProps<{
+  kind: 'ascii' | 'http' | 'mime' | 'headers' | 'ports' | 'git' | 'docker' | 'regex'
+}>()
 
 const filter = ref('')
 
@@ -24,6 +26,12 @@ const columns = computed<string[]>(() => {
       return ['MIME 类型', '扩展名', '说明']
     case 'headers':
       return ['请求头', '作用', '示例']
+    case 'git':
+      return ['Git 命令', '说明', '示例']
+    case 'docker':
+      return ['Docker 命令', '说明', '示例']
+    case 'regex':
+      return ['语法', '说明', '示例']
     default:
       return ['端口', '服务', '说明']
   }
@@ -54,6 +62,14 @@ const rows = computed<Row[]>(() => {
         cells: [row.header, row.desc, row.example],
         copy: row.header,
       }))
+    case 'git':
+    case 'docker':
+    case 'regex': {
+      const source = props.kind === 'git' ? GIT_ROWS : props.kind === 'docker' ? DOCKER_ROWS : REGEX_ROWS
+      return source
+        .filter((row) => match(`${row.command} ${row.desc} ${row.example}`))
+        .map((row) => ({ cells: [row.command, row.desc, row.example], copy: row.command }))
+    }
     default:
       return COMMON_PORTS.filter((row) => match(`${row.port} ${row.service} ${row.note}`)).map((row) => ({
         cells: [String(row.port), row.service, row.note],

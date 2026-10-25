@@ -12,6 +12,7 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "FinkMeter",
         "width": 1280,
         "height": 800,
@@ -27,6 +28,9 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "category": "DeveloperTool",
+    "shortDescription": "本地 API 调试与压测工具",
+    "longDescription": "FinkMeter 是一个完全本地运行的 API 调试、压测与开发工具箱，项目、历史与报告全部保存在本机。",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -37,8 +41,13 @@
     "windows": {
       "nsis": {
         "installMode": "currentUser",
-        "languages": ["SimpChinese"]
+        "languages": ["SimpChinese", "English"],
+        "displayLanguageSelector": true,
+        "compression": "lzma"
       }
+    },
+    "macOS": {
+      "minimumSystemVersion": "11.0"
     }
   }
 }

@@ -149,3 +149,88 @@ export const HEADER_ROWS: HeaderRow[] = [
   { header: 'X-Request-Id', desc: '链路追踪 ID', example: '9f1c2e5b' },
   { header: 'X-Forwarded-For', desc: '真实客户端 IP 链', example: '203.0.113.7' },
 ]
+
+export interface CommandRow {
+  command: string
+  desc: string
+  example: string
+}
+
+export const GIT_ROWS: CommandRow[] = [
+  { command: 'git init', desc: '初始化本地仓库', example: 'git init my-project' },
+  { command: 'git clone', desc: '克隆远程仓库', example: 'git clone https://github.com/user/repo.git' },
+  { command: 'git status', desc: '查看工作区与暂存区状态', example: 'git status -sb' },
+  { command: 'git add', desc: '把变更加入暂存区', example: 'git add src/main.ts' },
+  { command: 'git commit', desc: '提交暂存区的内容', example: 'git commit -m "feat: 新增登录接口"' },
+  { command: 'git log', desc: '查看提交历史', example: 'git log --oneline --graph -20' },
+  { command: 'git diff', desc: '查看尚未暂存的差异', example: 'git diff --stat' },
+  { command: 'git branch', desc: '列出、创建或删除分支', example: 'git branch -vv' },
+  { command: 'git switch', desc: '切换分支（推荐替代 checkout）', example: 'git switch -c feature/login' },
+  { command: 'git merge', desc: '合并分支到当前分支', example: 'git merge feature/login' },
+  { command: 'git rebase', desc: '变基，把当前分支接到目标分支之后', example: 'git rebase main' },
+  { command: 'git fetch', desc: '拉取远端更新但不合并', example: 'git fetch origin --prune' },
+  { command: 'git pull', desc: '拉取并合并远端更新', example: 'git pull --rebase origin main' },
+  { command: 'git push', desc: '推送本地提交到远端', example: 'git push -u origin main' },
+  { command: 'git reset', desc: '回退提交或撤销暂存', example: 'git reset --soft HEAD~1' },
+  { command: 'git restore', desc: '撤销工作区修改或取消暂存', example: 'git restore --staged file.txt' },
+  { command: 'git stash', desc: '暂存当前未提交修改', example: 'git stash push -m "临时保存"' },
+  { command: 'git tag', desc: '打标签，常用于发布版本', example: 'git tag -a v1.0.0 -m "首个版本"' },
+  { command: 'git cherry-pick', desc: '把指定提交摘到当前分支', example: 'git cherry-pick a1b2c3d' },
+  { command: 'git remote', desc: '管理远端仓库地址', example: 'git remote add origin git@github.com:user/repo.git' },
+  { command: 'git config', desc: '读写仓库或全局配置', example: 'git config --global user.name "张三"' },
+  { command: 'git blame', desc: '逐行查看最后修改者与提交', example: 'git blame -L 10,30 src/app.ts' },
+]
+
+export const DOCKER_ROWS: CommandRow[] = [
+  { command: 'docker ps', desc: '列出运行中的容器', example: 'docker ps -a' },
+  {
+    command: 'docker images',
+    desc: '列出本地镜像',
+    example: 'docker images --format "table {{.Repository}}\\t{{.Tag}}"',
+  },
+  { command: 'docker run', desc: '创建并启动容器', example: 'docker run -d -p 8080:80 --name web nginx' },
+  { command: 'docker start', desc: '启动已停止的容器', example: 'docker start web' },
+  { command: 'docker stop', desc: '停止运行中的容器', example: 'docker stop web' },
+  { command: 'docker restart', desc: '重启容器', example: 'docker restart web' },
+  { command: 'docker rm', desc: '删除容器', example: 'docker rm -f web' },
+  { command: 'docker rmi', desc: '删除镜像', example: 'docker rmi nginx:latest' },
+  { command: 'docker exec', desc: '在运行中的容器里执行命令', example: 'docker exec -it web /bin/sh' },
+  { command: 'docker logs', desc: '查看容器日志', example: 'docker logs -f --tail 100 web' },
+  { command: 'docker inspect', desc: '查看容器或镜像的完整配置', example: 'docker inspect web' },
+  { command: 'docker build', desc: '根据 Dockerfile 构建镜像', example: 'docker build -t myapp:1.0 .' },
+  { command: 'docker pull', desc: '拉取镜像', example: 'docker pull mysql:8.0' },
+  { command: 'docker push', desc: '推送镜像到仓库', example: 'docker push registry.example.com/myapp:1.0' },
+  { command: 'docker tag', desc: '给镜像打标签', example: 'docker tag myapp:1.0 registry.example.com/myapp:1.0' },
+  { command: 'docker compose up', desc: '按 compose 文件启动全部服务', example: 'docker compose up -d' },
+  { command: 'docker compose down', desc: '停止并移除 compose 服务', example: 'docker compose down -v' },
+  { command: 'docker compose logs', desc: '查看 compose 服务日志', example: 'docker compose logs -f api' },
+  { command: 'docker stats', desc: '实时查看容器资源占用', example: 'docker stats --no-stream' },
+  { command: 'docker system prune', desc: '清理未使用的容器、网络与镜像', example: 'docker system prune -a --volumes' },
+]
+
+export const REGEX_ROWS: CommandRow[] = [
+  { command: '\\d', desc: '数字，等价于 [0-9]', example: '2024 → 2 0 2 4' },
+  { command: '\\w', desc: '字母、数字或下划线', example: 'a_1 → a_1' },
+  { command: '\\s', desc: '空白字符（空格、制表符、换行）', example: 'a b → 空格' },
+  { command: '^', desc: '匹配行首', example: '^abc 只匹配开头是 abc 的行' },
+  { command: '$', desc: '匹配行尾', example: 'xyz$ 只匹配结尾是 xyz 的行' },
+  { command: '.', desc: '任意字符（不含换行，除非启用 s 标志）', example: 'a.c → abc / a1c' },
+  { command: '*', desc: '前面的元素重复 0 次或多次', example: 'ab* → a / ab / abbb' },
+  { command: '+', desc: '前面的元素重复 1 次或多次', example: 'ab+ → ab / abbb' },
+  { command: '?', desc: '前面的元素出现 0 次或 1 次', example: 'colou?r → color / colour' },
+  { command: '{n,m}', desc: '重复 n 到 m 次', example: '\\d{2,4} → 12 / 1234' },
+  { command: '[abc]', desc: '字符集合中的任意一个', example: '[aeiou] → 匹配元音' },
+  { command: '[^abc]', desc: '不在集合中的任意字符', example: '[^0-9] → 匹配非数字' },
+  { command: '(abc)', desc: '捕获分组', example: '(\\d{4})-(\\d{2}) 取年月' },
+  { command: '(?:abc)', desc: '非捕获分组，不占用分组编号', example: '(?:ab)+' },
+  { command: '(?<name>abc)', desc: '命名捕获分组', example: '(?<year>\\d{4})' },
+  { command: 'a|b', desc: '或，匹配 a 或 b', example: 'cat|dog' },
+  { command: '(?=abc)', desc: '正向先行断言，后面必须是 abc', example: '\\d+(?=px)' },
+  { command: '(?!abc)', desc: '负向先行断言，后面不能是 abc', example: '\\d+(?!px)' },
+  { command: '(?<=abc)', desc: '正向后行断言，前面必须是 abc', example: '(?<=¥)\\d+' },
+  { command: '(?<!abc)', desc: '负向后行断言，前面不能是 abc', example: '(?<!¥)\\d+' },
+  { command: '\\b', desc: '单词边界', example: '\\bcat\\b → 独立单词 cat' },
+  { command: '\\B', desc: '非单词边界', example: '\\Bcat' },
+  { command: '\\u4e00-\\u9fa5', desc: '中文汉字范围', example: '[\\u4e00-\\u9fa5]+' },
+]
+

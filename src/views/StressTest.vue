@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
@@ -145,6 +145,11 @@ const settings = reactive({
   rampUpSec: 5,
   thinkTimeMs: 0,
   timeoutMs: 30000,
+  connectTimeoutMs: 10000,
+  followRedirects: true,
+  stopOnErrorRate: false,
+  stopErrorRate: 5,
+  stopMinRequests: 100,
   insecure: false,
   targetRps: 0,
   slaEnabled: false,
@@ -177,24 +182,32 @@ const running = ref(false)
 const stopping = ref(false)
 const progress = ref<StressProgress | null>(null)
 const done = ref<StressDone | null>(null)
+const resultCard = ref<HTMLElement | null>(null)
 const unlisteners: UnlistenFn[] = []
 
 onMounted(async () => {
-  unlisteners.push(
-    await listen<StressProgress>('stress.progress', (event) => {
-      progress.value = event.payload
-    }),
-  )
-  unlisteners.push(
-    await listen<StressDone>('stress.done', (event) => {
-      done.value = event.payload
-      running.value = false
-      stopping.value = false
-      if (event.payload.reportId) {
-        message.success('压测已结束，报告已生成')
-      }
-    }),
-  )
+  try {
+    unlisteners.push(
+      await listen<StressProgress>('stress:progress', (event) => {
+        progress.value = event.payload
+      }),
+    )
+    unlisteners.push(
+      await listen<StressDone>('stress:done', (event) => {
+        done.value = event.payload
+        running.value = false
+        stopping.value = false
+        if (event.payload.reportId) {
+          message.success('压测已结束，报告已生成')
+        } else if (event.payload.message) {
+          message.error(event.payload.message)
+        }
+        nextTick(() => resultCard.value?.scrollIntoView({ behavior: 'smooth', block: 'center' }))
+      }),
+    )
+  } catch (e) {
+    console.error('压测事件监听失败', e)
+  }
 
   try {
     if (!requestId.value) {
@@ -344,6 +357,10 @@ async function start() {
       envId: envId.value,
       insecure: settings.insecure,
       timeoutMs: settings.timeoutMs,
+      connectTimeoutMs: settings.connectTimeoutMs,
+      followRedirects: settings.followRedirects,
+      stopErrorRate: settings.stopOnErrorRate ? settings.stopErrorRate : null,
+      stopMinRequests: settings.stopOnErrorRate ? settings.stopMinRequests : null,
       concurrent: settings.mode === 'fixed' ? settings.concurrent : peakConcurrent.value,
       durationSec: totalSeconds.value,
       rampUpSec: settings.mode === 'fixed' ? settings.rampUpSec : 0,
@@ -673,7 +690,7 @@ function backToRequest() {
             <LineChart :series="latencySeries" :labels="chartLabels" unit="ms" :area="false" />
           </div>
 
-          <div v-if="done" class="fm-card result-card">
+          <div v-if="done" ref="resultCard" class="fm-card result-card">
             <div class="result-icon"><FileTextOutlined /></div>
             <div class="result-main">
               <div class="result-title">
@@ -710,8 +727,9 @@ function backToRequest() {
     <a-modal
       v-model:open="configOpen"
       title="新建压测"
-      :width="680"
+      :width="1040"
       :mask-closable="false"
+      class="stress-config-modal"
       ok-text="开始压测"
       cancel-text="取消"
       :confirm-loading="preparing"
@@ -719,30 +737,54 @@ function backToRequest() {
     >
       <div class="modal-body">
         <div class="modal-section">
-          <div class="section-title"><span class="step">1</span>选择目标接口</div>
-          <div class="picker-grid">
+          <div class="section-title">
+            <span class="step">1</span>选择目标接口
+            <span class="section-sub">Target</span>
+          </div>
+          <div class="target-grid">
             <div class="field">
               <div class="label">项目</div>
               <a-select
                 v-model:value="targetProjectId"
                 :options="projectOptions"
                 placeholder="选择项目"
+                size="large"
                 show-search
                 option-filter-prop="label"
+                popup-class-name="stress-select-dropdown"
               />
             </div>
             <div class="field">
-              <div class="label">接口</div>
+              <div class="label">环境变量</div>
               <a-select
-                v-model:value="targetRequestId"
-                :options="requestSelectOptions"
-                :loading="choicesLoading"
-                placeholder="选择要压测的接口"
-                show-search
-                option-filter-prop="label"
-                :not-found-content="choicesLoading ? '加载中…' : '该项目下暂无接口'"
-              />
+                v-model:value="modalEnvId"
+                size="large"
+                allow-clear
+                placeholder="不使用环境变量"
+                popup-class-name="stress-select-dropdown"
+              >
+                <a-select-option v-for="env in modalEnvironments" :key="env.id" :value="env.id">
+                  {{ env.name }}
+                </a-select-option>
+              </a-select>
             </div>
+          </div>
+          <div class="field">
+            <div class="label">
+              接口
+              <span class="label-hint">选中后自动带入 Headers、Params、Body 与变量</span>
+            </div>
+            <a-select
+              v-model:value="targetRequestId"
+              :options="requestSelectOptions"
+              :loading="choicesLoading"
+              placeholder="选择要压测的接口"
+              size="large"
+              show-search
+              option-filter-prop="label"
+              popup-class-name="stress-select-dropdown"
+              :not-found-content="choicesLoading ? '加载中…' : '该项目下暂无接口'"
+            />
           </div>
           <div v-if="selectedChoice" class="target-preview">
             <div class="target-preview-top">
@@ -753,125 +795,254 @@ function backToRequest() {
             <div class="target-url mono">{{ selectedChoice.url }}</div>
           </div>
           <div v-else-if="currentProject" class="hint">
-            {{ currentProject.name }} · 共 {{ choices.length }} 个接口，选择后自动带入 Headers、Body 与环境变量
+            {{ currentProject.name }} · 共 {{ choices.length }} 个接口
           </div>
         </div>
 
         <div class="modal-section">
-          <div class="section-title"><span class="step">2</span>配置压测参数</div>
+          <div class="section-title">
+            <span class="step">2</span>配置压测参数
+            <span class="section-sub">JMeter 风格</span>
+          </div>
           <div class="modal-fields">
-            <div class="field">
-              <div class="label">加压模式</div>
-              <a-segmented
-                v-model:value="settings.mode"
-                :options="[
-                  { label: '固定并发', value: 'fixed' },
-                  { label: '阶梯加压', value: 'stages' },
-                ]"
-                block
-              />
-              <div class="hint">
-                {{ settings.mode === 'fixed'
-                  ? '固定并发持续压测，适合验证稳定吞吐'
-                  : '按阶段逐步提升并发，用于寻找性能拐点' }}
+            <!-- 线程组 -->
+            <div class="param-card">
+              <div class="param-head">
+                <span class="param-title">线程组</span>
+                <span class="param-sub">Thread Group</span>
               </div>
-            </div>
-
-            <template v-if="settings.mode === 'fixed'">
-              <div class="field">
-                <div class="label">并发数</div>
-                <a-input-number v-model:value="settings.concurrent" :min="1" :max="500" style="width: 100%" />
-                <div class="hint">同一时刻同时执行的请求数量，建议从 10～30 起步</div>
-              </div>
-              <div class="field-row">
+              <div class="param-body">
                 <div class="field">
-                  <div class="label">压测时长（秒）</div>
-                  <a-input-number v-model:value="settings.durationSec" :min="1" :max="3600" style="width: 100%" />
-                </div>
-                <div class="field">
-                  <div class="label">预热时长（秒）</div>
-                  <a-input-number v-model:value="settings.rampUpSec" :min="0" :max="600" style="width: 100%" />
-                </div>
-              </div>
-            </template>
-
-            <template v-else>
-              <div class="field">
-                <div class="label stage-label">
-                  <span>加压阶段</span>
-                  <a-button size="small" type="link" @click="addStage">+ 添加阶段</a-button>
-                </div>
-                <div class="stage-list">
-                  <div class="stage-row stage-header">
-                    <span />
-                    <span>并发数</span>
-                    <span>时长（秒）</span>
-                    <span />
-                  </div>
-                  <div v-for="(stage, index) in stages" :key="index" class="stage-row">
-                    <span class="stage-index">{{ index + 1 }}</span>
-                    <a-input-number v-model:value="stage.concurrent" :min="1" :max="500" size="small" />
-                    <a-input-number v-model:value="stage.durationSec" :min="1" :max="3600" size="small" />
-                    <a-button size="small" type="text" danger :disabled="stages.length <= 1" @click="removeStage(index)">
-                      移除
-                    </a-button>
+                  <div class="label">加压模式</div>
+                  <a-segmented
+                    v-model:value="settings.mode"
+                    :options="[
+                      { label: '固定并发', value: 'fixed' },
+                      { label: '阶梯加压', value: 'stages' },
+                    ]"
+                    block
+                  />
+                  <div class="hint">
+                    {{ settings.mode === 'fixed'
+                      ? '固定线程数持续压测，适合验证稳定吞吐'
+                      : '按阶段逐步提升并发，用于寻找性能拐点' }}
                   </div>
                 </div>
-                <div class="hint">共 {{ totalSeconds }} 秒，峰值并发 {{ peakConcurrent }}</div>
-              </div>
-            </template>
 
-            <div class="field-row">
-              <div class="field">
-                <div class="label">思考时间（毫秒）</div>
-                <a-input-number v-model:value="settings.thinkTimeMs" :min="0" :max="60000" :step="100" style="width: 100%" />
-              </div>
-              <div class="field">
-                <div class="label">超时（毫秒）</div>
-                <a-input-number v-model:value="settings.timeoutMs" :min="500" :max="120000" :step="1000" style="width: 100%" />
+                <template v-if="settings.mode === 'fixed'">
+                  <div class="field-row">
+                    <div class="field">
+                      <div class="label">线程数（并发）</div>
+                      <a-input-number
+                        v-model:value="settings.concurrent"
+                        :min="1"
+                        :max="500"
+                        size="large"
+                        style="width: 100%"
+                      />
+                      <div class="hint">建议从 10～30 起步，观察错误率后再提高</div>
+                    </div>
+                    <div class="field">
+                      <div class="label">持续时间（秒）</div>
+                      <a-input-number
+                        v-model:value="settings.durationSec"
+                        :min="1"
+                        :max="3600"
+                        size="large"
+                        style="width: 100%"
+                      />
+                    </div>
+                  </div>
+                  <div class="field">
+                    <div class="label">Ramp-Up 时间（秒）</div>
+                    <a-input-number
+                      v-model:value="settings.rampUpSec"
+                      :min="0"
+                      :max="600"
+                      size="large"
+                      style="width: 100%"
+                    />
+                    <div class="hint">并发从 0 逐步升到目标值的时间，需小于持续时间</div>
+                  </div>
+                </template>
+
+                <template v-else>
+                  <div class="field">
+                    <div class="label stage-label">
+                      <span>加压阶段</span>
+                      <a-button size="small" type="link" @click="addStage">+ 添加阶段</a-button>
+                    </div>
+                    <div class="stage-list">
+                      <div class="stage-row stage-header">
+                        <span />
+                        <span>并发数</span>
+                        <span>时长（秒）</span>
+                        <span />
+                      </div>
+                      <div v-for="(stage, index) in stages" :key="index" class="stage-row">
+                        <span class="stage-index">{{ index + 1 }}</span>
+                        <a-input-number v-model:value="stage.concurrent" :min="1" :max="500" />
+                        <a-input-number v-model:value="stage.durationSec" :min="1" :max="3600" />
+                        <a-button size="small" type="text" danger :disabled="stages.length <= 1" @click="removeStage(index)">
+                          移除
+                        </a-button>
+                      </div>
+                    </div>
+                    <div class="hint">共 {{ totalSeconds }} 秒，峰值并发 {{ peakConcurrent }}</div>
+                  </div>
+                </template>
               </div>
             </div>
 
-            <div class="field">
-              <div class="label">目标 RPS 限速</div>
-              <a-input-number v-model:value="settings.targetRps" :min="0" :max="100000" :step="10" style="width: 100%" />
-              <div class="hint">0 表示不限速；设置后每秒最多发出该数量的请求</div>
-            </div>
-
-            <div class="field">
-              <div class="label">环境</div>
-              <a-select v-model:value="modalEnvId" allow-clear placeholder="不使用环境变量" style="width: 100%">
-                <a-select-option v-for="env in modalEnvironments" :key="env.id" :value="env.id">
-                  {{ env.name }}
-                </a-select-option>
-              </a-select>
-            </div>
-
-            <a-checkbox v-model:checked="settings.insecure">忽略证书校验（自签证书）</a-checkbox>
-
-            <div class="sla-block">
-              <div class="sla-head">
-                <a-checkbox v-model:checked="settings.slaEnabled">设置 SLA 验收阈值</a-checkbox>
+            <!-- HTTP 请求默认值 -->
+            <div class="param-card">
+              <div class="param-head">
+                <span class="param-title">HTTP 请求默认值</span>
+                <span class="param-sub">HTTP Request Defaults</span>
               </div>
-              <div v-if="settings.slaEnabled" class="sla-grid">
-                <div class="field">
-                  <div class="label">P95 ≤（ms）</div>
-                  <a-input-number v-model:value="settings.slaP95" :min="0" :max="120000" size="small" style="width: 100%" />
+              <div class="param-body">
+                <div class="field-row">
+                  <div class="field">
+                    <div class="label">连接超时（毫秒）</div>
+                    <a-input-number
+                      v-model:value="settings.connectTimeoutMs"
+                      :min="500"
+                      :max="120000"
+                      :step="1000"
+                      size="large"
+                      style="width: 100%"
+                    />
+                  </div>
+                  <div class="field">
+                    <div class="label">请求超时（毫秒）</div>
+                    <a-input-number
+                      v-model:value="settings.timeoutMs"
+                      :min="500"
+                      :max="120000"
+                      :step="1000"
+                      size="large"
+                      style="width: 100%"
+                    />
+                  </div>
                 </div>
-                <div class="field">
-                  <div class="label">P99 ≤（ms）</div>
-                  <a-input-number v-model:value="settings.slaP99" :min="0" :max="120000" size="small" style="width: 100%" />
-                </div>
-                <div class="field">
-                  <div class="label">错误率 ≤（%）</div>
-                  <a-input-number v-model:value="settings.slaErrorRate" :min="0" :max="100" :step="0.5" size="small" style="width: 100%" />
-                </div>
-                <div class="field">
-                  <div class="label">平均 RPS ≥</div>
-                  <a-input-number v-model:value="settings.slaMinRps" :min="0" :max="100000" size="small" style="width: 100%" />
+                <div class="check-row">
+                  <a-checkbox v-model:checked="settings.followRedirects">跟随 3xx 重定向</a-checkbox>
+                  <a-checkbox v-model:checked="settings.insecure">忽略证书校验（自签证书）</a-checkbox>
                 </div>
               </div>
-              <div v-if="settings.slaEnabled" class="hint">报告生成时会逐项判定并给出是否达标</div>
+            </div>
+
+            <!-- 流量与节奏 -->
+            <div class="param-card">
+              <div class="param-head">
+                <span class="param-title">流量与节奏</span>
+                <span class="param-sub">Timer &amp; Throughput</span>
+              </div>
+              <div class="param-body">
+                <div class="field-row">
+                  <div class="field">
+                    <div class="label">思考时间（毫秒）</div>
+                    <a-input-number
+                      v-model:value="settings.thinkTimeMs"
+                      :min="0"
+                      :max="60000"
+                      :step="100"
+                      size="large"
+                      style="width: 100%"
+                    />
+                    <div class="hint">每个线程两次请求之间的固定间隔</div>
+                  </div>
+                  <div class="field">
+                    <div class="label">目标 RPS 限速</div>
+                    <a-input-number
+                      v-model:value="settings.targetRps"
+                      :min="0"
+                      :max="100000"
+                      :step="10"
+                      size="large"
+                      style="width: 100%"
+                    />
+                    <div class="hint">0 表示不限速；每秒最多发出该数量的请求</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 自动停止 -->
+            <div class="param-card">
+              <div class="param-head">
+                <span class="param-title">自动停止</span>
+                <span class="param-sub">Auto Stop</span>
+              </div>
+              <div class="param-body">
+                <div class="check-row">
+                  <a-checkbox v-model:checked="settings.stopOnErrorRate">错误率超过阈值时提前停止</a-checkbox>
+                </div>
+                <div v-if="settings.stopOnErrorRate" class="field-row">
+                  <div class="field">
+                    <div class="label">错误率阈值（%）</div>
+                    <a-input-number
+                      v-model:value="settings.stopErrorRate"
+                      :min="0.1"
+                      :max="100"
+                      :step="0.5"
+                      size="large"
+                      style="width: 100%"
+                    />
+                  </div>
+                  <div class="field">
+                    <div class="label">最少请求数</div>
+                    <a-input-number
+                      v-model:value="settings.stopMinRequests"
+                      :min="1"
+                      :max="1000000"
+                      :step="100"
+                      size="large"
+                      style="width: 100%"
+                    />
+                    <div class="hint">达到该请求数后才开始判定，避免起步阶段误停</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- SLA -->
+            <div class="param-card">
+              <div class="param-head">
+                <span class="param-title">SLA 验收</span>
+                <span class="param-sub">Service Level</span>
+              </div>
+              <div class="param-body">
+                <div class="check-row">
+                  <a-checkbox v-model:checked="settings.slaEnabled">设置 SLA 验收阈值</a-checkbox>
+                </div>
+                <div v-if="settings.slaEnabled" class="sla-grid">
+                  <div class="field">
+                    <div class="label">P95 ≤（ms）</div>
+                    <a-input-number v-model:value="settings.slaP95" :min="0" :max="120000" size="large" style="width: 100%" />
+                  </div>
+                  <div class="field">
+                    <div class="label">P99 ≤（ms）</div>
+                    <a-input-number v-model:value="settings.slaP99" :min="0" :max="120000" size="large" style="width: 100%" />
+                  </div>
+                  <div class="field">
+                    <div class="label">错误率 ≤（%）</div>
+                    <a-input-number
+                      v-model:value="settings.slaErrorRate"
+                      :min="0"
+                      :max="100"
+                      :step="0.5"
+                      size="large"
+                      style="width: 100%"
+                    />
+                  </div>
+                  <div class="field">
+                    <div class="label">平均 RPS ≥</div>
+                    <a-input-number v-model:value="settings.slaMinRps" :min="0" :max="100000" size="large" style="width: 100%" />
+                  </div>
+                </div>
+                <div v-if="settings.slaEnabled" class="hint">报告生成时会逐项判定并给出是否达标</div>
+              </div>
             </div>
           </div>
         </div>
@@ -1368,46 +1539,110 @@ function backToRequest() {
 .modal-body {
   display: flex;
   flex-direction: column;
-  gap: 18px;
-  max-height: 62vh;
+  gap: 20px;
+  max-height: 74vh;
   overflow-y: auto;
-  padding-right: 4px;
+  padding: 4px 8px 4px 2px;
+}
+
+.modal-body .label {
+  margin-bottom: 7px;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--fm-text-2);
+}
+
+.modal-body .hint {
+  margin-top: 6px;
+  font-size: 11px;
+}
+
+.label-hint {
+  margin-left: 8px;
+  font-size: 10.5px;
+  font-weight: 400;
+  color: var(--fm-muted);
+}
+
+.modal-body :deep(.ant-select-lg .ant-select-selector) {
+  min-height: 44px;
+  padding: 6px 14px;
+  font-size: 13.5px;
+  align-items: center;
+}
+
+.modal-body :deep(.ant-input-number-lg) {
+  min-height: 44px;
+  font-size: 13.5px;
+}
+
+.modal-body :deep(.ant-input-number-lg .ant-input-number-input) {
+  height: 42px;
 }
 
 .modal-section {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 13px;
 }
 
 .section-title {
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 600;
 }
 
+.section-sub {
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.4px;
+  color: var(--fm-muted);
+  text-transform: uppercase;
+}
+
 .step {
-  width: 18px;
-  height: 18px;
-  border-radius: 6px;
+  width: 20px;
+  height: 20px;
+  border-radius: 7px;
   background: var(--fm-primary-soft);
   color: var(--fm-primary);
-  font-size: 10px;
+  font-size: 11px;
   display: flex;
   align-items: center;
   justify-content: center;
 }
 
-.picker-grid {
+.target-grid {
   display: grid;
-  grid-template-columns: 200px minmax(0, 1fr);
-  gap: 12px;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+
+.target-grid .field,
+.modal-section > .field {
+  min-width: 0;
+}
+
+:global(.stress-select-dropdown) {
+  min-width: 260px;
+}
+
+:global(.stress-select-dropdown .ant-select-item) {
+  min-height: 38px;
+  padding: 9px 12px;
+  font-size: 13px;
+}
+
+:global(.stress-select-dropdown .ant-select-item-option-content) {
+  white-space: normal;
+  word-break: break-all;
+  line-height: 1.5;
 }
 
 .target-preview {
-  padding: 12px;
+  padding: 13px 15px;
   border: 1px solid var(--fm-border);
   border-radius: 10px;
   background: var(--fm-surface-alt);
@@ -1420,7 +1655,7 @@ function backToRequest() {
 }
 
 .target-preview-name {
-  font-size: 12px;
+  font-size: 12.5px;
   font-weight: 600;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1437,7 +1672,54 @@ function backToRequest() {
 .modal-fields {
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 12px;
+}
+
+/* 参数分组卡片 */
+.param-card {
+  border: 1px solid var(--fm-border);
+  border-radius: 11px;
+  background: var(--fm-surface);
+  overflow: hidden;
+}
+
+.param-head {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  padding: 10px 15px;
+  border-bottom: 1px solid var(--fm-border);
+  background: var(--fm-surface-alt);
+}
+
+.param-title {
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.param-sub {
+  font-size: 9.5px;
+  letter-spacing: 0.4px;
+  color: var(--fm-muted);
+  text-transform: uppercase;
+}
+
+.param-body {
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+  padding: 15px;
+}
+
+.check-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 24px;
+}
+
+.check-row :deep(.ant-checkbox-wrapper) {
+  font-size: 12.5px;
 }
 
 .modal-foot {
@@ -1462,7 +1744,9 @@ function backToRequest() {
 }
 
 @media (max-width: 720px) {
-  .picker-grid {
+  .target-grid,
+  .field-row,
+  .sla-grid {
     grid-template-columns: 1fr;
   }
   .modal-foot {

@@ -118,3 +118,34 @@ export const COMMON_PORTS: Array<{ port: number; service: string; note: string }
   { port: 8080, service: 'HTTP-Alt', note: '常见应用端口' },
   { port: 8443, service: 'HTTPS-Alt', note: '常见应用 HTTPS 端口' },
 ]
+
+/* ---------------- URL 解析 ---------------- */
+
+export function urlInfo(input: string): string {
+  const raw = input.trim()
+  if (!raw) throw new Error('请输入 URL，例如 https://example.com/api?page=1')
+  const candidate = /^[a-zA-Z][\w+.-]*:\/\//.test(raw) ? raw : `http://${raw}`
+  let url: URL
+  try {
+    url = new URL(candidate)
+  } catch {
+    throw new Error('URL 格式不正确')
+  }
+  const lines = [
+    `协议：${url.protocol.replace(':', '')}`,
+    `主机：${url.hostname}`,
+    `端口：${url.port || '(默认)'}`,
+    `路径：${url.pathname || '/'}`,
+    `查询串：${url.search || '(无)'}`,
+    `片段：${url.hash || '(无)'}`,
+    `完整 URL：${url.href}`,
+  ]
+  if (url.username) lines.splice(1, 0, `用户名：${decodeURIComponent(url.username)}`)
+  if (url.password) lines.splice(2, 0, `密码：${decodeURIComponent(url.password)}`)
+  const entries = Array.from(url.searchParams.entries())
+  if (entries.length) {
+    lines.push('', `查询参数（${entries.length} 项）：`)
+    entries.forEach(([key, value]) => lines.push(`  ${key} = ${value}`))
+  }
+  return lines.join('\n')
+}

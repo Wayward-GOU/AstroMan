@@ -3,18 +3,26 @@ import { toolHash, toolHmac } from '@/api'
 import {
   asciiDecode,
   asciiEncode,
+  base32Decode,
+  base32Encode,
   base64Decode,
   base64Encode,
   base64UrlDecode,
   base64UrlEncode,
   convertCase,
   dedupeLines,
+  escapeString,
+  extractText,
   gunzipFromBase64,
   gzipToBase64,
+  hexDecode,
+  hexEncode,
   htmlEscape,
   htmlUnescape,
   ipToLong,
+  lineOps,
   longToIp,
+  macInfo,
   morseDecode,
   morseEncode,
   rc4,
@@ -24,22 +32,30 @@ import {
   textStats,
   toFullWidth,
   toHalfWidth,
+  unescapeString,
   unicodeEscape,
   unicodeUnescape,
 } from './transforms'
 import {
   csvToJson,
   jsonToCsv,
+  jsonToJsonl,
+  jsonToMarkdown,
   jsonToQuery,
+  jsonToSql,
   jsonToXml,
   jsonToYaml,
+  jsonlToJson,
   queryToJson,
   xmlToJson,
   yamlToJson,
 } from './converters'
 import { jsonToEntity, sqlToJava } from './entity'
-import { crc16, crc32, luhnCheck, randomPassword, randomString, uuidV4 } from './calc'
-import type { CaseStyle } from './transforms'
+import { crc16, crc32, dateCalc, luhnCheck, pxRem, randomPassword, randomString, uuidV4 } from './calc'
+import { signJwt } from './crypto'
+import { cronInfo, snowflakeInfo } from './devtools'
+import { urlInfo } from './network'
+import type { CaseStyle, ExtractKind, LineOp } from './transforms'
 
 export const TOOL_CATEGORIES: ToolCategory[] = [
   { id: 'json', name: 'JSON 工具', hint: '格式化、互转、生成实体类' },
@@ -367,6 +383,76 @@ export const TOOLS: ToolDef[] = [
       actionLabel: '转 JSON',
       sample: '?page=1&size=20&tag=a&tag=b&name=%E5%BC%A0%E4%B8%89',
       run: (input) => queryToJson(input),
+    },
+  },
+  {
+    id: 'json2sql',
+    name: 'JSON 转 SQL',
+    category: 'json',
+    desc: '对象或数组生成 INSERT 语句，字段名与表名自动转义',
+    keywords: ['sql', 'insert', '建表', '导入', '数据库'],
+    simple: {
+      inputLabel: 'JSON 内容',
+      outputLabel: 'SQL 语句',
+      actionLabel: '生成 SQL',
+      sample: `[{"id": 1, "name": "张三", "active": true}, {"id": 2, "name": "李四", "active": false}]`,
+      options: [
+        { key: 'table', label: '表名', type: 'input', default: 't_data', width: 140 },
+        {
+          key: 'mode',
+          label: '写法',
+          type: 'select',
+          default: 'single',
+          options: [
+            { label: '逐条 INSERT', value: 'single' },
+            { label: '批量 VALUES', value: 'batch' },
+          ],
+        },
+      ],
+      run: (input, options) =>
+        jsonToSql(input, opt(options, 'table', 't_data'), opt(options, 'mode', 'single') as 'single' | 'batch'),
+    },
+  },
+  {
+    id: 'json2md',
+    name: 'JSON 转 Markdown',
+    category: 'json',
+    desc: '对象数组生成 Markdown 表格，便于贴进文档与 PR 描述',
+    keywords: ['markdown', 'md', '表格', '文档'],
+    simple: {
+      inputLabel: 'JSON 内容',
+      outputLabel: 'Markdown',
+      actionLabel: '转 Markdown',
+      sample: `[{"name": "张三", "role": "后端", "city": "杭州"}, {"name": "李四", "role": "前端", "city": "成都"}]`,
+      run: (input) => jsonToMarkdown(input),
+    },
+  },
+  {
+    id: 'json2jsonl',
+    name: 'JSON 转 JSON Lines',
+    category: 'json',
+    desc: '数组拆成每行一个对象，适合日志、批量导入与流式处理',
+    keywords: ['jsonl', 'ndjson', '逐行', '流式'],
+    simple: {
+      inputLabel: 'JSON 数组',
+      outputLabel: 'JSON Lines',
+      actionLabel: '转 JSON Lines',
+      sample: `[{"id": 1, "name": "张三"}, {"id": 2, "name": "李四"}]`,
+      run: (input) => jsonToJsonl(input),
+    },
+  },
+  {
+    id: 'jsonl2json',
+    name: 'JSON Lines 转 JSON',
+    category: 'json',
+    desc: '每行一个对象合并为标准 JSON 数组，自动定位出错行号',
+    keywords: ['jsonl', 'ndjson', '逐行', '合并'],
+    simple: {
+      inputLabel: 'JSON Lines 内容',
+      outputLabel: 'JSON 数组',
+      actionLabel: '转 JSON',
+      sample: `{"id": 1, "name": "张三"}\n{"id": 2, "name": "李四"}`,
+      run: (input) => jsonlToJson(input),
     },
   },
 
@@ -710,6 +796,128 @@ export const TOOLS: ToolDef[] = [
       },
     },
   },
+  {
+    id: 'base32',
+    name: 'Base32 编解码',
+    category: 'crypto',
+    desc: 'RFC 4648 Base32，兼容忽略填充与大小写',
+    keywords: ['base32', '编码', '解码', 'rfc4648'],
+    simple: {
+      inputLabel: '原始内容 / Base32',
+      outputLabel: '转换结果',
+      actionLabel: '转换',
+      sample: 'FinkMeter',
+      options: [
+        {
+          key: 'mode',
+          label: '方向',
+          type: 'select',
+          default: 'encode',
+          options: [
+            { label: '编码', value: 'encode' },
+            { label: '解码', value: 'decode' },
+          ],
+        },
+      ],
+      run: (input, options) =>
+        opt(options, 'mode', 'encode') === 'encode'
+          ? base32Encode(requireText(input))
+          : base32Decode(requireText(input)),
+    },
+  },
+  {
+    id: 'hex-codec',
+    name: '十六进制编解码',
+    category: 'crypto',
+    desc: '文本与十六进制互转，支持大小写、0x 前缀与连续写法',
+    keywords: ['hex', '十六进制', '编码', '解码', '二进制'],
+    simple: {
+      inputLabel: '文本 / 十六进制',
+      outputLabel: '转换结果',
+      actionLabel: '转换',
+      sample: 'FinkMeter 你好',
+      options: [
+        {
+          key: 'mode',
+          label: '方向',
+          type: 'select',
+          default: 'encode',
+          options: [
+            { label: '文本转十六进制', value: 'encode' },
+            { label: '十六进制转文本', value: 'decode' },
+          ],
+        },
+        { key: 'upper', label: '大写', type: 'switch', default: true },
+        { key: 'prefix', label: '0x 前缀', type: 'switch', default: false },
+      ],
+      run: (input, options) => {
+        const text = requireText(input)
+        if (opt(options, 'mode', 'encode') === 'decode') return hexDecode(text)
+        return hexEncode(text, { upper: options.upper === true, prefix: options.prefix === true })
+      },
+    },
+  },
+  {
+    id: 'string-escape',
+    name: '字符串转义 / 还原',
+    category: 'crypto',
+    desc: '把换行、引号、制表符转为 \\n、\\" 等转义序列，或反向还原',
+    keywords: ['escape', '转义', '反斜杠', '字符串', 'json'],
+    simple: {
+      inputLabel: '原始内容 / 转义内容',
+      outputLabel: '转换结果',
+      actionLabel: '转换',
+      sample: '第一行\n第二行 "引号" \t 制表符',
+      options: [
+        {
+          key: 'mode',
+          label: '方向',
+          type: 'select',
+          default: 'escape',
+          options: [
+            { label: '转义', value: 'escape' },
+            { label: '还原', value: 'unescape' },
+          ],
+        },
+      ],
+      run: (input, options) =>
+        opt(options, 'mode', 'escape') === 'escape' ? escapeString(input) : unescapeString(input),
+    },
+  },
+  {
+    id: 'jwt-sign',
+    name: 'JWT 签发',
+    category: 'crypto',
+    desc: '按 HS256 / HS512 生成 JWT，自动写入 iat 与 exp',
+    keywords: ['jwt', 'token', '签名', 'hs256', 'hs512'],
+    simple: {
+      inputLabel: 'Payload JSON',
+      outputLabel: 'JWT',
+      actionLabel: '生成 Token',
+      sample: `{"sub": "1001", "name": "张三", "role": "admin"}`,
+      options: [
+        {
+          key: 'algorithm',
+          label: '算法',
+          type: 'select',
+          default: 'HS256',
+          options: [
+            { label: 'HS256', value: 'HS256' },
+            { label: 'HS512', value: 'HS512' },
+          ],
+        },
+        { key: 'secret', label: '密钥', type: 'input', default: 'your-256-bit-secret', width: 200 },
+        { key: 'expire', label: '有效期(分钟)', type: 'number', default: 60, width: 110 },
+      ],
+      run: (input, options) =>
+        signJwt(
+          requireText(input),
+          opt(options, 'secret', 'your-256-bit-secret'),
+          opt(options, 'algorithm', 'HS256') as 'HS256' | 'HS512',
+          Number(options.expire ?? 60),
+        ),
+    },
+  },
 
   /* ---------------- 文本 ---------------- */
   {
@@ -935,6 +1143,90 @@ export const TOOLS: ToolDef[] = [
     keywords: ['diff', '对比', '差异', '比较'],
     component: () => import('@/components/tools/DiffTool.vue'),
   },
+  {
+    id: 'extract',
+    name: '内容提取',
+    category: 'text',
+    desc: '从大段文本中批量提取邮箱、URL、IP、手机号、UUID 与中文',
+    keywords: ['提取', '邮箱', 'email', 'url', 'ip', '手机号', 'uuid', '正则'],
+    simple: {
+      inputLabel: '待提取文本',
+      outputLabel: '提取结果',
+      actionLabel: '提取',
+      sample:
+        '联系邮箱 dev@example.com、ops@example.org；文档 https://docs.example.com/guide 和 http://10.0.0.12:8080/api；' +
+        '电话 13800138000；订单号 550e8400-e29b-41d4-a716-446655440000；备注：仅内部使用。',
+      options: [
+        {
+          key: 'kind',
+          label: '提取类型',
+          type: 'select',
+          default: 'email',
+          width: 150,
+          options: [
+            { label: '邮箱', value: 'email' },
+            { label: 'URL', value: 'url' },
+            { label: 'IPv4', value: 'ipv4' },
+            { label: '手机号', value: 'phone' },
+            { label: '数字', value: 'number' },
+            { label: 'UUID', value: 'uuid' },
+            { label: '中文', value: 'chinese' },
+          ],
+        },
+      ],
+      run: (input, options) => extractText(input, opt(options, 'kind', 'email') as ExtractKind),
+    },
+  },
+  {
+    id: 'line-ops',
+    name: '行处理',
+    category: 'text',
+    desc: '去空行、去重、排序、反转、加/去行号、合并为一行',
+    keywords: ['行', '去重', '排序', '空行', '行号', '合并'],
+    simple: {
+      inputLabel: '多行文本',
+      outputLabel: '处理结果',
+      actionLabel: '处理',
+      sample: '  apple\nbanana\n\nbanana\n  cherry  \n\napple',
+      options: [
+        {
+          key: 'op',
+          label: '操作',
+          type: 'select',
+          default: 'clean',
+          width: 160,
+          options: [
+            { label: '清理（去空格/空行/重复）', value: 'clean' },
+            { label: '去除首尾空格', value: 'trim' },
+            { label: '去除空行', value: 'noBlank' },
+            { label: '去除重复行', value: 'unique' },
+            { label: '升序排序', value: 'sortAsc' },
+            { label: '降序排序', value: 'sortDesc' },
+            { label: '反转行顺序', value: 'reverseLines' },
+            { label: '添加行号', value: 'number' },
+            { label: '去除行号', value: 'unnumber' },
+            { label: '合并为一行', value: 'join' },
+          ],
+        },
+      ],
+      run: (input, options) => lineOps(input, opt(options, 'op', 'clean') as LineOp),
+    },
+  },
+  {
+    id: 'mac',
+    name: 'MAC 地址工具',
+    category: 'text',
+    desc: '格式化 MAC 地址为多种写法，留空则随机生成一个测试地址',
+    keywords: ['mac', '网卡', '物理地址', '格式化', '随机'],
+    simple: {
+      inputLabel: 'MAC 地址（留空则随机生成）',
+      inputPlaceholder: '00-1A-2B-3C-4D-5E',
+      outputLabel: '格式化结果',
+      actionLabel: '处理',
+      sample: '00-1A-2B-3C-4D-5E',
+      run: (input) => macInfo(input),
+    },
+  },
 
   /* ---------------- 计算换算 ---------------- */
   {
@@ -1074,6 +1366,69 @@ export const TOOLS: ToolDef[] = [
     component: () => import('@/components/tools/KeyboardTool.vue'),
   },
 
+  {
+    id: 'date-calc',
+    name: '日期计算',
+    category: 'calc',
+    desc: '计算日期相差天数、工作日，或按天数推算目标日期',
+    keywords: ['日期', '天数', '工作日', '相差', '推算', 'date'],
+    simple: {
+      inputLabel: '日期（两个日期用空格分隔，或 日期 + 天数）',
+      inputPlaceholder: '2024-01-01 2024-03-15',
+      outputLabel: '计算结果',
+      actionLabel: '计算',
+      sample: '2024-01-01 2024-03-15',
+      options: [
+        {
+          key: 'mode',
+          label: '模式',
+          type: 'select',
+          default: 'diff',
+          width: 170,
+          options: [
+            { label: '相差天数 / 时分秒', value: 'diff' },
+            { label: '相差工作日', value: 'workdays' },
+            { label: '日期加减天数', value: 'add' },
+          ],
+        },
+      ],
+      run: (input, options) =>
+        dateCalc(requireText(input), opt(options, 'mode', 'diff') as 'diff' | 'add' | 'workdays'),
+    },
+  },
+  {
+    id: 'px-rem',
+    name: 'px / rem 换算',
+    category: 'calc',
+    desc: '按根字号批量换算 px 与 rem，支持一次输入多个值',
+    keywords: ['px', 'rem', 'css', '换算', '单位'],
+    simple: {
+      inputLabel: '数值（空格分隔，可带单位）',
+      outputLabel: '换算结果',
+      actionLabel: '换算',
+      sample: '12 14 16 20 24 32',
+      options: [
+        { key: 'base', label: '根字号', type: 'number', default: 16, width: 100 },
+        {
+          key: 'direction',
+          label: '方向',
+          type: 'select',
+          default: 'px2rem',
+          options: [
+            { label: 'px → rem', value: 'px2rem' },
+            { label: 'rem → px', value: 'rem2px' },
+          ],
+        },
+      ],
+      run: (input, options) =>
+        pxRem(
+          requireText(input),
+          Number(options.base ?? 16),
+          opt(options, 'direction', 'px2rem') as 'px2rem' | 'rem2px',
+        ),
+    },
+  },
+
   /* ---------------- 开发辅助 ---------------- */
   {
     id: 'mybatis',
@@ -1091,8 +1446,71 @@ export const TOOLS: ToolDef[] = [
     keywords: ['regex', '正则', '匹配', '分组'],
     component: () => import('@/components/tools/RegexTool.vue'),
   },
+  {
+    id: 'cron',
+    name: 'Cron 表达式解析',
+    category: 'dev',
+    desc: '解析 5 位 Cron，输出字段含义与接下来 5 次执行时间',
+    keywords: ['cron', '定时', '任务', '调度', '表达式'],
+    simple: {
+      inputLabel: 'Cron 表达式',
+      inputPlaceholder: '0 9 * * 1-5',
+      outputLabel: '解析结果',
+      actionLabel: '解析',
+      sample: '0 9 * * 1-5',
+      options: [{ key: 'count', label: '执行次数', type: 'number', default: 5, width: 100 }],
+      run: (input, options) => cronInfo(requireText(input), Number(options.count ?? 5)),
+    },
+  },
+  {
+    id: 'snowflake',
+    name: '雪花 ID 解析',
+    category: 'dev',
+    desc: '还原雪花 ID 的生成时间、数据中心、工作节点与序列号',
+    keywords: ['snowflake', '雪花', 'id', '分布式', 'mybatis'],
+    simple: {
+      inputLabel: '雪花 ID',
+      outputLabel: '解析结果',
+      actionLabel: '解析',
+      sample: '1812345678901234567',
+      options: [
+        {
+          key: 'workerBits',
+          label: '机器位',
+          type: 'select',
+          default: '10',
+          width: 120,
+          options: [
+            { label: '10 位（5+5）', value: '10' },
+            { label: '5 位', value: '5' },
+          ],
+        },
+        {
+          key: 'epoch',
+          label: '起始时间',
+          type: 'input',
+          default: '2010-11-04 16:35:00',
+          width: 190,
+        },
+      ],
+      run: (input, options) =>
+        snowflakeInfo(
+          requireText(input),
+          opt(options, 'epoch', '2010-11-04 16:35:00'),
+          Number(options.workerBits ?? 10),
+        ),
+    },
+  },
 
   /* ---------------- 网络 ---------------- */
+  {
+    id: 'ip-lookup',
+    name: 'IP 查询',
+    category: 'network',
+    desc: '查询本机公网 IP，展示归属地、运营商、经纬度等信息',
+    keywords: ['ip', '公网', '归属地', '运营商', '查询'],
+    component: () => import('@/components/tools/IpLookupTool.vue'),
+  },
   {
     id: 'subnet',
     name: '子网掩码计算',
@@ -1132,6 +1550,20 @@ export const TOOLS: ToolDef[] = [
           `二进制：${[24, 16, 8, 0].map((shift) => (long >>> shift & 0xff).toString(2).padStart(8, '0')).join('.')}`,
         ].join('\n')
       },
+    },
+  },
+  {
+    id: 'url-parse',
+    name: 'URL 解析',
+    category: 'network',
+    desc: '拆解协议、主机、端口、路径、片段与全部查询参数',
+    keywords: ['url', '解析', '参数', 'query', '域名'],
+    simple: {
+      inputLabel: 'URL',
+      outputLabel: '解析结果',
+      actionLabel: '解析',
+      sample: 'https://example.com:8443/api/v1/users?page=2&size=20&tag=a&tag=b#list',
+      run: (input) => urlInfo(requireText(input)),
     },
   },
   {
@@ -1180,6 +1612,33 @@ export const TOOLS: ToolDef[] = [
     keywords: ['header', '请求头', 'http'],
     component: () => import('@/components/tools/ReferenceTables.vue'),
     props: { kind: 'headers' },
+  },
+  {
+    id: 'git-commands',
+    name: 'Git 命令速查',
+    category: 'reference',
+    desc: '常用 Git 命令的作用与示例，支持关键字搜索与一键复制',
+    keywords: ['git', '命令', '版本控制', 'branch', 'commit'],
+    component: () => import('@/components/tools/ReferenceTables.vue'),
+    props: { kind: 'git' },
+  },
+  {
+    id: 'docker-commands',
+    name: 'Docker 命令速查',
+    category: 'reference',
+    desc: '容器、镜像、Compose 常用命令与参数示例',
+    keywords: ['docker', '容器', '镜像', 'compose', '命令'],
+    component: () => import('@/components/tools/ReferenceTables.vue'),
+    props: { kind: 'docker' },
+  },
+  {
+    id: 'regex-cheatsheet',
+    name: '正则语法速查',
+    category: 'reference',
+    desc: '字符类、量词、分组、断言等常用正则语法与示例',
+    keywords: ['regex', '正则', '语法', '断言', '分组'],
+    component: () => import('@/components/tools/ReferenceTables.vue'),
+    props: { kind: 'regex' },
   },
 ]
 

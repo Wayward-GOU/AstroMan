@@ -1,6 +1,6 @@
 use crate::models::{
-    ErrorTypeCount, HistogramBucket, ReportDetail, ReportError, ReportSample, StageSummary,
-    StatusCount, StressReport,
+    ErrorTypeCount, HistogramBucket, ReportDetail, ReportError, ReportRequestRecord,
+    ReportRequestsPage, ReportSample, StageSummary, StatusCount, StressReport,
 };
 use crate::state::AppState;
 use crate::util::{err, now_ms};
@@ -174,6 +174,7 @@ pub fn report_delete(state: State<'_, AppState>, id: i64) -> Result<(), String> 
 pub fn report_export(state: State<'_, AppState>, id: i64, path: String) -> Result<(), String> {
     let conn = state.pool.get().map_err(err)?;
     let detail = load_detail(&conn, id)?;
+    let requests = load_requests(&conn, id, 50_000, 0)?;
 
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
@@ -183,16 +184,110 @@ pub fn report_export(state: State<'_, AppState>, id: i64, path: String) -> Resul
         exported_at: i64,
         #[serde(flatten)]
         detail: ReportDetail,
+        requests: Vec<ReportRequestRecord>,
     }
 
     let bundle = ExportBundle {
         format: "finkmeter.report".to_string(),
-        version: 1,
+        version: 2,
         exported_at: now_ms(),
         detail,
+        requests,
     };
 
     let json = serde_json::to_string_pretty(&bundle).map_err(err)?;
     std::fs::write(&path, json).map_err(|e| format!("写入文件失败：{e}"))?;
+    Ok(())
+}
+
+fn map_request(row: &Row<'_>) -> rusqlite::Result<ReportRequestRecord> {
+    Ok(ReportRequestRecord {
+        elapsed_ms: row.get(0)?,
+        time_ms: row.get(1)?,
+        method: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+        url: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+        status: row.get(4)?,
+        latency_ms: row.get(5)?,
+        ttfb_ms: row.get(6)?,
+        bytes: row.get(7)?,
+        success: row.get::<_, i64>(8)? != 0,
+        body: row.get(9)?,
+        params: row.get(10)?,
+        headers: row.get(11)?,
+        response_headers: row.get(12)?,
+        response_body: row.get(13)?,
+        error_type: row.get(14)?,
+        error_message: row.get(15)?,
+    })
+}
+
+fn load_requests(
+    conn: &rusqlite::Connection,
+    id: i64,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<ReportRequestRecord>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT elapsed_ms, time_ms, method, url, status, latency_ms, ttfb_ms, bytes,
+                    success, body, params, req_headers, res_headers, res_body,
+                    error_type, error_message
+             FROM report_requests WHERE report_id = ?1 ORDER BY id ASC LIMIT ?2 OFFSET ?3",
+        )
+        .map_err(err)?;
+    let rows = stmt
+        .query_map(params![id, limit, offset], map_request)
+        .map_err(err)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(err)
+}
+
+/// 分页查询报告中的逐请求明细
+#[tauri::command]
+pub fn report_requests(
+    state: State<'_, AppState>,
+    id: i64,
+    page: Option<u32>,
+    page_size: Option<u32>,
+    success: Option<bool>,
+) -> Result<ReportRequestsPage, String> {
+    let page = page.unwrap_or(1).max(1) as i64;
+    let size = page_size.unwrap_or(50).clamp(1, 100_000) as i64;
+    let conn = state.pool.get().map_err(err)?;
+    let filter = match success {
+        Some(true) => " AND success = 1",
+        Some(false) => " AND success = 0",
+        None => "",
+    };
+
+    let total: i64 = conn
+        .query_row(
+            &format!("SELECT COUNT(*) FROM report_requests WHERE report_id = ?1{filter}"),
+            params![id],
+            |row| row.get(0),
+        )
+        .map_err(err)?;
+
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT elapsed_ms, time_ms, method, url, status, latency_ms, ttfb_ms, bytes,
+                    success, body, params, req_headers, res_headers, res_body,
+                    error_type, error_message
+             FROM report_requests WHERE report_id = ?1{filter}
+             ORDER BY id ASC LIMIT ?2 OFFSET ?3"
+        ))
+        .map_err(err)?;
+    let items = stmt
+        .query_map(params![id, size, (page - 1) * size], map_request)
+        .map_err(err)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(err)?;
+
+    Ok(ReportRequestsPage { total, items })
+}
+
+/// 将前端生成的报告内容（HTML 文本或 XLSX 字节）写入指定路径。
+#[tauri::command]
+pub fn report_write_file(path: String, data: Vec<u8>) -> Result<(), String> {
+    std::fs::write(&path, data).map_err(|e| format!("写入文件失败：{e}"))?;
     Ok(())
 }

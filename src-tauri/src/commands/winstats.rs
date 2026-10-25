@@ -457,10 +457,51 @@ fn battery_info() -> Option<BatteryInfo> {
             },
         })
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        macos_battery()
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         None
     }
+}
+
+/// macOS 通过 `pmset -g batt` 读取电池状态
+#[cfg(target_os = "macos")]
+fn macos_battery() -> Option<BatteryInfo> {
+    let output = std::process::Command::new("pmset")
+        .args(["-g", "batt"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let line = text.lines().find(|line| line.contains('%'))?;
+    let percent = line
+        .split('%')
+        .next()?
+        .split_whitespace()
+        .last()?
+        .parse::<u32>()
+        .ok()?;
+    // 形如「3:21 remaining」「0:00 remaining」「(no estimate)」
+    let minutes_left = line
+        .split_whitespace()
+        .find(|token| token.matches(':').count() == 1)
+        .and_then(|token| {
+            let (hours, minutes) = token.split_once(':')?;
+            Some(hours.parse::<u32>().ok()? * 60 + minutes.parse::<u32>().ok()?)
+        })
+        .unwrap_or(0);
+
+    Some(BatteryInfo {
+        present: true,
+        on_ac: text.contains("AC Power"),
+        percent: percent.min(100),
+        minutes_left,
+    })
 }
 
 /// 通过 PDH 读取 GPU Engine 利用率，按显卡（LUID）聚合

@@ -64,6 +64,10 @@ fn default_timeout() -> u64 {
     30_000
 }
 
+fn default_connect_timeout() -> u64 {
+    10_000
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KeyValueItem {
@@ -169,6 +173,7 @@ pub struct EnvVariable {
 #[serde(rename_all = "camelCase")]
 pub struct HistoryItem {
     pub id: i64,
+    pub request_id: Option<i64>,
     pub request_name: Option<String>,
     pub method: String,
     pub url: String,
@@ -204,6 +209,22 @@ pub struct AppInfo {
     pub version: String,
     pub data_dir: String,
     pub db_path: String,
+}
+
+/// 工作台总览统计
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceStats {
+    pub project_count: i64,
+    pub collection_count: i64,
+    pub request_count: i64,
+    pub environment_count: i64,
+    pub history_count: i64,
+    pub report_count: i64,
+    pub report_request_total: i64,
+    pub report_success_total: i64,
+    pub recent_history: i64,
+    pub recent_reports: i64,
 }
 
 fn default_concurrent() -> u32 {
@@ -259,6 +280,18 @@ pub struct StressConfig {
     pub insecure: bool,
     #[serde(default = "default_timeout")]
     pub timeout_ms: u64,
+    /// 建立连接的超时（毫秒）
+    #[serde(default = "default_connect_timeout")]
+    pub connect_timeout_ms: u64,
+    /// 是否跟随 3xx 重定向
+    #[serde(default = "default_true")]
+    pub follow_redirects: bool,
+    /// 自动停止：错误率阈值（%），需同时满足最少请求数
+    #[serde(default)]
+    pub stop_error_rate: Option<f64>,
+    /// 自动停止：触发判定的最少请求数
+    #[serde(default)]
+    pub stop_min_requests: Option<u32>,
     #[serde(default = "default_concurrent")]
     pub concurrent: u32,
     #[serde(default = "default_duration")]
@@ -302,6 +335,38 @@ pub struct ReportError {
     pub request_url: String,
     pub response_status: Option<i64>,
     pub response_body: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportRequestRecord {
+    pub elapsed_ms: i64,
+    pub time_ms: i64,
+    pub method: String,
+    pub url: String,
+    pub status: i64,
+    pub latency_ms: i64,
+    pub ttfb_ms: i64,
+    pub bytes: i64,
+    pub success: bool,
+    pub body: Option<String>,
+    /// 查询参数（原始 query string）
+    pub params: Option<String>,
+    /// 请求头（JSON 数组 [[key, value], ...]）
+    pub headers: Option<String>,
+    /// 响应头（JSON 数组 [[key, value], ...]）
+    pub response_headers: Option<String>,
+    /// 响应体（截断保留）
+    pub response_body: Option<String>,
+    pub error_type: Option<String>,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportRequestsPage {
+    pub total: i64,
+    pub items: Vec<ReportRequestRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

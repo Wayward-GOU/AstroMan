@@ -1,6 +1,7 @@
 /* 加解密、JWT、正则测试等与浏览器 WebCrypto 相关的工具 */
 
-import { bytesToBase64, base64ToBytes, base64UrlDecode } from './transforms'
+import { toolHmac } from '@/api'
+import { bytesToBase64, base64ToBytes, base64UrlDecode, base64UrlEncode } from './transforms'
 
 export async function deriveAesKey(secret: string): Promise<CryptoKey> {
   if (!secret) throw new Error('请填写 AES 密钥')
@@ -40,6 +41,45 @@ export interface JwtParts {
   signature: string
   headerRaw: string
   payloadRaw: string
+}
+
+/// 把 HMAC 的十六进制结果转成 Base64URL 签名段
+function hexToBase64Url(hex: string): string {
+  const cleaned = hex.trim().replace(/[^0-9a-fA-F]/g, '')
+  const bytes = new Uint8Array(Math.floor(cleaned.length / 2))
+  for (let index = 0; index < bytes.length; index += 1) {
+    bytes[index] = parseInt(cleaned.slice(index * 2, index * 2 + 2), 16)
+  }
+  return bytesToBase64(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+export async function signJwt(
+  payloadText: string,
+  secret: string,
+  algorithm: 'HS256' | 'HS512' = 'HS256',
+  expireMinutes = 60,
+): Promise<string> {
+  if (!secret) throw new Error('请填写签名密钥')
+  if (!payloadText.trim()) throw new Error('请填写 Payload JSON')
+  let payload: Record<string, unknown>
+  try {
+    const parsed = JSON.parse(payloadText)
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('Payload 需要是 JSON 对象')
+    }
+    payload = parsed as Record<string, unknown>
+  } catch (error) {
+    throw new Error(`Payload 解析失败：${error instanceof Error ? error.message : String(error)}`)
+  }
+  const now = Math.floor(Date.now() / 1000)
+  if (!payload.iat) payload.iat = now
+  if (expireMinutes > 0) payload.exp = now + Math.round(expireMinutes * 60)
+  const header = base64UrlEncode(JSON.stringify({ alg: algorithm, typ: 'JWT' }))
+  const body = base64UrlEncode(JSON.stringify(payload))
+  const signingInput = `${header}.${body}`
+  const digest = algorithm === 'HS512' ? 'sha512' : 'sha256'
+  const signature = hexToBase64Url(await toolHmac(signingInput, secret, digest))
+  return `${signingInput}.${signature}`
 }
 
 export function decodeJwt(token: string): JwtParts {

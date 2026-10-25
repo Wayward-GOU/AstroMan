@@ -21,6 +21,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::system::app_info,
+            commands::system::workspace_stats,
             commands::project::project_list,
             commands::project::project_create,
             commands::project::project_update,
@@ -51,11 +52,14 @@ pub fn run() {
             commands::report::report_get,
             commands::report::report_delete,
             commands::report::report_export,
+            commands::report::report_write_file,
+            commands::report::report_requests,
             commands::curl::curl_parse,
             commands::transfer::project_export,
             commands::transfer::project_import,
             commands::tools::tool_hash,
             commands::tools::tool_hmac,
+            commands::tools::ip_lookup,
             commands::winstats::winstats_snapshot,
             commands::winstats::winstats_processes,
             commands::storage::storage_info,
@@ -64,6 +68,28 @@ pub fn run() {
             commands::storage::storage_open,
             commands::storage::app_restart,
         ])
-        .run(tauri::generate_context!())
-        .expect("启动 FinkMeter 失败");
+        .on_window_event(|window, event| {
+            // macOS 点击关闭按钮时只隐藏窗口，保留实例，便于从 Dock 再次打开
+            #[cfg(target_os = "macos")]
+            if let tauri::WindowEvent::CloseRequested { api } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (window, event);
+        })
+        .build(tauri::generate_context!())
+        .expect("启动 FinkMeter 失败")
+        .run(|app_handle, event| {
+            // macOS 点击 Dock 图标时把隐藏的主窗口重新显示出来
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = event {
+                if let Some(window) = app_handle.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app_handle, event);
+        });
 }

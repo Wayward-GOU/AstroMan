@@ -13,7 +13,23 @@ import KeyValueEditor from '@/components/KeyValueEditor.vue'
 import CodeArea from '@/components/CodeArea.vue'
 import { useProjectStore } from '@/stores/project'
 import * as api from '@/api'
-import type { HttpRequestDetail, HttpResult, RequestRun } from '@/types/models'
+import type {
+  HttpRequestDetail,
+  HttpResult,
+  KeyValueItem,
+  RequestRun,
+  SendRequestPayload,
+} from '@/types/models'
+import {
+  clearRuntimeVars,
+  listRuntimeVars,
+  renderRuntimeVars,
+  runPostScript,
+  runPreScript,
+  type ScriptAssertion,
+  type ScriptLog,
+  type ScriptRequest,
+} from '@/utils/scriptRunner'
 
 const route = useRoute()
 const router = useRouter()
@@ -44,6 +60,55 @@ const activeTab = ref('params')
 const responseTab = ref('body')
 const insecure = ref(false)
 const envId = ref<number | null>(null)
+
+/* ---------- 脚本执行结果 ---------- */
+const scriptLogs = ref<ScriptLog[]>([])
+const scriptAssertions = ref<ScriptAssertion[]>([])
+const scriptError = ref('')
+const scriptVars = ref<Record<string, string>>({})
+const scriptMs = ref(0)
+
+const passedAssertions = computed(() => scriptAssertions.value.filter((item) => item.passed).length)
+const failedAssertions = computed(() => scriptAssertions.value.length - passedAssertions.value)
+const scriptVarsList = computed(() =>
+  Object.entries(scriptVars.value).map(([key, value]) => ({ key, value })),
+)
+
+function resetScriptOutput() {
+  scriptLogs.value = []
+  scriptAssertions.value = []
+  scriptError.value = ''
+  scriptMs.value = 0
+}
+
+function resetScriptVars() {
+  clearRuntimeVars()
+  scriptVars.value = {}
+  message.success('已清空运行时变量')
+}
+
+function activeEnvVars(): Record<string, string> {
+  const env = store.environments.find((item) => item.id === envId.value)
+  const map: Record<string, string> = {}
+  for (const item of env?.variables ?? []) {
+    if (item.key) map[item.key] = item.value
+  }
+  return map
+}
+
+function kvToMap(items: KeyValueItem[]): Record<string, string> {
+  const map: Record<string, string> = {}
+  for (const item of items) {
+    const key = item.key.trim()
+    if (!item.enabled || !key) continue
+    map[key] = item.value
+  }
+  return map
+}
+
+function mapToItems(map: Record<string, string>): KeyValueItem[] {
+  return Object.entries(map).map(([key, value]) => ({ key, value, enabled: true }))
+}
 
 const methods = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']
 const bodyTypes = [
@@ -174,24 +239,68 @@ async function send() {
   }
   sending.value = true
   result.value = null
+  resetScriptOutput()
   try {
-    result.value = await api.sendRequest({
-      requestId: form.value.id ?? null,
-      name: form.value.name,
+    const envVars = activeEnvVars()
+    const request: ScriptRequest = {
       method: form.value.method,
       url: form.value.url,
-      headers: form.value.headers,
-      params: form.value.params,
+      headers: kvToMap(form.value.headers),
+      params: kvToMap(form.value.params),
       bodyType: form.value.bodyType,
-      body: form.value.body,
+      body: form.value.body ?? '',
+    }
+    const preCode = form.value.preScript?.trim()
+    let outgoing = request
+    if (preCode) {
+      const preResult = runPreScript(preCode, request, envVars)
+      scriptLogs.value.push(...preResult.logs)
+      scriptMs.value += preResult.durationMs
+      scriptError.value = preResult.error ?? ''
+      if (preResult.error) {
+        message.error(`前置脚本执行失败：${preResult.error}`)
+        return
+      }
+      outgoing = preResult.request
+    }
+
+    const payload: SendRequestPayload = {
+      requestId: form.value.id ?? null,
+      name: form.value.name,
+      method: outgoing.method,
+      url: renderRuntimeVars(outgoing.url),
+      headers: mapToItems(outgoing.headers).map((item) => ({
+        ...item,
+        value: renderRuntimeVars(item.value),
+      })),
+      params: mapToItems(outgoing.params).map((item) => ({
+        ...item,
+        value: renderRuntimeVars(item.value),
+      })),
+      bodyType: outgoing.bodyType,
+      body: renderRuntimeVars(outgoing.body),
       envId: envId.value,
       insecure: insecure.value,
       timeoutMs: 30000,
-    })
+    }
+
+    result.value = await api.sendRequest(payload)
+
+    const postCode = form.value.postScript?.trim()
+    if (postCode) {
+      const postResult = runPostScript(postCode, outgoing, result.value, envVars)
+      scriptLogs.value.push(...postResult.logs)
+      scriptAssertions.value = postResult.assertions
+      scriptMs.value += postResult.durationMs
+      scriptError.value = postResult.error ?? ''
+      if (postResult.error) message.error(`后置脚本执行失败：${postResult.error}`)
+      if (postResult.assertions.length || postResult.error) responseTab.value = 'tests'
+    }
   } catch (e) {
     message.error(String(e))
   } finally {
     sending.value = false
+    scriptVars.value = listRuntimeVars()
   }
   await loadRuns()
 }
@@ -285,13 +394,33 @@ const prettyBody = computed(() => {
   }
 })
 
-const statusColor = computed(() => {
-  const code = result.value?.status ?? 0
-  if (!code) return '#64748b'
-  if (code < 300) return 'var(--fm-success)'
-  if (code < 400) return 'var(--fm-warning)'
-  return 'var(--fm-danger)'
-})
+const bodyView = ref<'pretty' | 'raw'>('pretty')
+
+const bodySize = computed(() => new Blob([form.value.body ?? '']).size)
+
+const projectName = computed(
+  () => store.projects.find((p) => p.id === projectId.value)?.name ?? '',
+)
+
+function formatBody() {
+  try {
+    form.value.body = JSON.stringify(JSON.parse(form.value.body), null, 2)
+    message.success('已格式化')
+  } catch {
+    message.error('JSON 解析失败，请检查格式')
+  }
+}
+
+async function copyBody() {
+  const text = result.value?.body ?? ''
+  if (!text) return
+  try {
+    await navigator.clipboard.writeText(text)
+    message.success('已复制响应体')
+  } catch {
+    message.error('复制失败')
+  }
+}
 
 function fmtSize(n: number) {
   if (n < 1024) return `${n} B`
@@ -315,7 +444,11 @@ const responseHeaders = computed(() => {
             返回
           </a-button>
           <span class="divider" />
-          <a-input v-model:value="form.name" class="name-input" placeholder="请求名称" />
+          <span class="crumb">
+            <span class="crumb-project">{{ projectName || '项目' }}</span>
+            <span class="crumb-sep">/</span>
+            <a-input v-model:value="form.name" class="name-input" placeholder="请求名称" />
+          </span>
           <span class="saved-hint">{{ form.id ? `#${form.id}` : '未保存' }}</span>
         </div>
         <div class="right">
@@ -332,43 +465,66 @@ const responseHeaders = computed(() => {
             <template #icon><ThunderboltOutlined /></template>
             压测
           </a-button>
-          <a-button type="primary" :loading="sending" @click="send">
-            <template #icon><SendOutlined /></template>
-            发送
-          </a-button>
         </div>
       </div>
 
       <div class="url-bar">
-        <a-select v-model:value="form.method" class="method-select" :class="`m-${form.method}`">
-          <a-select-option v-for="m in methods" :key="m" :value="m">{{ m }}</a-select-option>
-        </a-select>
-        <a-input
-          v-model:value="form.url"
-          class="url-input mono"
-          placeholder="https://api.example.com/users 或 {{base_url}}/users"
-          @press-enter="send"
-        />
-        <a-select v-model:value="envId" class="env-select" placeholder="不使用环境" allow-clear>
-          <a-select-option v-for="env in store.environments" :key="env.id" :value="env.id">
-            {{ env.name }}
-          </a-select-option>
-        </a-select>
+        <div class="request-bar">
+          <a-select v-model:value="form.method" class="method-select" :class="`m-${form.method}`" :bordered="false">
+            <a-select-option v-for="m in methods" :key="m" :value="m">{{ m }}</a-select-option>
+          </a-select>
+          <span class="bar-divider" />
+          <a-input
+            v-model:value="form.url"
+            class="url-input mono"
+            :bordered="false"
+            placeholder="https://api.example.com/users 或 {{base_url}}/users"
+            @press-enter="send"
+          />
+          <span class="bar-divider" />
+          <a-select
+            v-model:value="envId"
+            class="env-select"
+            :bordered="false"
+            placeholder="不使用环境"
+            allow-clear
+          >
+            <a-select-option v-for="env in store.environments" :key="env.id" :value="env.id">
+              {{ env.name }}
+            </a-select-option>
+          </a-select>
+          <a-button type="primary" class="send-btn" :loading="sending" @click="send">
+            <template #icon><SendOutlined /></template>
+            发送
+          </a-button>
+        </div>
+        <span class="url-tip">Enter 发送 · 支持 {{ }} 变量</span>
       </div>
 
       <div class="panes">
         <div class="req-pane fm-card">
           <div class="pane-head">
-            <span class="pane-title">请求配置</span>
-            <span class="pane-meta">{{ enabledParams }} Params · {{ enabledHeaders }} Headers</span>
+            <span class="pane-title">
+              <span class="pane-dot req" />
+              Request
+            </span>
+            <span class="pane-meta mono">
+              {{ form.method }} · {{ enabledParams }} Params · {{ enabledHeaders }} Headers
+            </span>
           </div>
           <a-tabs v-model:active-key="activeTab" size="small" class="tabs">
-            <a-tab-pane key="params" tab="Params">
+            <a-tab-pane key="params">
+              <template #tab>
+                Params <span class="tab-count">{{ enabledParams }}</span>
+              </template>
               <div class="tab-body">
                 <KeyValueEditor v-model="form.params" key-placeholder="参数名" value-placeholder="参数值" />
               </div>
             </a-tab-pane>
-            <a-tab-pane key="headers" tab="Headers">
+            <a-tab-pane key="headers">
+              <template #tab>
+                Headers <span class="tab-count">{{ enabledHeaders }}</span>
+              </template>
               <div class="tab-body">
                 <div class="header-tools">
                   <a-select
@@ -397,19 +553,33 @@ const responseHeaders = computed(() => {
                 <KeyValueEditor v-model="form.headers" key-placeholder="Header 名" value-placeholder="Header 值" />
               </div>
             </a-tab-pane>
-            <a-tab-pane key="body" tab="Body">
-              <div class="tab-body">
+            <a-tab-pane key="body">
+              <template #tab>
+                Body <span class="tab-count" :class="{ off: form.bodyType === 'none' }">{{ form.bodyType }}</span>
+              </template>
+              <div class="tab-body body-tab">
                 <div class="body-head">
                   <a-radio-group v-model:value="form.bodyType" size="small" button-style="solid">
                     <a-radio-button v-for="t in bodyTypes" :key="t.value" :value="t.value">
                       {{ t.label }}
                     </a-radio-button>
                   </a-radio-group>
+                  <a-button
+                    v-if="form.bodyType === 'json'"
+                    size="small"
+                    type="link"
+                    :disabled="!form.body.trim()"
+                    @click="formatBody"
+                  >
+                    格式化 JSON
+                  </a-button>
+                  <span v-if="form.body" class="body-size mono">{{ fmtSize(bodySize) }}</span>
                 </div>
                 <CodeArea
                   v-if="form.bodyType !== 'none'"
                   v-model="form.body"
-                  :rows="10"
+                  fill
+                  :rows="14"
                   placeholder='{"name":"fink"}'
                 />
                 <div v-else class="empty-hint">该请求没有 Body</div>
@@ -417,10 +587,26 @@ const responseHeaders = computed(() => {
             </a-tab-pane>
             <a-tab-pane key="script" tab="脚本">
               <div class="tab-body">
-                <div class="script-label">前置脚本（JavaScript）</div>
-                <a-textarea v-model:value="form.preScript" class="mono" :rows="8" placeholder="// 修改 request.headers / request.body" />
-                <div class="script-label">后置脚本</div>
-                <a-textarea v-model:value="form.postScript" class="mono" :rows="8" placeholder="// vars.set('token', response.json().data.token)" />
+                <div class="script-label">前置脚本（发送前执行，可生成/修改请求参数）</div>
+                <a-textarea
+                  v-model:value="form.preScript"
+                  class="mono script-input"
+                  :rows="7"
+                  placeholder="// 例如&#10;request.body = JSON.stringify({ id: Date.now(), name: 'fink' })&#10;vars.set('traceId', 'req-' + Date.now())"
+                />
+                <div class="script-label">后置脚本 / 测试断言（收到响应后执行）</div>
+                <a-textarea
+                  v-model:value="form.postScript"
+                  class="mono script-input"
+                  :rows="7"
+                  placeholder="// 例如&#10;test('状态码为 200', () => assert(response.status === 200))"
+                />
+                <div class="script-hint">
+                  可用：<code>request</code>（method / url / headers / params / body）、
+                  <code>response</code>（status / headers / body / json()）、
+                  <code>vars</code>（get / set / unset）、<code>console</code>；后置脚本另有
+                  <code>test(name, fn)</code>、<code>assert(条件, 提示)</code>。变量可用 <code v-pre>{{name}}</code> 写入 URL、Header 或 Body。
+                </div>
               </div>
             </a-tab-pane>
           </a-tabs>
@@ -428,36 +614,116 @@ const responseHeaders = computed(() => {
 
         <div class="res-pane fm-card">
           <div class="res-head">
-            <span class="pane-title">响应</span>
+            <span class="pane-title">
+              <span class="pane-dot res" />
+              Response
+            </span>
             <template v-if="result">
-              <span class="status-text mono" :style="{ color: statusColor }">
-                {{ result.status || 'ERR' }} {{ result.statusText }}
+              <span class="status-pill mono" :class="{ ok: result.status > 0 && result.status < 400, bad: result.status >= 400 || !result.status }">
+                {{ result.status || 'ERR' }}{{ result.statusText ? ` ${result.statusText}` : '' }}
               </span>
               <span class="meta-divider" />
               <span class="meta mono">{{ result.durationMs }} ms</span>
               <span class="meta-divider" />
               <span class="meta mono">{{ fmtSize(result.sizeBytes) }}</span>
             </template>
+            <span
+              v-if="scriptAssertions.length"
+              class="assert-pill mono"
+              :class="{ bad: failedAssertions > 0 }"
+            >
+              {{ failedAssertions > 0 ? '✗' : '✓' }}
+              断言 {{ passedAssertions }}/{{ scriptAssertions.length }}
+            </span>
+            <span class="res-spacer" />
+            <template v-if="result && !result.error">
+              <a-radio-group v-model:value="bodyView" size="small" button-style="solid" class="view-toggle">
+                <a-radio-button value="pretty">Pretty</a-radio-button>
+                <a-radio-button value="raw">Raw</a-radio-button>
+              </a-radio-group>
+              <a-button size="small" type="text" @click="copyBody">复制</a-button>
+            </template>
           </div>
 
           <div v-if="!result" class="res-empty">
             <div class="res-empty-icon">⇥</div>
             <div class="res-empty-title">准备就绪</div>
-            <div class="res-empty-desc">点「发送」或按 Enter 查看响应结果</div>
+            <div class="res-empty-desc">填写 URL 后点「发送」或按 Enter 查看响应结果</div>
           </div>
           <template v-else>
             <a-alert v-if="result.error" type="error" :message="result.error" show-icon style="margin: 12px 14px" />
             <a-tabs v-model:active-key="responseTab" size="small" class="tabs res-tabs">
-              <a-tab-pane key="body" tab="Body">
+              <a-tab-pane key="body">
+                <template #tab>
+                  Body <span class="tab-count">{{ prettyBody ? `${prettyBody.split('\n').length} 行` : '0' }}</span>
+                </template>
                 <div v-if="result.truncated" class="truncate-hint">响应体超过 5MB，已截断显示</div>
-                <pre class="mono body-pre">{{ prettyBody }}</pre>
+                <div class="res-body-wrap">
+                  <pre class="mono body-pre">{{ bodyView === 'pretty' ? prettyBody : result.body }}</pre>
+                </div>
               </a-tab-pane>
-              <a-tab-pane key="headers" tab="Headers">
+              <a-tab-pane key="headers">
+                <template #tab>
+                  Headers <span class="tab-count">{{ responseHeaders.length }}</span>
+                </template>
                 <div class="res-header-list">
                   <div v-for="h in responseHeaders" :key="h.key" class="res-header-row">
                     <span class="mono hk">{{ h.key }}</span>
                     <span class="mono hv">{{ h.value }}</span>
                   </div>
+                </div>
+              </a-tab-pane>
+              <a-tab-pane key="tests">
+                <template #tab>
+                  测试
+                  <span
+                    class="tab-count"
+                    :class="{ bad: failedAssertions > 0, ok: scriptAssertions.length > 0 && failedAssertions === 0 }"
+                  >
+                    {{ scriptAssertions.length ? `${passedAssertions}/${scriptAssertions.length}` : '0' }}
+                  </span>
+                </template>
+                <div class="test-panel">
+                  <a-alert
+                    v-if="scriptError"
+                    type="error"
+                    :message="`脚本执行出错：${scriptError}`"
+                    show-icon
+                    class="test-alert"
+                  />
+                  <div v-if="scriptAssertions.length" class="test-list">
+                    <div
+                      v-for="(item, index) in scriptAssertions"
+                      :key="`${index}-${item.name}`"
+                      class="test-row"
+                      :class="{ failed: !item.passed }"
+                    >
+                      <span class="test-mark">{{ item.passed ? '✓' : '✗' }}</span>
+                      <span class="test-name">{{ item.name }}</span>
+                      <span v-if="item.message" class="test-msg mono">{{ item.message }}</span>
+                    </div>
+                  </div>
+                  <div v-else-if="!scriptError" class="empty-hint">
+                    后置脚本没有产生断言。可在「脚本」页的 后置脚本 中用 test() 添加。
+                  </div>
+                  <div v-if="scriptLogs.length" class="test-block">
+                    <div class="test-section">控制台输出</div>
+                    <div v-for="(log, index) in scriptLogs" :key="`log-${index}`" class="log-row" :class="log.level">
+                      <span class="log-phase">{{ log.phase === 'pre' ? '前置' : '后置' }}</span>
+                      <span class="log-text mono">{{ log.text }}</span>
+                    </div>
+                  </div>
+                  <div v-if="scriptVarsList.length" class="test-block">
+                    <div class="test-section">
+                      运行时变量
+                      <a class="vars-clear" @click="resetScriptVars">清空</a>
+                    </div>
+                    <div v-for="item in scriptVarsList" :key="item.key" class="var-row">
+                      <span class="var-key mono">{{ item.key }}</span>
+                      <span class="var-value mono">{{ item.value }}</span>
+                    </div>
+                  </div>
+                  <div v-if="scriptMs" class="test-time">脚本耗时 {{ scriptMs }} ms</div>
                 </div>
               </a-tab-pane>
             </a-tabs>
@@ -601,14 +867,36 @@ const responseHeaders = computed(() => {
 }
 
 .name-input {
-  width: 250px;
+  width: 230px;
   font-weight: 600;
   border-color: transparent;
   background: transparent;
+  font-size: 13px;
 }
 
 .name-input:hover {
   border-color: var(--fm-border);
+}
+
+.crumb {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.crumb-project {
+  font-size: 11.5px;
+  color: var(--fm-muted);
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.crumb-sep {
+  font-size: 11px;
+  color: var(--fm-border-strong);
 }
 
 .saved-hint {
@@ -635,16 +923,40 @@ const responseHeaders = computed(() => {
 
 .url-bar {
   display: flex;
-  gap: 8px;
-  padding: 8px 14px;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
   background: var(--fm-surface);
   border-bottom: 1px solid var(--fm-border);
 }
 
+.request-bar {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  height: 42px;
+  padding: 3px 3px 3px 4px;
+  border: 1px solid var(--fm-border-strong);
+  border-radius: 9px;
+  background: var(--fm-surface);
+  transition: border-color 0.16s, box-shadow 0.16s;
+}
+
+.request-bar:focus-within {
+  border-color: var(--fm-primary);
+  box-shadow: 0 0 0 3px var(--fm-primary-soft);
+}
+
 .method-select {
-  width: 108px;
+  width: 104px;
   flex-shrink: 0;
   font-weight: 700;
+}
+
+.method-select :deep(.ant-select-selector) {
+  box-shadow: none !important;
 }
 
 .method-select.m-GET :deep(.ant-select-selection-item) {
@@ -663,70 +975,125 @@ const responseHeaders = computed(() => {
   color: var(--fm-danger);
 }
 
+.bar-divider {
+  width: 1px;
+  height: 20px;
+  flex-shrink: 0;
+  background: var(--fm-border);
+}
+
 .url-input {
   flex: 1;
+  min-width: 0;
   font-size: 13px;
 }
 
+.url-input :deep(.ant-input) {
+  height: 36px;
+}
+
 .env-select {
-  width: 170px;
+  width: 150px;
   flex-shrink: 0;
+  font-size: 12px;
+}
+
+.env-select :deep(.ant-select-selector) {
+  box-shadow: none !important;
+}
+
+.send-btn {
+  height: 34px;
+  flex-shrink: 0;
+  border-radius: 7px;
+  font-weight: 600;
+}
+
+.url-tip {
+  flex-shrink: 0;
+  font-size: 10px;
+  color: var(--fm-muted);
 }
 
 .panes {
   flex: 1;
   min-height: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  padding: 10px 14px 10px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+  padding: 12px 14px 14px;
   overflow: hidden;
 }
 
 .req-pane,
 .res-pane {
   min-width: 0;
+  min-height: 0;
+  height: 100%;
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  border-radius: 6px;
-  box-shadow: none;
+  border: 1px solid var(--fm-border);
+  border-radius: 10px;
+  background: var(--fm-surface);
+  box-shadow: var(--fm-shadow-sm);
+  transition: border-color 0.16s ease, box-shadow 0.16s ease;
 }
 
-.req-pane {
-  flex: 0 0 auto;
-  height: 42%;
-  min-height: 222px;
-}
-
-.res-pane {
-  flex: 1;
-  min-height: 190px;
+.req-pane:focus-within,
+.res-pane:hover {
+  border-color: var(--fm-border-strong);
 }
 
 .pane-head {
-  height: 36px;
-  padding: 0 12px;
+  height: 40px;
+  flex-shrink: 0;
+  padding: 0 14px;
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 10px;
   background: var(--fm-surface-alt);
   border-bottom: 1px solid var(--fm-border);
 }
 
 .pane-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
   font-size: 12px;
   font-weight: 600;
+  letter-spacing: 0.02em;
   color: var(--fm-text-2);
+}
+
+.pane-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.pane-dot.req {
+  background: var(--fm-primary);
+  box-shadow: 0 0 0 3px var(--fm-primary-soft);
+}
+
+.pane-dot.res {
+  background: var(--fm-success);
+  box-shadow: 0 0 0 3px var(--fm-success-soft);
 }
 
 .pane-meta {
   font-size: 10px;
   color: var(--fm-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .tabs {
-  padding: 0 12px;
+  padding: 0 14px 10px;
   flex: 1;
   min-height: 0;
   display: flex;
@@ -734,11 +1101,38 @@ const responseHeaders = computed(() => {
 }
 
 .tabs :deep(.ant-tabs-nav) {
-  margin-bottom: 6px;
+  margin-bottom: 8px;
 }
 
 .tabs :deep(.ant-tabs-content-holder) {
+  flex: 1;
+  min-height: 0;
   overflow: auto;
+}
+
+.tabs :deep(.ant-tabs-content),
+.tabs :deep(.ant-tabs-tabpane) {
+  height: 100%;
+}
+
+.tab-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 17px;
+  height: 16px;
+  padding: 0 5px;
+  margin-left: 5px;
+  border-radius: 5px;
+  background: var(--fm-surface-alt);
+  color: var(--fm-muted);
+  font-size: 9.5px;
+  font-weight: 600;
+  line-height: 1;
+}
+
+.tab-count.off {
+  opacity: 0.6;
 }
 
 .header-tools {
@@ -761,8 +1155,24 @@ const responseHeaders = computed(() => {
   padding: 4px 0 8px;
 }
 
+.body-tab {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  padding-bottom: 0;
+}
+
 .body-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
   margin: 6px 0 10px;
+}
+
+.body-size {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--fm-muted);
 }
 
 .body-input {
@@ -776,9 +1186,202 @@ const responseHeaders = computed(() => {
   margin: 10px 0 6px;
 }
 
+.script-input {
+  font-size: 11.5px;
+  line-height: 1.65;
+}
+
+.script-hint {
+  margin-top: 10px;
+  padding: 9px 11px;
+  border-radius: 7px;
+  background: var(--fm-surface-alt);
+  font-size: 10.5px;
+  line-height: 1.8;
+  color: var(--fm-muted);
+}
+
+.script-hint code {
+  padding: 1px 4px;
+  margin: 0 1px;
+  border-radius: 4px;
+  background: var(--fm-surface);
+  color: var(--fm-text-2);
+  font-size: 10px;
+}
+
+.assert-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 10px;
+  padding: 2px 8px;
+  border-radius: 20px;
+  background: var(--fm-success-soft);
+  color: var(--fm-success);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.assert-pill.bad {
+  background: var(--fm-danger-soft, #fdeaea);
+  color: var(--fm-danger);
+}
+
+.tab-count.ok {
+  background: var(--fm-success-soft);
+  color: var(--fm-success);
+}
+
+.tab-count.bad {
+  background: var(--fm-danger-soft, #fdeaea);
+  color: var(--fm-danger);
+}
+
+/* ---------- 脚本测试结果 ---------- */
+.test-panel {
+  height: 100%;
+  box-sizing: border-box;
+  padding: 6px 14px 14px;
+  overflow: auto;
+  font-size: 11.5px;
+}
+
+.test-alert {
+  margin-bottom: 10px;
+}
+
+.test-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.test-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 9px;
+  border-radius: 6px;
+  background: var(--fm-success-soft);
+  color: var(--fm-text-2);
+}
+
+.test-row.failed {
+  background: var(--fm-danger-soft, #fdeaea);
+}
+
+.test-mark {
+  width: 12px;
+  flex-shrink: 0;
+  color: var(--fm-success);
+  font-weight: 700;
+}
+
+.test-row.failed .test-mark {
+  color: var(--fm-danger);
+}
+
+.test-name {
+  flex-shrink: 0;
+}
+
+.test-msg {
+  margin-left: auto;
+  max-width: 60%;
+  color: var(--fm-danger);
+  font-size: 10.5px;
+  word-break: break-all;
+  text-align: right;
+}
+
+.test-block {
+  margin-top: 14px;
+}
+
+.test-section {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--fm-text-2);
+}
+
+.vars-clear {
+  font-weight: 400;
+  color: var(--fm-primary);
+  font-size: 10px;
+}
+
+.log-row {
+  display: flex;
+  gap: 8px;
+  padding: 4px 8px;
+  border-radius: 5px;
+  border-bottom: 1px dashed var(--fm-border);
+}
+
+.log-row.warn .log-text {
+  color: var(--fm-warning);
+}
+
+.log-row.error .log-text {
+  color: var(--fm-danger);
+}
+
+.log-phase {
+  flex-shrink: 0;
+  padding: 0 5px;
+  height: 15px;
+  line-height: 15px;
+  border-radius: 4px;
+  background: var(--fm-surface-alt);
+  color: var(--fm-muted);
+  font-size: 9.5px;
+}
+
+.log-text {
+  flex: 1;
+  min-width: 0;
+  font-size: 10.5px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--fm-text-2);
+}
+
+.var-row {
+  display: flex;
+  gap: 10px;
+  padding: 5px 8px;
+  border-bottom: 1px dashed var(--fm-border);
+  font-size: 10.5px;
+}
+
+.var-key {
+  width: 150px;
+  flex-shrink: 0;
+  color: var(--fm-primary);
+}
+
+.var-value {
+  flex: 1;
+  min-width: 0;
+  color: var(--fm-text-2);
+  word-break: break-all;
+}
+
+.test-time {
+  margin-top: 12px;
+  font-size: 10px;
+  color: var(--fm-muted);
+}
+
 .res-head {
-  height: 36px;
-  padding: 0 12px;
+  height: 40px;
+  flex-shrink: 0;
+  padding: 0 14px;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -786,9 +1389,30 @@ const responseHeaders = computed(() => {
   border-bottom: 1px solid var(--fm-border);
 }
 
-.status-text {
-  font-size: 12px;
+.status-pill {
+  padding: 1px 8px;
+  border-radius: 5px;
+  font-size: 11.5px;
   font-weight: 700;
+}
+
+.status-pill.ok {
+  color: var(--fm-success);
+  background: var(--fm-success-soft);
+}
+
+.status-pill.bad {
+  color: var(--fm-danger);
+  background: var(--fm-danger-soft);
+}
+
+.res-spacer {
+  flex: 1;
+}
+
+.view-toggle :deep(.ant-radio-button-wrapper) {
+  font-size: 10.5px;
+  padding: 0 9px;
 }
 
 .meta-divider {
@@ -843,11 +1467,21 @@ const responseHeaders = computed(() => {
   flex-direction: column;
 }
 
+.res-body-wrap {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
 .body-pre {
+  flex: 1;
+  min-height: 0;
+  box-sizing: border-box;
   margin: 0;
-  padding: 10px 14px;
-  font-size: 12px;
-  line-height: 1.7;
+  padding: 14px 16px;
+  font-size: 12.5px;
+  line-height: 1.75;
   white-space: pre-wrap;
   word-break: break-all;
   overflow: auto;
@@ -861,15 +1495,17 @@ const responseHeaders = computed(() => {
 }
 
 .res-header-list {
-  padding: 4px 0;
+  height: 100%;
+  box-sizing: border-box;
+  padding: 4px 0 10px;
   overflow: auto;
 }
 
 .res-header-row {
   display: flex;
   gap: 14px;
-  padding: 6px 14px;
-  border-bottom: 1px dashed #f1f4f9;
+  padding: 7px 14px;
+  border-bottom: 1px dashed var(--fm-border);
   font-size: 11px;
 }
 
@@ -888,7 +1524,7 @@ const responseHeaders = computed(() => {
 /* ---------- 运行历史 ---------- */
 .runs-panel {
   flex: 0 0 auto;
-  max-height: 42%;
+  max-height: 32%;
   display: flex;
   flex-direction: column;
   background: var(--fm-surface);
@@ -1115,6 +1751,17 @@ const responseHeaders = computed(() => {
 }
 
 @media (max-width: 1100px) {
+  .panes {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
+    overflow: auto;
+  }
+
+  .req-pane,
+  .res-pane {
+    min-height: 320px;
+  }
+
   .runs-panel {
     max-height: 50%;
   }

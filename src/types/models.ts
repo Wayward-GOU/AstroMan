@@ -112,6 +112,7 @@ export interface EnvVariable {
 
 export interface HistoryItem {
   id: number
+  requestId?: number | null
   requestName?: string | null
   method: string
   url: string
@@ -124,6 +125,19 @@ export interface AppInfo {
   version: string
   dataDir: string
   dbPath: string
+}
+
+export interface WorkspaceStats {
+  projectCount: number
+  collectionCount: number
+  requestCount: number
+  environmentCount: number
+  historyCount: number
+  reportCount: number
+  reportRequestTotal: number
+  reportSuccessTotal: number
+  recentHistory: number
+  recentReports: number
 }
 
 export interface RequestRun {
@@ -169,6 +183,10 @@ export interface StressConfig {
   envId?: number | null
   insecure?: boolean
   timeoutMs?: number
+  connectTimeoutMs?: number
+  followRedirects?: boolean
+  stopErrorRate?: number | null
+  stopMinRequests?: number | null
   concurrent: number
   durationSec: number
   rampUpSec: number
@@ -199,6 +217,30 @@ export interface ReportError {
   requestUrl: string
   responseStatus?: number | null
   responseBody: string
+}
+
+export interface ReportRequestRecord {
+  elapsedMs: number
+  timeMs: number
+  method: string
+  url: string
+  status: number
+  latencyMs: number
+  ttfbMs: number
+  bytes: number
+  success: boolean
+  body?: string | null
+  params?: string | null
+  headers?: string | null
+  responseHeaders?: string | null
+  responseBody?: string | null
+  errorType?: string | null
+  errorMessage?: string | null
+}
+
+export interface ReportRequestsPage {
+  total: number
+  items: ReportRequestRecord[]
 }
 
 export interface StressReport {
@@ -422,4 +464,24 @@ export interface MonitorProcess {
   name: string
   cpu: number
   memory: number
+}
+
+/* ---------- 工具箱：IP 查询 ---------- */
+
+export interface IpLookupInfo {
+  ip: string
+  country?: string
+  country_code?: string
+  prov?: string
+  city?: string
+  city_code?: string
+  city_short_code?: string
+  area?: string
+  post_code?: string
+  area_code?: string
+  isp?: string
+  lng?: string
+  lat?: string
+  long_ip?: number
+  big_area?: string
 }

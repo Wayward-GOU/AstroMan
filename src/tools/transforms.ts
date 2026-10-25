@@ -432,6 +432,252 @@ export function bytesText(bytes: Uint8Array): string {
   return new TextDecoder().decode(bytes)
 }
 
+/* ---------------- Base32 ---------------- */
+
+const BASE32_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'
+
+export function base32Encode(text: string): string {
+  if (!text) throw new Error('请输入需要编码的内容')
+  const bytes = new TextEncoder().encode(text)
+  let buffer = 0
+  let bits = 0
+  let output = ''
+  for (const byte of bytes) {
+    buffer = (buffer << 8) | byte
+    bits += 8
+    while (bits >= 5) {
+      output += BASE32_CHARS[(buffer >>> (bits - 5)) & 31]
+      bits -= 5
+    }
+  }
+  if (bits > 0) output += BASE32_CHARS[(buffer << (5 - bits)) & 31]
+  while (output.length % 8 !== 0) output += '='
+  return output
+}
+
+export function base32Decode(text: string): string {
+  const cleaned = text.replace(/[\s=]/g, '').toUpperCase()
+  if (!cleaned) throw new Error('请输入需要解码的 Base32 内容')
+  let buffer = 0
+  let bits = 0
+  const bytes: number[] = []
+  for (const char of cleaned) {
+    const index = BASE32_CHARS.indexOf(char)
+    if (index < 0) throw new Error(`包含非法 Base32 字符：${char}`)
+    buffer = (buffer << 5) | index
+    bits += 5
+    if (bits >= 8) {
+      bytes.push((buffer >>> (bits - 8)) & 0xff)
+      bits -= 8
+    }
+  }
+  return new TextDecoder().decode(new Uint8Array(bytes))
+}
+
+/* ---------------- 十六进制 ---------------- */
+
+export interface HexOptions {
+  upper?: boolean
+  prefix?: boolean
+  compact?: boolean
+}
+
+export function hexEncode(text: string, options: HexOptions = {}): string {
+  if (!text) throw new Error('请输入需要转换的内容')
+  const parts = Array.from(new TextEncoder().encode(text), (byte) => {
+    const hex = byte.toString(16).padStart(2, '0')
+    const value = options.upper ? hex.toUpperCase() : hex
+    return options.prefix ? `0x${value}` : value
+  })
+  return parts.join(options.compact ? '' : ' ')
+}
+
+export function hexDecode(text: string): string {
+  const cleaned = text.replace(/0x/gi, '').replace(/[^0-9a-fA-F]/g, '')
+  if (!cleaned) throw new Error('请输入十六进制内容')
+  if (cleaned.length % 2 !== 0) throw new Error('十六进制字符数量必须为偶数')
+  const bytes = new Uint8Array(cleaned.length / 2)
+  for (let index = 0; index < bytes.length; index += 1) {
+    bytes[index] = parseInt(cleaned.slice(index * 2, index * 2 + 2), 16)
+  }
+  return new TextDecoder().decode(bytes)
+}
+
+/* ---------------- 字符串转义 ---------------- */
+
+export function escapeString(text: string): string {
+  if (!text) return ''
+  return text.replace(/[\\'"\n\r\t\b\f\v\u0000-\u001f]/g, (char) => {
+    switch (char) {
+      case '\\':
+        return '\\\\'
+      case "'":
+        return "\\'"
+      case '"':
+        return '\\"'
+      case '\n':
+        return '\\n'
+      case '\r':
+        return '\\r'
+      case '\t':
+        return '\\t'
+      case '\b':
+        return '\\b'
+      case '\f':
+        return '\\f'
+      case '\v':
+        return '\\v'
+      default:
+        return `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`
+    }
+  })
+}
+
+export function unescapeString(text: string): string {
+  if (!text) return ''
+  return text.replace(/\\(u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|.)/g, (_match, token: string) => {
+    if (token.startsWith('u') || token.startsWith('x')) {
+      return String.fromCharCode(parseInt(token.slice(1), 16))
+    }
+    switch (token) {
+      case 'n':
+        return '\n'
+      case 'r':
+        return '\r'
+      case 't':
+        return '\t'
+      case 'b':
+        return '\b'
+      case 'f':
+        return '\f'
+      case 'v':
+        return '\v'
+      case '0':
+        return '\u0000'
+      default:
+        return token
+    }
+  })
+}
+
+/* ---------------- 内容提取 ---------------- */
+
+export type ExtractKind = 'email' | 'url' | 'ipv4' | 'phone' | 'number' | 'uuid' | 'chinese'
+
+const EXTRACT_PATTERNS: Record<ExtractKind, RegExp> = {
+  email: /[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}/g,
+  url: /https?:\/\/[^\s"'<>，。；、）】]+/g,
+  ipv4: /\b(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\b/g,
+  phone: /(?:\+?86[- ]?)?1[3-9]\d{9}\b/g,
+  number: /-?\d+(?:\.\d+)?/g,
+  uuid: /[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/g,
+  chinese: /[\u4e00-\u9fa5]+/g,
+}
+
+export function extractText(text: string, kind: ExtractKind): string {
+  if (!text.trim()) throw new Error('请输入待提取的文本')
+  const matches = text.match(EXTRACT_PATTERNS[kind]) ?? []
+  const unique = Array.from(new Set(matches.map((item) => item.trim())))
+  if (!unique.length) return '未匹配到内容'
+  return [`共 ${unique.length} 项：`, '', ...unique].join('\n')
+}
+
+/* ---------------- 行处理 ---------------- */
+
+export type LineOp =
+  | 'trim'
+  | 'noBlank'
+  | 'unique'
+  | 'clean'
+  | 'sortAsc'
+  | 'sortDesc'
+  | 'reverseLines'
+  | 'number'
+  | 'unnumber'
+  | 'join'
+
+export function lineOps(text: string, op: LineOp): string {
+  if (!text) return ''
+  const lines = text.split(/\r?\n/)
+  switch (op) {
+    case 'trim':
+      return lines.map((line) => line.trim()).join('\n')
+    case 'noBlank':
+      return lines.filter((line) => line.trim()).join('\n')
+    case 'unique': {
+      const seen = new Set<string>()
+      return lines
+        .filter((line) => {
+          if (seen.has(line)) return false
+          seen.add(line)
+          return true
+        })
+        .join('\n')
+    }
+    case 'clean': {
+      const seen = new Set<string>()
+      return lines
+        .map((line) => line.trim())
+        .filter((line) => {
+          if (!line || seen.has(line)) return false
+          seen.add(line)
+          return true
+        })
+        .join('\n')
+    }
+    case 'sortAsc':
+      return [...lines].sort((a, b) => a.localeCompare(b, 'zh-CN')).join('\n')
+    case 'sortDesc':
+      return [...lines].sort((a, b) => b.localeCompare(a, 'zh-CN')).join('\n')
+    case 'reverseLines':
+      return [...lines].reverse().join('\n')
+    case 'number':
+      return lines.map((line, index) => `${index + 1}. ${line}`).join('\n')
+    case 'unnumber':
+      return lines.map((line) => line.replace(/^\s*\d+[.、):]\s*/, '')).join('\n')
+    case 'join':
+      return lines
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .join(' ')
+    default:
+      return text
+  }
+}
+
+/* ---------------- MAC 地址 ---------------- */
+
+function macHex(text: string): string[] {
+  const hex = text.replace(/[^0-9a-fA-F]/g, '')
+  if (hex.length !== 12) throw new Error('MAC 地址需要 12 位十六进制字符')
+  return Array.from({ length: 6 }, (_, index) => hex.slice(index * 2, index * 2 + 2).toUpperCase())
+}
+
+export function macInfo(text: string): string {
+  const raw = text.trim()
+  let groups: string[]
+  let source: string
+  if (raw) {
+    groups = macHex(raw)
+    source = '来自输入'
+  } else {
+    const bytes = Array.from({ length: 6 }, () => Math.floor(Math.random() * 256))
+    // 第二位强制为 0，既是单播地址也不会与真实厂商 OUI 冲突
+    bytes[0] = (bytes[0] & 0xfe) | 0x02
+    groups = bytes.map((byte) => byte.toString(16).padStart(2, '0').toUpperCase())
+    source = '随机生成（本地管理单播地址）'
+  }
+  const compact = groups.join('')
+  return [
+    `来源：${source}`,
+    `冒号分隔：${groups.join(':')}`,
+    `短横线分隔：${groups.join('-')}`,
+    `连续格式：${compact}`,
+    `Cisco 格式：${compact.replace(/(.{4})(?=.)/g, '$1.')}`,
+    `小写：${groups.join(':').toLowerCase()}`,
+  ].join('\n')
+}
+
 export function formatBytes(value: number): string {
   if (!value || value <= 0) return '0 B'
   const units = ['B', 'KB', 'MB', 'GB', 'TB']

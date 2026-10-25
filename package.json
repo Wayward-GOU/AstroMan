@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
+    "build:win": "tauri build --bundles nsis",
+    "build:mac": "tauri build --target universal-apple-darwin --bundles dmg",
     "preview": "vite preview",
     "tauri": "tauri"
   },

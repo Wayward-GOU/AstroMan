@@ -144,6 +144,30 @@ CREATE TABLE IF NOT EXISTS report_errors (
     response_body   TEXT
 );
 
+-- 报告请求明细（每次请求一条，最多保留前 50000 条）
+CREATE TABLE IF NOT EXISTS report_requests (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_id     INTEGER NOT NULL REFERENCES test_reports(id) ON DELETE CASCADE,
+    elapsed_ms    INTEGER DEFAULT 0,
+    time_ms       INTEGER DEFAULT 0,
+    method        TEXT,
+    url           TEXT,
+    status        INTEGER DEFAULT 0,
+    latency_ms    INTEGER DEFAULT 0,
+    ttfb_ms       INTEGER DEFAULT 0,
+    bytes         INTEGER DEFAULT 0,
+    success       INTEGER DEFAULT 1,
+    body          TEXT,
+    params        TEXT,
+    req_headers   TEXT,
+    res_headers   TEXT,
+    res_body      TEXT,
+    error_type    TEXT,
+    error_message TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_report_requests_report ON report_requests(report_id, id);
+
 -- 请求历史（本地，最多保留最近 5000 条）
 CREATE TABLE IF NOT EXISTS request_history (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,

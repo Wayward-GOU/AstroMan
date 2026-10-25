@@ -9,11 +9,16 @@ import {
   CheckCircleOutlined,
   CloseCircleOutlined,
   DownloadOutlined,
+  DownOutlined,
+  EyeOutlined,
+  CopyOutlined,
 } from '@ant-design/icons-vue'
 import PageHeader from '@/components/PageHeader.vue'
 import LineChart from '@/components/LineChart.vue'
 import * as api from '@/api'
-import type { ReportDetail } from '@/types/models'
+import type { ReportDetail, ReportRequestRecord, ReportRequestsPage } from '@/types/models'
+import { buildReportHtml, buildReportSheets } from '@/utils/reportExport'
+import { buildXlsx } from '@/utils/xlsx'
 
 const route = useRoute()
 const router = useRouter()
@@ -24,6 +29,123 @@ const exporting = ref(false)
 
 const reportId = computed(() => Number(route.params.id))
 
+const requestFilter = ref<'all' | 'success' | 'failed'>('all')
+const requestPage = ref(1)
+const requestPageSize = ref(50)
+const requestsLoading = ref(false)
+const requestPageData = ref<ReportRequestsPage | null>(null)
+
+const requestItems = computed(() => requestPageData.value?.items ?? [])
+const requestTotal = computed(() => requestPageData.value?.total ?? 0)
+
+/* ---------- 请求明细详情 ---------- */
+const recordOpen = ref(false)
+const recordItem = ref<ReportRequestRecord | null>(null)
+const recordTab = ref<'request' | 'response'>('request')
+
+type HeaderPair = { key: string; value: string }
+
+function parsePairs(json?: string | null): HeaderPair[] {
+  if (!json) return []
+  try {
+    const parsed = JSON.parse(json)
+    if (!Array.isArray(parsed)) return []
+    return parsed.map((item) => {
+      if (Array.isArray(item)) {
+        return { key: String(item[0] ?? ''), value: String(item[1] ?? '') }
+      }
+      return { key: String(item?.key ?? ''), value: String(item?.value ?? '') }
+    })
+  } catch {
+    return []
+  }
+}
+
+function prettyText(raw?: string | null) {
+  if (!raw) return ''
+  try {
+    return JSON.stringify(JSON.parse(raw), null, 2)
+  } catch {
+    return raw
+  }
+}
+
+const recordBody = computed(() => prettyText(recordItem.value?.body))
+const recordResBody = computed(() => prettyText(recordItem.value?.responseBody))
+const recordParams = computed(() => {
+  const query = recordItem.value?.params ?? ''
+  if (!query) return [] as HeaderPair[]
+  const out: HeaderPair[] = []
+  new URLSearchParams(query).forEach((value, key) => out.push({ key, value }))
+  return out
+})
+const recordReqHeaders = computed(() => parsePairs(recordItem.value?.headers))
+const recordResHeaders = computed(() => parsePairs(recordItem.value?.responseHeaders))
+
+function openRecord(item: ReportRequestRecord) {
+  recordItem.value = item
+  recordTab.value = 'request'
+  recordOpen.value = true
+}
+
+async function copyText(text: string, label: string) {
+  if (!text) return
+  try {
+    await navigator.clipboard.writeText(text)
+    message.success(`已复制${label}`)
+  } catch {
+    message.error('复制失败')
+  }
+}
+
+async function copyRecordBody() {
+  await copyText(recordBody.value, '请求体')
+}
+
+async function copyRecordResBody() {
+  await copyText(recordResBody.value, '响应体')
+}
+
+function fmtFullTime(ts?: number | null) {
+  if (!ts) return '-'
+  const d = new Date(ts)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(
+    d.getHours(),
+  )}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${String(d.getMilliseconds()).padStart(3, '0')}`
+}
+
+async function loadRequests() {
+  requestsLoading.value = true
+  try {
+    const success =
+      requestFilter.value === 'all' ? null : requestFilter.value === 'success'
+    requestPageData.value = await api.reportRequests(
+      reportId.value,
+      requestPage.value,
+      requestPageSize.value,
+      success,
+    )
+  } catch (e) {
+    requestPageData.value = { total: 0, items: [] }
+    console.error('请求明细加载失败', e)
+  } finally {
+    requestsLoading.value = false
+  }
+}
+
+function onRequestFilterChange() {
+  requestPage.value = 1
+  loadRequests()
+}
+
+function onRequestPageChange(page: number, pageSize: number) {
+  const size = Number(pageSize)
+  requestPage.value = size === requestPageSize.value ? page : 1
+  requestPageSize.value = size
+  loadRequests()
+}
+
 onMounted(async () => {
   try {
     detail.value = await api.reportGet(reportId.value)
@@ -32,6 +154,7 @@ onMounted(async () => {
   } finally {
     loading.value = false
   }
+  loadRequests()
 })
 
 const report = computed(() => detail.value?.report ?? null)
@@ -205,6 +328,15 @@ function fmtTime(ts?: number | null) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
 }
 
+function fmtClock(ts?: number | null) {
+  if (!ts) return '-'
+  const d = new Date(ts)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${String(
+    d.getMilliseconds(),
+  ).padStart(3, '0')}`
+}
+
 function codeTone(code: number) {
   if (code >= 500) return 'bad'
   if (code >= 400) return 'warn'
@@ -212,24 +344,52 @@ function codeTone(code: number) {
   return 'ok'
 }
 
-async function exportReport() {
-  if (!report.value) return
-  const safeName = report.value.planName.replace(/[\\/:*?"<>|]/g, '_')
+type ExportFormat = 'json' | 'html' | 'excel'
+
+const EXPORT_META: Record<ExportFormat, { extension: string; filterName: string; label: string }> = {
+  json: { extension: 'json', filterName: 'FinkMeter 压测报告', label: 'JSON 归档' },
+  html: { extension: 'html', filterName: 'HTML 报告', label: 'HTML 报告' },
+  excel: { extension: 'xlsx', filterName: 'Excel 工作簿', label: 'Excel 表格' },
+}
+
+async function exportReport(format: ExportFormat) {
+  const current = report.value
+  const data = detail.value
+  if (!current || !data) return
+  const meta = EXPORT_META[format]
+  const safeName = current.planName.replace(/[\\/:*?"<>|]/g, '_')
   exporting.value = true
   try {
     const path = await save({
-      title: '导出压测报告',
-      defaultPath: `${safeName}-report.json`,
-      filters: [{ name: 'FinkMeter 压测报告', extensions: ['json'] }],
+      title: `导出压测报告（${meta.label}）`,
+      defaultPath: `${safeName}-report.${meta.extension}`,
+      filters: [{ name: meta.filterName, extensions: [meta.extension] }],
     })
     if (!path) return
-    await api.reportExport(report.value.id, path)
-    message.success('报告已导出')
+    const suffix = `.${meta.extension}`
+    const target = path.toLowerCase().endsWith(suffix) ? path : `${path}${suffix}`
+    if (format === 'json') {
+      await api.reportExport(current.id, target)
+    } else {
+      const records = await api.reportRequests(current.id, 1, 50000, null)
+      if (format === 'html') {
+        const bytes = new TextEncoder().encode(buildReportHtml(data, records.items))
+        await api.reportWriteFile(target, Array.from(bytes))
+      } else {
+        const bytes = buildXlsx(buildReportSheets(data, records.items))
+        await api.reportWriteFile(target, Array.from(bytes))
+      }
+    }
+    message.success(`已导出 ${meta.label}`)
   } catch (e) {
     message.error(String(e))
   } finally {
     exporting.value = false
   }
+}
+
+function onExportMenu(info: { key: string | number }) {
+  exportReport(info.key as ExportFormat)
 }
 
 function remove() {
@@ -260,10 +420,20 @@ function remove() {
         <template #icon><ArrowLeftOutlined /></template>
         返回列表
       </a-button>
-      <a-button :loading="exporting" @click="exportReport">
-        <template #icon><DownloadOutlined /></template>
-        导出报告
-      </a-button>
+      <a-dropdown :trigger="['click']" placement="bottomRight">
+        <a-button :loading="exporting">
+          <template #icon><DownloadOutlined /></template>
+          导出报告
+          <DownOutlined />
+        </a-button>
+        <template #overlay>
+          <a-menu @click="onExportMenu">
+            <a-menu-item key="json">JSON 归档（完整数据）</a-menu-item>
+            <a-menu-item key="html">HTML 报告（可视化）</a-menu-item>
+            <a-menu-item key="excel">Excel 表格（多工作表）</a-menu-item>
+          </a-menu>
+        </template>
+      </a-dropdown>
       <a-button danger @click="remove">
         <template #icon><DeleteOutlined /></template>
         删除
@@ -620,6 +790,262 @@ function remove() {
           </div>
           <div v-else class="inline-empty">历史报告未保存配置快照</div>
         </div>
+
+        <div class="section-head">
+          <div>
+            <h2 class="section-title">请求明细</h2>
+            <div class="section-desc">
+              逐条记录每次请求的时间、耗时、状态与结果{{
+                requestTotal ? `，共 ${requestTotal.toLocaleString()} 条` : ''
+              }}{{ requestTotal >= 50000 ? '（最多保留前 50000 条）' : '' }}
+            </div>
+          </div>
+          <a-radio-group
+            v-model:value="requestFilter"
+            size="small"
+            button-style="solid"
+            @change="onRequestFilterChange"
+          >
+            <a-radio-button value="all">全部</a-radio-button>
+            <a-radio-button value="success">成功</a-radio-button>
+            <a-radio-button value="failed">失败</a-radio-button>
+          </a-radio-group>
+        </div>
+
+        <div class="fm-card request-card">
+          <a-spin :spinning="requestsLoading">
+            <div v-if="requestItems.length" class="data-table request-table">
+              <table>
+                <thead>
+                  <tr>
+                    <th class="req-index">#</th>
+                    <th class="req-time">请求时间</th>
+                    <th class="req-method-col">方法</th>
+                    <th class="req-url-col">URL</th>
+                    <th class="req-body-col">请求体</th>
+                    <th>状态</th>
+                    <th>耗时</th>
+                    <th>TTFB</th>
+                    <th>大小</th>
+                    <th>结果</th>
+                    <th class="req-error-col">错误信息</th>
+                    <th class="req-detail-col">详情</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr
+                    v-for="(item, index) in requestItems"
+                    :key="`${item.timeMs}-${index}`"
+                    class="req-row"
+                    @click="openRecord(item)"
+                  >
+                    <td class="req-index mono">
+                      {{ (requestPage - 1) * requestPageSize + index + 1 }}
+                    </td>
+                    <td class="req-time mono">{{ fmtClock(item.timeMs) }}</td>
+                    <td class="req-method-col">
+                      <span class="req-method">{{ item.method }}</span>
+                    </td>
+                    <td class="req-url-col mono" :title="item.url">{{ item.url }}</td>
+                    <td class="req-body-col mono" :title="item.body ?? ''">
+                      {{ item.body || '-' }}
+                    </td>
+                    <td class="mono" :class="{ bad: item.status >= 400 }">
+                      {{ item.status || '-' }}
+                    </td>
+                    <td class="mono" :class="{ bad: item.latencyMs >= 1000 }">
+                      {{ fmtNum(item.latencyMs, 0) }} ms
+                    </td>
+                    <td class="mono">{{ fmtNum(item.ttfbMs, 0) }} ms</td>
+                    <td class="mono">{{ fmtBytes(item.bytes) }}</td>
+                    <td>
+                      <span class="req-result" :class="item.success ? 'ok' : 'bad'">
+                        {{ item.success ? '成功' : '失败' }}
+                      </span>
+                    </td>
+                    <td class="req-error-col" :title="item.errorMessage ?? ''">
+                      <span v-if="item.errorType" class="req-error-type">{{ item.errorType }}</span>
+                      <span v-if="item.errorMessage" class="req-error-msg">{{ item.errorMessage }}</span>
+                      <span v-else-if="!item.errorType">-</span>
+                    </td>
+                    <td class="req-detail-col">
+                      <span class="req-detail-link"><EyeOutlined /> 查看</span>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div v-else-if="!requestsLoading" class="inline-empty">
+              {{
+                requestFilter === 'all'
+                  ? '本次压测没有记录请求明细（旧版本报告不包含逐请求数据）'
+                  : '没有符合条件的请求'
+              }}
+            </div>
+            <div class="request-pager">
+              <a-pagination
+                v-model:current="requestPage"
+                v-model:page-size="requestPageSize"
+                :total="requestTotal"
+                :page-size-options="[20, 50, 100, 200]"
+                :show-total="(total: number) => `共 ${total.toLocaleString()} 条`"
+                show-size-changer
+                show-quick-jumper
+                size="small"
+                @change="onRequestPageChange"
+              />
+            </div>
+          </a-spin>
+        </div>
+
+        <a-drawer
+          v-model:open="recordOpen"
+          title="请求详情"
+          placement="right"
+          :width="640"
+          :body-style="{ padding: '18px 20px' }"
+        >
+          <template v-if="recordItem">
+            <div class="rec-head">
+              <span class="req-method">{{ recordItem.method }}</span>
+              <span class="req-result" :class="recordItem.success ? 'ok' : 'bad'">
+                {{ recordItem.success ? '成功' : '失败' }}
+              </span>
+              <span class="rec-status mono" :class="{ bad: recordItem.status >= 400 }">
+                {{ recordItem.status || '无响应' }}
+              </span>
+              <span class="rec-elapsed">压测第 {{ recordItem.elapsedMs }} ms</span>
+            </div>
+
+            <div class="rec-url mono">{{ recordItem.url }}</div>
+
+            <a-descriptions :column="2" size="small" bordered class="rec-desc">
+              <a-descriptions-item label="请求时间" :span="2">
+                {{ fmtFullTime(recordItem.timeMs) }}
+              </a-descriptions-item>
+              <a-descriptions-item label="耗时">
+                {{ fmtNum(recordItem.latencyMs, 0) }} ms
+              </a-descriptions-item>
+              <a-descriptions-item label="TTFB">
+                {{ fmtNum(recordItem.ttfbMs, 0) }} ms
+              </a-descriptions-item>
+              <a-descriptions-item label="响应大小">
+                {{ fmtBytes(recordItem.bytes) }}
+              </a-descriptions-item>
+              <a-descriptions-item label="状态码">
+                {{ recordItem.status || '无响应' }}
+              </a-descriptions-item>
+            </a-descriptions>
+
+            <a-tabs v-model:activeKey="recordTab" size="small" class="rec-tabs">
+              <a-tab-pane key="request">
+                <template #tab>
+                  请求参数
+                  <span class="tab-badge">
+                    {{ recordParams.length + recordReqHeaders.length + (recordBody ? 1 : 0) }}
+                  </span>
+                </template>
+
+                <div class="rec-block first">
+                  <div class="rec-block-head">
+                    <span>查询参数</span>
+                    <span class="rec-note">{{ recordParams.length }} 项</span>
+                  </div>
+                  <div v-if="recordParams.length" class="kv-list">
+                    <div v-for="(p, i) in recordParams" :key="`p-${i}`" class="kv-row">
+                      <span class="kv-key mono">{{ p.key }}</span>
+                      <span class="kv-value mono">{{ p.value }}</span>
+                    </div>
+                  </div>
+                  <div v-else class="rec-empty">该请求没有查询参数</div>
+                </div>
+
+                <div class="rec-block">
+                  <div class="rec-block-head">
+                    <span>请求头</span>
+                    <span class="rec-note">{{ recordReqHeaders.length }} 项</span>
+                  </div>
+                  <div v-if="recordReqHeaders.length" class="kv-list">
+                    <div v-for="(h, i) in recordReqHeaders" :key="`h-${i}`" class="kv-row">
+                      <span class="kv-key mono">{{ h.key }}</span>
+                      <span class="kv-value mono">{{ h.value }}</span>
+                    </div>
+                  </div>
+                  <div v-else class="rec-empty">该请求没有额外请求头</div>
+                </div>
+
+                <div class="rec-block">
+                  <div class="rec-block-head">
+                    <span>请求体</span>
+                    <span v-if="recordBody" class="rec-note">最多保留 1000 字符</span>
+                    <a-button
+                      v-if="recordBody"
+                      type="link"
+                      size="small"
+                      class="rec-copy"
+                      @click="copyRecordBody"
+                    >
+                      <CopyOutlined /> 复制
+                    </a-button>
+                  </div>
+                  <pre v-if="recordBody" class="mono rec-body">{{ recordBody }}</pre>
+                  <div v-else class="rec-empty">该请求没有请求体（GET / HEAD 或未配置 Body）</div>
+                </div>
+              </a-tab-pane>
+
+              <a-tab-pane key="response">
+                <template #tab>
+                  返回结果
+                  <span class="tab-badge">{{ recordResHeaders.length + (recordResBody ? 1 : 0) }}</span>
+                </template>
+
+                <div class="rec-block first">
+                  <div class="rec-block-head">
+                    <span>响应头</span>
+                    <span class="rec-note">{{ recordResHeaders.length }} 项</span>
+                  </div>
+                  <div v-if="recordResHeaders.length" class="kv-list">
+                    <div v-for="(h, i) in recordResHeaders" :key="`rh-${i}`" class="kv-row">
+                      <span class="kv-key mono">{{ h.key }}</span>
+                      <span class="kv-value mono">{{ h.value }}</span>
+                    </div>
+                  </div>
+                  <div v-else class="rec-empty">没有记录到响应头</div>
+                </div>
+
+                <div class="rec-block">
+                  <div class="rec-block-head">
+                    <span>响应体</span>
+                    <span v-if="recordResBody" class="rec-note">最多保留 2000 字符</span>
+                    <a-button
+                      v-if="recordResBody"
+                      type="link"
+                      size="small"
+                      class="rec-copy"
+                      @click="copyRecordResBody"
+                    >
+                      <CopyOutlined /> 复制
+                    </a-button>
+                  </div>
+                  <pre v-if="recordResBody" class="mono rec-body">{{ recordResBody }}</pre>
+                  <div v-else class="rec-empty">没有记录到响应体（连接失败或响应为空）</div>
+                </div>
+
+                <div v-if="recordItem.errorType || recordItem.errorMessage" class="rec-block">
+                  <div class="rec-block-head">
+                    <span>错误信息</span>
+                  </div>
+                  <div class="rec-error">
+                    <span v-if="recordItem.errorType" class="req-error-type">
+                      {{ recordItem.errorType }}
+                    </span>
+                    <span class="rec-error-msg">{{ recordItem.errorMessage || '-' }}</span>
+                  </div>
+                </div>
+              </a-tab-pane>
+            </a-tabs>
+          </template>
+        </a-drawer>
 
         <div class="section-head">
           <div>
@@ -1206,6 +1632,316 @@ function remove() {
 
 .sample-table {
   max-height: 360px;
+}
+
+/* ---------- 请求明细 ---------- */
+.request-card {
+  padding: 10px 12px 8px;
+}
+
+.request-table {
+  max-height: 440px;
+}
+
+.request-table th,
+.request-table td {
+  padding: 6px 8px;
+}
+
+.request-table th.req-index,
+.request-table td.req-index {
+  width: 56px;
+  text-align: right;
+  color: var(--fm-muted);
+}
+
+.request-table th.req-time,
+.request-table td.req-time {
+  width: 92px;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.request-table th.req-method-col,
+.request-table td.req-method-col {
+  width: 72px;
+  text-align: left;
+}
+
+.request-table th.req-url-col,
+.request-table td.req-url-col {
+  text-align: left;
+  min-width: 220px;
+  max-width: 380px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.request-table th.req-body-col,
+.request-table td.req-body-col {
+  text-align: left;
+  min-width: 160px;
+  max-width: 300px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fm-muted);
+}
+
+.request-table th.req-error-col,
+.request-table td.req-error-col {
+  text-align: left;
+  min-width: 180px;
+  max-width: 300px;
+  white-space: normal;
+  word-break: break-all;
+  color: var(--fm-muted);
+}
+
+.req-method {
+  display: inline-block;
+  padding: 0 6px;
+  border-radius: 4px;
+  background: var(--fm-primary-soft);
+  color: var(--fm-primary);
+  font-family: 'JetBrains Mono', 'Cascadia Code', Consolas, monospace;
+  font-size: 10px;
+  line-height: 17px;
+}
+
+.req-result {
+  display: inline-block;
+  padding: 0 7px;
+  border-radius: 999px;
+  font-size: 10px;
+  line-height: 17px;
+}
+
+.req-result.ok {
+  background: var(--fm-success-soft);
+  color: var(--fm-success);
+}
+
+.req-result.bad {
+  background: var(--fm-danger-soft);
+  color: var(--fm-danger);
+}
+
+.req-error-type {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: var(--fm-danger-soft);
+  color: var(--fm-danger);
+  font-size: 10px;
+  line-height: 16px;
+}
+
+.req-error-msg {
+  font-size: 10.5px;
+}
+
+.request-table tbody tr.req-row {
+  cursor: pointer;
+}
+
+.request-table tbody tr.req-row:hover td {
+  background: var(--fm-primary-soft);
+}
+
+.req-detail-col {
+  width: 66px;
+  text-align: center;
+}
+
+.req-detail-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 10.5px;
+  color: var(--fm-primary);
+  opacity: 0.65;
+  transition: opacity 0.16s;
+}
+
+.req-row:hover .req-detail-link {
+  opacity: 1;
+}
+
+/* ---------- 请求详情抽屉 ---------- */
+.rec-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.rec-status {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fm-text-2);
+}
+
+.rec-status.bad {
+  color: var(--fm-danger);
+}
+
+.rec-elapsed {
+  margin-left: auto;
+  font-size: 10.5px;
+  color: var(--fm-muted);
+}
+
+.rec-url {
+  margin: 10px 0 14px;
+  padding: 9px 11px;
+  border-radius: 7px;
+  background: var(--fm-surface-alt);
+  font-size: 11.5px;
+  line-height: 1.7;
+  color: var(--fm-text-2);
+  word-break: break-all;
+}
+
+.rec-desc :deep(.ant-descriptions-item-label) {
+  width: 84px;
+  font-size: 11px;
+  color: var(--fm-muted);
+}
+
+.rec-desc :deep(.ant-descriptions-item-content) {
+  font-size: 11.5px;
+}
+
+.rec-block {
+  margin-top: 18px;
+}
+
+.rec-block.first {
+  margin-top: 4px;
+}
+
+.rec-tabs {
+  margin-top: 4px;
+}
+
+.rec-tabs :deep(.ant-tabs-nav) {
+  margin-bottom: 2px;
+}
+
+.tab-badge {
+  display: inline-block;
+  min-width: 16px;
+  margin-left: 5px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: var(--fm-surface-alt);
+  color: var(--fm-muted);
+  font-size: 9.5px;
+  line-height: 15px;
+  text-align: center;
+}
+
+.kv-list {
+  border: 1px solid var(--fm-border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--fm-surface-alt);
+}
+
+.kv-row {
+  display: flex;
+  gap: 12px;
+  padding: 6px 11px;
+  border-bottom: 1px dashed var(--fm-border);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.kv-row:last-child {
+  border-bottom: none;
+}
+
+.kv-key {
+  width: 38%;
+  flex-shrink: 0;
+  color: var(--fm-primary);
+  word-break: break-all;
+}
+
+.kv-value {
+  flex: 1;
+  min-width: 0;
+  color: var(--fm-text-2);
+  word-break: break-all;
+}
+
+.rec-block-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--fm-text-2);
+}
+
+.rec-note {
+  font-size: 10px;
+  font-weight: 400;
+  color: var(--fm-muted);
+}
+
+.rec-copy {
+  margin-left: auto;
+  font-size: 10.5px;
+  padding: 0;
+  height: auto;
+}
+
+.rec-body {
+  margin: 0;
+  padding: 12px 14px;
+  max-height: 380px;
+  overflow: auto;
+  border: 1px solid var(--fm-border);
+  border-radius: 8px;
+  background: var(--fm-surface-alt);
+  font-size: 11.5px;
+  line-height: 1.7;
+  color: var(--fm-text-2);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.rec-empty {
+  padding: 12px 14px;
+  border: 1px dashed var(--fm-border);
+  border-radius: 8px;
+  font-size: 11px;
+  color: var(--fm-muted);
+}
+
+.rec-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 11px 13px;
+  border-radius: 8px;
+  background: var(--fm-danger-soft);
+}
+
+.rec-error-msg {
+  font-size: 11.5px;
+  line-height: 1.7;
+  color: var(--fm-danger);
+  word-break: break-all;
+}
+
+.request-pager {
+  display: flex;
+  justify-content: flex-end;
+  padding-top: 10px;
 }
 
 /* ---------- 配置快照 ---------- */

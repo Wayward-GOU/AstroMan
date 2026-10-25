@@ -31,6 +31,11 @@ fn migrate(pool: &DbPool) -> Result<(), String> {
         "ALTER TABLE report_samples ADD COLUMN p50_rt REAL DEFAULT 0",
         "ALTER TABLE report_samples ADD COLUMN ttfb_avg REAL DEFAULT 0",
         "ALTER TABLE report_samples ADD COLUMN bytes INTEGER DEFAULT 0",
+        "ALTER TABLE report_requests ADD COLUMN body TEXT",
+        "ALTER TABLE report_requests ADD COLUMN params TEXT",
+        "ALTER TABLE report_requests ADD COLUMN req_headers TEXT",
+        "ALTER TABLE report_requests ADD COLUMN res_headers TEXT",
+        "ALTER TABLE report_requests ADD COLUMN res_body TEXT",
     ];
     for sql in statements {
         let _ = conn.execute(sql, []);

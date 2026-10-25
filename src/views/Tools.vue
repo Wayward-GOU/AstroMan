@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, defineAsyncComponent, markRaw, ref, shallowRef, watch, type Component } from 'vue'
+import { computed, defineAsyncComponent, markRaw, onMounted, ref, shallowRef, watch, type Component } from 'vue'
+import { useRoute } from 'vue-router'
 import {
   ArrowLeftOutlined,
   BookOutlined,
@@ -20,6 +21,21 @@ const activeCategory = ref<ToolCategoryId>('json')
 const activeToolId = ref<string | null>(null)
 const activeComponent = shallowRef<Component | null>(null)
 const loading = ref(false)
+
+const route = useRoute()
+
+/** 支持从工作台等页面通过 ?tool=xxx 直接打开指定工具 */
+function openFromRoute() {
+  const id = typeof route.query.tool === 'string' ? route.query.tool : ''
+  const tool = id ? TOOL_MAP.get(id) : null
+  if (!tool) return
+  keyword.value = ''
+  activeCategory.value = tool.category
+  activeToolId.value = tool.id
+}
+
+onMounted(openFromRoute)
+watch(() => route.query.tool, openFromRoute)
 
 const CATEGORY_ICONS: Record<ToolCategoryId, Component> = {
   json: CodeOutlined,

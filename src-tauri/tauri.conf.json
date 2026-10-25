@@ -43,7 +43,8 @@
         "installMode": "currentUser",
         "languages": ["SimpChinese", "English"],
         "displayLanguageSelector": true,
-        "compression": "lzma"
+        "compression": "lzma",
+        "installerHooks": "./windows/installer-hooks.nsh"
       }
     },
     "macOS": {

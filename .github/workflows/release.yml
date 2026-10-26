@@ -4,13 +4,6 @@ on:
   push:
     tags:
       - 'v*'
-      - 'FinkMeter-v*'
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: '发行版本号，例如 v1.0.0'
-        required: true
-        default: 'v1.0.0'
 
 permissions:
   contents: write
@@ -58,8 +51,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
-          releaseName: "FinkMeter ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}"
+          tagName: ${{ github.ref_name }}
+          releaseName: 'FinkMeter ${{ github.ref_name }}'
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}

@@ -298,15 +298,6 @@ npm run tauri build
 | WAL 临时文件 | `finkmeter.db-wal` / `finkmeter.db-shm`（同目录） | 同目录 |
 | 存储位置配置 | `%APPDATA%\com.finkmeter.app\storage.json` | `~/Library/Application Support/com.finkmeter.app/storage.json` |
 
-Windows 安装向导的第一步可以指定数据存储位置：
-
-- 默认填 `%APPDATA%\FinkMeter`，直接点下一步即使用该目录
-- 也可以「浏览」选择其他目录，安装完成后会自动写入 `storage.json` 指向该目录
-- 留空同样表示使用默认目录，不写配置
-- 若目录不可写（例如受保护的系统目录），安装器会阻止继续并提示重新选择
-
-macOS 没有安装向导，默认使用 `~/Library/Application Support/FinkMeter`，可在应用内「设置 → 数据存储」中修改。
-
 首次启动会自动建库，并写入一份可直接试用的示例数据：
 
 - 项目：`示例项目`（已存在但仍是初始示例时会自动补齐场景）

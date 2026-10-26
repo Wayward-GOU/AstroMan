@@ -105,12 +105,37 @@ jobs:
       - name: Verify macOS universal binary
         if: matrix.platform == 'macos-latest'
         run: |
-          APP="src-tauri/target/universal-apple-darwin/release/bundle/macos/FinkMeter.app"
-          test -d "$APP" || { echo "未找到 $APP"; exit 1; }
-          BIN="$APP/Contents/MacOS/finkmeter"
-          if [ ! -f "$BIN" ]; then
-            BIN="$(find "$APP/Contents/MacOS" -maxdepth 1 -type f | head -1)"
+          echo "== 定位构建产物 =="
+          find src-tauri/target -maxdepth 5 -type d -name bundle -print 2>/dev/null || true
+
+          APP="$(find src-tauri/target -maxdepth 6 -type d -name '*.app' -print 2>/dev/null | head -1)"
+          DMG="$(find src-tauri/target -maxdepth 7 -type f -name '*.dmg' -print 2>/dev/null | head -1)"
+          echo "app=$APP"
+          echo "dmg=$DMG"
+
+          MOUNT=""
+          cleanup() {
+            if [ -n "$MOUNT" ]; then
+              hdiutil detach "$MOUNT" -quiet || true
+            fi
+          }
+          trap cleanup EXIT
+
+          # tauri-action 的产物目录随版本变化，找不到 .app 时直接从 dmg 中取应用校验
+          if [ -z "$APP" ] && [ -n "$DMG" ]; then
+            MOUNT="$(mktemp -d)"
+            hdiutil attach "$DMG" -nobrowse -readonly -mountpoint "$MOUNT" >/dev/null
+            APP="$(find "$MOUNT" -maxdepth 2 -type d -name '*.app' -print | head -1)"
+            echo "从 dmg 挂载取到 app=$APP"
           fi
+
+          if [ -z "$APP" ]; then
+            echo "未找到 .app 或可用的 .dmg 产物"
+            find src-tauri/target -maxdepth 4 -type d -name 'bundle' -exec ls -R {} \; 2>/dev/null | head -80
+            exit 1
+          fi
+
+          BIN="$(find "$APP/Contents/MacOS" -maxdepth 1 -type f -perm -111 -print 2>/dev/null | head -1)"
           test -f "$BIN" || { echo "未找到可执行文件"; exit 1; }
 
           echo "== 可执行文件架构 =="
@@ -131,5 +156,5 @@ jobs:
           codesign --verify --deep --strict "$APP" || { echo "ad-hoc 签名校验失败"; exit 1; }
 
           echo "== dmg 产物 =="
-          ls -lh src-tauri/target/universal-apple-darwin/release/bundle/dmg/
+          [ -n "$DMG" ] && ls -lh "$DMG"
 

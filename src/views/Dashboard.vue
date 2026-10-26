@@ -249,7 +249,76 @@ const steps = computed(() => [
     action: '去压测',
     go: () => router.push('/stress'),
   },
+  {
+    key: '05',
+    title: '签名与加密',
+    desc: '脚本页「插入示例」可一键填入 MD5 / HMAC 签名、AES 加密、RSA 加密，生成的值用 {{变量}} 引用。',
+    action: '打开项目',
+    go: goProject,
+  },
+  {
+    key: '06',
+    title: '导入现成接口',
+    desc: '项目页可粘贴 cURL 一键解析；工作台可导入项目 JSON，用于同事共享或换机迁移。',
+    action: '打开项目',
+    go: goProject,
+  },
+  {
+    key: '07',
+    title: '数据与备份',
+    desc: '数据默认存在本机 SQLite；设置页可查看路径、迁移目录，项目页可导出 JSON 备份。',
+    action: '打开设置',
+    go: () => router.push('/settings'),
+  },
 ])
+
+const tips = [
+  {
+    title: '变量引用与优先级',
+    desc: 'URL、Header、Body 都能写变量；优先级：运行时变量（脚本 vars.set）> 环境变量 > 内置变量。',
+    code: '{{base_url}}/api/users/{{user_id}}\n{{timestamp}}  {{uuid}}  {{randomInt(1,100)}}',
+  },
+  {
+    title: '前置脚本：签名头',
+    desc: '在「脚本 → 前置脚本」里拼接待签名串，算好后写进请求头。',
+    code: "var ts = String(Date.now())\nrequest.headers.timestamp = ts\nrequest.headers.sign = cipher.md5(env.APP_ID + ts + request.body + env.APP_SECRET)",
+  },
+  {
+    title: '前置脚本：加密请求体',
+    desc: 'AES 默认 CBC + PKCS7，与 Java 的 AES/CBC/PKCS5Padding 结果一致；密钥与 IV 放环境变量。',
+    code: "request.body = cipher.aes.encrypt(request.body, env.AES_KEY, { iv: env.AES_IV })",
+  },
+  {
+    title: '前置脚本：RSA 加密参数',
+    desc: '公钥加密（PKCS#1 v1.5）后存入变量，Header 里用 {{authCode}} 引用即可。',
+    code: "vars.set('authCode', rsa.publicEncrypt(env.APP_ID + '.' + env.USER_CODE + '.' + Date.now(), env.PUBLIC_KEY))",
+  },
+  {
+    title: '后置脚本：断言与取变量',
+    desc: '断言结果展示在响应区「测试」页；提取的变量可供后续请求复用。',
+    code: "test('HTTP 200', () => assert(response.status === 200))\nvars.set('token', response.json().token)",
+  },
+  {
+    title: 'cURL 导入与代码生成',
+    desc: '项目页粘贴 cURL 即可解析成接口；请求栏「代码」按钮反向生成 cURL / 原始报文 / fetch / Python。',
+    code: '',
+  },
+  {
+    title: '多标签并行调试',
+    desc: '同一项目最多同时打开 20 个接口标签，编辑内容自动保存，切换或关闭都不丢改动。',
+    code: '',
+  },
+  {
+    title: '压测参数怎么起步',
+    desc: '建议 10～30 并发、30 秒时长起步，观察错误率与 P95 后再加；可配 P95 / P99 / 错误率 SLA 自动判定。',
+    code: '',
+  },
+  {
+    title: '数据备份与迁移',
+    desc: '项目页或卡片菜单导出 *.finkmeter.json 交给同事；设置页可查看数据库路径并迁移数据目录。',
+    code: '',
+  },
+]
 
 const faqs = [
   {
@@ -259,6 +328,30 @@ const faqs = [
   {
     q: '请求里的 {{变量}} 是怎么替换的？',
     a: '先选一个环境，再用 {{变量名}} 引用环境变量。还支持内置函数：{{timestamp}}、{{uuid}}、{{randomInt(1,100)}}、{{randomString(8)}}。',
+  },
+  {
+    q: '接口要签名或加密，脚本里怎么写？',
+    a: '打开接口编辑器的「脚本」页，右上角「插入示例」可直接填入时间戳、MD5 / HMAC-SHA256 签名、AES 加密、RSA 公钥加密等可运行代码，改几个变量名即可。脚本中可用 cipher（aes / des / tripleDes 加解密、md5 / sha1 / sha256、hmac、base64 / hex 编解码）与 rsa.publicEncrypt，生成的值用 vars.set 写入后，在 Header 或 Body 里用 {{变量}} 引用。',
+  },
+  {
+    q: '密钥长度报错是什么原因？',
+    a: 'AES 密钥必须是 16 / 24 / 32 字节，DES 是 8 字节，3DES 是 24 字节；AES 的 IV 要 16 字节，DES / 3DES 要 8 字节。密钥本身是十六进制字符串时传 { keyFormat: \'hex\' }，Base64 则用 { keyFormat: \'base64\' }，避免把编码后的文本当成原始字节。',
+  },
+  {
+    q: '怎么快速导入现成的接口？',
+    a: '在项目页点「导入接口」，把浏览器 Network 里复制的 cURL 命令粘进去，会自动解析出方法、URL、请求头、查询参数与 Body，再选目标集合即可。反过来，请求栏「代码」按钮可以把当前请求生成 cURL / 原始报文 / fetch / Python 代码。',
+  },
+  {
+    q: '怎么把项目分享给同事？',
+    a: '项目页顶部或工作台项目卡片菜单里选「导出项目」，会得到 *.finkmeter.json（含集合、接口、脚本与断言）。对方在工作台点「导入项目 → 导入项目 JSON」即可复原；重名时会自动加「（导入）」后缀，不影响原有项目。',
+  },
+  {
+    q: '变量没生效怎么排查？',
+    a: '先确认请求栏选择的环境是否正确，再检查变量名拼写与大小写。若脚本里用 vars.set 写过同名变量，运行时会覆盖环境变量（优先级：运行时 > 环境 > 内置）；脚本页底部的「运行时变量」列表可以直接看到实际取值。',
+  },
+  {
+    q: '压测报告在哪里看？可以导出吗？',
+    a: '压测结束后报告自动入库，侧边栏「压测报告」可查看 SLA 判定、延迟分位、状态码分布与逐请求明细；详情页支持导出 JSON（归档）、HTML（可浏览器打开或打印 PDF）与 Excel（多工作表）。',
   },
   {
     q: '压测并发数开多少合适？',
@@ -872,7 +965,7 @@ function statusColor(code?: number | null) {
     <div class="section-head">
       <div>
         <h2 class="section-title">使用说明</h2>
-        <div class="section-desc">四步走完整流程，常见问题也在下方</div>
+        <div class="section-desc">从建项目到签名加密、压测与备份，右侧是常见问题</div>
       </div>
     </div>
 
@@ -894,6 +987,23 @@ function statusColor(code?: number | null) {
             <p class="faq-answer">{{ f.a }}</p>
           </a-collapse-panel>
         </a-collapse>
+      </div>
+    </div>
+
+    <div class="section-head tips-head">
+      <div>
+        <h2 class="section-title">常用操作</h2>
+        <div class="section-desc">
+          高频用法速查；脚本示例也可在接口编辑器「脚本」页用「插入示例」一键填入
+        </div>
+      </div>
+    </div>
+
+    <div class="tips-grid">
+      <div v-for="tip in tips" :key="tip.title" class="fm-card tip-card">
+        <div class="tip-title">{{ tip.title }}</div>
+        <div class="tip-desc">{{ tip.desc }}</div>
+        <pre v-if="tip.code" class="tip-code mono">{{ tip.code }}</pre>
       </div>
     </div>
 
@@ -1749,6 +1859,45 @@ function statusColor(code?: number | null) {
   align-items: start;
 }
 
+.tips-head {
+  margin-top: 22px;
+}
+
+.tips-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(258px, 1fr));
+  gap: 14px;
+}
+
+.tip-card {
+  padding: 14px 16px;
+}
+
+.tip-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.tip-desc {
+  font-size: 11px;
+  line-height: 1.7;
+  color: var(--fm-muted);
+}
+
+.tip-code {
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  border: 1px solid var(--fm-border);
+  border-radius: 6px;
+  background: var(--fm-surface-alt);
+  color: var(--fm-text);
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
 .steps-card {
   padding: 6px 18px;
 }
@@ -1869,6 +2018,10 @@ function statusColor(code?: number | null) {
   .history-head,
   .history-row {
     grid-template-columns: 60px minmax(0, 1fr) 58px 78px 96px;
+  }
+
+  .help-grid {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .history-head span:nth-child(2),

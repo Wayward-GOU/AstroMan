@@ -226,7 +226,9 @@ function removeEnv(env: Environment) {
           <div class="hint-sub">
             每次发送请求前执行，可用 <span class="mono" v-pre>vars.set('key', value)</span> 赋值，请求里用
             <span class="mono" v-pre>{{key}}</span> 引用；也可读取 <span class="mono" v-pre>request</span>、
-            <span class="mono" v-pre>env</span> 与 <span class="mono" v-pre>console</span>。
+            <span class="mono" v-pre>env</span>、<span class="mono" v-pre>rsa.publicEncrypt(明文, 公钥)</span>、
+            <span class="mono" v-pre>cipher</span>（aes / des / md5 / sha256 / hmac / base64）与
+            <span class="mono" v-pre>console</span>。
           </div>
         </div>
         <a-button size="small" type="primary" :loading="scriptSaving" :disabled="!current" @click="saveEnvScript">

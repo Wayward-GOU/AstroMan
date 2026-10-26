@@ -309,6 +309,110 @@ npm run tauri build
 
 ---
 
+## 新手上手
+
+首次启动后自带「示例项目」，可以直接拿它练习；想从零开始就按下面五步走。
+
+**1. 建项目、建集合**
+
+工作台点「新建项目」，进入项目后右键集合树可新建子集合。项目与集合只影响组织方式，不会影响请求本身。
+
+**2. 配环境变量**
+
+侧边栏「环境」里建一个环境，把 `base_url`、`token` 等可变内容写进去，勾选为当前环境。请求里用 `{{base_url}}`、`{{token}}` 引用，切换环境即可整体换域名和凭证。
+
+内置变量可直接使用：`{{timestamp}}`、`{{uuid}}`、`{{randomInt(1,100)}}`、`{{randomString(8)}}`。
+
+**3. 调一个接口**
+
+新建请求，填方法、URL、Params、Headers、Body，点「发送」。响应区可切换 Pretty / Raw，并查看状态码、耗时、大小与响应头；请求栏「代码」按钮能生成 cURL / 原始报文 / fetch / Python 四种代码片段。
+
+变量优先级：运行时变量（脚本 `vars.set`）> 环境变量 > 内置变量。
+
+**4. 用脚本生成签名或密文**
+
+请求编辑器「脚本」页分前置（发送前）与后置（收到响应后）。右上角「插入示例」会直接把可运行的代码填进编辑器，改几个变量名即可用。详见下方[脚本与加密示例](#脚本与加密示例)。
+
+**5. 压测与报告**
+
+侧边栏「压测」新建压测，选项目 / 环境 / 接口后配置并发、时长与 SLA 阈值，开始后实时看 RPS、P95/P99 与状态码分布；结束后报告自动入库，可导出 JSON / HTML / Excel。
+
+---
+
+## 脚本与加密示例
+
+脚本沙箱是同步 JavaScript，可用对象：`request`、`response`（仅后置）、`vars`、`env`、`console`、`rsa`、`cipher`；后置脚本另有 `test(name, fn)` 与 `assert(条件, 提示)`。
+
+### 前置脚本：生成签名
+
+```js
+// MD5 签名：appId + 时间戳 + 请求体 + 密钥
+var timestamp = String(Date.now())
+var raw = ['demo-app', timestamp, request.body, env.APP_SECRET].join('.')
+request.headers.timestamp = timestamp
+request.headers.sign = cipher.md5(raw)
+```
+
+```js
+// HMAC-SHA256 签名，Base64 输出
+var timestamp = String(Date.now())
+var sign = cipher.hmacSha256(env.APP_ID + '.' + timestamp, env.APP_SECRET, 'base64')
+request.headers.Authorization = 'HMAC ' + env.APP_ID + ':' + timestamp + ':' + sign
+```
+
+### 前置脚本：加密请求内容
+
+```js
+// AES/CBC/PKCS7（等价 Java 的 AES/CBC/PKCS5Padding），密钥与 IV 放环境变量
+var encrypted = cipher.aes.encrypt(request.body, env.AES_KEY, { iv: env.AES_IV })
+request.headers['Content-Type'] = 'text/plain'
+request.body = encrypted
+```
+
+```js
+// RSA 公钥加密，写入变量后在 Header 里用 {{authCode}} 引用
+var raw = env.APP_ID + '.' + env.USER_CODE + '.' + Date.now()
+vars.set('authCode', rsa.publicEncrypt(raw, env.PUBLIC_KEY))
+```
+
+```js
+// AES/ECB、3DES、Hex 输出、ZeroPadding 等按选项切换
+cipher.aes.encrypt(text, key, { mode: 'ecb' })
+cipher.aes.encrypt(text, key, { iv: iv, output: 'hex' })
+cipher.tripleDes.encrypt(text, key24, { iv: iv8 })
+cipher.des.encrypt(text, key8, { iv: iv8 })
+```
+
+### 前置脚本：直接改请求
+
+```js
+request.method = 'POST'
+request.params.page = '1'
+request.headers['X-Trace-Id'] = 'trace-' + Date.now()
+request.body = JSON.stringify({ id: Date.now(), name: 'fink' })
+```
+
+### 后置脚本：断言与取变量
+
+```js
+test('HTTP 200', () => assert(response.status === 200))
+test('业务码为 0', () => {
+  var data = response.json()
+  assert(data.code === 0, '实际业务码：' + data.code)
+})
+vars.set('accessToken', response.json().token) // 后续请求用 {{accessToken}}
+```
+
+```js
+// 解密服务端返回的密文
+var plain = cipher.aes.decrypt(response.body, env.AES_KEY, { iv: env.AES_IV })
+console.log('解密结果：' + plain)
+```
+
+> 加密约定：密钥长度必须精确（AES 16/24/32、DES 8、3DES 24 字节），长度不符会直接报错；密钥与 IV 也可用 `{ keyFormat: 'hex' }` / `{ ivFormat: 'base64' }` 指定格式。RSA 默认为 PKCS#1 v1.5 填充，与 Java 默认的 `Cipher.getInstance("RSA")` 一致。
+
+---
+
 ## 已实现功能
 
 - 项目的新建、重命名、删除
@@ -318,7 +422,8 @@ npm run tauri build
 - 代码片段（Postman 式）：请求栏「代码」按钮打开右侧抽屉，可按 cURL / HTTP 原始报文 / JavaScript fetch / Python requests 四种格式查看并一键复制；环境变量按当前环境替换，敏感变量保持占位符，请求头缺少 Content-Type 时自动补齐
 - 自动更新：启动约 5 秒后静默查询 GitHub Release 最新版本，发现新版本弹窗展示发布说明与版本号，可一键下载对应平台安装包（Windows `setup.exe` / macOS `dmg`）并启动安装；设置页可手动检查、开关启动自动检查、打开发布页
 - 请求历史页：侧边栏「请求历史」集中查看最近发送记录（最新 500 条），支持按接口名 / URL / 方法 / 状态码搜索，展示总数、失败数与平均耗时，点击任意记录可直接跳回原接口继续编辑
-- 脚本执行：发送前运行前置脚本（可读写 `request.method / url / headers / params / body`，用 `vars.set()` 生成变量并渲染进 URL、Header、Body），收到响应后运行后置脚本（`response.status / headers / body / json()`，`test(name, fn)` + `assert()` 断言，`vars` 提取变量供后续请求复用）；响应区「测试」页展示断言通过率、失败原因、控制台输出与运行时变量
+- 脚本执行：发送前运行前置脚本（可读写 `request.method / url / headers / params / body`，用 `vars.set()` 生成变量并渲染进 URL、Header、Body），收到响应后运行后置脚本（`response.status / headers / body / json()`，`test(name, fn)` + `assert()` 断言，`vars` 提取变量供后续请求复用）；脚本页内置「插入示例」，覆盖时间戳、MD5 / HMAC 签名、AES 加密、RSA 加密、断言与提取 Token 等常用写法；响应区「测试」页展示断言通过率、失败原因、控制台输出与运行时变量
+- 脚本加密能力：`cipher.aes / des / tripleDes`（CBC / ECB / CFB / OFB / CTR，PKCS7 / Zero / None 填充，支持 hex、base64 密钥与 IV）、`cipher.md5 / sha1 / sha256`、`cipher.hmacSha1 / hmacSha256`、`cipher.base64 / hex` 编解码，以及 `rsa.publicEncrypt`（PKCS#1 v1.5，兼容 Java 默认 RSA 加密）
 - 本地发送 HTTP 请求，展示状态码、耗时、大小、响应头、响应体
 - 响应体 JSON 自动格式化，超过 5MB 自动截断
 - 忽略证书校验开关、30 秒超时

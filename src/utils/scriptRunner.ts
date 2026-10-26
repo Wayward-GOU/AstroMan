@@ -1,4 +1,6 @@
 import type { HttpResult } from '@/types/models'
+import { createCipher, type CipherFacade } from '@/utils/cryptoScript'
+import { rsaPublicEncrypt } from '@/utils/rsa'
 
 export type ScriptPhase = 'env' | 'pre' | 'post'
 export type ScriptLogLevel = 'log' | 'warn' | 'error'
@@ -52,6 +54,19 @@ interface ConsoleFacade {
   debug(...args: unknown[]): void
   warn(...args: unknown[]): void
   error(...args: unknown[]): void
+}
+
+interface RsaFacade {
+  /** 公钥加密（PKCS#1 v1.5），返回 Base64，等价于 Java 的 RSAUtils.publicEncrypt */
+  publicEncrypt(text: unknown, publicKey: unknown): string
+}
+
+function createRsa(): RsaFacade {
+  return {
+    publicEncrypt(text, publicKey) {
+      return rsaPublicEncrypt(String(text ?? ''), String(publicKey ?? ''))
+    },
+  }
 }
 
 export interface PreScriptResult {
@@ -186,13 +201,15 @@ export function runPreScript(
     params: { ...request.params },
   }
   try {
-    const runner = new Function('request', 'vars', 'env', 'console', `${code}\n`) as (
+    const runner = new Function('request', 'vars', 'env', 'console', 'rsa', 'cipher', `${code}\n`) as (
       r: ScriptRequest,
       v: VarsFacade,
       e: Record<string, string>,
       c: ConsoleFacade,
+      rsa: RsaFacade,
+      cipher: CipherFacade,
     ) => void
-    runner(target, createVars(env), { ...env }, createConsole(phase, logs))
+    runner(target, createVars(env), { ...env }, createConsole(phase, logs), createRsa(), createCipher())
     return { request: target, logs, durationMs: Math.round(performance.now() - started) }
   } catch (e) {
     return {
@@ -250,6 +267,8 @@ export function runPostScript(
       'vars',
       'env',
       'console',
+      'rsa',
+      'cipher',
       'test',
       'assert',
       `${code}\n`,
@@ -259,6 +278,8 @@ export function runPostScript(
       v: VarsFacade,
       e: Record<string, string>,
       c: ConsoleFacade,
+      rsa: RsaFacade,
+      cipher: CipherFacade,
       t: (name: unknown, fn: unknown) => void,
       a: (condition: unknown, message?: unknown) => void,
     ) => void
@@ -268,6 +289,8 @@ export function runPostScript(
       createVars(env),
       { ...env },
       createConsole('post', logs),
+      createRsa(),
+      createCipher(),
       test,
       assert,
     )

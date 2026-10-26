@@ -234,12 +234,27 @@ npm run tauri build
 | 应用程序 | `src-tauri/target/universal-apple-darwin/release/bundle/macos/FinkMeter.app` |
 | 当前架构可执行文件 | `src-tauri/target/release/bundle/macos/FinkMeter.app` |
 
-最低支持 macOS 11.0。安装包未签名、未公证，首次打开会被 Gatekeeper 拦截：
+最低支持 macOS 11.0。安装包未签名、未公证，首次打开会被 Gatekeeper 拦截（提示「Apple 无法验证 FinkMeter.app」）。
+
+仓库提供了 [scripts/install-macos.sh](scripts/install-macos.sh)，发布时由 [release.yml](.github/workflows/release.yml) 上传到 Release 附件，用户一条命令即可完成下载、安装与放行：
+
+```bash
+curl -fLO https://github.com/Wayward-GOU/FinkMeter/releases/download/v1.0.0/install-macos.sh
+bash install-macos.sh v1.0.0
+```
+
+不带参数执行时安装最新正式版。仓库若为私有，需要先提供 Token：
+
+```bash
+GITHUB_TOKEN=ghp_xxx bash install-macos.sh v1.0.0
+```
+
+手动安装的放行方式：
 
 - 右键点击 `FinkMeter.app` → 打开 → 再次确认，或
 - 终端执行 `xattr -dr com.apple.quarantine /Applications/FinkMeter.app`
 
-> 如需分发给其他用户，建议准备 Apple Developer ID 并做签名 + 公证（`codesign` + `notarytool`），避免对方每次打开都要手动放行。
+> Gatekeeper 只认 Apple 签发的 Developer ID 证书 + 公证票据，GitHub Actions 无法替代签发，只能执行 `codesign` / `notarytool`。如需彻底消除提示，准备 Apple Developer Program 账号后在 workflow 中配置 `APPLE_CERTIFICATE`、`APPLE_ID`、`APPLE_PASSWORD`、`APPLE_TEAM_ID` 等 secrets 即可。
 
 ---
 
@@ -371,11 +386,13 @@ Windows: %APPDATA%\FinkMeter\finkmeter.db
 macOS:   ~/Library/Application Support/FinkMeter/finkmeter.db
 ```
 
-**6. macOS 提示「无法打开，因为无法验证开发者」**
+**6. macOS 提示「无法打开，因为无法验证开发者」或「未打开 FinkMeter.app」**
 
-安装包未签名、未公证，用以下任一方式放行：
+安装包未签名、未公证，属于 Gatekeeper 的正常拦截。**不要点「移到废纸篓」**，用以下任一方式放行：
 
+- 使用 Release 附件里的 `install-macos.sh`（自动下载、安装并移除隔离属性）：`bash install-macos.sh`
 - 右键点击 `FinkMeter.app` → 打开 → 再次点击「打开」
+- 打开「系统设置 → 隐私与安全性」，拉到最下方点击「仍要打开」
 - 终端执行 `xattr -dr com.apple.quarantine /Applications/FinkMeter.app`
 
 **7. macOS 构建报缺少 SDK / linker**

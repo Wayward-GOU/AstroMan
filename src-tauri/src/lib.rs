@@ -71,7 +71,7 @@ pub fn run() {
         .on_window_event(|window, event| {
             // macOS 点击关闭按钮时只隐藏窗口，保留实例，便于从 Dock 再次打开
             #[cfg(target_os = "macos")]
-            if let tauri::WindowEvent::CloseRequested { api } = event {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();
             }

@@ -76,7 +76,7 @@ verify_arch() {
       warn "未知架构 ${host}，跳过架构校验。"
       ;;
   esac
-  info "架构校验通过。"
+  info "架构校验通过：安装包已包含本机（${host}）所需的二进制切片。"
 }
 
 if [ -n "${VERSION}" ]; then
@@ -178,12 +178,25 @@ else
 fi
 
 info "完成，正在启动 ${APP_NAME}（${TAG_NAME}）..."
-if ! open "${DEST_APP}" 2>/dev/null; then
+if ! open "${DEST_APP}" >/dev/null 2>&1; then
   warn "自动启动失败，请到「应用程序」中手动打开 ${APP_NAME}。"
+fi
+
+# 启动后检查进程：open 即使被 Gatekeeper 拦下也可能返回 0，需要实际确认
+sleep 3
+if command -v pgrep >/dev/null 2>&1 && pgrep -f "${APP_BUNDLE}/Contents/MacOS" >/dev/null 2>&1; then
+  info "${APP_NAME} 已启动。"
+else
+  warn "${APP_NAME} 未启动，系统可能仍在拦截首次运行。"
+  info "请打开「系统设置 → 隐私与安全性」，在「安全性」区域点击「仍要打开」并输入密码。"
+  info "或在终端执行："
+  printf '    sudo xattr -dr com.apple.quarantine "%s"\n' "${DEST_APP}"
+  printf '    open "%s"\n' "${DEST_APP}"
 fi
 
 printf '\n'
 info "安装路径：${DEST_APP}"
+info "架构：$(uname -m)（安装包为 Intel / Apple Silicon 通用包，无需单独下载 Intel 版）"
 if [ "${MACOS_MAJOR}" -ge 13 ]; then
   info "若仍提示「Apple 无法验证」：打开「系统设置 → 隐私与安全性」，在「安全性」区域点击「仍要打开」并输入密码。macOS 15 起右键「打开」不再生效。"
 else

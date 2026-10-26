@@ -19,7 +19,7 @@ import {
 import PageHeader from '@/components/PageHeader.vue'
 import * as api from '@/api'
 import { themes, currentThemeId, setTheme } from '@/stores/theme'
-import { openDirLabel, platformLabel, shortcutText } from '@/utils/platform'
+import { isMac, openDirLabel, platformLabel, shortcutText } from '@/utils/platform'
 import { checkForUpdates, isAutoUpdateEnabled, setAutoUpdateEnabled } from '@/utils/updater'
 import type { AppInfo, StorageInfo, UpdateInfo } from '@/types/models'
 
@@ -329,6 +329,13 @@ async function openReleasePage() {
             检查更新
           </a-button>
           <a-button @click="openReleasePage">打开发布页</a-button>
+        </div>
+        <div v-if="isMac" class="storage-tip">
+          <SafetyCertificateOutlined />
+          <span>
+            macOS 首次打开或覆盖升级后若提示「Apple 无法验证 FinkMeter.app」，是系统对未公证应用的拦截，与 Intel / Apple Silicon 架构无关：到「系统设置 → 隐私与安全性」点击「仍要打开」，或在终端执行
+            <code>sudo xattr -dr com.apple.quarantine /Applications/FinkMeter.app</code>。
+          </span>
         </div>
         <div class="storage-tip">
           <SafetyCertificateOutlined />

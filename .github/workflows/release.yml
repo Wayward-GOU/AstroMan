@@ -60,22 +60,26 @@ jobs:
             FinkMeter ${{ github.ref_name }} — 纯本地运行的 API 调试、压测与开发工具箱。
 
             ### 下载
+            - macOS 11+（Apple Silicon / Intel 通用）：`FinkMeter_*_universal.dmg` + 一键安装脚本 `install-macos.sh`
             - Windows 10/11（x64）：`FinkMeter_*_x64-setup.exe`
-            - macOS 11+（Apple Silicon / Intel 通用包）：`FinkMeter_*_universal.dmg`，或使用下方的一键安装脚本
 
-            ### 安装说明
-            - Windows：双击安装，可选语言与安装目录，当前用户安装无需管理员权限；缺少 WebView2 时安装器会自动联网安装
-            - macOS 一键安装（自动安装到「应用程序」并移除 Gatekeeper 隔离属性）：
+            > macOS 的 dmg 是通用包，已内置 Intel（`x86_64`）与 Apple Silicon（`arm64`）两个切片，**Intel Mac 无需单独下载 Intel 版**。
+            > 若出现「Apple 无法验证 FinkMeter.app 是否包含可能危害 Mac 安全或泄漏隐私的恶意软件」，这是系统对未公证应用的拦截，与芯片架构无关。
+
+            ### macOS 安装（推荐一键脚本）
+            脚本会自动校验本机架构、安装到「应用程序」、清除隔离属性、ad-hoc 重新签名并启动：
 
             ```bash
             curl -fLO https://github.com/Wayward-GOU/FinkMeter/releases/download/${{ github.ref_name }}/install-macos.sh
             bash install-macos.sh ${{ github.ref_name }}
             ```
 
-            - macOS 手动安装：把应用拖到「应用程序」。若提示「Apple 无法验证 FinkMeter.app」，打开「系统设置 → 隐私与安全性」，在「安全性」一栏点击「仍要打开」，再输入密码确认。macOS 15 起右键「打开」不再能绕过该提示。
-            - 也可在终端手动放行（Intel / Apple Silicon 通用）：
-              `sudo xattr -dr com.apple.quarantine /Applications/FinkMeter.app`
-            - 安装包已做 ad-hoc 签名但未做 Apple 公证，SmartScreen / Gatekeeper 首次提示属正常现象
+            手动安装：把应用拖到「应用程序」后，打开「系统设置 → 隐私与安全性」，在「安全性」一栏点击「仍要打开」并输入密码（macOS 15 起右键「打开」不再能绕过该提示）；或在终端执行 `sudo xattr -dr com.apple.quarantine /Applications/FinkMeter.app`。
+
+            ### Windows 安装
+            双击安装，可选语言与安装目录，当前用户安装无需管理员权限；缺少 WebView2 时安装器会自动联网安装。
+
+            > 安装包已做 ad-hoc 签名但未做 Apple 公证，SmartScreen / Gatekeeper 首次提示属正常现象。
 
             ### 本次更新
             - 示例项目新增 6 个场景集合、约 30 个接口，覆盖各请求方法、认证方式、Body 类型、变量脚本、状态码与压测；旧数据库启动时自动补齐，不覆盖已有修改

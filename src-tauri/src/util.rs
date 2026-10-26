@@ -1,3 +1,5 @@
+use chrono::{Local, SecondsFormat};
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn now_ms() -> i64 {
@@ -12,8 +14,10 @@ pub fn err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
 }
 
-/// 简单模板渲染：支持 {{var}} 与少量内置函数
-pub fn render(input: &str, vars: &std::collections::HashMap<String, String>) -> String {
+/// 简单模板渲染：支持 {{var}} 与内置变量
+///
+/// 内置变量支持 `{{timestamp}}` 与 Postman 风格的 `{{$timestamp}}` 两种写法。
+pub fn render(input: &str, vars: &HashMap<String, String>) -> String {
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
 
@@ -31,39 +35,166 @@ pub fn render(input: &str, vars: &std::collections::HashMap<String, String>) -> 
     out
 }
 
-fn resolve_expr(expr: &str, vars: &std::collections::HashMap<String, String>) -> String {
-    match expr {
-        "timestamp" => return now_ms().to_string(),
-        "uuid" => return uuid::Uuid::new_v4().to_string(),
-        _ => {}
-    }
+fn resolve_expr(expr: &str, vars: &HashMap<String, String>) -> String {
+    let name = expr.strip_prefix('$').unwrap_or(expr);
 
-    if let Some(inner) = expr.strip_prefix("randomInt(").and_then(|s| s.strip_suffix(')')) {
-        let parts: Vec<&str> = inner.split(',').map(|s| s.trim()).collect();
-        if parts.len() == 2 {
-            if let (Ok(min), Ok(max)) = (parts[0].parse::<i64>(), parts[1].parse::<i64>()) {
-                if max >= min {
-                    let span = (max - min + 1) as u64;
-                    let seed = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map(|d| d.subsec_nanos() as u64)
-                        .unwrap_or(1);
-                    return (min + (seed % span) as i64).to_string();
-                }
-            }
-        }
-    }
-
-    if let Some(inner) = expr.strip_prefix("randomString(").and_then(|s| s.strip_suffix(')')) {
-        if let Ok(len) = inner.trim().parse::<usize>() {
-            let raw = uuid::Uuid::new_v4().simple().to_string();
-            return raw.chars().cycle().take(len.max(1)).collect();
-        }
-    }
-
-    if let Some(value) = vars.get(expr) {
+    // 自定义变量优先，避免同名环境变量被内置变量覆盖
+    if let Some(value) = vars.get(expr).or_else(|| vars.get(name)) {
         return value.clone();
     }
 
+    if let Some(value) = resolve_time(name) {
+        return value;
+    }
+    if let Some(value) = resolve_plain(name) {
+        return value;
+    }
+    if let Some(value) = resolve_function(name) {
+        return value;
+    }
+
     format!("{{{{{expr}}}}}")
+}
+
+/// 与时间相关的内置变量，统一按本机时区输出
+fn resolve_time(name: &str) -> Option<String> {
+    let now = Local::now();
+    Some(match name {
+        "timestamp" | "timestampMs" => now.timestamp_millis().to_string(),
+        "timestampSec" => now.timestamp().to_string(),
+        "isoTime" | "isoTimestamp" => now.to_rfc3339_opts(SecondsFormat::Millis, false),
+        "datetime" | "now" => now.format("%Y-%m-%d %H:%M:%S").to_string(),
+        "date" | "today" => now.format("%Y-%m-%d").to_string(),
+        "time" => now.format("%H:%M:%S").to_string(),
+        "yyyyMMdd" => now.format("%Y%m%d").to_string(),
+        "yyyyMMddHHmmss" => now.format("%Y%m%d%H%M%S").to_string(),
+        _ => return None,
+    })
+}
+
+/// 不需要参数的内置变量
+fn resolve_plain(name: &str) -> Option<String> {
+    Some(match name {
+        "uuid" | "guid" => uuid::Uuid::new_v4().to_string(),
+        "uuidNoDash" | "guidNoDash" | "uuidSimple" => uuid::Uuid::new_v4().simple().to_string(),
+        "randomBool" => {
+            if random_int(0, 1) == 1 {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        }
+        "randomHex" => random_string(16, "hex"),
+        "randomEmail" => format!("fink_{}@example.com", random_string(8, "hex")),
+        "randomPhone" => format!("1{}{}", random_int(3, 9), random_string(9, "num")),
+        "randomIPv4" => format!(
+            "{}.{}.{}.{}",
+            random_int(1, 254),
+            random_int(0, 255),
+            random_int(0, 255),
+            random_int(1, 254)
+        ),
+        "randomInt" => random_int(1, 1000).to_string(),
+        "randomString" => random_string(8, "alnum"),
+        _ => return None,
+    })
+}
+
+/// 带参数的函数型变量
+fn resolve_function(name: &str) -> Option<String> {
+    if let Some(inner) = call_args(name, "randomInt") {
+        let args = int_args(inner)?;
+        return Some(match args.as_slice() {
+            [max] => random_int(0, *max).to_string(),
+            [min, max] => random_int(*min, *max).to_string(),
+            _ => return None,
+        });
+    }
+
+    if let Some(inner) = call_args(name, "randomFloat") {
+        let raw: Vec<&str> = inner.split(',').map(str::trim).collect();
+        let min = raw.first()?.parse::<f64>().ok()?;
+        let max = raw.get(1)?.parse::<f64>().ok()?;
+        let decimals = match raw.get(2) {
+            Some(value) => value.parse::<usize>().ok()?.min(6),
+            None => 2,
+        };
+        return Some(random_float(min, max, decimals));
+    }
+
+    if let Some(inner) = call_args(name, "randomString") {
+        let raw: Vec<&str> = inner.split(',').map(str::trim).collect();
+        let len = raw.first()?.parse::<usize>().ok()?;
+        let pool = raw.get(1).copied().unwrap_or("alnum");
+        return Some(random_string(len, pool));
+    }
+
+    if let Some(inner) = call_args(name, "randomHex") {
+        let len = inner.trim().parse::<usize>().ok()?;
+        return Some(random_string(len, "hex"));
+    }
+
+    if let Some(inner) = call_args(name, "randomNumber") {
+        let len = inner.trim().parse::<usize>().ok()?;
+        return Some(random_string(len, "num"));
+    }
+
+    None
+}
+
+fn call_args<'a>(expr: &'a str, name: &str) -> Option<&'a str> {
+    expr.strip_prefix(name)?
+        .strip_prefix('(')?
+        .strip_suffix(')')
+}
+
+fn int_args(inner: &str) -> Option<Vec<i64>> {
+    inner
+        .split(',')
+        .map(|part| part.trim().parse::<i64>().ok())
+        .collect()
+}
+
+/// 用 UUID 作为熵源，避免额外引入随机数依赖
+fn entropy() -> u128 {
+    uuid::Uuid::new_v4().as_u128()
+}
+
+fn random_int(min: i64, max: i64) -> i64 {
+    if max <= min {
+        return min;
+    }
+    let span = (max as i128 - min as i128 + 1) as u128;
+    (min as i128 + (entropy() % span) as i128) as i64
+}
+
+fn random_float(min: f64, max: f64, decimals: usize) -> String {
+    let ratio = entropy() as f64 / u128::MAX as f64;
+    let value = if max > min {
+        min + (max - min) * ratio
+    } else {
+        min
+    };
+    format!("{value:.decimals$}")
+}
+
+fn random_string(len: usize, pool: &str) -> String {
+    const ALNUM: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    const ALPHA: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+    let chars: Vec<char> = match pool.trim().to_ascii_lowercase().as_str() {
+        "num" | "number" | "digit" | "digits" => "0123456789".chars().collect(),
+        "hex" => "0123456789abcdef".chars().collect(),
+        "lower" => "abcdefghijklmnopqrstuvwxyz".chars().collect(),
+        "upper" => "ABCDEFGHIJKLMNOPQRSTUVWXYZ".chars().collect(),
+        "alpha" | "letter" | "letters" => ALPHA.chars().collect(),
+        _ => ALNUM.chars().collect(),
+    };
+
+    let len = len.clamp(1, 4096);
+    let mut out = String::with_capacity(len);
+    for _ in 0..len {
+        out.push(chars[(entropy() % chars.len() as u128) as usize]);
+    }
+    out
 }

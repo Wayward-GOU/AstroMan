@@ -1,5 +1,7 @@
 use crate::state::DbPool;
-use crate::util::{err, now_ms};
+use crate::util::err;
+
+mod seed;
 
 pub fn init(pool: &DbPool) -> Result<(), String> {
     let conn = pool.get().map_err(err)?;
@@ -7,7 +9,7 @@ pub fn init(pool: &DbPool) -> Result<(), String> {
     drop(conn);
 
     migrate(pool)?;
-    seed_if_empty(pool)
+    seed_database(pool)
 }
 
 /// 老版本数据库补列：已存在的列会报错，直接忽略
@@ -36,6 +38,7 @@ fn migrate(pool: &DbPool) -> Result<(), String> {
         "ALTER TABLE report_requests ADD COLUMN req_headers TEXT",
         "ALTER TABLE report_requests ADD COLUMN res_headers TEXT",
         "ALTER TABLE report_requests ADD COLUMN res_body TEXT",
+        "ALTER TABLE environments ADD COLUMN script TEXT",
     ];
     for sql in statements {
         let _ = conn.execute(sql, []);
@@ -43,58 +46,17 @@ fn migrate(pool: &DbPool) -> Result<(), String> {
     Ok(())
 }
 
-/// 首次启动时写入一份可直接上手试用的示例数据
-fn seed_if_empty(pool: &DbPool) -> Result<(), String> {
+/// 首次启动写入示例数据；已有数据库则按需补齐示例场景
+fn seed_database(pool: &DbPool) -> Result<(), String> {
     let conn = pool.get().map_err(err)?;
 
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))
         .map_err(err)?;
-    if count > 0 {
-        return Ok(());
+
+    if count == 0 {
+        seed::seed(&conn)
+    } else {
+        seed::upgrade_sample(&conn)
     }
-
-    let now = now_ms();
-
-    conn.execute(
-        "INSERT INTO projects (name, description, color, sort_order, created_at, updated_at)
-         VALUES (?1, ?2, ?3, 0, ?4, ?4)",
-        rusqlite::params!["示例项目", "本地创建的示例，可直接改名或删除", "#3b7ddd", now],
-    )
-    .map_err(err)?;
-    let project_id = conn.last_insert_rowid();
-
-    conn.execute(
-        "INSERT INTO collections (project_id, parent_id, name, sort_order, created_at, updated_at)
-         VALUES (?1, NULL, ?2, 0, ?3, ?3)",
-        rusqlite::params![project_id, "默认集合", now],
-    )
-    .map_err(err)?;
-    let collection_id = conn.last_insert_rowid();
-
-    conn.execute(
-        "INSERT INTO requests
-            (collection_id, name, method, url, headers, params, body_type, body,
-             pre_script, post_script, assertions, sort_order, created_at, updated_at)
-         VALUES (?1, ?2, 'GET', ?3, '[]', '[]', 'none', '', '', '', '[]', 0, ?4, ?4)",
-        rusqlite::params![collection_id, "示例请求", "{{base_url}}/get", now],
-    )
-    .map_err(err)?;
-
-    conn.execute(
-        "INSERT INTO environments (project_id, name, is_active, created_at)
-         VALUES (?1, ?2, 1, ?3)",
-        rusqlite::params![project_id, "本地环境", now],
-    )
-    .map_err(err)?;
-    let env_id = conn.last_insert_rowid();
-
-    conn.execute(
-        "INSERT INTO env_variables (env_id, \"key\", value, is_secret, sort_order)
-         VALUES (?1, 'base_url', 'https://httpbin.org', 0, 0)",
-        rusqlite::params![env_id],
-    )
-    .map_err(err)?;
-
-    Ok(())
 }

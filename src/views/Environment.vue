@@ -18,6 +18,8 @@ const saving = ref(false)
 const createOpen = ref(false)
 const newName = ref('')
 const showSecret = ref<Record<number, boolean>>({})
+const envScript = ref('')
+const scriptSaving = ref(false)
 
 const current = computed(() => environments.value.find((e) => e.id === currentId.value) ?? null)
 
@@ -38,6 +40,22 @@ function select(id: number) {
   currentId.value = id
   const env = environments.value.find((e) => e.id === id)
   variables.value = (env?.variables ?? []).map((v) => ({ ...v }))
+  envScript.value = env?.script ?? ''
+}
+
+async function saveEnvScript() {
+  if (!currentId.value) return
+  scriptSaving.value = true
+  try {
+    await api.envScriptSave(currentId.value, envScript.value)
+    const env = environments.value.find((e) => e.id === currentId.value)
+    if (env) env.script = envScript.value
+    message.success('环境脚本已保存')
+  } catch (e) {
+    message.error(String(e))
+  } finally {
+    scriptSaving.value = false
+  }
 }
 
 function addVariable() {
@@ -113,7 +131,7 @@ function removeEnv(env: Environment) {
     <PageHeader
       eyebrow="Environment"
       title="环境变量"
-      subtitle="请求里的 {{变量名}} 会被替换成当前环境下的值"
+      subtitle="请求里的 {{变量名}} 会被替换成当前环境变量、环境脚本或内置变量的值"
     >
       <a-button @click="router.push(`/project/${projectId}`)">返回项目</a-button>
       <a-button type="primary" @click="createOpen = true">
@@ -201,28 +219,128 @@ function removeEnv(env: Environment) {
       </div>
     </div>
 
+    <div class="fm-card script-card">
+      <div class="script-head">
+        <div>
+          <div class="hint-title">环境脚本</div>
+          <div class="hint-sub">
+            每次发送请求前执行，可用 <span class="mono" v-pre>vars.set('key', value)</span> 赋值，请求里用
+            <span class="mono" v-pre>{{key}}</span> 引用；也可读取 <span class="mono" v-pre>request</span>、
+            <span class="mono" v-pre>env</span> 与 <span class="mono" v-pre>console</span>。
+          </div>
+        </div>
+        <a-button size="small" type="primary" :loading="scriptSaving" :disabled="!current" @click="saveEnvScript">
+          保存脚本
+        </a-button>
+      </div>
+      <a-textarea
+        v-model:value="envScript"
+        class="mono script-input"
+        :rows="7"
+        :disabled="!current"
+        placeholder="vars.set('trace_id', 'trace-' + Date.now())&#10;vars.set('nonce', Math.random().toString(36).slice(2, 10))"
+      />
+    </div>
+
     <div class="fm-card hint-card">
-      <div class="hint-title">变量使用说明</div>
-      <div class="hint-grid">
-        <div class="hint-item">
-          <span class="hint-key mono" v-pre>{{base_url}}</span>
-          <span class="hint-desc">引用当前环境的变量</span>
+      <div class="hint-head">
+        <div class="hint-title">变量与脚本说明</div>
+        <div class="hint-sub">
+          变量优先级：运行时变量（脚本 <span class="mono" v-pre>vars.set</span>）&gt; 环境变量 &gt; 内置变量
         </div>
-        <div class="hint-item">
-          <span class="hint-key mono" v-pre>{{timestamp}}</span>
-          <span class="hint-desc">当前毫秒时间戳</span>
+      </div>
+      <div class="hint-groups">
+        <div class="hint-group">
+          <div class="hint-group-title">时间类</div>
+          <div class="hint-item">
+            <span class="hint-key mono" v-pre>{{timestamp}}</span>
+            <span class="hint-desc" v-pre>毫秒时间戳，也支持 Postman 写法 {{$timestamp}}</span>
+          </div>
+          <div class="hint-item">
+            <span class="hint-key mono" v-pre>{{timestampSec}}</span>
+            <span class="hint-desc">秒级时间戳</span>
+          </div>
+          <div class="hint-item">
+            <span class="hint-key mono" v-pre>{{isoTime}}</span>
+            <span class="hint-desc">ISO 8601，如 2026-10-26T20:30:00.123+08:00</span>
+          </div>
+          <div class="hint-item">
+            <span class="hint-key mono" v-pre>{{datetime}}</span>
+            <span class="hint-desc">2026-10-26 20:30:00</span>
+          </div>
+          <div class="hint-item">
+            <span class="hint-key mono" v-pre>{{date}}</span>
+            <span class="hint-desc">日期 2026-10-26</span>
+          </div>
+          <div class="hint-item">
+            <span class="hint-key mono" v-pre>{{time}}</span>
+            <span class="hint-desc">时间 20:30:00</span>
+          </div>
+          <div class="hint-item">
+            <span class="hint-key mono" v-pre>{{yyyyMMdd}}</span>
+            <span class="hint-desc">紧凑日期 20261026</span>
+          </div>
+          <div class="hint-item">
+            <span class="hint-key mono" v-pre>{{yyyyMMddHHmmss}}</span>
+            <span class="hint-desc">紧凑时间 20261026203000</span>
+          </div>
         </div>
-        <div class="hint-item">
-          <span class="hint-key mono" v-pre>{{uuid}}</span>
-          <span class="hint-desc">随机 UUID</span>
+
+        <div class="hint-group">
+          <div class="hint-group-title">随机类</div>
+          <div class="hint-item">
+            <span class="hint-key mono" v-pre>{{uuid}}</span>
+            <span class="hint-desc" v-pre>随机 UUID，{{uuidNoDash}} 为无短横线版本</span>
+          </div>
+          <div class="hint-item">
+            <span class="hint-key mono" v-pre>{{randomInt(1,100)}}</span>
+            <span class="hint-desc">区间随机整数，单参数时为 0 到该值</span>
+          </div>
+          <div class="hint-item">
+            <span class="hint-key mono" v-pre>{{randomFloat(1,10,2)}}</span>
+            <span class="hint-desc">区间随机小数，第三个参数为小数位</span>
+          </div>
+          <div class="hint-item">
+            <span class="hint-key mono" v-pre>{{randomString(8)}}</span>
+            <span class="hint-desc" v-pre>随机字母数字；{{randomString(8, hex)}} 可指定字符集</span>
+          </div>
+          <div class="hint-item">
+            <span class="hint-key mono" v-pre>{{randomHex(16)}}</span>
+            <span class="hint-desc">指定长度十六进制串</span>
+          </div>
+          <div class="hint-item">
+            <span class="hint-key mono" v-pre>{{randomNumber(6)}}</span>
+            <span class="hint-desc">指定长度纯数字串</span>
+          </div>
+          <div class="hint-item">
+            <span class="hint-key mono" v-pre>{{randomBool}}</span>
+            <span class="hint-desc">随机 true / false</span>
+          </div>
+          <div class="hint-item">
+            <span class="hint-key mono" v-pre>{{randomEmail}}</span>
+            <span class="hint-desc" v-pre>随机邮箱，另有 {{randomPhone}}、{{randomIPv4}}</span>
+          </div>
         </div>
-        <div class="hint-item">
-          <span class="hint-key mono" v-pre>{{randomInt(1,100)}}</span>
-          <span class="hint-desc">区间随机整数</span>
-        </div>
-        <div class="hint-item">
-          <span class="hint-key mono" v-pre>{{randomString(8)}}</span>
-          <span class="hint-desc">指定长度随机字符串</span>
+
+        <div class="hint-group">
+          <div class="hint-group-title">自定义与脚本</div>
+          <div class="hint-item">
+            <span class="hint-key mono" v-pre>{{base_url}}</span>
+            <span class="hint-desc">引用当前环境的变量</span>
+          </div>
+          <div class="hint-item">
+            <span class="hint-key mono" v-pre>{{trace_id}}</span>
+            <span class="hint-desc">引用环境脚本 vars.set 生成的运行时变量</span>
+          </div>
+          <div class="hint-item">
+            <span class="hint-key mono" v-pre>{{last_title}}</span>
+            <span class="hint-desc">引用后置脚本从响应中提取的值</span>
+          </div>
+          <pre class="mono hint-code" v-pre>// 环境脚本示例
+vars.set('trace_id', 'trace-' + Date.now())
+vars.set('nonce', Math.random().toString(36).slice(2, 10))</pre>
+          <pre class="mono hint-code" v-pre>// 后置脚本提取响应字段
+vars.set('last_title', response.json().slideshow.title)</pre>
         </div>
       </div>
     </div>
@@ -460,9 +578,23 @@ function removeEnv(env: Environment) {
   font-size: 10px;
 }
 
+.script-card,
 .hint-card {
   margin-top: 16px;
   padding: 16px 20px;
+}
+
+.script-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 10px;
+}
+
+.script-input {
+  font-size: 12px;
+  line-height: 1.7;
 }
 
 .hint-title {
@@ -472,10 +604,60 @@ function removeEnv(env: Environment) {
   margin-bottom: 12px;
 }
 
-.hint-grid {
+.script-head .hint-title {
+  margin-bottom: 4px;
+}
+
+.hint-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+
+.hint-head .hint-title {
+  margin-bottom: 0;
+}
+
+.hint-sub {
+  font-size: 11.5px;
+  color: var(--fm-muted);
+  line-height: 1.7;
+}
+
+.hint-groups {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
-  gap: 10px 20px;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 18px 28px;
+}
+
+.hint-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.hint-group-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fm-text-2);
+  padding-bottom: 6px;
+  border-bottom: 1px dashed var(--fm-border);
+}
+
+.hint-code {
+  margin: 2px 0 0;
+  padding: 8px 10px;
+  background: var(--fm-code-bg);
+  border: 1px solid var(--fm-border);
+  border-radius: var(--fm-radius-sm);
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--fm-text-2);
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 
 .hint-item {

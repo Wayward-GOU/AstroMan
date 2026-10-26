@@ -72,14 +72,27 @@ jobs:
             bash install-macos.sh ${{ github.ref_name }}
             ```
 
-            - macOS 手动安装：把应用拖到「应用程序」，首次打开若被拦截，右键应用选择「打开」，或执行 `xattr -dr com.apple.quarantine /Applications/FinkMeter.app`
-            - 安装包未做代码签名与公证，SmartScreen / Gatekeeper 提示属正常现象
+            - macOS 手动安装：把应用拖到「应用程序」。若提示「Apple 无法验证 FinkMeter.app」，打开「系统设置 → 隐私与安全性」，在「安全性」一栏点击「仍要打开」，再输入密码确认。macOS 15 起右键「打开」不再能绕过该提示。
+            - 也可在终端手动放行（Intel / Apple Silicon 通用）：
+              `sudo xattr -dr com.apple.quarantine /Applications/FinkMeter.app`
+            - 安装包已做 ad-hoc 签名但未做 Apple 公证，SmartScreen / Gatekeeper 首次提示属正常现象
+
+            ### 本次更新
+            - 示例项目新增 6 个场景集合、约 30 个接口，覆盖各请求方法、认证方式、Body 类型、变量脚本、状态码与压测；旧数据库启动时自动补齐，不覆盖已有修改
+            - 内置变量扩容：时间类（timestamp / isoTime / datetime / yyyyMMdd 等）与随机类（uuid / randomInt / randomFloat / randomString / randomEmail / randomPhone / randomIPv4 等），兼容 `{{$timestamp}}` 写法
+            - 新增环境脚本：每个环境可写一段请求前执行的脚本，用 `vars.set()` 生成运行时变量；变量优先级为运行时变量 > 环境变量 > 内置变量
+            - 新增代码片段：一键查看并复制 cURL / HTTP 原始报文 / JavaScript fetch / Python requests，环境变量按当前环境替换
+            - 新增请求历史页：最近 500 条发送记录，支持搜索、失败数与平均耗时统计，点击可回到原接口
+            - 新增自动更新：启动静默检查 GitHub Release，可一键下载对应平台安装包，设置页支持开关与手动检查
+            - 工具箱新增「文本一键处理」（SQL IN 自动加单引号、去重排序、表格转 Markdown/HTML、MyBatis 日志提取 SQL 等）与「二维码生成 / 识别」，共 9 大类 75 个工具
+            - 修复 macOS 安装问题：ad-hoc 签名避免被判定为「已损坏」，通用包同时包含 Intel 与 Apple Silicon 切片并在 CI 校验，安装脚本增加架构检查与 Gatekeeper 放行指引
+            - 修复项目导入导出遗漏环境脚本、旧库缺少脚本字段等问题
 
             ### 主要功能
             - 项目 / 集合 / 接口管理与 cURL 导入、项目导入导出、接口全局搜索
-            - HTTP 调试：Params / Headers / Body、环境变量、前置与后置脚本、断言测试
+            - HTTP 调试：Params / Headers / Body、环境变量与环境脚本、前置与后置脚本、断言测试、代码片段
             - 本地压测：固定并发与阶梯加压、RPS 限速、SLA 验收、逐请求明细与 JSON / HTML / Excel 报告导出
-            - 系统监控与开发工具箱（8 大类 72 个工具）
+            - 请求历史、自动更新、系统监控与开发工具箱（9 大类 75 个工具）
 
       - name: Attach macOS installer script
         if: matrix.platform == 'macos-latest'
@@ -88,4 +101,35 @@ jobs:
         run: |
           chmod +x scripts/install-macos.sh
           gh release upload "${{ github.ref_name }}" scripts/install-macos.sh --clobber
+
+      - name: Verify macOS universal binary
+        if: matrix.platform == 'macos-latest'
+        run: |
+          APP="src-tauri/target/universal-apple-darwin/release/bundle/macos/FinkMeter.app"
+          test -d "$APP" || { echo "未找到 $APP"; exit 1; }
+          BIN="$APP/Contents/MacOS/finkmeter"
+          if [ ! -f "$BIN" ]; then
+            BIN="$(find "$APP/Contents/MacOS" -maxdepth 1 -type f | head -1)"
+          fi
+          test -f "$BIN" || { echo "未找到可执行文件"; exit 1; }
+
+          echo "== 可执行文件架构 =="
+          file "$BIN"
+          ARCHS="$(lipo -archs "$BIN")"
+          echo "archs: $ARCHS"
+          case "$ARCHS" in
+            *x86_64*) ;;
+            *) echo "缺少 Intel (x86_64) 切片，Intel Mac 将无法运行"; exit 1 ;;
+          esac
+          case "$ARCHS" in
+            *arm64*) ;;
+            *) echo "缺少 Apple Silicon (arm64) 切片"; exit 1 ;;
+          esac
+
+          echo "== 签名信息 =="
+          codesign -dv "$APP" 2>&1 || true
+          codesign --verify --deep --strict "$APP" || { echo "ad-hoc 签名校验失败"; exit 1; }
+
+          echo "== dmg 产物 =="
+          ls -lh src-tauri/target/universal-apple-darwin/release/bundle/dmg/
 

@@ -151,6 +151,8 @@ pub struct Environment {
     pub project_id: i64,
     pub name: String,
     pub is_active: bool,
+    #[serde(default)]
+    pub script: String,
     pub variables: Vec<EnvVariable>,
 }
 
@@ -174,6 +176,7 @@ pub struct EnvVariable {
 pub struct HistoryItem {
     pub id: i64,
     pub request_id: Option<i64>,
+    pub project_id: Option<i64>,
     pub request_name: Option<String>,
     pub method: String,
     pub url: String,

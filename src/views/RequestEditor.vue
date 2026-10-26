@@ -38,6 +38,7 @@ import {
   type ScriptLog,
   type ScriptRequest,
 } from '@/utils/scriptRunner'
+import { POST_SCRIPT_EXAMPLES, PRE_SCRIPT_EXAMPLES } from '@/utils/scriptExamples'
 
 const route = useRoute()
 const router = useRouter()
@@ -107,6 +108,33 @@ const scriptAssertions = ref<ScriptAssertion[]>([])
 const scriptError = ref('')
 const scriptVars = ref<Record<string, string>>({})
 const scriptMs = ref(0)
+
+/* ---------- 脚本示例 ---------- */
+const preExample = ref<number>()
+const postExample = ref<number>()
+const preExampleOptions = PRE_SCRIPT_EXAMPLES.map((item, index) => ({
+  label: item.label,
+  value: index,
+}))
+const postExampleOptions = POST_SCRIPT_EXAMPLES.map((item, index) => ({
+  label: item.label,
+  value: index,
+}))
+
+function insertExample(phase: 'pre' | 'post', index?: number) {
+  if (typeof index !== 'number') return
+  const example = (phase === 'pre' ? PRE_SCRIPT_EXAMPLES : POST_SCRIPT_EXAMPLES)[index]
+  if (!example) return
+  if (phase === 'pre') {
+    const current = form.value.preScript?.trim()
+    form.value.preScript = current ? `${current}\n\n${example.code}` : example.code
+    preExample.value = undefined
+  } else {
+    const current = form.value.postScript?.trim()
+    form.value.postScript = current ? `${current}\n\n${example.code}` : example.code
+    postExample.value = undefined
+  }
+}
 
 const passedAssertions = computed(() => scriptAssertions.value.filter((item) => item.passed).length)
 const failedAssertions = computed(() => scriptAssertions.value.length - passedAssertions.value)
@@ -865,14 +893,34 @@ const responseHeaders = computed(() => {
             </a-tab-pane>
             <a-tab-pane key="script" tab="脚本">
               <div class="tab-body">
-                <div class="script-label">前置脚本（发送前执行，可生成/修改请求参数）</div>
+                <div class="script-label script-label-row">
+                  <span>前置脚本（发送前执行，可生成/修改请求参数）</span>
+                  <a-select
+                    v-model:value="preExample"
+                    :options="preExampleOptions"
+                    size="small"
+                    class="script-example"
+                    placeholder="插入示例"
+                    @change="insertExample('pre', $event)"
+                  />
+                </div>
                 <a-textarea
                   v-model:value="form.preScript"
                   class="mono script-input"
                   :rows="7"
                   placeholder="// 例如&#10;request.body = JSON.stringify({ id: Date.now(), name: 'fink' })&#10;vars.set('traceId', 'req-' + Date.now())"
                 />
-                <div class="script-label">后置脚本 / 测试断言（收到响应后执行）</div>
+                <div class="script-label script-label-row">
+                  <span>后置脚本 / 测试断言（收到响应后执行）</span>
+                  <a-select
+                    v-model:value="postExample"
+                    :options="postExampleOptions"
+                    size="small"
+                    class="script-example"
+                    placeholder="插入示例"
+                    @change="insertExample('post', $event)"
+                  />
+                </div>
                 <a-textarea
                   v-model:value="form.postScript"
                   class="mono script-input"
@@ -882,7 +930,9 @@ const responseHeaders = computed(() => {
                 <div class="script-hint">
                   可用：<code>request</code>（method / url / headers / params / body）、
                   <code>response</code>（status / headers / body / json()）、
-                  <code>vars</code>（get / set / unset）、<code>console</code>；后置脚本另有
+                  <code>vars</code>（get / set / unset）、<code>console</code>、
+                  <code>rsa.publicEncrypt(明文, 公钥)</code>（PKCS#1 v1.5，返回 Base64，等价 Java 的 RSAUtils.publicEncrypt）、
+                  <code>cipher</code>（aes / des / tripleDes 加解密，md5 / sha1 / sha256、hmacSha1 / hmacSha256、base64 / hex 编解码）；后置脚本另有
                   <code>test(name, fn)</code>、<code>assert(条件, 提示)</code>。变量可用 <code v-pre>{{name}}</code> 写入 URL、Header 或 Body。
                 </div>
               </div>
@@ -1636,6 +1686,18 @@ const responseHeaders = computed(() => {
   font-size: 11px;
   color: var(--fm-muted);
   margin: 10px 0 6px;
+}
+
+.script-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.script-example {
+  width: 118px;
+  flex: none;
 }
 
 .script-input {

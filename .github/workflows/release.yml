@@ -99,9 +99,20 @@ jobs:
             - 修复 macOS 安装问题：ad-hoc 签名避免被判定为「已损坏」，通用包同时包含 Intel 与 Apple Silicon 切片并在 CI 校验，安装脚本增加架构检查与 Gatekeeper 放行指引
             - 修复项目导入导出遗漏环境脚本、旧库缺少脚本字段等问题
 
+            ### 1.0.3 补充（脚本加密与上手引导）
+            - 新增脚本加密能力：前置 / 环境 / 后置脚本均可使用 `cipher` 与 `rsa`
+              - `cipher.aes / des / tripleDes`：CBC / ECB / CFB / OFB / CTR，PKCS7 / Zero / None 填充，支持 hex、Base64 格式的密钥与 IV
+              - `cipher.md5 / sha1 / sha256`、`cipher.hmacSha1 / hmacSha256`、`cipher.base64 / hex` 编解码
+              - `rsa.publicEncrypt`：RSA PKCS#1 v1.5 + Base64，与 Java `RSAUtils.publicEncrypt`（默认 `Cipher.getInstance("RSA")`）结果一致
+              - 密钥长度（AES 16/24/32、DES 8、3DES 24 字节）与 IV 长度不合法时直接报错，避免静默生成错误密文
+            - 脚本页新增「插入示例」：前置脚本提供时间戳 / nonce、MD5 签名、HMAC-SHA256、AES 加密请求体、RSA 加密字段、改写请求等 6 个示例；后置脚本提供断言、提取 Token、耗时断言、AES 解密响应等 4 个示例，选中即插入，不覆盖已有代码
+            - 工作台「使用说明」扩充：引导从 4 步增至 7 步（新增签名加密、导入接口、数据备份），新增「常用操作」9 张速查卡（含可直接复制的签名 / 加密代码），常见问题从 7 条增至 13 条（密钥长度、cURL 导入、项目分享、变量排查、报告导出等）
+            - 文档补充「新手上手」五步流程和「脚本与加密示例」章节，说明变量优先级与加密填充、密钥格式约定
+
             ### 主要功能
             - 项目 / 集合 / 接口管理与 cURL 导入、项目导入导出、接口全局搜索
             - HTTP 调试：Params / Headers / Body、环境变量与环境脚本、前置与后置脚本、断言测试、代码片段
+            - 脚本加密：AES / DES / 3DES 加解密、MD5 / SHA / HMAC 摘要、RSA 公钥加密，满足签名与密文入参场景
             - 本地压测：固定并发与阶梯加压、RPS 限速、SLA 验收、逐请求明细与 JSON / HTML / Excel 报告导出
             - 请求历史、自动更新、系统监控与开发工具箱（9 大类 75 个工具）
 

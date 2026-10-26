@@ -99,6 +99,8 @@ export interface Environment {
   projectId: number
   name: string
   isActive: boolean
+  /** 环境脚本：每次发送请求前执行，可用 vars.set() 生成运行时变量 */
+  script: string
   variables: EnvVariable[]
 }
 
@@ -113,6 +115,7 @@ export interface EnvVariable {
 export interface HistoryItem {
   id: number
   requestId?: number | null
+  projectId?: number | null
   requestName?: string | null
   method: string
   url: string
@@ -432,6 +435,18 @@ export interface StorageInfo {
   dbSize: number
   walSize: number
   pendingDir?: string | null
+}
+
+export interface UpdateInfo {
+  currentVersion: string
+  latestVersion: string
+  hasUpdate: boolean
+  releaseUrl: string
+  notes: string
+  publishedAt: string
+  assetName?: string | null
+  assetUrl?: string | null
+  assetSize?: number | null
 }
 
 export interface MonitorBattery {

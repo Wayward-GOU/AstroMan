@@ -8,6 +8,7 @@ export type ToolCategoryId =
   | 'calc'
   | 'dev'
   | 'network'
+  | 'qr'
   | 'reference'
 
 export interface ToolCategory {

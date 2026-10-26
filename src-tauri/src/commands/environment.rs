@@ -30,7 +30,7 @@ pub fn env_list(state: State<'_, AppState>, project_id: i64) -> Result<Vec<Envir
     let conn = state.pool.get().map_err(err)?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, project_id, name, is_active
+            "SELECT id, project_id, name, is_active, COALESCE(script, '')
              FROM environments WHERE project_id = ?1 ORDER BY id ASC",
         )
         .map_err(err)?;
@@ -41,6 +41,7 @@ pub fn env_list(state: State<'_, AppState>, project_id: i64) -> Result<Vec<Envir
                 project_id: row.get(1)?,
                 name: row.get(2)?,
                 is_active: row.get::<_, i64>(3)? != 0,
+                script: row.get(4)?,
                 variables: Vec::new(),
             })
         })
@@ -77,8 +78,8 @@ pub fn env_create(
     let is_active = count == 0;
 
     conn.execute(
-        "INSERT INTO environments (project_id, name, is_active, created_at)
-         VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO environments (project_id, name, is_active, script, created_at)
+         VALUES (?1, ?2, ?3, '', ?4)",
         params![project_id, name, if is_active { 1 } else { 0 }, now_ms()],
     )
     .map_err(err)?;
@@ -88,8 +89,25 @@ pub fn env_create(
         project_id,
         name,
         is_active,
+        script: String::new(),
         variables: Vec::new(),
     })
+}
+
+/// 保存环境脚本：每次发送请求前执行，可用 vars.set() 生成运行时变量
+#[tauri::command]
+pub fn env_script_save(state: State<'_, AppState>, id: i64, script: String) -> Result<(), String> {
+    let conn = state.pool.get().map_err(err)?;
+    let changed = conn
+        .execute(
+            "UPDATE environments SET script = ?1 WHERE id = ?2",
+            params![script, id],
+        )
+        .map_err(err)?;
+    if changed == 0 {
+        return Err("环境不存在".to_string());
+    }
+    Ok(())
 }
 
 #[tauri::command]

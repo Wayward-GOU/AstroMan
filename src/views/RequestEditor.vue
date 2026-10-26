@@ -9,12 +9,15 @@ import {
   SaveOutlined,
   DeleteOutlined,
   CloseOutlined,
+  CopyOutlined,
+  CodeOutlined,
 } from '@ant-design/icons-vue'
 import KeyValueEditor from '@/components/KeyValueEditor.vue'
 import CodeArea from '@/components/CodeArea.vue'
 import { useProjectStore } from '@/stores/project'
 import { MAX_REQUEST_TABS, useTabsStore } from '@/stores/tabs'
 import { formatDateTime } from '@/utils/datetime'
+import { buildSnippets, type Snippet } from '@/utils/curl'
 import * as api from '@/api'
 import type {
   HttpRequestDetail,
@@ -28,6 +31,7 @@ import {
   clearRuntimeVars,
   listRuntimeVars,
   renderRuntimeVars,
+  runEnvScript,
   runPostScript,
   runPreScript,
   type ScriptAssertion,
@@ -429,10 +433,23 @@ async function send() {
       bodyType: form.value.bodyType,
       body: form.value.body ?? '',
     }
-    const preCode = form.value.preScript?.trim()
     let outgoing = request
+    const envScript = store.environments.find((item) => item.id === envId.value)?.script?.trim()
+    if (envScript) {
+      const envResult = runEnvScript(envScript, request, envVars)
+      scriptLogs.value.push(...envResult.logs)
+      scriptMs.value += envResult.durationMs
+      scriptError.value = envResult.error ?? ''
+      if (envResult.error) {
+        message.error(`环境脚本执行失败：${envResult.error}`)
+        return
+      }
+      outgoing = envResult.request
+    }
+
+    const preCode = form.value.preScript?.trim()
     if (preCode) {
-      const preResult = runPreScript(preCode, request, envVars)
+      const preResult = runPreScript(preCode, outgoing, envVars)
       scriptLogs.value.push(...preResult.logs)
       scriptMs.value += preResult.durationMs
       scriptError.value = preResult.error ?? ''
@@ -599,6 +616,34 @@ async function copyBody() {
   }
 }
 
+/* ---------- 代码片段（Postman 风格） ---------- */
+const codeOpen = ref(false)
+const snippetKey = ref('curl')
+const snippets = computed<Snippet[]>(() => {
+  const env = store.environments.find((item) => item.id === envId.value)
+  return buildSnippets(form.value, env?.variables)
+})
+const activeSnippet = computed(
+  () => snippets.value.find((item) => item.key === snippetKey.value) ?? snippets.value[0],
+)
+
+function openCode() {
+  if (!form.value.url?.trim()) {
+    message.warning('请先填写请求 URL')
+    return
+  }
+  codeOpen.value = true
+}
+
+async function copySnippet() {
+  try {
+    await navigator.clipboard.writeText(activeSnippet.value.code)
+    message.success(`已复制 ${activeSnippet.value.label} 代码`)
+  } catch {
+    message.error('复制失败')
+  }
+}
+
 function fmtSize(n: number) {
   if (n < 1024) return `${n} B`
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
@@ -639,6 +684,10 @@ const responseHeaders = computed(() => {
           <a-button v-if="form.id" type="text" size="small" danger class="del-btn" @click="deleteRequest">
             <template #icon><DeleteOutlined /></template>
             删除
+          </a-button>
+          <a-button @click="openCode">
+            <template #icon><CodeOutlined /></template>
+            代码
           </a-button>
           <a-button :loading="saving" @click="save()">
             <template #icon><SaveOutlined /></template>
@@ -938,7 +987,9 @@ const responseHeaders = computed(() => {
                   <div v-if="scriptLogs.length" class="test-block">
                     <div class="test-section">控制台输出</div>
                     <div v-for="(log, index) in scriptLogs" :key="`log-${index}`" class="log-row" :class="log.level">
-                      <span class="log-phase">{{ log.phase === 'pre' ? '前置' : '后置' }}</span>
+                      <span class="log-phase">{{
+                        log.phase === 'env' ? '环境' : log.phase === 'pre' ? '前置' : '后置'
+                      }}</span>
                       <span class="log-text mono">{{ log.text }}</span>
                     </div>
                   </div>
@@ -1053,6 +1104,31 @@ const responseHeaders = computed(() => {
         </div>
       </section>
     </div>
+
+    <a-drawer
+      v-model:open="codeOpen"
+      placement="right"
+      :width="580"
+      title="代码片段"
+      class="code-drawer"
+    >
+      <div class="code-hint">
+        与 Postman 的 Code snippet 一致，可直接复制到终端、脚本或文档中；环境变量已按当前环境替换，敏感变量保持占位符。
+      </div>
+      <a-radio-group v-model:value="snippetKey" size="small" button-style="solid" class="code-tabs">
+        <a-radio-button v-for="item in snippets" :key="item.key" :value="item.key">
+          {{ item.label }}
+        </a-radio-button>
+      </a-radio-group>
+      <div class="code-actions">
+        <a-button size="small" type="primary" @click="copySnippet">
+          <template #icon><CopyOutlined /></template>
+          复制
+        </a-button>
+        <span class="code-file mono">{{ form.name || 'request' }} · {{ activeSnippet.language }}</span>
+      </div>
+      <pre class="code-block mono">{{ activeSnippet.code }}</pre>
+    </a-drawer>
   </a-spin>
 </template>
 
@@ -2226,5 +2302,48 @@ const responseHeaders = computed(() => {
   .run-row > :nth-child(5) {
     display: none;
   }
+}
+
+/* ---------- 代码片段抽屉 ---------- */
+.code-hint {
+  font-size: 11.5px;
+  line-height: 1.75;
+  color: var(--fm-muted);
+  padding: 10px 12px;
+  border-radius: 9px;
+  background: var(--fm-surface-alt);
+  border: 1px dashed var(--fm-border-strong);
+  margin-bottom: 14px;
+}
+
+.code-tabs {
+  margin-bottom: 12px;
+}
+
+.code-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.code-file {
+  font-size: 11px;
+  color: var(--fm-muted);
+}
+
+.code-block {
+  margin: 0;
+  padding: 14px 16px;
+  border-radius: 10px;
+  border: 1px solid var(--fm-border);
+  background: var(--fm-surface-alt);
+  font-size: 11.5px;
+  line-height: 1.75;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--fm-text-2);
+  max-height: calc(100vh - 280px);
+  overflow: auto;
 }
 </style>

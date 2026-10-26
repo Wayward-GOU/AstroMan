@@ -6,8 +6,8 @@
 #   bash install-macos.sh            # 安装 GitHub 上最新的正式版
 #   bash install-macos.sh v1.0.0     # 安装指定版本
 #
-# 流程：从 GitHub Release 下载 universal dmg → 安装到 /Applications
-#      → 移除 com.apple.quarantine 隔离属性 → 启动应用
+# 流程：从 GitHub Release 下载 universal dmg → 校验架构（Intel / Apple Silicon）
+#      → 安装到 /Applications → 移除隔离属性 → ad-hoc 签名 → 启动应用
 # 说明：安装包未做 Apple 公证，本脚本的作用就是替用户完成「手动放行」这一步。
 
 set -euo pipefail
@@ -38,7 +38,7 @@ trap cleanup EXIT
 trap 'exit 130' INT TERM
 
 [ "$(uname -s)" = "Darwin" ] || error "该脚本仅支持 macOS。"
-for cmd in curl hdiutil xattr sw_vers; do
+for cmd in curl hdiutil xattr sw_vers file; do
   command -v "${cmd}" >/dev/null 2>&1 || error "缺少必需命令：${cmd}"
 done
 
@@ -46,6 +46,38 @@ MACOS_MAJOR="$(sw_vers -productVersion | cut -d. -f1)"
 if [ "${MACOS_MAJOR}" -lt 11 ]; then
   error "需要 macOS 11.0 或更高版本，当前为 $(sw_vers -productVersion)。"
 fi
+
+# 校验安装包是否包含本机架构，避免在 Intel Mac 上装到仅 arm64 的包
+verify_arch() {
+  local app="$1" bin host arch_info
+  bin="$(find "${app}/Contents/MacOS" -maxdepth 1 -type f -print -quit)"
+  [ -n "${bin}" ] || error "应用包内未找到可执行文件：${app}"
+
+  host="$(uname -m)"
+  info "本机架构：${host}"
+  info "可执行文件：$(basename "${bin}")"
+  file "${bin}"
+
+  arch_info="$(file -b "${bin}")"
+  case "${host}" in
+    arm64)
+      case "${arch_info}" in
+        *arm64*) ;;
+        *) error "安装包不含 Apple Silicon (arm64) 架构，请下载 universal 版本。" ;;
+      esac
+      ;;
+    x86_64)
+      case "${arch_info}" in
+        *x86_64*) ;;
+        *) error "安装包不含 Intel (x86_64) 架构，请下载 universal 版本。" ;;
+      esac
+      ;;
+    *)
+      warn "未知架构 ${host}，跳过架构校验。"
+      ;;
+  esac
+  info "架构校验通过。"
+}
 
 if [ -n "${VERSION}" ]; then
   API_URL="https://api.github.com/repos/${REPO}/releases/tags/${VERSION}"
@@ -56,8 +88,7 @@ fi
 json_first_string() {
   # $1: 字段名  $2: JSON 文本，取第一个字符串值
   printf '%s' "$2" |
-    grep -o "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" |
-    head -1 |
+    grep -m1 -o "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" |
     sed 's/^[^:]*:[[:space:]]*"//; s/"$//'
 }
 
@@ -84,11 +115,10 @@ info "获取 Release 信息..."
 RELEASE_JSON="$(api_get "${API_URL}")" \
   || error "无法获取 Release（版本不存在、仍为草稿，私有仓库需先设置 GITHUB_TOKEN，或网络异常）。"
 
-TAG_NAME="$(json_first_string tag_name "${RELEASE_JSON}")"
+TAG_NAME="$(json_first_string tag_name "${RELEASE_JSON}")" || TAG_NAME=""
 DMG_URL="$(printf '%s' "${RELEASE_JSON}" \
-  | grep -o '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]*\.dmg"' \
-  | head -1 \
-  | sed 's/^[^:]*:[[:space:]]*"//; s/"$//')"
+  | grep -m1 -o '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]*\.dmg"' \
+  | sed 's/^[^:]*:[[:space:]]*"//; s/"$//')" || DMG_URL=""
 
 [ -n "${DMG_URL}" ] || error "该版本未提供 dmg 安装包，请到 Releases 页面检查。"
 
@@ -100,14 +130,19 @@ info "${DMG_URL}"
 download_dmg "${DMG_PATH}" "${DMG_URL}" \
   || error "下载失败，请检查网络后重试。"
 
+# 浏览器下载的 dmg 会带隔离属性，先移除，避免安装后的应用继续被 Gatekeeper 拦截
+xattr -d com.apple.quarantine "${DMG_PATH}" >/dev/null 2>&1 || true
+
 info "挂载安装镜像..."
 ATTACH_OUT="$(hdiutil attach -nobrowse -readonly "${DMG_PATH}")" \
   || error "挂载 dmg 失败（文件可能已损坏，请重新下载）。"
-MOUNT_POINT="$(printf '%s\n' "${ATTACH_OUT}" | grep -o '/Volumes/.*' | tail -1)"
+MOUNT_POINT="$(printf '%s\n' "${ATTACH_OUT}" | grep -o '/Volumes/.*' | tail -1)" || MOUNT_POINT=""
 [ -n "${MOUNT_POINT}" ] || error "未能定位挂载点。"
 
 SRC_APP="${MOUNT_POINT}/${APP_BUNDLE}"
 [ -d "${SRC_APP}" ] || error "镜像中未找到 ${APP_BUNDLE}。"
+
+verify_arch "${SRC_APP}"
 
 osascript -e "tell application \"${APP_NAME}\" to quit" >/dev/null 2>&1 || true
 
@@ -124,14 +159,33 @@ if ! cp -R "${SRC_APP}" "${DEST_APP}" 2>/dev/null; then
 fi
 
 info "移除 Gatekeeper 隔离属性..."
-if ! xattr -dr com.apple.quarantine "${DEST_APP}" 2>/dev/null; then
-  sudo xattr -dr com.apple.quarantine "${DEST_APP}" \
-    || warn "去除隔离属性失败，首次打开时请右键应用选择「打开」。"
+for attr in com.apple.quarantine com.apple.provenance; do
+  xattr -dr "${attr}" "${DEST_APP}" 2>/dev/null \
+    || sudo xattr -dr "${attr}" "${DEST_APP}" 2>/dev/null \
+    || true
+done
+if xattr -p com.apple.quarantine "${DEST_APP}" >/dev/null 2>&1; then
+  warn "隔离属性未完全清除，请按最后一步的提示在系统设置中放行。"
+fi
+
+info "重新执行 ad-hoc 签名..."
+if command -v codesign >/dev/null 2>&1; then
+  codesign --force --deep --sign - "${DEST_APP}" >/dev/null 2>&1 \
+    || sudo codesign --force --deep --sign - "${DEST_APP}" >/dev/null 2>&1 \
+    || warn "ad-hoc 签名失败，但隔离属性已处理，通常不影响启动。"
+else
+  warn "未找到 codesign，跳过签名步骤。"
 fi
 
 info "完成，正在启动 ${APP_NAME}（${TAG_NAME}）..."
-open "${DEST_APP}"
+if ! open "${DEST_APP}" 2>/dev/null; then
+  warn "自动启动失败，请到「应用程序」中手动打开 ${APP_NAME}。"
+fi
 
 printf '\n'
 info "安装路径：${DEST_APP}"
-info "如仍被系统拦截，请到「系统设置 → 隐私与安全性」底部点击「仍要打开」。"
+if [ "${MACOS_MAJOR}" -ge 13 ]; then
+  info "若仍提示「Apple 无法验证」：打开「系统设置 → 隐私与安全性」，在「安全性」区域点击「仍要打开」并输入密码。macOS 15 起右键「打开」不再生效。"
+else
+  info "若仍提示「Apple 无法验证」：打开「系统偏好设置 → 安全性」点击「仍要打开」。"
+fi

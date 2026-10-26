@@ -20,6 +20,7 @@ import type {
   StorageInfo,
   StressConfig,
   StressReport,
+  UpdateInfo,
   WorkspaceStats,
 } from '@/types/models'
 
@@ -80,6 +81,9 @@ export const envDelete = (id: number) => invoke<void>('env_delete', { id })
 export const envVarSave = (envId: number, variables: EnvVariable[]) =>
   invoke<void>('env_var_save', { envId, variables })
 
+export const envScriptSave = (id: number, script: string) =>
+  invoke<void>('env_script_save', { id, script })
+
 // 历史
 export const historyList = (limit = 100) => invoke<HistoryItem[]>('history_list', { limit })
 
@@ -118,6 +122,14 @@ export const projectExport = (projectId: number, path: string) =>
   invoke<void>('project_export', { projectId, path })
 
 export const projectImport = (path: string) => invoke<Project>('project_import', { path })
+
+// 自动更新
+export const updateCheck = () => invoke<UpdateInfo>('update_check')
+
+export const updateDownload = (url: string, fileName: string) =>
+  invoke<string>('update_download', { url, fileName })
+
+export const openExternal = (target: string) => invoke<void>('open_external', { target })
 
 // Postman（Collection v2.0/v2.1）与 Apifox（OpenAPI）导入
 export const apiImport = (path: string, projectId?: number | null) =>

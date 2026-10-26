@@ -77,6 +77,8 @@ struct ExportEnvironment {
     #[serde(default)]
     is_active: bool,
     #[serde(default)]
+    script: Option<String>,
+    #[serde(default)]
     variables: Vec<ExportVariable>,
 }
 
@@ -158,7 +160,8 @@ fn build_collections(
 fn read_environments(conn: &Connection, project_id: i64) -> Result<Vec<ExportEnvironment>, String> {
     let mut env_stmt = conn
         .prepare(
-            "SELECT id, name, is_active FROM environments WHERE project_id = ?1 ORDER BY id ASC",
+            "SELECT id, name, is_active, script
+             FROM environments WHERE project_id = ?1 ORDER BY id ASC",
         )
         .map_err(err)?;
     let envs = env_stmt
@@ -167,6 +170,7 @@ fn read_environments(conn: &Connection, project_id: i64) -> Result<Vec<ExportEnv
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, Option<i64>>(2)?.unwrap_or(0) == 1,
+                row.get::<_, Option<String>>(3)?,
             ))
         })
         .map_err(err)?
@@ -174,7 +178,7 @@ fn read_environments(conn: &Connection, project_id: i64) -> Result<Vec<ExportEnv
         .map_err(err)?;
 
     let mut result = Vec::new();
-    for (env_id, name, is_active) in envs {
+    for (env_id, name, is_active, script) in envs {
         let mut var_stmt = conn
             .prepare(
                 "SELECT \"key\", value, is_secret, sort_order FROM env_variables
@@ -196,6 +200,7 @@ fn read_environments(conn: &Connection, project_id: i64) -> Result<Vec<ExportEnv
         result.push(ExportEnvironment {
             name,
             is_active,
+            script,
             variables,
         });
     }
@@ -373,8 +378,15 @@ pub fn project_import(state: State<'_, AppState>, path: String) -> Result<Projec
             active_taken = true;
         }
         tx.execute(
-            "INSERT INTO environments (project_id, name, is_active, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![project_id, environment.name, active as i64, now],
+            "INSERT INTO environments (project_id, name, is_active, script, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                project_id,
+                environment.name,
+                active as i64,
+                environment.script.clone().unwrap_or_default(),
+                now
+            ],
         )
         .map_err(err)?;
         let env_id = tx.last_insert_rowid();

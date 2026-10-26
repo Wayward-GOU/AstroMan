@@ -1,6 +1,6 @@
 import type { HttpResult } from '@/types/models'
 
-export type ScriptPhase = 'pre' | 'post'
+export type ScriptPhase = 'env' | 'pre' | 'post'
 export type ScriptLogLevel = 'log' | 'warn' | 'error'
 
 export interface ScriptLog {
@@ -176,6 +176,7 @@ export function runPreScript(
   code: string,
   request: ScriptRequest,
   env: Record<string, string>,
+  phase: ScriptPhase = 'pre',
 ): PreScriptResult {
   const logs: ScriptLog[] = []
   const started = performance.now()
@@ -191,7 +192,7 @@ export function runPreScript(
       e: Record<string, string>,
       c: ConsoleFacade,
     ) => void
-    runner(target, createVars(env), { ...env }, createConsole('pre', logs))
+    runner(target, createVars(env), { ...env }, createConsole(phase, logs))
     return { request: target, logs, durationMs: Math.round(performance.now() - started) }
   } catch (e) {
     return {
@@ -201,6 +202,15 @@ export function runPreScript(
       durationMs: Math.round(performance.now() - started),
     }
   }
+}
+
+/** 执行环境脚本：每次发送请求前运行，可用 vars.set() 为环境生成运行时变量 */
+export function runEnvScript(
+  code: string,
+  request: ScriptRequest,
+  env: Record<string, string>,
+): PreScriptResult {
+  return runPreScript(code, request, env, 'env')
 }
 
 /** 执行后置脚本：读取 response，用 test() / assert() 断言，并可用 vars.set() 提取变量 */

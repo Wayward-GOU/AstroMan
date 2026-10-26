@@ -14,12 +14,14 @@ import {
   ReloadOutlined,
   LoginOutlined,
   SwapOutlined,
+  CloudDownloadOutlined,
 } from '@ant-design/icons-vue'
 import PageHeader from '@/components/PageHeader.vue'
 import * as api from '@/api'
 import { themes, currentThemeId, setTheme } from '@/stores/theme'
 import { openDirLabel, platformLabel, shortcutText } from '@/utils/platform'
-import type { AppInfo, StorageInfo } from '@/types/models'
+import { checkForUpdates, isAutoUpdateEnabled, setAutoUpdateEnabled } from '@/utils/updater'
+import type { AppInfo, StorageInfo, UpdateInfo } from '@/types/models'
 
 const info = ref<AppInfo | null>(null)
 const storage = ref<StorageInfo | null>(null)
@@ -157,6 +159,34 @@ async function restartApp() {
     message.error(String(e))
   }
 }
+
+/* ---------- 自动更新 ---------- */
+const autoUpdate = ref(isAutoUpdateEnabled())
+const updateLoading = ref(false)
+const updateInfo = ref<UpdateInfo | null>(null)
+
+function toggleAutoUpdate(value: boolean) {
+  autoUpdate.value = value
+  setAutoUpdateEnabled(value)
+}
+
+async function manualCheck() {
+  updateLoading.value = true
+  try {
+    const result = await checkForUpdates()
+    if (result) updateInfo.value = result
+  } finally {
+    updateLoading.value = false
+  }
+}
+
+async function openReleasePage() {
+  try {
+    await api.openExternal(updateInfo.value?.releaseUrl || 'https://github.com/Wayward-GOU/FinkMeter/releases')
+  } catch (e) {
+    message.error(String(e))
+  }
+}
 </script>
 
 <template>
@@ -264,6 +294,48 @@ async function restartApp() {
             </span>
           </div>
         </a-spin>
+      </div>
+
+      <div class="fm-card block update-block">
+        <div class="block-head">
+          <span class="block-icon blue"><CloudDownloadOutlined /></span>
+          <div>
+            <div class="block-title">版本更新</div>
+            <div class="block-desc">从 GitHub Release 获取最新版本，下载后按安装向导升级</div>
+          </div>
+          <span v-if="updateInfo?.hasUpdate" class="update-badge">有新版本</span>
+        </div>
+        <div class="rows">
+          <div class="row">
+            <span class="label">当前版本</span>
+            <span class="value mono">v{{ info?.version || '-' }}</span>
+          </div>
+          <div class="row">
+            <span class="label">最新版本</span>
+            <span class="value mono">
+              {{ updateInfo ? `v${updateInfo.latestVersion}` : '尚未检查' }}
+              <template v-if="updateInfo && !updateInfo.hasUpdate">（已是最新）</template>
+            </span>
+          </div>
+          <div class="row">
+            <span class="label">自动检查</span>
+            <span class="value">启动后自动检查更新，有新版本时弹窗提示</span>
+            <a-switch :checked="autoUpdate" size="small" @change="(v: unknown) => toggleAutoUpdate(Boolean(v))" />
+          </div>
+        </div>
+        <div class="storage-actions">
+          <a-button type="primary" :loading="updateLoading" @click="manualCheck">
+            <template #icon><CloudDownloadOutlined /></template>
+            检查更新
+          </a-button>
+          <a-button @click="openReleasePage">打开发布页</a-button>
+        </div>
+        <div class="storage-tip">
+          <SafetyCertificateOutlined />
+          <span>
+            安装包直接从 GitHub Release 下载，不经过任何第三方服务器。国内网络访问 GitHub 可能较慢，失败时请检查网络后重试。
+          </span>
+        </div>
       </div>
 
       <div class="fm-card block">
@@ -498,6 +570,20 @@ async function restartApp() {
 .block-icon.amber {
   background: var(--fm-warning-soft);
   color: var(--fm-warning);
+}
+
+.update-block {
+  grid-column: 1 / -1;
+}
+
+.update-badge {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--fm-success);
+  background: var(--fm-success-soft);
+  padding: 2px 10px;
+  border-radius: 999px;
+  flex-shrink: 0;
 }
 
 .block-title {

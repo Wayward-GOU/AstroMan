@@ -6,6 +6,7 @@ import { getCurrentWebview } from '@tauri-apps/api/webview'
 import {
   AppstoreOutlined,
   FundProjectionScreenOutlined,
+  HistoryOutlined,
   SettingOutlined,
   SafetyCertificateOutlined,
   LineChartOutlined,
@@ -15,6 +16,7 @@ import {
 import AppLogo from '@/components/AppLogo.vue'
 import { currentTheme } from '@/stores/theme'
 import { isMac, shortcutText } from '@/utils/platform'
+import { checkForUpdates, isAutoUpdateEnabled } from '@/utils/updater'
 
 const route = useRoute()
 
@@ -85,6 +87,13 @@ onMounted(() => {
   const stored = Number(localStorage.getItem(ZOOM_KEY) ?? '1')
   applyZoom(Number.isFinite(stored) && stored > 0 ? stored : 1, false)
   window.addEventListener('keydown', onZoomHotkey)
+
+  // 启动后静默检查一次 GitHub 最新版本，有更新才提示
+  if (isAutoUpdateEnabled()) {
+    window.setTimeout(() => {
+      checkForUpdates({ silent: true })
+    }, 5000)
+  }
 })
 
 onBeforeUnmount(() => {
@@ -96,6 +105,7 @@ const navs = [
   { key: 'home', label: '工作台', hint: '项目与请求调试', to: '/', icon: AppstoreOutlined },
   { key: 'stress', label: '压测', hint: '选择接口发起压测', to: '/stress', icon: ThunderboltOutlined },
   { key: 'reports', label: '压测报告', hint: '历史压测结果', to: '/reports', icon: FundProjectionScreenOutlined },
+  { key: 'history', label: '请求历史', hint: '最近发送记录', to: '/history', icon: HistoryOutlined },
   { key: 'monitor', label: '系统监视', hint: 'CPU · 内存 · 磁盘 · 网络', to: '/monitor', icon: LineChartOutlined },
   { key: 'tools', label: '工具箱', hint: 'JSON · 加解密 · 时间戳', to: '/tools', icon: ToolOutlined },
   { key: 'settings', label: '设置', hint: '应用与数据', to: '/settings', icon: SettingOutlined },
@@ -105,6 +115,7 @@ const activeKey = computed(() => {
   const path = route.path
   if (path.startsWith('/stress')) return 'stress'
   if (path.startsWith('/reports')) return 'reports'
+  if (path.startsWith('/history')) return 'history'
   if (path.startsWith('/monitor')) return 'monitor'
   if (path.startsWith('/tools')) return 'tools'
   if (path === '/settings') return 'settings'

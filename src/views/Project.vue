@@ -16,6 +16,7 @@ import {
 import { useProjectStore } from '@/stores/project'
 import { MAX_REQUEST_TABS, useTabsStore } from '@/stores/tabs'
 import { formatDateTime } from '@/utils/datetime'
+import { buildCurl } from '@/utils/curl'
 import * as api from '@/api'
 import type { CollectionNode, RequestSearchHit, RequestSummary } from '@/types/models'
 
@@ -220,6 +221,18 @@ function openRequest(row: RequestSummary | RequestSearchHit) {
   openRequestTab(row.id)
 }
 
+async function copyRowCurl(row: RequestSummary | RequestSearchHit) {
+  try {
+    const detail = await api.requestGet(row.id)
+    await navigator.clipboard.writeText(
+      buildCurl(detail, store.activeEnvironment?.variables),
+    )
+    message.success(`已复制「${row.name}」的 cURL`)
+  } catch (e) {
+    message.error(String(e))
+  }
+}
+
 function deleteRequest(row: RequestSummary | RequestSearchHit) {
   Modal.confirm({
     title: `删除请求「${row.name}」？`,
@@ -315,7 +328,7 @@ async function exportProject() {
   const safeName = (store.currentProject?.name || 'finkmeter-project').replace(/[\\/:*?"<>|]/g, '_')
   try {
     const path = await save({
-      title: '导出项目',
+      title: '导出项目 JSON',
       defaultPath: `${safeName}.finkmeter.json`,
       filters: [{ name: 'FinkMeter 项目文件', extensions: ['json'] }],
     })
@@ -368,14 +381,14 @@ const columns = computed(() =>
         { title: '方法', dataIndex: 'method', key: 'method', width: 88 },
         { title: 'URL', dataIndex: 'url', key: 'url', ellipsis: true },
         { title: '更新', dataIndex: 'updatedAt', key: 'updatedAt', width: 158 },
-        { title: '', key: 'ops', width: 56 },
+        { title: '', key: 'ops', width: 96 },
       ]
     : [
         { title: '请求', dataIndex: 'name', key: 'name' },
         { title: '方法', dataIndex: 'method', key: 'method', width: 92 },
         { title: 'URL', dataIndex: 'url', key: 'url', ellipsis: true },
         { title: '更新', dataIndex: 'updatedAt', key: 'updatedAt', width: 158 },
-        { title: '', key: 'ops', width: 56 },
+        { title: '', key: 'ops', width: 96 },
       ],
 )
 </script>
@@ -417,7 +430,7 @@ const columns = computed(() =>
         </a-button>
         <a-button size="small" @click="exportProject">
           <template #icon><ExportOutlined /></template>
-          导出项目
+          导出项目 JSON
         </a-button>
         <a-button size="small" @click="router.push(`/environment/${projectId}`)">
           <template #icon><SettingOutlined /></template>
@@ -531,7 +544,10 @@ const columns = computed(() =>
                 <span class="muted">{{ fmtTime((record as RequestSummary).updatedAt) }}</span>
               </template>
               <template v-else-if="column.key === 'ops'">
-                <a class="row-delete" @click.stop="deleteRequest(record as RequestSummary)">删除</a>
+                <span class="row-ops">
+                  <a class="row-copy" @click.stop="copyRowCurl(record as RequestSummary)">cURL</a>
+                  <a class="row-delete" @click.stop="deleteRequest(record as RequestSummary)">删除</a>
+                </span>
               </template>
             </template>
           </a-table>
@@ -887,6 +903,22 @@ const columns = computed(() =>
 .muted {
   color: var(--fm-muted);
   font-size: 11px;
+}
+
+.row-ops {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.row-copy {
+  font-size: 11px;
+  color: var(--fm-primary);
+  opacity: 0.8;
+}
+
+.row-copy:hover {
+  opacity: 1;
 }
 
 .row-delete {

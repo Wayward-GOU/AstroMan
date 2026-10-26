@@ -2,7 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
-import { open } from '@tauri-apps/plugin-dialog'
+import { open, save } from '@tauri-apps/plugin-dialog'
 import {
   PlusOutlined,
   ArrowRightOutlined,
@@ -116,7 +116,7 @@ const kpis = computed(() => {
       label: '历史请求',
       value: s?.historyCount ?? null,
       note: s ? `近 7 天 ${s.recentHistory} 次` : '本机保留最近 5000 条',
-      go: scrollToHistory,
+      go: () => router.push('/history'),
     },
   ]
 })
@@ -388,6 +388,22 @@ async function importProject() {
   }
 }
 
+async function exportProjectJson(id: number, name: string) {
+  const safeName = name.replace(/[\\/:*?"<>|]/g, '_')
+  try {
+    const path = await save({
+      title: '导出项目 JSON',
+      defaultPath: `${safeName}.finkmeter.json`,
+      filters: [{ name: 'FinkMeter 项目文件', extensions: ['json'] }],
+    })
+    if (!path) return
+    await api.projectExport(id, path)
+    message.success(`项目「${name}」已导出，可发给他人用「导入项目 JSON」恢复`)
+  } catch (e) {
+    message.error(String(e))
+  }
+}
+
 const importingApi = ref(false)
 
 async function importApiProject() {
@@ -460,10 +476,6 @@ function openTool(id: string) {
   router.push({ path: '/tools', query: { tool: id } })
 }
 
-function scrollToHistory() {
-  document.getElementById('recent-history')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
-}
-
 /* ---------- 格式化 ---------- */
 
 function fmtInt(value: number) {
@@ -524,8 +536,8 @@ function statusColor(code?: number | null) {
         </a-button>
         <template #overlay>
           <a-menu @click="onImportMenu">
-            <a-menu-item key="finkmeter">FinkMeter 项目文件</a-menu-item>
-            <a-menu-item key="api">Postman / Apifox 数据</a-menu-item>
+            <a-menu-item key="finkmeter">导入项目 JSON</a-menu-item>
+            <a-menu-item key="api">导入 Postman / Apifox 数据</a-menu-item>
           </a-menu>
         </template>
       </a-dropdown>
@@ -677,6 +689,9 @@ function statusColor(code?: number | null) {
                   <a class="more" @click.stop>···</a>
                   <template #overlay>
                     <a-menu>
+                      <a-menu-item key="export" @click="exportProjectJson(p.id, p.name)">
+                        导出项目 JSON
+                      </a-menu-item>
                       <a-menu-item key="delete" danger @click="removeProject(p.id, p.name)">
                         删除项目
                       </a-menu-item>
@@ -702,7 +717,7 @@ function statusColor(code?: number | null) {
             <div class="empty-desc">创建一个项目开始调试，或者导入 FinkMeter 项目、Postman 集合或 Apifox 数据。</div>
             <div class="empty-actions">
               <a-button type="primary" @click="createOpen = true">新建项目</a-button>
-              <a-button @click="importProject">导入项目</a-button>
+              <a-button @click="importProject">导入项目 JSON</a-button>
               <a-button @click="importApiProject">导入 Postman/Apifox</a-button>
             </div>
           </div>
@@ -813,6 +828,7 @@ function statusColor(code?: number | null) {
       </div>
       <div v-if="history.length" class="head-actions">
         <a-button size="small" @click="clearHistory">清空历史</a-button>
+        <a-button size="small" @click="router.push('/history')">查看全部</a-button>
         <a-button type="link" size="small" @click="goProject">去发送请求</a-button>
       </div>
     </div>

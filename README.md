@@ -13,6 +13,58 @@
 
 ---
 
+## 下载安装
+
+| 平台 | 安装包 | 说明 |
+|---|---|---|
+| Windows 10/11（x64） | `FinkMeter_*_x64-setup.exe` | 双击安装，当前用户安装无需管理员权限 |
+| macOS 11+（Apple Silicon / Intel） | `FinkMeter_*_universal.dmg` | 通用包，自带 `arm64` 与 `x86_64` 两个切片，**Intel Mac 无需单独下载 Intel 版** |
+
+macOS 首次打开若出现下面这个提示（按钮只有「完成 / 移到废纸篓」），是系统对未公证应用的 Gatekeeper 拦截，**不是芯片架构不兼容**：
+
+> Apple 无法验证「FinkMeter.app」是否包含可能危害 Mac 安全或泄漏隐私的恶意软件。
+
+按下方「[macOS 安装](#macos-安装)」中的方式一（一键安装脚本）或方式二（系统设置放行）处理即可。
+
+---
+
+## macOS 安装
+
+最低支持 macOS 11.0。Release 中的 dmg 是通用包，同时包含 Intel（`x86_64`）与 Apple Silicon（`arm64`）切片，安装脚本会自动校验本机架构是否被支持。
+
+安装包做的是 ad-hoc 签名、未做 Apple 公证，因此首次打开会触发 Gatekeeper 提示「Apple 无法验证 FinkMeter.app」。这是签名 / 隔离属性问题，不是芯片不兼容，按下面任一方式放行即可。
+
+**方式一：一键安装脚本（推荐）**
+
+仓库提供了 [scripts/install-macos.sh](scripts/install-macos.sh)，发布时由 [release.yml](.github/workflows/release.yml) 上传到 Release 附件，一条命令完成下载、架构校验、安装、清除隔离属性、ad-hoc 签名与启动：
+
+```bash
+curl -fLO https://github.com/Wayward-GOU/FinkMeter/releases/download/v1.0.3/install-macos.sh
+bash install-macos.sh v1.0.3
+```
+
+不带参数执行时安装最新正式版。仓库若为私有，需要先提供 Token：
+
+```bash
+GITHUB_TOKEN=ghp_xxx bash install-macos.sh v1.0.3
+```
+
+**方式二：手动安装**
+
+1. 打开 dmg，把 `FinkMeter.app` 拖到「应用程序」
+2. 双击打开，若提示「Apple 无法验证」：打开「系统设置 → 隐私与安全性」，在「安全性」区域点击「仍要打开」，输入密码确认（macOS 15 起右键「打开」不再能绕过该提示，必须走这一步）
+3. 也可以直接在终端手动放行：
+
+```bash
+sudo xattr -dr com.apple.quarantine /Applications/FinkMeter.app
+sudo codesign --force --deep --sign - /Applications/FinkMeter.app
+open /Applications/FinkMeter.app
+```
+
+> Gatekeeper 只认 Apple 签发的 Developer ID 证书 + 公证票据，GitHub Actions 无法替代签发，只能执行 `codesign` / `notarytool`。如需彻底消除提示，准备 Apple Developer Program 账号后在 workflow 中配置 `APPLE_CERTIFICATE`、`APPLE_ID`、`APPLE_PASSWORD`、`APPLE_TEAM_ID` 等 secrets 即可。当前仓库已配置 ad-hoc 签名（`signingIdentity: "-"`），可避免系统把应用判定为「已损坏」。
+
+---
+
 ## 当前状态
 
 | 检查项 | 结果 |
@@ -230,42 +282,11 @@ npm run tauri build
 
 | 产物 | 路径 |
 |---|---|
-| **dmg 安装包** | `src-tauri/target/universal-apple-darwin/release/bundle/dmg/FinkMeter_1.0.0_universal.dmg` |
+| **dmg 安装包** | `src-tauri/target/universal-apple-darwin/release/bundle/dmg/FinkMeter_*_universal.dmg` |
 | 应用程序 | `src-tauri/target/universal-apple-darwin/release/bundle/macos/FinkMeter.app` |
 | 当前架构可执行文件 | `src-tauri/target/release/bundle/macos/FinkMeter.app` |
 
-最低支持 macOS 11.0。Release 中的 dmg 是通用包，同时包含 Intel（`x86_64`）与 Apple Silicon（`arm64`）切片，安装脚本会自动校验本机架构是否被支持。
-
-安装包未做 Apple 公证，首次打开会触发 Gatekeeper 提示「Apple 无法验证 FinkMeter.app」。这是签名/隔离属性问题，不是芯片不兼容，按下面任一方式放行即可。
-
-**方式一：一键安装脚本（推荐）**
-
-仓库提供了 [scripts/install-macos.sh](scripts/install-macos.sh)，发布时由 [release.yml](.github/workflows/release.yml) 上传到 Release 附件，一条命令完成下载、架构校验、安装、清除隔离属性与 ad-hoc 签名：
-
-```bash
-curl -fLO https://github.com/Wayward-GOU/FinkMeter/releases/download/v1.0.3/install-macos.sh
-bash install-macos.sh v1.0.3
-```
-
-不带参数执行时安装最新正式版。仓库若为私有，需要先提供 Token：
-
-```bash
-GITHUB_TOKEN=ghp_xxx bash install-macos.sh v1.0.3
-```
-
-**方式二：手动安装**
-
-1. 打开 dmg，把 `FinkMeter.app` 拖到「应用程序」
-2. 若提示「Apple 无法验证」：打开「系统设置 → 隐私与安全性」，在「安全性」区域点击「仍要打开」，输入密码确认（macOS 15 起右键「打开」不再能绕过该提示）
-3. 也可以在终端手动放行：
-
-```bash
-sudo xattr -dr com.apple.quarantine /Applications/FinkMeter.app
-sudo codesign --force --deep --sign - /Applications/FinkMeter.app
-open /Applications/FinkMeter.app
-```
-
-> Gatekeeper 只认 Apple 签发的 Developer ID 证书 + 公证票据，GitHub Actions 无法替代签发，只能执行 `codesign` / `notarytool`。如需彻底消除提示，准备 Apple Developer Program 账号后在 workflow 中配置 `APPLE_CERTIFICATE`、`APPLE_ID`、`APPLE_PASSWORD`、`APPLE_TEAM_ID` 等 secrets 即可。当前仓库已配置 ad-hoc 签名（`signingIdentity: "-"`），可避免系统把应用判定为「已损坏」。
+最低支持 macOS 11.0。Release 中的 dmg 是通用包，同时包含 Intel（`x86_64`）与 Apple Silicon（`arm64`）切片；安装、放行与 Gatekeeper 说明见 [macOS 安装](#macos-安装)。
 
 ---
 

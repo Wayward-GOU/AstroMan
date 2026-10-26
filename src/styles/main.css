@@ -330,3 +330,88 @@ body {
 .ant-spin-container::after {
   border-radius: var(--fm-radius);
 }
+
+/* ---------- Windows / macOS 平台差异化 ---------- */
+html[data-platform='macos'] body {
+  font-family: 'SF Pro Text', -apple-system, BlinkMacSystemFont, 'PingFang SC',
+    'Hiragino Sans GB', 'Helvetica Neue', sans-serif;
+  letter-spacing: 0.1px;
+}
+
+html[data-platform='windows'] body {
+  font-family: 'Segoe UI Variable Text', 'Segoe UI', 'Microsoft YaHei', 'DengXian',
+    'PingFang SC', sans-serif;
+}
+
+html[data-platform='macos'] ::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+html[data-platform='macos'] ::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: 10px;
+  background: rgba(100, 116, 139, 0.26);
+  background-clip: content-box;
+}
+
+html[data-platform='macos'] ::-webkit-scrollbar-thumb:hover {
+  background: rgba(100, 116, 139, 0.45);
+  background-clip: content-box;
+}
+
+html[data-platform='windows'] ::-webkit-scrollbar {
+  width: 12px;
+  height: 12px;
+}
+
+html[data-platform='windows'] ::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: 3px;
+  background: var(--fm-border-strong);
+  background-clip: content-box;
+}
+
+html[data-platform='windows'] ::-webkit-scrollbar-thumb:hover {
+  background: var(--fm-muted);
+  background-clip: content-box;
+}
+
+html[data-platform='macos'] .ant-btn {
+  border-radius: 7px;
+}
+
+html[data-platform='windows'] .ant-btn {
+  border-radius: 5px;
+}
+
+html[data-platform='macos'] .ant-modal-content {
+  border-radius: 14px;
+  padding: 20px 22px;
+}
+
+html[data-platform='windows'] .ant-modal-content {
+  border-radius: 8px;
+  padding: 22px 24px;
+}
+
+html[data-platform='macos'] .page {
+  padding: 20px 24px 30px;
+}
+
+/* 更新弹窗中的发布说明预览 */
+.update-notes {
+  margin: 10px 0;
+  padding: 10px 12px;
+  max-height: 160px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.7;
+  color: var(--fm-text-2);
+  background: var(--fm-surface-alt);
+  border: 1px solid var(--fm-border);
+  border-radius: 8px;
+}

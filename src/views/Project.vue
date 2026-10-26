@@ -2,7 +2,7 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
-import { save } from '@tauri-apps/plugin-dialog'
+import { open, save } from '@tauri-apps/plugin-dialog'
 import {
   ArrowLeftOutlined,
   PlusOutlined,
@@ -14,6 +14,9 @@ import {
   SearchOutlined,
 } from '@ant-design/icons-vue'
 import { useProjectStore } from '@/stores/project'
+import { MAX_REQUEST_TABS, useTabsStore } from '@/stores/tabs'
+import { formatDateTime } from '@/utils/datetime'
+import { buildCurl } from '@/utils/curl'
 import * as api from '@/api'
 import type { CollectionNode, RequestSearchHit, RequestSummary } from '@/types/models'
 
@@ -27,6 +30,7 @@ interface TreeNode {
 const route = useRoute()
 const router = useRouter()
 const store = useProjectStore()
+const tabs = useTabsStore()
 
 const projectId = computed(() => Number(route.params.id))
 const selectedKeys = ref<string[]>([])
@@ -100,6 +104,7 @@ function toTreeData(nodes: CollectionNode[]): TreeNode[] {
 const treeData = computed(() => toTreeData(store.tree))
 
 onMounted(async () => {
+  tabs.ensureProject(projectId.value)
   try {
     await store.openProject(projectId.value)
     store.syncActiveEnvironment()
@@ -197,14 +202,35 @@ async function addRequest(collection: CollectionNode) {
   try {
     const saved = await api.requestSave(payload)
     await loadRequests(collection.id)
-    router.push({ name: 'request', params: { id: saved.id }, query: { projectId: projectId.value } })
+    openRequestTab(saved.id!)
   } catch (e) {
     message.error(String(e))
   }
 }
 
+function openRequestTab(id: number) {
+  tabs.ensureProject(projectId.value)
+  if (!tabs.canOpen(id)) {
+    message.warning(`最多同时打开 ${MAX_REQUEST_TABS} 个接口，请先关闭部分标签`)
+    return
+  }
+  router.push({ name: 'request', params: { id }, query: { projectId: projectId.value } })
+}
+
 function openRequest(row: RequestSummary | RequestSearchHit) {
-  router.push({ name: 'request', params: { id: row.id }, query: { projectId: projectId.value } })
+  openRequestTab(row.id)
+}
+
+async function copyRowCurl(row: RequestSummary | RequestSearchHit) {
+  try {
+    const detail = await api.requestGet(row.id)
+    await navigator.clipboard.writeText(
+      buildCurl(detail, store.activeEnvironment?.variables),
+    )
+    message.success(`已复制「${row.name}」的 cURL`)
+  } catch (e) {
+    message.error(String(e))
+  }
 }
 
 function deleteRequest(row: RequestSummary | RequestSearchHit) {
@@ -216,6 +242,8 @@ function deleteRequest(row: RequestSummary | RequestSearchHit) {
     cancelText: '取消',
     async onOk() {
       await api.requestDelete(row.id)
+      tabs.ensureProject(projectId.value)
+      tabs.close(row.id)
       message.success('已删除请求')
       if (searchMode.value) await runSearch()
       else if (selectedKeys.value.length) await loadRequests(Number(selectedKeys.value[0]))
@@ -288,7 +316,7 @@ async function submitCurl() {
     }
     await loadRequests(collectionId)
     message.success('已导入请求')
-    router.push({ name: 'request', params: { id: saved.id }, query: { projectId: projectId.value } })
+    openRequestTab(saved.id!)
   } catch (e) {
     message.error(String(e))
   } finally {
@@ -300,7 +328,7 @@ async function exportProject() {
   const safeName = (store.currentProject?.name || 'finkmeter-project').replace(/[\\/:*?"<>|]/g, '_')
   try {
     const path = await save({
-      title: '导出项目',
+      title: '导出项目 JSON',
       defaultPath: `${safeName}.finkmeter.json`,
       filters: [{ name: 'FinkMeter 项目文件', extensions: ['json'] }],
     })
@@ -312,10 +340,37 @@ async function exportProject() {
   }
 }
 
+const importingApi = ref(false)
+
+async function importApiFile() {
+  try {
+    const path = await open({
+      title: '导入 Postman / Apifox 数据',
+      multiple: false,
+      filters: [{ name: 'JSON 文件', extensions: ['json'] }],
+    })
+    if (!path) return
+    importingApi.value = true
+    await api.apiImport(path, projectId.value)
+    await store.refreshTree(projectId.value)
+    await store.refreshEnvironments(projectId.value)
+    store.syncActiveEnvironment()
+    requests.value = []
+    selectedKeys.value = []
+    if (store.tree.length) {
+      selectedKeys.value = [String(store.tree[0].id)]
+      await loadRequests(store.tree[0].id)
+    }
+    message.success('接口已导入到当前项目')
+  } catch (e) {
+    message.error(String(e))
+  } finally {
+    importingApi.value = false
+  }
+}
+
 function fmtTime(ts: number) {
-  const d = new Date(ts)
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${d.getMonth() + 1}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+  return formatDateTime(ts)
 }
 
 const columns = computed(() =>
@@ -325,15 +380,15 @@ const columns = computed(() =>
         { title: '集合', dataIndex: 'collectionName', key: 'collectionName', width: 130, ellipsis: true },
         { title: '方法', dataIndex: 'method', key: 'method', width: 88 },
         { title: 'URL', dataIndex: 'url', key: 'url', ellipsis: true },
-        { title: '更新', dataIndex: 'updatedAt', key: 'updatedAt', width: 104 },
-        { title: '', key: 'ops', width: 56 },
+        { title: '更新', dataIndex: 'updatedAt', key: 'updatedAt', width: 158 },
+        { title: '', key: 'ops', width: 96 },
       ]
     : [
         { title: '请求', dataIndex: 'name', key: 'name' },
         { title: '方法', dataIndex: 'method', key: 'method', width: 92 },
         { title: 'URL', dataIndex: 'url', key: 'url', ellipsis: true },
-        { title: '更新', dataIndex: 'updatedAt', key: 'updatedAt', width: 110 },
-        { title: '', key: 'ops', width: 56 },
+        { title: '更新', dataIndex: 'updatedAt', key: 'updatedAt', width: 158 },
+        { title: '', key: 'ops', width: 96 },
       ],
 )
 </script>
@@ -369,9 +424,13 @@ const columns = computed(() =>
           <template #icon><ImportOutlined /></template>
           导入 cURL
         </a-button>
+        <a-button size="small" :loading="importingApi" @click="importApiFile">
+          <template #icon><ImportOutlined /></template>
+          导入 Postman/Apifox
+        </a-button>
         <a-button size="small" @click="exportProject">
           <template #icon><ExportOutlined /></template>
-          导出项目
+          导出项目 JSON
         </a-button>
         <a-button size="small" @click="router.push(`/environment/${projectId}`)">
           <template #icon><SettingOutlined /></template>
@@ -485,7 +544,10 @@ const columns = computed(() =>
                 <span class="muted">{{ fmtTime((record as RequestSummary).updatedAt) }}</span>
               </template>
               <template v-else-if="column.key === 'ops'">
-                <a class="row-delete" @click.stop="deleteRequest(record as RequestSummary)">删除</a>
+                <span class="row-ops">
+                  <a class="row-copy" @click.stop="copyRowCurl(record as RequestSummary)">cURL</a>
+                  <a class="row-delete" @click.stop="deleteRequest(record as RequestSummary)">删除</a>
+                </span>
               </template>
             </template>
           </a-table>
@@ -841,6 +903,22 @@ const columns = computed(() =>
 .muted {
   color: var(--fm-muted);
   font-size: 11px;
+}
+
+.row-ops {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.row-copy {
+  font-size: 11px;
+  color: var(--fm-primary);
+  opacity: 0.8;
+}
+
+.row-copy:hover {
+  opacity: 1;
 }
 
 .row-delete {

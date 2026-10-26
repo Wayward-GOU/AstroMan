@@ -13,6 +13,58 @@
 
 ---
 
+## 下载安装
+
+| 平台 | 安装包 | 说明 |
+|---|---|---|
+| Windows 10/11（x64） | `FinkMeter_*_x64-setup.exe` | 双击安装，当前用户安装无需管理员权限 |
+| macOS 11+（Apple Silicon / Intel） | `FinkMeter_*_universal.dmg` | 通用包，自带 `arm64` 与 `x86_64` 两个切片，**Intel Mac 无需单独下载 Intel 版** |
+
+macOS 首次打开若出现下面这个提示（按钮只有「完成 / 移到废纸篓」），是系统对未公证应用的 Gatekeeper 拦截，**不是芯片架构不兼容**：
+
+> Apple 无法验证「FinkMeter.app」是否包含可能危害 Mac 安全或泄漏隐私的恶意软件。
+
+按下方「[macOS 安装](#macos-安装)」中的方式一（一键安装脚本）或方式二（系统设置放行）处理即可。
+
+---
+
+## macOS 安装
+
+最低支持 macOS 11.0。Release 中的 dmg 是通用包，同时包含 Intel（`x86_64`）与 Apple Silicon（`arm64`）切片，安装脚本会自动校验本机架构是否被支持。
+
+安装包做的是 ad-hoc 签名、未做 Apple 公证，因此首次打开会触发 Gatekeeper 提示「Apple 无法验证 FinkMeter.app」。这是签名 / 隔离属性问题，不是芯片不兼容，按下面任一方式放行即可。
+
+**方式一：一键安装脚本（推荐）**
+
+仓库提供了 [scripts/install-macos.sh](scripts/install-macos.sh)，发布时由 [release.yml](.github/workflows/release.yml) 上传到 Release 附件，一条命令完成下载、架构校验、安装、清除隔离属性、ad-hoc 签名与启动：
+
+```bash
+curl -fLO https://github.com/Wayward-GOU/FinkMeter/releases/latest/download/install-macos.sh
+bash install-macos.sh v1.0.4
+```
+
+不带参数执行时安装最新正式版。仓库若为私有，需要先提供 Token：
+
+```bash
+GITHUB_TOKEN=ghp_xxx bash install-macos.sh v1.0.4
+```
+
+**方式二：手动安装**
+
+1. 打开 dmg，把 `FinkMeter.app` 拖到「应用程序」
+2. 双击打开，若提示「Apple 无法验证」：打开「系统设置 → 隐私与安全性」，在「安全性」区域点击「仍要打开」，输入密码确认（macOS 15 起右键「打开」不再能绕过该提示，必须走这一步）
+3. 也可以直接在终端手动放行：
+
+```bash
+sudo xattr -dr com.apple.quarantine /Applications/FinkMeter.app
+sudo codesign --force --deep --sign - /Applications/FinkMeter.app
+open /Applications/FinkMeter.app
+```
+
+> Gatekeeper 只认 Apple 签发的 Developer ID 证书 + 公证票据，GitHub Actions 无法替代签发，只能执行 `codesign` / `notarytool`。如需彻底消除提示，准备 Apple Developer Program 账号后在 workflow 中配置 `APPLE_CERTIFICATE`、`APPLE_ID`、`APPLE_PASSWORD`、`APPLE_TEAM_ID` 等 secrets 即可。当前仓库已配置 ad-hoc 签名（`signingIdentity: "-"`），可避免系统把应用判定为「已损坏」。
+
+---
+
 ## 当前状态
 
 | 检查项 | 结果 |
@@ -230,16 +282,11 @@ npm run tauri build
 
 | 产物 | 路径 |
 |---|---|
-| **dmg 安装包** | `src-tauri/target/universal-apple-darwin/release/bundle/dmg/FinkMeter_1.0.0_universal.dmg` |
+| **dmg 安装包** | `src-tauri/target/universal-apple-darwin/release/bundle/dmg/FinkMeter_*_universal.dmg` |
 | 应用程序 | `src-tauri/target/universal-apple-darwin/release/bundle/macos/FinkMeter.app` |
 | 当前架构可执行文件 | `src-tauri/target/release/bundle/macos/FinkMeter.app` |
 
-最低支持 macOS 11.0。安装包未签名、未公证，首次打开会被 Gatekeeper 拦截：
-
-- 右键点击 `FinkMeter.app` → 打开 → 再次确认，或
-- 终端执行 `xattr -dr com.apple.quarantine /Applications/FinkMeter.app`
-
-> 如需分发给其他用户，建议准备 Apple Developer ID 并做签名 + 公证（`codesign` + `notarytool`），避免对方每次打开都要手动放行。
+最低支持 macOS 11.0。Release 中的 dmg 是通用包，同时包含 Intel（`x86_64`）与 Apple Silicon（`arm64`）切片；安装、放行与 Gatekeeper 说明见 [macOS 安装](#macos-安装)。
 
 ---
 
@@ -262,12 +309,116 @@ macOS 没有安装向导，默认使用 `~/Library/Application Support/FinkMeter
 
 首次启动会自动建库，并写入一份可直接试用的示例数据：
 
-- 项目：`示例项目`
-- 集合：`默认集合`
-- 请求：`示例请求`（`GET {{base_url}}/get`）
-- 环境：`本地环境`（`base_url = https://httpbin.org`）
+- 项目：`示例项目`（已存在但仍是初始示例时会自动补齐场景）
+- 集合：`01 基础请求`、`02 认证与请求头`、`03 表单与内容类型`、`04 变量与脚本`、`05 状态码与延迟`、`06 压测示例`
+- 请求：约 30 个场景接口，覆盖 GET/POST/PUT/PATCH/DELETE/HEAD、Bearer / API Key 认证、Form / Raw / JSON Body、内置变量、前置与后置脚本、`<500` / `401` / `400` 等状态码、延迟与重定向、压测基准接口
+- 环境：`本地环境`（`base_url = https://httpbin.org`、`token`、`api_key`、`user_id`、`username`，并附带一段环境脚本示例）
 
 > `httpbin.org` 在国内可能较慢。把 URL 换成你自己的接口，或修改环境变量 `base_url` 即可。
+
+---
+
+## 新手上手
+
+首次启动后自带「示例项目」，可以直接拿它练习；想从零开始就按下面五步走。
+
+**1. 建项目、建集合**
+
+工作台点「新建项目」，进入项目后右键集合树可新建子集合。项目与集合只影响组织方式，不会影响请求本身。
+
+**2. 配环境变量**
+
+侧边栏「环境」里建一个环境，把 `base_url`、`token` 等可变内容写进去，勾选为当前环境。请求里用 `{{base_url}}`、`{{token}}` 引用，切换环境即可整体换域名和凭证。
+
+内置变量可直接使用：`{{timestamp}}`、`{{uuid}}`、`{{randomInt(1,100)}}`、`{{randomString(8)}}`。
+
+**3. 调一个接口**
+
+新建请求，填方法、URL、Params、Headers、Body，点「发送」。响应区可切换 Pretty / Raw，并查看状态码、耗时、大小与响应头；请求栏「代码」按钮能生成 cURL / 原始报文 / fetch / Python 四种代码片段。
+
+变量优先级：运行时变量（脚本 `vars.set`）> 环境变量 > 内置变量。
+
+**4. 用脚本生成签名或密文**
+
+请求编辑器「脚本」页分前置（发送前）与后置（收到响应后）。右上角「插入示例」会直接把可运行的代码填进编辑器，改几个变量名即可用。详见下方[脚本与加密示例](#脚本与加密示例)。
+
+**5. 压测与报告**
+
+侧边栏「压测」新建压测，选项目 / 环境 / 接口后配置并发、时长与 SLA 阈值，开始后实时看 RPS、P95/P99 与状态码分布；结束后报告自动入库，可导出 JSON / HTML / Excel。
+
+---
+
+## 脚本与加密示例
+
+脚本沙箱是同步 JavaScript，可用对象：`request`、`response`（仅后置）、`vars`、`env`、`console`、`rsa`、`cipher`；后置脚本另有 `test(name, fn)` 与 `assert(条件, 提示)`。
+
+### 前置脚本：生成签名
+
+```js
+// MD5 签名：appId + 时间戳 + 请求体 + 密钥
+var timestamp = String(Date.now())
+var raw = ['demo-app', timestamp, request.body, env.APP_SECRET].join('.')
+request.headers.timestamp = timestamp
+request.headers.sign = cipher.md5(raw)
+```
+
+```js
+// HMAC-SHA256 签名，Base64 输出
+var timestamp = String(Date.now())
+var sign = cipher.hmacSha256(env.APP_ID + '.' + timestamp, env.APP_SECRET, 'base64')
+request.headers.Authorization = 'HMAC ' + env.APP_ID + ':' + timestamp + ':' + sign
+```
+
+### 前置脚本：加密请求内容
+
+```js
+// AES/CBC/PKCS7（等价 Java 的 AES/CBC/PKCS5Padding），密钥与 IV 放环境变量
+var encrypted = cipher.aes.encrypt(request.body, env.AES_KEY, { iv: env.AES_IV })
+request.headers['Content-Type'] = 'text/plain'
+request.body = encrypted
+```
+
+```js
+// RSA 公钥加密，写入变量后在 Header 里用 {{authCode}} 引用
+var raw = env.APP_ID + '.' + env.USER_CODE + '.' + Date.now()
+vars.set('authCode', rsa.publicEncrypt(raw, env.PUBLIC_KEY))
+```
+
+```js
+// AES/ECB、3DES、Hex 输出、ZeroPadding 等按选项切换
+cipher.aes.encrypt(text, key, { mode: 'ecb' })
+cipher.aes.encrypt(text, key, { iv: iv, output: 'hex' })
+cipher.tripleDes.encrypt(text, key24, { iv: iv8 })
+cipher.des.encrypt(text, key8, { iv: iv8 })
+```
+
+### 前置脚本：直接改请求
+
+```js
+request.method = 'POST'
+request.params.page = '1'
+request.headers['X-Trace-Id'] = 'trace-' + Date.now()
+request.body = JSON.stringify({ id: Date.now(), name: 'fink' })
+```
+
+### 后置脚本：断言与取变量
+
+```js
+test('HTTP 200', () => assert(response.status === 200))
+test('业务码为 0', () => {
+  var data = response.json()
+  assert(data.code === 0, '实际业务码：' + data.code)
+})
+vars.set('accessToken', response.json().token) // 后续请求用 {{accessToken}}
+```
+
+```js
+// 解密服务端返回的密文
+var plain = cipher.aes.decrypt(response.body, env.AES_KEY, { iv: env.AES_IV })
+console.log('解密结果：' + plain)
+```
+
+> 加密约定：密钥长度必须精确（AES 16/24/32、DES 8、3DES 24 字节），长度不符会直接报错；密钥与 IV 也可用 `{ keyFormat: 'hex' }` / `{ ivFormat: 'base64' }` 指定格式。RSA 默认为 PKCS#1 v1.5 填充，与 Java 默认的 `Cipher.getInstance("RSA")` 一致。
 
 ---
 
@@ -276,12 +427,19 @@ macOS 没有安装向导，默认使用 `~/Library/Application Support/FinkMeter
 - 项目的新建、重命名、删除
 - 集合树（无限嵌套、子集合、改名、删除）
 - 请求编辑：方法、URL、Params、Headers、Body、前置/后置脚本字段；Postman 风格布局——面包屑导航、方法 / URL / 环境 / 发送按钮合一的请求栏、Tab 数量角标、JSON 一键格式化、响应 Pretty/Raw 切换与一键复制；左右双栏对照（左侧请求参数、右侧响应结果，Body 编辑器与响应区自适应撑满），底部运行历史固定保留
-- 脚本执行：发送前运行前置脚本（可读写 `request.method / url / headers / params / body`，用 `vars.set()` 生成变量并渲染进 URL、Header、Body），收到响应后运行后置脚本（`response.status / headers / body / json()`，`test(name, fn)` + `assert()` 断言，`vars` 提取变量供后续请求复用）；响应区「测试」页展示断言通过率、失败原因、控制台输出与运行时变量
+- 接口多标签页：同一项目内可像 Postman 一样同时打开最多 20 个接口，标签按项目记忆（重启后恢复），支持点击切换、中键 / 关闭按钮关闭、一键关闭全部；编辑内容自动保存（停止输入约 1 秒后写入，切换标签、关闭标签或离开页面时立即保存），无需手动点保存即可在接口间复制参数
+- 代码片段（Postman 式）：请求栏「代码」按钮打开右侧抽屉，可按 cURL / HTTP 原始报文 / JavaScript fetch / Python requests 四种格式查看并一键复制；环境变量按当前环境替换，敏感变量保持占位符，请求头缺少 Content-Type 时自动补齐
+- 自动更新：启动约 5 秒后静默查询 GitHub Release 最新版本，发现新版本弹窗展示发布说明与版本号，可一键下载对应平台安装包（Windows `setup.exe` / macOS `dmg`）并启动安装；设置页可手动检查、开关启动自动检查、打开发布页
+- 请求历史页：侧边栏「请求历史」集中查看最近发送记录（最新 500 条），支持按接口名 / URL / 方法 / 状态码搜索，展示总数、失败数与平均耗时，点击任意记录可直接跳回原接口继续编辑
+- 脚本执行：发送前运行前置脚本（可读写 `request.method / url / headers / params / body`，用 `vars.set()` 生成变量并渲染进 URL、Header、Body），收到响应后运行后置脚本（`response.status / headers / body / json()`，`test(name, fn)` + `assert()` 断言，`vars` 提取变量供后续请求复用）；脚本页内置「插入示例」，覆盖时间戳、MD5 / HMAC 签名、AES 加密、RSA 加密、断言与提取 Token 等常用写法；响应区「测试」页展示断言通过率、失败原因、控制台输出与运行时变量
+- 脚本加密能力：`cipher.aes / des / tripleDes`（CBC / ECB / CFB / OFB / CTR，PKCS7 / Zero / None 填充，支持 hex、base64 密钥与 IV）、`cipher.md5 / sha1 / sha256`、`cipher.hmacSha1 / hmacSha256`、`cipher.base64 / hex` 编解码，以及 `rsa.publicEncrypt`（PKCS#1 v1.5，兼容 Java 默认 RSA 加密）
 - 本地发送 HTTP 请求，展示状态码、耗时、大小、响应头、响应体
 - 响应体 JSON 自动格式化，超过 5MB 自动截断
 - 忽略证书校验开关、30 秒超时
-- 环境变量与 `{{变量}}` 替换
-- 内置变量函数：`{{timestamp}}`、`{{uuid}}`、`{{randomInt(a,b)}}`、`{{randomString(n)}}`
+- 环境变量与 `{{变量}}` 替换，优先级：运行时变量（脚本 `vars.set`）> 环境变量 > 内置变量
+- 内置时间变量：`{{timestamp}}`（毫秒）、`{{timestampSec}}`、`{{isoTime}}`、`{{datetime}}`、`{{date}}`、`{{time}}`、`{{yyyyMMdd}}`、`{{yyyyMMddHHmmss}}`，同时兼容 Postman 的 `{{$timestamp}}` 写法
+- 内置随机变量：`{{uuid}}`、`{{uuidNoDash}}`、`{{randomInt(1,100)}}`、`{{randomFloat(1,10,2)}}`、`{{randomString(8)}}`、`{{randomString(8, hex)}}`、`{{randomHex(16)}}`、`{{randomNumber(6)}}`、`{{randomBool}}`、`{{randomEmail}}`、`{{randomPhone}}`、`{{randomIPv4}}`
+- 环境脚本：每个环境可编写一段每次请求前执行的脚本，用 `vars.set('key', value)` 生成运行时变量（如签名、traceId、nonce），请求里用 `{{key}}` 引用；脚本运行日志会并入请求编辑器的「脚本」页
 - 请求历史（本地保留最近 5000 条）
 - 本地压测引擎：固定并发与阶梯加压两种模式，支持并发数、压测时长、Ramp-Up 预热、思考时间、连接超时、请求超时、跟随重定向、忽略证书、目标 RPS 限速与错误率自动停止
 - 压测配置入口：点击侧边栏「压测」或页面「新建压测」，弹窗内先选项目、环境，再选接口，后按 JMeter 线程组风格分组填写参数（线程组 / HTTP 请求默认值 / 流量与节奏 / 自动停止 / SLA 验收），一步完成配置并开始压测；也可从请求编辑器直接带入配置
@@ -299,15 +457,16 @@ macOS 没有安装向导，默认使用 `~/Library/Application Support/FinkMeter
 - 单接口运行历史：每次发送自动记录请求参数（Params / Headers / Body）、响应状态、响应头、响应体与耗时，在编辑器底部展开查看，每个接口保留最近 50 条并可一键清空
 - 完整删除能力：项目、集合、请求（列表与编辑器内均可删）、环境与变量、压测报告均支持删除，请求历史支持一键清空，删除前统一二次确认
 - 常用请求头预设：请求编辑器内置 Postman 风格分组下拉（常用/认证/内容协商/客户端信息/条件请求），选中即追加，同名自动覆盖
-- 项目一键导出/导入：导出为 `*.finkmeter.json`，包含嵌套集合、全部请求与环境变量，导入后自动生成新项目
-- 工具箱（参考 tool.aiapaas.com，目录式布局，共 8 大分类 72 个工具，支持关键词全局搜索与懒加载）
+- 项目 JSON 导出/导入（迁移用）：项目页顶部或工作台项目卡片菜单可一键导出为 `*.finkmeter.json`，包含项目信息、嵌套集合、全部请求（含请求头、参数、Body、脚本、断言）与环境变量；在工作台「导入项目 → 导入项目 JSON」选择文件即可复原为新项目，项目重名时自动追加「（导入）」后缀
+- 工具箱（参考 tool.aiapaas.com，目录式布局，共 9 大分类 75 个工具，支持关键词全局搜索与懒加载）
   - JSON 工具（18）：JSON 格式化 / 压缩 / 校验 / 转义（树形与文本双视图、行号与字符统计、报错行列定位）、JSON → Java / C# / Go / TypeScript 实体类、SQL CREATE TABLE → Java 实体类、JSON ↔ YAML / XML / CSV / GET 查询参数、JSON → SQL（逐条 / 批量 INSERT，标识符与字符串自动转义）、JSON → Markdown 表格、JSON ↔ JSON Lines（转换出错定位行号）
   - 格式化转换（1）：HTML / XML / CSS / JavaScript / Java / C# / Go / PHP / C / SQL 代码美化与压缩（可调缩进，JS 注释与正则字面量安全）
   - 加密编码（15）：MD5 / SHA-1 / SHA-256 / SHA-512 / HMAC 哈希、AES-256-CBC 加解密、JWT 解码（过期状态与声明解析）与 JWT 签发（HS256 / HS512，自动写入 iat / exp）、Base64 / Base64URL、Base32、十六进制编解码（大小写与 0x 前缀）、字符串转义还原、URL 编解码、Unicode 转义、HTML 实体、ASCII 码转换、RC4、Gzip 压缩、CRC32 / CRC16 / Luhn 校验
-  - 文本处理（12）：命名风格转换（10 种）、文本统计、行去重、批量替换、文本反转、全角半角互转、人民币金额大写、摩尔斯电码、文本对比（行级 LCS 差异高亮）、内容提取（邮箱 / URL / IPv4 / 手机号 / 数字 / UUID / 中文）、行处理（清理 / 去重 / 排序 / 反转 / 行号 / 合并）、MAC 地址格式化与随机生成
+  - 文本处理（13）：命名风格转换（10 种）、文本统计、行去重、批量替换、文本反转、全角半角互转、人民币金额大写、摩尔斯电码、文本对比（行级 LCS 差异高亮）、内容提取（邮箱 / URL / IPv4 / 手机号 / 数字 / UUID / 中文）、行处理（清理 / 去重 / 排序 / 反转 / 行号 / 合并）、MAC 地址格式化与随机生成、文本一键处理（清空 / 撤销 / 重做 / 复制、随机密码、去空行空格、大小写、去重取重、排序、SQL IN（按换行或逗号拆分，所有值自动加单引号，输出 `IN(...);`）、or / 逗号 / 自定义符号连接、列转行、表格转 Markdown 或 HTML、自动与指定符号转置、多表连接、格式化 JSON、MyBatis 日志提取 SQL）
   - 计算换算（10）：进制转换（2/8/10/16/32/36）、单位换算（长度/重量/面积/体积/速度/数据/时间/温度）、颜色转换（HEX/RGB/HSL/HSV/CMYK + WCAG 对比度）、时间戳互转、日期计算（相差天数 / 工作日 / 日期加减）、px 与 rem 换算、密码生成、UUID v4、随机字符串、键盘按键码
   - 开发辅助（4）：MyBatis 动态 SQL 填充（if / where / set / trim / foreach / choose / bind，支持 `#{}` 与 `${}` 渲染、占位符模式、参数清单）与 MyBatis 日志回填（解析 `Preparing` / `Parameters` / `Total`，按类型还原字面量 SQL，支持多语句切换与 Mapper 来源信息）、正则表达式测试（分组、命名分组、高亮预览）、Cron 表达式解析（字段含义 + 未来执行时间）、雪花 ID 解析（时间 / 数据中心 / 工作节点 / 序列号）
   - 网络工具（5）：IP 查询（支持本机公网 IP 与任意指定 IP 的归属地、运营商、经纬度）、IPv4 子网计算（掩码/广播/可用范围/主机数/分类）、IP 与整数互转、URL 解析（协议 / 主机 / 端口 / 路径 / 查询参数）、常用端口速查
+  - 二维码（2）：二维码生成（文本/网址、WiFi、名片、电话、短信、邮件、定位七类内容，可调尺寸、留白、容错级别、前景背景色、码点与定位点样式、Logo，导出 PNG/SVG）、二维码识别（上传或拖入图片，本机解析内容并识别 WiFi、名片、邮件、链接等类型）
   - 查询手册（7）：ASCII 码表、HTTP 状态码、MIME 类型、常用请求头、Git 命令速查、Docker 命令速查、正则语法速查
 - 系统监视（Windows / macOS）：CPU 每核心占用与频率、内存/交换区、磁盘容量与读写速率、网络接口上下行速率与累计流量、电池状态、运行时长与系统信息；GPU 利用率在 Windows 下通过 PDH 采集，其他平台自动隐藏
 - 本机 IP 展示：Windows 走 Win32 `GetAdaptersAddresses`，macOS / Linux 走 `getifaddrs` + 系统路由表，采集全部网卡的 IPv4/IPv6 地址、MAC 与默认网关，主 IP 卡片支持一键复制，网卡列表与系统信息同步展示
@@ -380,11 +539,13 @@ Windows: %APPDATA%\FinkMeter\finkmeter.db
 macOS:   ~/Library/Application Support/FinkMeter/finkmeter.db
 ```
 
-**6. macOS 提示「无法打开，因为无法验证开发者」**
+**6. macOS 提示「无法打开，因为无法验证开发者」或「未打开 FinkMeter.app」**
 
-安装包未签名、未公证，用以下任一方式放行：
+安装包未签名、未公证，属于 Gatekeeper 的正常拦截。**不要点「移到废纸篓」**，用以下任一方式放行：
 
+- 使用 Release 附件里的 `install-macos.sh`（自动下载、安装并移除隔离属性）：`bash install-macos.sh`
 - 右键点击 `FinkMeter.app` → 打开 → 再次点击「打开」
+- 打开「系统设置 → 隐私与安全性」，拉到最下方点击「仍要打开」
 - 终端执行 `xattr -dr com.apple.quarantine /Applications/FinkMeter.app`
 
 **7. macOS 构建报缺少 SDK / linker**

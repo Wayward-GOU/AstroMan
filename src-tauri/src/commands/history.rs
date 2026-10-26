@@ -14,8 +14,12 @@ pub fn history_list(
     let conn = state.pool.get().map_err(err)?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, request_id, request_name, method, url, status_code, duration_ms, created_at
-             FROM request_history ORDER BY id DESC LIMIT ?1",
+            "SELECT h.id, h.request_id, c.project_id, h.request_name, h.method, h.url,
+                    h.status_code, h.duration_ms, h.created_at
+             FROM request_history h
+             LEFT JOIN requests r ON r.id = h.request_id
+             LEFT JOIN collections c ON c.id = r.collection_id
+             ORDER BY h.id DESC LIMIT ?1",
         )
         .map_err(err)?;
     let rows = stmt
@@ -23,12 +27,13 @@ pub fn history_list(
             Ok(HistoryItem {
                 id: row.get(0)?,
                 request_id: row.get(1)?,
-                request_name: row.get(2)?,
-                method: row.get(3).unwrap_or_default(),
-                url: row.get(4).unwrap_or_default(),
-                status_code: row.get(5)?,
-                duration_ms: row.get(6)?,
-                created_at: row.get(7)?,
+                project_id: row.get(2)?,
+                request_name: row.get(3)?,
+                method: row.get(4).unwrap_or_default(),
+                url: row.get(5).unwrap_or_default(),
+                status_code: row.get(6)?,
+                duration_ms: row.get(7)?,
+                created_at: row.get(8)?,
             })
         })
         .map_err(err)?;

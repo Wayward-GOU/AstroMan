@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from 'vue'
 import { message } from 'ant-design-vue'
 import { CopyOutlined } from '@ant-design/icons-vue'
 import * as api from '@/api'
+import { formatDateTime } from '@/utils/datetime'
 import type { IpLookupInfo } from '@/types/models'
 
 const presets = ['8.8.8.8', '1.1.1.1', '114.114.114.114', '223.5.5.5']
@@ -42,7 +43,7 @@ async function query() {
   try {
     info.value = await api.ipLookup(target)
     queriedTarget.value = target
-    queriedAt.value = new Date().toLocaleTimeString('zh-CN', { hour12: false })
+    queriedAt.value = formatDateTime(new Date())
   } catch (e) {
     info.value = null
     error.value = typeof e === 'string' ? e : String(e)

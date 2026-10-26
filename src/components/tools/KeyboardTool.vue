@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { KEY_CODES, type KeyCodeItem } from '@/tools/calc'
+import { formatDateTime } from '@/utils/datetime'
 
 interface KeyEventInfo {
   key: string
@@ -39,7 +40,7 @@ function onKeydown(event: KeyboardEvent) {
     ]
       .filter(Boolean)
       .join(' + ') || '无',
-    time: new Date().toLocaleTimeString('zh-CN'),
+    time: formatDateTime(new Date()),
   }
   current.value = info
   history.value = [info, ...history.value].slice(0, 10)

@@ -9,6 +9,7 @@ import {
   FontColorsOutlined,
   GlobalOutlined,
   LockOutlined,
+  QrcodeOutlined,
   SearchOutlined,
   ToolOutlined,
 } from '@ant-design/icons-vue'
@@ -45,6 +46,7 @@ const CATEGORY_ICONS: Record<ToolCategoryId, Component> = {
   calc: CalculatorOutlined,
   dev: ToolOutlined,
   network: GlobalOutlined,
+  qr: QrcodeOutlined,
   reference: BookOutlined,
 }
 

@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS environments (
     project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     name        TEXT NOT NULL,
     is_active   INTEGER DEFAULT 0,
+    script      TEXT,
     created_at  INTEGER NOT NULL
 );
 

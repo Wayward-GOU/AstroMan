@@ -1,5 +1,7 @@
 /* 开发辅助：Cron 表达式解析、雪花 ID 解析 */
 
+import { formatDateTime } from '@/utils/datetime'
+
 /* ---------------- Cron 解析 ---------------- */
 
 const CRON_LABELS = ['分钟', '小时', '日', '月', '星期']
@@ -160,17 +162,14 @@ export function snowflakeInfo(input: string, epoch = '2010-11-04 16:35:00', work
 
   const date = new Date(timestamp)
   if (Number.isNaN(date.getTime())) throw new Error('时间戳超出有效范围')
-  const pad = (number: number) => String(number).padStart(2, '0')
-  const local =
-    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ` +
-    `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${pad(date.getMilliseconds())}`
+  const local = formatDateTime(date)
 
   const lines = [
     `雪花 ID：${raw}`,
     `生成时间：${local}`,
     `毫秒时间戳：${timestamp}`,
     `距起始时间偏移：${timestamp - base} ms`,
-    `起始时间：${new Date(base).toLocaleString('zh-CN')}`,
+    `起始时间：${formatDateTime(base)}`,
   ]
   if (datacenterBits) lines.push(`数据中心 ID（${datacenterBits} 位）：${datacenter}`)
   lines.push(`工作节点 ID（${workerIdBits} 位）：${workerId}`)

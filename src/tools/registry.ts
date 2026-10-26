@@ -65,6 +65,7 @@ export const TOOL_CATEGORIES: ToolCategory[] = [
   { id: 'calc', name: '计算换算', hint: '进制、单位、颜色、时间戳' },
   { id: 'dev', name: '开发辅助', hint: 'MyBatis、正则、随机数据' },
   { id: 'network', name: '网络工具', hint: 'IP、子网、端口' },
+  { id: 'qr', name: '二维码', hint: '生成美化、扫码识别' },
   { id: 'reference', name: '查询手册', hint: 'ASCII、状态码、MIME' },
 ]
 
@@ -1228,6 +1229,47 @@ export const TOOLS: ToolDef[] = [
     },
   },
 
+  {
+    id: 'text-toolbox',
+    name: '文本一键处理',
+    category: 'text',
+    desc:
+      '清空与撤销、随机密码、去空行空格、大小写、去重取重、排序、SQL IN、or/逗号/自定义符号连接、' +
+      '列转行、表格转 Markdown 或 HTML、转置、多表拼接、格式化 JSON、MyBatis 提取 SQL',
+    keywords: [
+      '文本',
+      '一键',
+      '清空',
+      '复制',
+      '撤销',
+      '还原',
+      '密码',
+      '空行',
+      '空格',
+      '大写',
+      '小写',
+      '去重',
+      '重复',
+      '翻转',
+      '排序',
+      'or',
+      'sql in',
+      '逗号',
+      '分隔',
+      '连接',
+      '列转行',
+      'markdown',
+      'urlencode',
+      '转置',
+      'json',
+      '多表',
+      'join',
+      'html',
+      'mybatis',
+    ],
+    component: () => import('@/components/tools/TextToolbox.vue'),
+  },
+
   /* ---------------- 计算换算 ---------------- */
   {
     id: 'base-convert',
@@ -1574,6 +1616,44 @@ export const TOOLS: ToolDef[] = [
     keywords: ['端口', 'port', '服务'],
     component: () => import('@/components/tools/ReferenceTables.vue'),
     props: { kind: 'ports' },
+  },
+
+  /* ---------------- 二维码 ---------------- */
+  {
+    id: 'qr-generate',
+    name: '二维码生成',
+    category: 'qr',
+    desc:
+      '文本 / 网址、WiFi、名片、电话、短信、邮件、定位七类内容；可调尺寸、留白、容错级别、' +
+      '前景背景色、码点与定位点样式、Logo；导出 PNG 或 SVG',
+    keywords: [
+      '二维码',
+      'qrcode',
+      'qr',
+      '生成',
+      'wifi',
+      '名片',
+      'vcard',
+      '电话',
+      '短信',
+      '邮件',
+      '定位',
+      'geo',
+      'logo',
+      'png',
+      'svg',
+    ],
+    component: () => import('@/components/tools/QrTool.vue'),
+    props: { mode: 'generate' },
+  },
+  {
+    id: 'qr-decode',
+    name: '二维码识别',
+    category: 'qr',
+    desc: '上传或拖入二维码图片，在本机解析内容并识别 WiFi、名片、邮件、链接等类型',
+    keywords: ['二维码', 'qr', '识别', '解析', '扫码', '解码', 'decode', '图片'],
+    component: () => import('@/components/tools/QrTool.vue'),
+    props: { mode: 'decode' },
   },
 
   /* ---------------- 参考手册 ---------------- */

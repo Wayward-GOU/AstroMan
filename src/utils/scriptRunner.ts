@@ -1,6 +1,8 @@
 import type { HttpResult } from '@/types/models'
+import { createCipher, type CipherFacade } from '@/utils/cryptoScript'
+import { rsaPublicEncrypt } from '@/utils/rsa'
 
-export type ScriptPhase = 'pre' | 'post'
+export type ScriptPhase = 'env' | 'pre' | 'post'
 export type ScriptLogLevel = 'log' | 'warn' | 'error'
 
 export interface ScriptLog {
@@ -52,6 +54,19 @@ interface ConsoleFacade {
   debug(...args: unknown[]): void
   warn(...args: unknown[]): void
   error(...args: unknown[]): void
+}
+
+interface RsaFacade {
+  /** 公钥加密（PKCS#1 v1.5），返回 Base64，等价于 Java 的 RSAUtils.publicEncrypt */
+  publicEncrypt(text: unknown, publicKey: unknown): string
+}
+
+function createRsa(): RsaFacade {
+  return {
+    publicEncrypt(text, publicKey) {
+      return rsaPublicEncrypt(String(text ?? ''), String(publicKey ?? ''))
+    },
+  }
 }
 
 export interface PreScriptResult {
@@ -176,6 +191,7 @@ export function runPreScript(
   code: string,
   request: ScriptRequest,
   env: Record<string, string>,
+  phase: ScriptPhase = 'pre',
 ): PreScriptResult {
   const logs: ScriptLog[] = []
   const started = performance.now()
@@ -185,13 +201,15 @@ export function runPreScript(
     params: { ...request.params },
   }
   try {
-    const runner = new Function('request', 'vars', 'env', 'console', `${code}\n`) as (
+    const runner = new Function('request', 'vars', 'env', 'console', 'rsa', 'cipher', `${code}\n`) as (
       r: ScriptRequest,
       v: VarsFacade,
       e: Record<string, string>,
       c: ConsoleFacade,
+      rsa: RsaFacade,
+      cipher: CipherFacade,
     ) => void
-    runner(target, createVars(env), { ...env }, createConsole('pre', logs))
+    runner(target, createVars(env), { ...env }, createConsole(phase, logs), createRsa(), createCipher())
     return { request: target, logs, durationMs: Math.round(performance.now() - started) }
   } catch (e) {
     return {
@@ -201,6 +219,15 @@ export function runPreScript(
       durationMs: Math.round(performance.now() - started),
     }
   }
+}
+
+/** 执行环境脚本：每次发送请求前运行，可用 vars.set() 为环境生成运行时变量 */
+export function runEnvScript(
+  code: string,
+  request: ScriptRequest,
+  env: Record<string, string>,
+): PreScriptResult {
+  return runPreScript(code, request, env, 'env')
 }
 
 /** 执行后置脚本：读取 response，用 test() / assert() 断言，并可用 vars.set() 提取变量 */
@@ -240,6 +267,8 @@ export function runPostScript(
       'vars',
       'env',
       'console',
+      'rsa',
+      'cipher',
       'test',
       'assert',
       `${code}\n`,
@@ -249,6 +278,8 @@ export function runPostScript(
       v: VarsFacade,
       e: Record<string, string>,
       c: ConsoleFacade,
+      rsa: RsaFacade,
+      cipher: CipherFacade,
       t: (name: unknown, fn: unknown) => void,
       a: (condition: unknown, message?: unknown) => void,
     ) => void
@@ -258,6 +289,8 @@ export function runPostScript(
       createVars(env),
       { ...env },
       createConsole('post', logs),
+      createRsa(),
+      createCipher(),
       test,
       assert,
     )

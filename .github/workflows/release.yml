@@ -92,7 +92,12 @@ jobs:
             - 修复 macOS 安装问题：ad-hoc 签名避免被判定为「已损坏」，通用包同时包含 Intel 与 Apple Silicon 切片并在 CI 校验，安装脚本增加架构检查与 Gatekeeper 放行指引
             - 修复项目导入导出遗漏环境脚本、旧库缺少脚本字段等问题
 
-            ### 1.0.3 补充（脚本加密与上手引导）
+            ### 1.0.4 更新（RSA 公钥解析修复）
+            - 修复脚本里使用 `rsa.publicEncrypt` 时报 `Failed to execute 'atob' on 'Window': The string to be decoded is not correctly encoded`
+            - 公钥解析自动容错：剥除 PEM 头尾、换行、空格、引号与字面量 `\n`，兼容 URL-safe Base64 和缺少尾部 `=` 的写法，复制粘贴即可用
+            - 非法公钥不再抛浏览器原生英文错误，改为可读提示：公钥为空 / 含非 Base64 字符 / Base64 长度不合法
+
+            ### 1.0.3 更新（脚本加密与上手引导）
             - 新增脚本加密能力：前置 / 环境 / 后置脚本均可使用 `cipher` 与 `rsa`
               - `cipher.aes / des / tripleDes`：CBC / ECB / CFB / OFB / CTR，PKCS7 / Zero / None 填充，支持 hex、Base64 格式的密钥与 IV
               - `cipher.md5 / sha1 / sha256`、`cipher.hmacSha1 / hmacSha256`、`cipher.base64 / hex` 编解码

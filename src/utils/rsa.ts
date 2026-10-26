@@ -13,12 +13,46 @@ interface DerNode {
 }
 
 function base64ToBytes(text: string): Uint8Array {
-  const binary = atob(text.replace(/\s/g, ''))
+  let binary: string
+  try {
+    binary = atob(text)
+  } catch {
+    throw new Error('RSA 公钥不是有效的 Base64 内容，请检查是否完整复制了公钥')
+  }
   const bytes = new Uint8Array(binary.length)
   for (let index = 0; index < binary.length; index += 1) {
     bytes[index] = binary.charCodeAt(index)
   }
   return bytes
+}
+
+/**
+ * 归一化公钥文本：去掉 PEM 头尾、空白、引号与转义换行，兼容 URL-safe Base64 与缺少尾部填充的情况。
+ * 直接在 atob 里跑非 Base64 内容会抛出浏览器原生错误（The string to be decoded is not correctly encoded），
+ * 这里先校验并给出可读的提示。
+ */
+function normalizePublicKeyBase64(publicKey: string): string {
+  let body = String(publicKey ?? '')
+    .replace(/-----(BEGIN|END)[^-]*-----/gi, '')
+    .replace(/\\[rnt]/g, '')
+    .replace(/[\s"']/g, '')
+    .replace(/-/g, '+')
+    .replace(/_/g, '/')
+  if (!body) throw new Error('RSA 公钥为空：请检查环境变量是否已填写，或是否引用了不存在的变量')
+
+  body = body.replace(/=+$/, '')
+
+  const invalid = body.match(/[^A-Za-z0-9+/]/)
+  if (invalid) {
+    throw new Error(
+      `RSA 公钥包含非 Base64 字符「${invalid[0]}」，请确认复制的是完整的公钥内容（不需要私钥）`,
+    )
+  }
+  if (body.includes('=')) throw new Error('RSA 公钥 Base64 填充位置异常，可能复制时中间丢失了字符')
+  const remainder = body.length % 4
+  if (remainder === 1) throw new Error('RSA 公钥 Base64 长度不合法，可能复制时缺失或多出了字符')
+  if (remainder) body += '='.repeat(4 - remainder)
+  return body
 }
 
 function bytesToBase64(bytes: Uint8Array): string {
@@ -67,11 +101,7 @@ interface RsaPublicKey {
 
 /** 支持 X.509 SubjectPublicKeyInfo（PEM / 纯 Base64）与 PKCS#1 RSAPublicKey 两种公钥格式 */
 function parsePublicKey(publicKey: string): RsaPublicKey {
-  const body = publicKey
-    .replace(/-----(BEGIN|END)[^-]*-----/g, '')
-    .replace(/\s+/g, '')
-  if (!body) throw new Error('请填写 RSA 公钥')
-  const der = base64ToBytes(body)
+  const der = base64ToBytes(normalizePublicKeyBase64(publicKey))
   const outer = readDerNode(der, 0)
   if (outer.tag !== 0x30) throw new Error('公钥不是合法的 DER 结构')
 

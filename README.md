@@ -39,14 +39,14 @@ macOS 首次打开若出现下面这个提示（按钮只有「完成 / 移到�
 仓库提供了 [scripts/install-macos.sh](scripts/install-macos.sh)，发布时由 [release.yml](.github/workflows/release.yml) 上传到 Release 附件，一条命令完成下载、架构校验、安装、清除隔离属性、ad-hoc 签名与启动：
 
 ```bash
-curl -fLO https://github.com/Wayward-GOU/FinkMeter/releases/download/v1.0.3/install-macos.sh
-bash install-macos.sh v1.0.3
+curl -fLO https://github.com/Wayward-GOU/FinkMeter/releases/latest/download/install-macos.sh
+bash install-macos.sh v1.0.4
 ```
 
 不带参数执行时安装最新正式版。仓库若为私有，需要先提供 Token：
 
 ```bash
-GITHUB_TOKEN=ghp_xxx bash install-macos.sh v1.0.3
+GITHUB_TOKEN=ghp_xxx bash install-macos.sh v1.0.4
 ```
 
 **方式二：手动安装**

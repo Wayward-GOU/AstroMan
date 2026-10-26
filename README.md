@@ -282,6 +282,7 @@ GITHUB_TOKEN=ghp_xxx bash install-macos.sh v1.0.0
 - 项目的新建、重命名、删除
 - 集合树（无限嵌套、子集合、改名、删除）
 - 请求编辑：方法、URL、Params、Headers、Body、前置/后置脚本字段；Postman 风格布局——面包屑导航、方法 / URL / 环境 / 发送按钮合一的请求栏、Tab 数量角标、JSON 一键格式化、响应 Pretty/Raw 切换与一键复制；左右双栏对照（左侧请求参数、右侧响应结果，Body 编辑器与响应区自适应撑满），底部运行历史固定保留
+- 接口多标签页：同一项目内可像 Postman 一样同时打开最多 20 个接口，标签按项目记忆（重启后恢复），支持点击切换、中键 / 关闭按钮关闭、一键关闭全部；编辑内容自动保存（停止输入约 1 秒后写入，切换标签、关闭标签或离开页面时立即保存），无需手动点保存即可在接口间复制参数
 - 脚本执行：发送前运行前置脚本（可读写 `request.method / url / headers / params / body`，用 `vars.set()` 生成变量并渲染进 URL、Header、Body），收到响应后运行后置脚本（`response.status / headers / body / json()`，`test(name, fn)` + `assert()` 断言，`vars` 提取变量供后续请求复用）；响应区「测试」页展示断言通过率、失败原因、控制台输出与运行时变量
 - 本地发送 HTTP 请求，展示状态码、耗时、大小、响应头、响应体
 - 响应体 JSON 自动格式化，超过 5MB 自动截断

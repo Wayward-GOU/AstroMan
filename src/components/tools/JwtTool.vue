@@ -4,6 +4,7 @@ import { message } from 'ant-design-vue'
 import { CopyOutlined, DeleteOutlined } from '@ant-design/icons-vue'
 import CodeArea from '@/components/CodeArea.vue'
 import { decodeJwt, type JwtParts } from '@/tools/crypto'
+import { formatDateTime } from '@/utils/datetime'
 
 const token = ref('')
 const error = ref('')
@@ -27,7 +28,7 @@ const claims = computed(() => {
     const formatTime = (value: unknown) => {
       if (typeof value !== 'number') return ''
       const date = new Date(value * 1000)
-      return `${date.toLocaleString('zh-CN')}（${value}）`
+      return `${formatDateTime(date)}（${value}）`
     }
     if (payload.iat !== undefined) rows.push({ key: 'iat 签发时间', value: formatTime(payload.iat) })
     if (payload.nbf !== undefined) rows.push({ key: 'nbf 生效时间', value: formatTime(payload.nbf) })

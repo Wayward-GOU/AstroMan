@@ -18,6 +18,7 @@ import {
 import PageHeader from '@/components/PageHeader.vue'
 import * as api from '@/api'
 import { themes, currentThemeId, setTheme } from '@/stores/theme'
+import { openDirLabel, platformLabel, shortcutText } from '@/utils/platform'
 import type { AppInfo, StorageInfo } from '@/types/models'
 
 const info = ref<AppInfo | null>(null)
@@ -248,7 +249,7 @@ async function restartApp() {
             </a-button>
             <a-button :disabled="!storage?.dataDir" @click="openStorageDir(storage?.dataDir)">
               <template #icon><FolderOpenOutlined /></template>
-              打开目录
+              {{ openDirLabel }}
             </a-button>
             <a-button :disabled="!storage?.isCustom && !storage?.pendingDir" @click="resetStorage">
               <template #icon><ReloadOutlined /></template>
@@ -281,6 +282,10 @@ async function restartApp() {
           <div class="row">
             <span class="label">运行模式</span>
             <span class="value">纯本地桌面应用（Tauri）</span>
+          </div>
+          <div class="row">
+            <span class="label">运行系统</span>
+            <span class="value">{{ platformLabel }}</span>
           </div>
           <div class="row">
             <span class="label">数据目录</span>
@@ -346,6 +351,9 @@ async function restartApp() {
           <div class="shortcut"><span class="keys"><kbd>Enter</kbd></span><span>在 URL 输入框直接发送请求</span></div>
           <div class="shortcut"><span class="keys"><kbd v-pre>{{base_url}}</kbd></span><span>在 URL / Headers / Body 中引用环境变量</span></div>
           <div class="shortcut"><span class="keys"><kbd v-pre>{{randomInt(1,100)}}</kbd></span><span>生成范围内的随机整数，用于造测试数据</span></div>
+          <div class="shortcut"><span class="keys"><kbd>{{ shortcutText('+') }}</kbd></span><span>放大界面（也可使用左下角的缩放控件）</span></div>
+          <div class="shortcut"><span class="keys"><kbd>{{ shortcutText('-') }}</kbd></span><span>缩小界面</span></div>
+          <div class="shortcut"><span class="keys"><kbd>{{ shortcutText('0') }}</kbd></span><span>恢复界面缩放为 100%</span></div>
           <div class="shortcut"><span class="keys"><kbd>停止</kbd></span><span>压测中可随时停止，数据仍会保存成报告</span></div>
         </div>
       </div>

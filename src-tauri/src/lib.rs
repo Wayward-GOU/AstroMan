@@ -57,6 +57,7 @@ pub fn run() {
             commands::curl::curl_parse,
             commands::transfer::project_export,
             commands::transfer::project_import,
+            commands::importer::api_import,
             commands::tools::tool_hash,
             commands::tools::tool_hmac,
             commands::tools::ip_lookup,

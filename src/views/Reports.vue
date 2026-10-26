@@ -10,6 +10,7 @@ import {
   ClockCircleOutlined,
 } from '@ant-design/icons-vue'
 import PageHeader from '@/components/PageHeader.vue'
+import { formatDateTime } from '@/utils/datetime'
 import * as api from '@/api'
 import type { StressReport } from '@/types/models'
 
@@ -39,9 +40,7 @@ const stats = computed(() => {
 })
 
 function fmtTime(ts: number) {
-  const d = new Date(ts)
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+  return formatDateTime(ts)
 }
 
 function fmtNum(v: number, digits = 1) {

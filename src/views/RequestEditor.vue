@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { computed, onMounted, ref, watch } from 'vue'
+import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
 import {
   ArrowLeftOutlined,
@@ -8,16 +8,20 @@ import {
   SendOutlined,
   SaveOutlined,
   DeleteOutlined,
+  CloseOutlined,
 } from '@ant-design/icons-vue'
 import KeyValueEditor from '@/components/KeyValueEditor.vue'
 import CodeArea from '@/components/CodeArea.vue'
 import { useProjectStore } from '@/stores/project'
+import { MAX_REQUEST_TABS, useTabsStore } from '@/stores/tabs'
+import { formatDateTime } from '@/utils/datetime'
 import * as api from '@/api'
 import type {
   HttpRequestDetail,
   HttpResult,
   KeyValueItem,
   RequestRun,
+  RequestSearchHit,
   SendRequestPayload,
 } from '@/types/models'
 import {
@@ -34,6 +38,7 @@ import {
 const route = useRoute()
 const router = useRouter()
 const store = useProjectStore()
+const tabStore = useTabsStore()
 
 const requestId = computed(() => Number(route.params.id))
 const projectId = computed(() => Number(route.query.projectId || 0))
@@ -60,6 +65,37 @@ const activeTab = ref('params')
 const responseTab = ref('body')
 const insecure = ref(false)
 const envId = ref<number | null>(null)
+
+/* ---------- 自动保存 ---------- */
+const autoState = ref<'saved' | 'dirty' | 'saving' | 'error'>('saved')
+let hydrating = true
+let lastSaved = ''
+let saveTimer: number | undefined
+let saveQueue: Promise<boolean> = Promise.resolve(true)
+
+function syncTabMeta() {
+  if (!form.value.id) return
+  tabStore.touch(form.value.id, form.value.name.trim() || '未命名请求', form.value.method)
+}
+
+function scheduleAutoSave() {
+  if (saveTimer) window.clearTimeout(saveTimer)
+  saveTimer = window.setTimeout(() => {
+    saveTimer = undefined
+    void save(false)
+  }, 900)
+}
+
+watch(
+  form,
+  () => {
+    if (hydrating || !form.value.id) return
+    autoState.value = 'dirty'
+    syncTabMeta()
+    scheduleAutoSave()
+  },
+  { deep: true },
+)
 
 /* ---------- 脚本执行结果 ---------- */
 const scriptLogs = ref<ScriptLog[]>([])
@@ -184,6 +220,60 @@ function applyHeaderPreset(id: number) {
   message.success(`已加入 ${preset.key}`)
 }
 
+async function loadRequest(id: number) {
+  if (!id) {
+    loading.value = false
+    return
+  }
+  loading.value = true
+  hydrating = true
+  try {
+    const detail = await api.requestGet(id)
+    form.value = detail
+    lastSaved = JSON.stringify(detail)
+    autoState.value = 'saved'
+    tabStore.ensureProject(projectId.value)
+    const opened = tabStore.open({
+      id,
+      name: detail.name || '未命名请求',
+      method: detail.method,
+    })
+    if (!opened) {
+      message.warning(`最多同时打开 ${MAX_REQUEST_TABS} 个接口，请先关闭部分标签`)
+    }
+    await loadRuns()
+  } catch (e) {
+    tabStore.close(id)
+    message.error(String(e))
+  } finally {
+    loading.value = false
+    hydrating = false
+  }
+}
+
+/* ---------- 快速切换到本项目其他接口 ---------- */
+const quickOptions = ref<RequestSearchHit[]>([])
+const quickValue = ref<number | undefined>(undefined)
+
+async function loadQuickOptions() {
+  if (!projectId.value) return
+  try {
+    quickOptions.value = await api.requestOptions(projectId.value)
+  } catch {
+    quickOptions.value = []
+  }
+}
+
+function quickOpen(value: number) {
+  quickValue.value = undefined
+  if (value === requestId.value) return
+  if (!tabStore.canOpen(value)) {
+    message.warning(`最多同时打开 ${MAX_REQUEST_TABS} 个接口，请先关闭部分标签`)
+    return
+  }
+  switchTab(value)
+}
+
 onMounted(async () => {
   try {
     if (projectId.value && !store.environments.length) {
@@ -191,28 +281,106 @@ onMounted(async () => {
     }
     const active = store.environments.find((e) => e.isActive) ?? store.environments[0]
     envId.value = active?.id ?? null
-    form.value = await api.requestGet(requestId.value)
-    await loadRuns()
   } catch (e) {
     message.error(String(e))
-  } finally {
-    loading.value = false
   }
+  await loadRequest(requestId.value)
+  await loadQuickOptions()
 })
 
-async function save(showToast = true): Promise<boolean> {
+watch(requestId, async (id, previous) => {
+  if (!id || id === previous) return
+  await flushSave()
+  await loadRequest(id)
+})
+
+onBeforeRouteLeave(async () => {
+  await flushSave()
+})
+
+async function flushSave(): Promise<boolean> {
+  if (saveTimer) {
+    window.clearTimeout(saveTimer)
+    saveTimer = undefined
+  }
+  return save(false)
+}
+
+async function persist(showToast: boolean): Promise<boolean> {
+  if (!form.value.id) return true
+  const payload = JSON.parse(JSON.stringify(form.value)) as HttpRequestDetail
+  const snapshot = JSON.stringify(payload)
+  if (!showToast && snapshot === lastSaved) {
+    autoState.value = 'saved'
+    return true
+  }
   saving.value = true
+  autoState.value = 'saving'
   try {
-    const saved = await api.requestSave(form.value)
-    form.value = saved
+    await api.requestSave(payload)
+    lastSaved = snapshot
+    if (JSON.stringify(form.value) === snapshot) {
+      autoState.value = 'saved'
+    } else {
+      autoState.value = 'dirty'
+      scheduleAutoSave()
+    }
+    syncTabMeta()
     if (showToast) message.success('已保存')
     return true
   } catch (e) {
+    autoState.value = 'error'
     message.error(String(e))
     return false
   } finally {
     saving.value = false
   }
+}
+
+function save(showToast = true): Promise<boolean> {
+  if (!form.value.id) return Promise.resolve(true)
+  saveQueue = saveQueue.then(
+    () => persist(showToast),
+    () => persist(showToast),
+  )
+  return saveQueue
+}
+
+async function goBack() {
+  await flushSave()
+  router.push(`/project/${projectId.value}`)
+}
+
+async function switchTab(id: number) {
+  if (id === requestId.value) return
+  await flushSave()
+  router.push({
+    name: 'request',
+    params: { id },
+    query: projectId.value ? { projectId: projectId.value } : {},
+  })
+}
+
+async function closeTab(id: number) {
+  const isActive = id === requestId.value
+  const next = tabStore.close(id)
+  if (!isActive) return
+  await flushSave()
+  if (next) {
+    router.push({
+      name: 'request',
+      params: { id: next },
+      query: projectId.value ? { projectId: projectId.value } : {},
+    })
+  } else {
+    router.push(`/project/${projectId.value}`)
+  }
+}
+
+async function closeAllTabs() {
+  await flushSave()
+  tabStore.closeAll()
+  router.push(`/project/${projectId.value}`)
 }
 
 function deleteRequest() {
@@ -226,8 +394,19 @@ function deleteRequest() {
     cancelText: '取消',
     async onOk() {
       await api.requestDelete(id)
+      form.value.id = undefined
+      tabStore.close(id)
       message.success('已删除请求')
-      router.push(projectId.value ? `/project/${projectId.value}` : '/')
+      const next = tabStore.activeId
+      if (next) {
+        router.push({
+          name: 'request',
+          params: { id: next },
+          query: projectId.value ? { projectId: projectId.value } : {},
+        })
+      } else {
+        router.push(projectId.value ? `/project/${projectId.value}` : '/')
+      }
     },
   })
 }
@@ -334,9 +513,7 @@ function runStatusColor(status: number) {
 }
 
 function fmtRunTime(ts: number) {
-  const d = new Date(ts)
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+  return formatDateTime(ts)
 }
 
 function runHeaders(run: RequestRun) {
@@ -439,7 +616,7 @@ const responseHeaders = computed(() => {
     <div class="editor-page">
       <div class="topbar">
         <div class="left">
-          <a-button type="text" size="small" class="back-btn" @click="router.push(`/project/${projectId}`)">
+          <a-button type="text" size="small" class="back-btn" @click="goBack">
             <template #icon><ArrowLeftOutlined /></template>
             返回
           </a-button>
@@ -449,7 +626,13 @@ const responseHeaders = computed(() => {
             <span class="crumb-sep">/</span>
             <a-input v-model:value="form.name" class="name-input" placeholder="请求名称" />
           </span>
-          <span class="saved-hint">{{ form.id ? `#${form.id}` : '未保存' }}</span>
+          <span class="saved-hint" :class="`is-${autoState}`">
+            <template v-if="autoState === 'saving'">保存中…</template>
+            <template v-else-if="autoState === 'dirty'">待自动保存</template>
+            <template v-else-if="autoState === 'error'">保存失败</template>
+            <template v-else>已自动保存</template>
+            <template v-if="form.id"> · #{{ form.id }}</template>
+          </span>
         </div>
         <div class="right">
           <a-checkbox v-model:checked="insecure" class="insecure">忽略证书校验</a-checkbox>
@@ -464,6 +647,52 @@ const responseHeaders = computed(() => {
           <a-button class="stress-btn" @click="openStress">
             <template #icon><ThunderboltOutlined /></template>
             压测
+          </a-button>
+        </div>
+      </div>
+
+      <div class="tabs-bar">
+        <div class="tabs-scroll">
+          <div
+            v-for="tab in tabStore.tabs"
+            :key="tab.id"
+            class="req-tab"
+            :class="{ active: tab.id === requestId }"
+            :title="tab.name"
+            @click="switchTab(tab.id)"
+            @auxclick.middle.prevent="closeTab(tab.id)"
+          >
+            <span class="tab-method" :class="`m-${tab.method}`">{{ tab.method }}</span>
+            <span class="tab-name">{{ tab.name || '未命名请求' }}</span>
+            <span class="tab-close" @click.stop="closeTab(tab.id)">
+              <CloseOutlined />
+            </span>
+          </div>
+        </div>
+        <div class="tabs-tools">
+          <a-select
+            v-if="quickOptions.length"
+            v-model:value="quickValue"
+            class="quick-open"
+            size="small"
+            show-search
+            placeholder="打开其他接口"
+            :options="
+              quickOptions
+                .filter((item) => item.id !== requestId)
+                .map((item) => ({ value: item.id, label: `${item.method} ${item.name}` }))
+            "
+            :filter-option="
+              (input: string, option: any) =>
+                String(option?.label ?? '')
+                  .toLowerCase()
+                  .includes(input.toLowerCase())
+            "
+            @change="quickOpen"
+          />
+          <span class="tabs-count">{{ tabStore.tabs.length }} / {{ MAX_REQUEST_TABS }}</span>
+          <a-button v-if="tabStore.tabs.length > 1" type="text" size="small" @click="closeAllTabs">
+            关闭全部
           </a-button>
         </div>
       </div>
@@ -856,6 +1085,140 @@ const responseHeaders = computed(() => {
   gap: 10px;
 }
 
+.tabs-bar {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  height: 36px;
+  padding: 0 10px;
+  background: var(--fm-surface-alt);
+  border-bottom: 1px solid var(--fm-border);
+}
+
+.tabs-scroll {
+  display: flex;
+  align-items: stretch;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding-top: 5px;
+}
+
+.tabs-scroll::-webkit-scrollbar {
+  height: 4px;
+}
+
+.tabs-scroll::-webkit-scrollbar-thumb {
+  border: none;
+  border-radius: 4px;
+  background: var(--fm-border-strong);
+}
+
+.req-tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  min-width: 118px;
+  max-width: 220px;
+  padding: 0 8px 0 10px;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: 7px 7px 0 0;
+  color: var(--fm-muted);
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.req-tab:hover {
+  background: rgba(100, 116, 139, 0.08);
+  color: var(--fm-text-2);
+}
+
+.req-tab.active {
+  background: var(--fm-surface);
+  border-color: var(--fm-border);
+  color: var(--fm-text);
+  box-shadow: inset 0 1px 0 var(--fm-primary);
+}
+
+.tab-method {
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+  flex-shrink: 0;
+}
+
+.tab-method.m-GET {
+  color: var(--fm-success);
+}
+
+.tab-method.m-POST {
+  color: var(--fm-warning);
+}
+
+.tab-method.m-PUT {
+  color: var(--fm-primary);
+}
+
+.tab-method.m-PATCH {
+  color: var(--fm-purple);
+}
+
+.tab-method.m-DELETE {
+  color: var(--fm-danger);
+}
+
+.tab-method.m-HEAD,
+.tab-method.m-OPTIONS {
+  color: var(--fm-muted);
+}
+
+.tab-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tab-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  border-radius: 4px;
+  font-size: 10px;
+  color: var(--fm-muted);
+}
+
+.tab-close:hover {
+  background: rgba(100, 116, 139, 0.18);
+  color: var(--fm-danger);
+}
+
+.tabs-tools {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.tabs-count {
+  font-size: 10px;
+  color: var(--fm-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.quick-open {
+  width: 168px;
+}
+
 .back-btn {
   color: var(--fm-text-2);
 }
@@ -902,6 +1265,19 @@ const responseHeaders = computed(() => {
 .saved-hint {
   font-size: 10px;
   color: var(--fm-muted);
+  white-space: nowrap;
+}
+
+.saved-hint.is-dirty {
+  color: var(--fm-warning);
+}
+
+.saved-hint.is-saving {
+  color: var(--fm-primary);
+}
+
+.saved-hint.is-error {
+  color: var(--fm-danger);
 }
 
 .insecure {

@@ -11,6 +11,7 @@ import {
   FolderOpenOutlined,
   DatabaseOutlined,
   ImportOutlined,
+  DownOutlined,
   ToolOutlined,
   LineChartOutlined,
   FundProjectionScreenOutlined,
@@ -22,6 +23,7 @@ import {
   RocketOutlined,
 } from '@ant-design/icons-vue'
 import PageHeader from '@/components/PageHeader.vue'
+import { formatDateTime } from '@/utils/datetime'
 import { useProjectStore } from '@/stores/project'
 import * as api from '@/api'
 import type {
@@ -386,6 +388,34 @@ async function importProject() {
   }
 }
 
+const importingApi = ref(false)
+
+async function importApiProject() {
+  try {
+    const path = await open({
+      title: '导入 Postman / Apifox 数据',
+      multiple: false,
+      filters: [{ name: 'JSON 文件', extensions: ['json'] }],
+    })
+    if (!path) return
+    importingApi.value = true
+    const project = await api.apiImport(path, null)
+    await store.loadProjects()
+    refreshStats()
+    message.success(`已导入「${project.name}」`)
+    router.push(`/project/${project.id}`)
+  } catch (e) {
+    message.error(String(e))
+  } finally {
+    importingApi.value = false
+  }
+}
+
+function onImportMenu(info: { key: string | number }) {
+  if (info.key === 'finkmeter') importProject()
+  else if (info.key === 'api') importApiProject()
+}
+
 function clearHistory() {
   Modal.confirm({
     title: '清空全部请求历史？',
@@ -462,21 +492,7 @@ function fmtPercent(value: number) {
 }
 
 function fmtWhen(value?: number | null) {
-  if (!value) return '-'
-  const now = Date.now()
-  const diff = now - value
-  if (diff < 60_000) return '刚刚'
-  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`
-  const date = new Date(value)
-  const pad = (n: number) => String(n).padStart(2, '0')
-  const clock = `${pad(date.getHours())}:${pad(date.getMinutes())}`
-  const today = new Date(now)
-  if (date.toDateString() === today.toDateString()) return `今天 ${clock}`
-  const yesterday = new Date(now - 86_400_000)
-  if (date.toDateString() === yesterday.toDateString()) return `昨天 ${clock}`
-  const monthDay = `${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
-  if (date.getFullYear() === today.getFullYear()) return `${monthDay} ${clock}`
-  return `${date.getFullYear()}-${monthDay}`
+  return formatDateTime(value)
 }
 
 function reportRate(report: StressReport) {
@@ -500,10 +516,19 @@ function statusColor(code?: number | null) {
 <template>
   <div class="page dashboard">
     <PageHeader eyebrow="Workspace" title="工作台" :subtitle="headerSubtitle">
-      <a-button @click="importProject">
-        <template #icon><ImportOutlined /></template>
-        导入项目
-      </a-button>
+      <a-dropdown trigger="click">
+        <a-button :loading="importingApi">
+          <template #icon><ImportOutlined /></template>
+          导入项目
+          <DownOutlined style="font-size: 10px; margin-left: 4px" />
+        </a-button>
+        <template #overlay>
+          <a-menu @click="onImportMenu">
+            <a-menu-item key="finkmeter">FinkMeter 项目文件</a-menu-item>
+            <a-menu-item key="api">Postman / Apifox 数据</a-menu-item>
+          </a-menu>
+        </template>
+      </a-dropdown>
       <a-button @click="router.push('/stress')">
         <template #icon><ThunderboltOutlined /></template>
         发起压测
@@ -674,10 +699,11 @@ function statusColor(code?: number | null) {
           <div v-else class="fm-card panel-empty">
             <div class="empty-mark">📁</div>
             <div class="empty-title">还没有项目</div>
-            <div class="empty-desc">创建一个项目开始调试，或者导入已有的 FinkMeter 项目文件。</div>
+            <div class="empty-desc">创建一个项目开始调试，或者导入 FinkMeter 项目、Postman 集合或 Apifox 数据。</div>
             <div class="empty-actions">
               <a-button type="primary" @click="createOpen = true">新建项目</a-button>
               <a-button @click="importProject">导入项目</a-button>
+              <a-button @click="importApiProject">导入 Postman/Apifox</a-button>
             </div>
           </div>
         </a-spin>

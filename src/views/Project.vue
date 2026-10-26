@@ -2,7 +2,7 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
-import { save } from '@tauri-apps/plugin-dialog'
+import { open, save } from '@tauri-apps/plugin-dialog'
 import {
   ArrowLeftOutlined,
   PlusOutlined,
@@ -14,6 +14,8 @@ import {
   SearchOutlined,
 } from '@ant-design/icons-vue'
 import { useProjectStore } from '@/stores/project'
+import { MAX_REQUEST_TABS, useTabsStore } from '@/stores/tabs'
+import { formatDateTime } from '@/utils/datetime'
 import * as api from '@/api'
 import type { CollectionNode, RequestSearchHit, RequestSummary } from '@/types/models'
 
@@ -27,6 +29,7 @@ interface TreeNode {
 const route = useRoute()
 const router = useRouter()
 const store = useProjectStore()
+const tabs = useTabsStore()
 
 const projectId = computed(() => Number(route.params.id))
 const selectedKeys = ref<string[]>([])
@@ -100,6 +103,7 @@ function toTreeData(nodes: CollectionNode[]): TreeNode[] {
 const treeData = computed(() => toTreeData(store.tree))
 
 onMounted(async () => {
+  tabs.ensureProject(projectId.value)
   try {
     await store.openProject(projectId.value)
     store.syncActiveEnvironment()
@@ -197,14 +201,23 @@ async function addRequest(collection: CollectionNode) {
   try {
     const saved = await api.requestSave(payload)
     await loadRequests(collection.id)
-    router.push({ name: 'request', params: { id: saved.id }, query: { projectId: projectId.value } })
+    openRequestTab(saved.id!)
   } catch (e) {
     message.error(String(e))
   }
 }
 
+function openRequestTab(id: number) {
+  tabs.ensureProject(projectId.value)
+  if (!tabs.canOpen(id)) {
+    message.warning(`最多同时打开 ${MAX_REQUEST_TABS} 个接口，请先关闭部分标签`)
+    return
+  }
+  router.push({ name: 'request', params: { id }, query: { projectId: projectId.value } })
+}
+
 function openRequest(row: RequestSummary | RequestSearchHit) {
-  router.push({ name: 'request', params: { id: row.id }, query: { projectId: projectId.value } })
+  openRequestTab(row.id)
 }
 
 function deleteRequest(row: RequestSummary | RequestSearchHit) {
@@ -216,6 +229,8 @@ function deleteRequest(row: RequestSummary | RequestSearchHit) {
     cancelText: '取消',
     async onOk() {
       await api.requestDelete(row.id)
+      tabs.ensureProject(projectId.value)
+      tabs.close(row.id)
       message.success('已删除请求')
       if (searchMode.value) await runSearch()
       else if (selectedKeys.value.length) await loadRequests(Number(selectedKeys.value[0]))
@@ -288,7 +303,7 @@ async function submitCurl() {
     }
     await loadRequests(collectionId)
     message.success('已导入请求')
-    router.push({ name: 'request', params: { id: saved.id }, query: { projectId: projectId.value } })
+    openRequestTab(saved.id!)
   } catch (e) {
     message.error(String(e))
   } finally {
@@ -312,10 +327,37 @@ async function exportProject() {
   }
 }
 
+const importingApi = ref(false)
+
+async function importApiFile() {
+  try {
+    const path = await open({
+      title: '导入 Postman / Apifox 数据',
+      multiple: false,
+      filters: [{ name: 'JSON 文件', extensions: ['json'] }],
+    })
+    if (!path) return
+    importingApi.value = true
+    await api.apiImport(path, projectId.value)
+    await store.refreshTree(projectId.value)
+    await store.refreshEnvironments(projectId.value)
+    store.syncActiveEnvironment()
+    requests.value = []
+    selectedKeys.value = []
+    if (store.tree.length) {
+      selectedKeys.value = [String(store.tree[0].id)]
+      await loadRequests(store.tree[0].id)
+    }
+    message.success('接口已导入到当前项目')
+  } catch (e) {
+    message.error(String(e))
+  } finally {
+    importingApi.value = false
+  }
+}
+
 function fmtTime(ts: number) {
-  const d = new Date(ts)
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${d.getMonth() + 1}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+  return formatDateTime(ts)
 }
 
 const columns = computed(() =>
@@ -325,14 +367,14 @@ const columns = computed(() =>
         { title: '集合', dataIndex: 'collectionName', key: 'collectionName', width: 130, ellipsis: true },
         { title: '方法', dataIndex: 'method', key: 'method', width: 88 },
         { title: 'URL', dataIndex: 'url', key: 'url', ellipsis: true },
-        { title: '更新', dataIndex: 'updatedAt', key: 'updatedAt', width: 104 },
+        { title: '更新', dataIndex: 'updatedAt', key: 'updatedAt', width: 158 },
         { title: '', key: 'ops', width: 56 },
       ]
     : [
         { title: '请求', dataIndex: 'name', key: 'name' },
         { title: '方法', dataIndex: 'method', key: 'method', width: 92 },
         { title: 'URL', dataIndex: 'url', key: 'url', ellipsis: true },
-        { title: '更新', dataIndex: 'updatedAt', key: 'updatedAt', width: 110 },
+        { title: '更新', dataIndex: 'updatedAt', key: 'updatedAt', width: 158 },
         { title: '', key: 'ops', width: 56 },
       ],
 )
@@ -368,6 +410,10 @@ const columns = computed(() =>
         <a-button size="small" @click="openCurl">
           <template #icon><ImportOutlined /></template>
           导入 cURL
+        </a-button>
+        <a-button size="small" :loading="importingApi" @click="importApiFile">
+          <template #icon><ImportOutlined /></template>
+          导入 Postman/Apifox
         </a-button>
         <a-button size="small" @click="exportProject">
           <template #icon><ExportOutlined /></template>

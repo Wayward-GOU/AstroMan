@@ -15,6 +15,7 @@ import {
 } from '@ant-design/icons-vue'
 import PageHeader from '@/components/PageHeader.vue'
 import LineChart from '@/components/LineChart.vue'
+import { formatDateTime } from '@/utils/datetime'
 import * as api from '@/api'
 import type { ReportDetail, ReportRequestRecord, ReportRequestsPage } from '@/types/models'
 import { buildReportHtml, buildReportSheets } from '@/utils/reportExport'
@@ -107,12 +108,7 @@ async function copyRecordResBody() {
 }
 
 function fmtFullTime(ts?: number | null) {
-  if (!ts) return '-'
-  const d = new Date(ts)
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(
-    d.getHours(),
-  )}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${String(d.getMilliseconds()).padStart(3, '0')}`
+  return formatDateTime(ts)
 }
 
 async function loadRequests() {
@@ -322,19 +318,7 @@ function fmtBytes(v: number | undefined | null) {
 }
 
 function fmtTime(ts?: number | null) {
-  if (!ts) return '-'
-  const d = new Date(ts)
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
-}
-
-function fmtClock(ts?: number | null) {
-  if (!ts) return '-'
-  const d = new Date(ts)
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${String(
-    d.getMilliseconds(),
-  ).padStart(3, '0')}`
+  return formatDateTime(ts)
 }
 
 function codeTone(code: number) {
@@ -842,7 +826,7 @@ function remove() {
                     <td class="req-index mono">
                       {{ (requestPage - 1) * requestPageSize + index + 1 }}
                     </td>
-                    <td class="req-time mono">{{ fmtClock(item.timeMs) }}</td>
+                    <td class="req-time mono">{{ fmtTime(item.timeMs) }}</td>
                     <td class="req-method-col">
                       <span class="req-method">{{ item.method }}</span>
                     </td>
@@ -1657,7 +1641,7 @@ function remove() {
 
 .request-table th.req-time,
 .request-table td.req-time {
-  width: 92px;
+  width: 158px;
   text-align: left;
   white-space: nowrap;
 }

@@ -6,7 +6,9 @@ import './styles/main.css'
 import App from './App.vue'
 import router from './router'
 import { initTheme } from './stores/theme'
+import { applyPlatformAttributes } from './utils/platform'
 
+applyPlatformAttributes()
 initTheme()
 
 const app = createApp(App)

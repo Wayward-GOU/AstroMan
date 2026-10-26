@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "FinkMeter 默认能力",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:default"]
+  "permissions": ["core:default", "core:webview:allow-set-webview-zoom", "dialog:default"]
 }

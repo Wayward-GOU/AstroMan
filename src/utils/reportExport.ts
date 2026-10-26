@@ -40,15 +40,6 @@ function fmtTime(value: number | null | undefined): string {
   )}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
 }
 
-function fmtClock(value: number | null | undefined): string {
-  if (!value) return '-'
-  const date = new Date(value)
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${String(
-    date.getMilliseconds(),
-  ).padStart(3, '0')}`
-}
-
 function fmtDuration(start: number | null | undefined, end: number | null | undefined): string {
   if (!start || !end || end <= start) return '-'
   const seconds = Math.round((end - start) / 1000)
@@ -394,7 +385,7 @@ function renderHtml(detail: ReportDetail, requests: ReportRequestRecord[] = []):
 
   const requestRows = htmlRequests.map((item) => [
     `<span class="mono">${(item.elapsedMs / 1000).toFixed(3)}s</span>`,
-    `<span class="mono">${fmtClock(item.timeMs)}</span>`,
+    `<span class="mono">${fmtTime(item.timeMs)}</span>`,
     escapeHtml(item.method),
     `<div class="break mono">${escapeHtml(clip(item.url, 300))}</div>`,
     `<div class="break mono">${escapeHtml(clip(item.body ?? '', 300))}</div>`,
@@ -739,7 +730,7 @@ export function buildReportSheets(
     ],
     ...requests.map((item) => [
       Number((item.elapsedMs / 1000).toFixed(3)),
-      fmtClock(item.timeMs),
+      fmtTime(item.timeMs),
       item.method,
       item.url,
       clip(item.body ?? '', 1000),

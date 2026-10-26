@@ -258,7 +258,7 @@ pub fn project_export(
     Ok(())
 }
 
-fn unique_project_name(conn: &Connection, base: &str) -> String {
+pub(crate) fn unique_project_name(conn: &Connection, base: &str) -> String {
     let mut candidate = base.to_string();
     let mut index = 1;
     loop {

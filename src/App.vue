@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { theme as AntTheme } from 'ant-design-vue'
+import { getCurrentWebview } from '@tauri-apps/api/webview'
 import {
   AppstoreOutlined,
   FundProjectionScreenOutlined,
@@ -13,8 +14,83 @@ import {
 } from '@ant-design/icons-vue'
 import AppLogo from '@/components/AppLogo.vue'
 import { currentTheme } from '@/stores/theme'
+import { isMac, shortcutText } from '@/utils/platform'
 
 const route = useRoute()
+
+const ZOOM_KEY = 'fm-zoom'
+const ZOOM_MIN = 0.5
+const ZOOM_MAX = 2
+const ZOOM_STEP = 0.1
+
+const zoom = ref(1)
+const zoomNotice = ref(false)
+let noticeTimer: number | undefined
+
+function normalizeZoom(value: number) {
+  return Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Math.round(value * 100) / 100))
+}
+
+function showZoomNotice() {
+  zoomNotice.value = true
+  if (noticeTimer) window.clearTimeout(noticeTimer)
+  noticeTimer = window.setTimeout(() => {
+    zoomNotice.value = false
+  }, 900)
+}
+
+async function applyZoom(value: number, persist = true) {
+  const next = normalizeZoom(value)
+  zoom.value = next
+  try {
+    await getCurrentWebview().setZoom(next)
+  } catch {
+    // 浏览器预览环境不支持 WebView 缩放，忽略即可
+  }
+  if (persist) {
+    localStorage.setItem(ZOOM_KEY, String(next))
+    showZoomNotice()
+  }
+}
+
+function zoomIn() {
+  applyZoom(zoom.value + ZOOM_STEP)
+}
+
+function zoomOut() {
+  applyZoom(zoom.value - ZOOM_STEP)
+}
+
+function resetZoom() {
+  applyZoom(1)
+}
+
+function onZoomHotkey(event: KeyboardEvent) {
+  if (event.altKey) return
+  const modifier = isMac ? event.metaKey : event.ctrlKey
+  if (!modifier) return
+  if (event.key === '=' || event.key === '+') {
+    event.preventDefault()
+    zoomIn()
+  } else if (event.key === '-' || event.key === '_') {
+    event.preventDefault()
+    zoomOut()
+  } else if (event.key === '0') {
+    event.preventDefault()
+    resetZoom()
+  }
+}
+
+onMounted(() => {
+  const stored = Number(localStorage.getItem(ZOOM_KEY) ?? '1')
+  applyZoom(Number.isFinite(stored) && stored > 0 ? stored : 1, false)
+  window.addEventListener('keydown', onZoomHotkey)
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onZoomHotkey)
+  if (noticeTimer) window.clearTimeout(noticeTimer)
+})
 
 const navs = [
   { key: 'home', label: '工作台', hint: '项目与请求调试', to: '/', icon: AppstoreOutlined },
@@ -35,36 +111,40 @@ const activeKey = computed(() => {
   return 'home'
 })
 
-const theme = computed(() => ({
-  algorithm: AntTheme[currentTheme.value.dark ? 'darkAlgorithm' : 'defaultAlgorithm'],
-  token: {
-    colorPrimary: currentTheme.value.vars['--fm-primary'],
-    colorInfo: currentTheme.value.vars['--fm-primary'],
-    colorSuccess: currentTheme.value.vars['--fm-success'],
-    colorWarning: currentTheme.value.vars['--fm-warning'],
-    colorError: currentTheme.value.vars['--fm-danger'],
-    colorText: currentTheme.value.vars['--fm-text'],
-    colorTextSecondary: currentTheme.value.vars['--fm-text-2'],
-    colorBorder: currentTheme.value.vars['--fm-border'],
-    colorBgLayout: currentTheme.value.vars['--fm-bg'],
-    colorBgContainer: currentTheme.value.vars['--fm-surface'],
-    colorBgElevated: currentTheme.value.vars['--fm-surface'],
-    borderRadius: 6,
-    borderRadiusLG: 10,
-    fontSize: 13,
-    fontFamily:
-      "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif",
-  },
-  components: {
-    Button: { controlHeight: 34, fontWeight: 500 },
-    Input: { controlHeight: 34 },
-    Select: { controlHeight: 34 },
-    Table: {
-      headerBg: currentTheme.value.vars['--fm-surface-alt'],
-      headerColor: currentTheme.value.vars['--fm-muted'],
+const theme = computed(() => {
+  const controlHeight = isMac ? 32 : 34
+  return {
+    algorithm: AntTheme[currentTheme.value.dark ? 'darkAlgorithm' : 'defaultAlgorithm'],
+    token: {
+      colorPrimary: currentTheme.value.vars['--fm-primary'],
+      colorInfo: currentTheme.value.vars['--fm-primary'],
+      colorSuccess: currentTheme.value.vars['--fm-success'],
+      colorWarning: currentTheme.value.vars['--fm-warning'],
+      colorError: currentTheme.value.vars['--fm-danger'],
+      colorText: currentTheme.value.vars['--fm-text'],
+      colorTextSecondary: currentTheme.value.vars['--fm-text-2'],
+      colorBorder: currentTheme.value.vars['--fm-border'],
+      colorBgLayout: currentTheme.value.vars['--fm-bg'],
+      colorBgContainer: currentTheme.value.vars['--fm-surface'],
+      colorBgElevated: currentTheme.value.vars['--fm-surface'],
+      borderRadius: isMac ? 7 : 6,
+      borderRadiusLG: isMac ? 11 : 10,
+      fontSize: 13,
+      fontFamily: isMac
+        ? "'SF Pro Text', -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Hiragino Sans GB', sans-serif"
+        : "'Segoe UI Variable Text', 'Segoe UI', 'Microsoft YaHei', 'PingFang SC', sans-serif",
     },
-  },
-}))
+    components: {
+      Button: { controlHeight, fontWeight: 500 },
+      Input: { controlHeight },
+      Select: { controlHeight },
+      Table: {
+        headerBg: currentTheme.value.vars['--fm-surface-alt'],
+        headerColor: currentTheme.value.vars['--fm-muted'],
+      },
+    },
+  }
+})
 </script>
 
 <template>
@@ -100,6 +180,25 @@ const theme = computed(() => ({
           </router-link>
         </nav>
 
+        <div class="zoom-box">
+          <a-tooltip :title="`放大 · ${shortcutText('+')}`" placement="right">
+            <button class="zoom-btn" type="button" @click="zoomIn">+</button>
+          </a-tooltip>
+          <a-tooltip :title="`恢复 100% · ${shortcutText('0')}`" placement="right">
+            <button
+              class="zoom-value"
+              :class="{ active: zoom !== 1 }"
+              type="button"
+              @click="resetZoom"
+            >
+              {{ Math.round(zoom * 100) }}%
+            </button>
+          </a-tooltip>
+          <a-tooltip :title="`缩小 · ${shortcutText('-')}`" placement="right">
+            <button class="zoom-btn" type="button" @click="zoomOut">−</button>
+          </a-tooltip>
+        </div>
+
         <div class="sider-foot">
           <div class="local-card">
             <SafetyCertificateOutlined class="local-icon" />
@@ -115,6 +214,10 @@ const theme = computed(() => ({
       <main class="main">
         <router-view />
       </main>
+
+      <transition name="zoom-fade">
+        <div v-if="zoomNotice" class="zoom-notice">{{ Math.round(zoom * 100) }}%</div>
+      </transition>
     </div>
   </a-config-provider>
 </template>
@@ -242,6 +345,81 @@ const theme = computed(() => ({
 
 .nav-indicator {
   display: none;
+}
+
+.zoom-box {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  padding: 8px 0 6px;
+}
+
+.zoom-btn {
+  width: 34px;
+  height: 24px;
+  border-radius: 6px;
+  border: 1px solid var(--fm-border);
+  background: var(--fm-surface);
+  color: var(--fm-sidebar-text);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+}
+
+.zoom-btn:hover {
+  color: var(--fm-primary);
+  border-color: var(--fm-border-strong);
+}
+
+.zoom-btn:active {
+  transform: scale(0.96);
+}
+
+.zoom-value {
+  width: 44px;
+  height: 20px;
+  border: none;
+  background: transparent;
+  color: var(--fm-muted);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  padding: 0;
+}
+
+.zoom-value.active {
+  color: var(--fm-primary);
+  font-weight: 600;
+}
+
+.zoom-notice {
+  position: fixed;
+  right: 24px;
+  bottom: 24px;
+  z-index: 2000;
+  padding: 8px 16px;
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.88);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.28);
+}
+
+.zoom-fade-enter-active,
+.zoom-fade-leave-active {
+  transition: opacity 0.18s ease, transform 0.18s ease;
+}
+
+.zoom-fade-enter-from,
+.zoom-fade-leave-to {
+  opacity: 0;
+  transform: translateY(6px);
 }
 
 .sider-foot {

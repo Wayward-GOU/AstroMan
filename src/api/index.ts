@@ -119,6 +119,10 @@ export const projectExport = (projectId: number, path: string) =>
 
 export const projectImport = (path: string) => invoke<Project>('project_import', { path })
 
+// Postman（Collection v2.0/v2.1）与 Apifox（OpenAPI）导入
+export const apiImport = (path: string, projectId?: number | null) =>
+  invoke<Project>('api_import', { path, projectId: projectId ?? null })
+
 // 工具箱
 export const toolHash = (text: string, algorithm: string) =>
   invoke<string>('tool_hash', { text, algorithm })

@@ -3,6 +3,7 @@ pub mod curl;
 pub mod environment;
 pub mod history;
 pub mod http;
+pub mod importer;
 pub mod project;
 pub mod report;
 pub mod request;

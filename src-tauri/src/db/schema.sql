@@ -204,10 +204,11 @@ CREATE TABLE IF NOT EXISTS request_runs (
     created_at        INTEGER NOT NULL
 );
 
--- AI Provider（API Key 密文存储）
+-- AI Provider（api_key_enc 为 AES-GCM 密文，见 commands/ai.rs）
 CREATE TABLE IF NOT EXISTS ai_providers (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     name          TEXT NOT NULL,
+    kind          TEXT NOT NULL DEFAULT 'openai',
     base_url      TEXT NOT NULL,
     model         TEXT NOT NULL,
     api_key_enc   TEXT,
@@ -229,6 +230,50 @@ CREATE TABLE IF NOT EXISTS ai_conversations (
     token_input  INTEGER DEFAULT 0,
     token_output INTEGER DEFAULT 0,
     created_at   INTEGER NOT NULL
+);
+
+-- AI 会话（一次对话 = 一条会话，消息按 id 顺序追加）
+CREATE TABLE IF NOT EXISTS ai_sessions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    title       TEXT NOT NULL,
+    provider_id INTEGER,
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ai_messages (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL,
+    role       TEXT NOT NULL,
+    content    TEXT NOT NULL,
+    reasoning  TEXT,
+    created_at INTEGER NOT NULL
+);
+
+-- AI 工具调用流水（每次执行单独记录，供用户在界面上回看）
+CREATE TABLE IF NOT EXISTS ai_tool_logs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id    INTEGER,
+    tool          TEXT NOT NULL,
+    args          TEXT,
+    ok            INTEGER NOT NULL DEFAULT 1,
+    duration_ms   INTEGER NOT NULL DEFAULT 0,
+    result_preview TEXT,
+    created_at    INTEGER NOT NULL
+);
+
+-- AI 模型调用用量（每次对话一行，用于 token / 成功率统计）
+CREATE TABLE IF NOT EXISTS ai_usage_logs (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider_id       INTEGER,
+    provider_name     TEXT,
+    model             TEXT,
+    prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    ok                INTEGER NOT NULL DEFAULT 1,
+    latency_ms        INTEGER NOT NULL DEFAULT 0,
+    error             TEXT,
+    created_at        INTEGER NOT NULL
 );
 
 -- 本机 Cookie（响应 Set-Cookie 自动写入，发送请求时按域自动携带）
@@ -256,4 +301,7 @@ CREATE INDEX IF NOT EXISTS idx_history_created ON request_history(created_at DES
 CREATE INDEX IF NOT EXISTS idx_runs_request ON request_runs(request_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_reports_created ON test_reports(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_cookies_domain ON cookies(domain);
+CREATE INDEX IF NOT EXISTS idx_ai_messages_session ON ai_messages(session_id, id);
+CREATE INDEX IF NOT EXISTS idx_ai_tool_logs_session ON ai_tool_logs(session_id, id);
+CREATE INDEX IF NOT EXISTS idx_ai_usage_provider ON ai_usage_logs(provider_id, created_at DESC);
 -- idx_plans_project 依赖 updated_at 列，老库需先补列，因此放在 migrate() 中创建

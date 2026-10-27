@@ -13,6 +13,7 @@ import {
   ToolOutlined,
   ThunderboltOutlined,
   PlayCircleOutlined,
+  RobotOutlined,
   SearchOutlined,
   EnterOutlined,
 } from '@ant-design/icons-vue'
@@ -93,6 +94,7 @@ const navs = [
   { key: 'home', label: '工作台', hint: '项目与请求调试', to: '/', icon: AppstoreOutlined },
   { key: 'stress', label: '压测', hint: '选择接口发起压测', to: '/stress', icon: ThunderboltOutlined },
   { key: 'runner', label: '批量运行', hint: '集合 Runner · 数据驱动', to: '/runner', icon: PlayCircleOutlined },
+  { key: 'ai', label: '小HI', hint: 'AI 助手 · 自动建请求并分析', to: '/ai', icon: RobotOutlined },
   { key: 'reports', label: '压测报告', hint: '历史压测结果', to: '/reports', icon: FundProjectionScreenOutlined },
   { key: 'history', label: '请求历史', hint: '最近发送记录', to: '/history', icon: HistoryOutlined },
   { key: 'monitor', label: '系统监视', hint: 'CPU · 内存 · 磁盘 · 网络', to: '/monitor', icon: LineChartOutlined },
@@ -254,6 +256,7 @@ const activeKey = computed(() => {
   const path = route.path
   if (path.startsWith('/stress')) return 'stress'
   if (path.startsWith('/runner')) return 'runner'
+  if (path.startsWith('/ai')) return 'ai'
   if (path.startsWith('/reports')) return 'reports'
   if (path.startsWith('/history')) return 'history'
   if (path.startsWith('/monitor')) return 'monitor'
@@ -362,12 +365,77 @@ const theme = computed(() => {
         </div>
       </aside>
 
-      <main class="main">
+      <main class="main" :class="{ 'main-dock': !route.path.startsWith('/ai') }">
         <router-view />
       </main>
 
       <transition name="zoom-fade">
         <div v-if="zoomNotice" class="zoom-notice">{{ Math.round(zoom * 100) }}%</div>
+      </transition>
+
+      <transition name="zoom-fade">
+        <button
+          v-if="!route.path.startsWith('/ai')"
+          class="hi-float"
+          type="button"
+          aria-label="打开小HI"
+          @click="go('/ai')"
+        >
+          <span class="hi-float-halo" />
+          <svg class="hi-bot" viewBox="0 0 64 64" aria-hidden="true">
+            <defs>
+              <linearGradient id="hiShell" x1="0" y1="0" x2="0.4" y2="1">
+                <stop offset="0" stop-color="#ffffff" />
+                <stop offset="1" stop-color="#dce6f2" />
+              </linearGradient>
+              <linearGradient id="hiFace" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0" stop-color="#2c3646" />
+                <stop offset="1" stop-color="#111722" />
+              </linearGradient>
+            </defs>
+
+            <path d="M32 9 L32 14" stroke="#a8b6c8" stroke-width="1.8" stroke-linecap="round" />
+            <circle cx="32" cy="6.4" r="2.4" class="hi-antenna" />
+
+            <rect x="8.5" y="27" width="4" height="9" rx="2" fill="#cbd8e6" />
+            <rect x="51.5" y="27" width="4" height="9" rx="2" fill="#cbd8e6" />
+
+            <rect x="13.5" y="14.5" width="39" height="32" rx="10" fill="#c2cfdf" />
+            <rect
+              x="11.5"
+              y="12.5"
+              width="41"
+              height="32"
+              rx="10"
+              fill="url(#hiShell)"
+              stroke="#c9d6e5"
+              stroke-width="1"
+            />
+            <rect x="16.5" y="17.5" width="32" height="22" rx="6.5" fill="url(#hiFace)" />
+
+            <g class="hi-eyes">
+              <path d="M25.5 24.8 L29 28.5 L25.5 32.2 L22 28.5 Z" fill="#7ee7ff" />
+              <path d="M38.5 24.8 L42 28.5 L38.5 32.2 L35 28.5 Z" fill="#7ee7ff" />
+            </g>
+
+            <rect x="19" y="47" width="26" height="9" rx="4.5" fill="#c2cfdf" />
+            <rect
+              x="18"
+              y="45.5"
+              width="26"
+              height="9"
+              rx="4.5"
+              fill="url(#hiShell)"
+              stroke="#c9d6e5"
+              stroke-width="1"
+            />
+
+            <circle cx="15.5" cy="50" r="3.2" fill="#dbe5f1" stroke="#c9d6e5" stroke-width="1" />
+            <circle cx="48.5" cy="50" r="3.2" fill="#dbe5f1" stroke="#c9d6e5" stroke-width="1" />
+          </svg>
+          <span class="hi-float-tip">小HI · AI 助手</span>
+          <span class="hi-float-dot" />
+        </button>
       </transition>
 
       <a-modal
@@ -588,8 +656,8 @@ const theme = computed(() => {
 
 .zoom-notice {
   position: fixed;
-  right: 24px;
-  bottom: 24px;
+  right: 26px;
+  bottom: 100px;
   z-index: 2000;
   padding: 8px 16px;
   border-radius: 10px;
@@ -601,6 +669,197 @@ const theme = computed(() => {
   font-variant-numeric: tabular-nums;
   pointer-events: none;
   box-shadow: 0 8px 24px rgba(15, 23, 42, 0.28);
+}
+
+/* 全局悬浮入口：小HI 小机器人，贴右下角，尽量不压内容 */
+.hi-float {
+  position: fixed;
+  right: 14px;
+  bottom: 14px;
+  z-index: 900;
+  width: 54px;
+  height: 54px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  opacity: 0.78;
+  transition: transform 0.22s cubic-bezier(0.2, 0.8, 0.3, 1.2), opacity 0.2s ease;
+}
+
+.hi-float:hover,
+.hi-float:focus-visible {
+  opacity: 1;
+}
+
+.hi-float::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: radial-gradient(circle at 50% 34%, #ffffff 0%, #eff5fc 60%, #e1ebf7 100%);
+  border: 1px solid rgba(148, 170, 196, 0.34);
+  box-shadow: 0 10px 24px rgba(52, 84, 120, 0.22), 0 2px 6px rgba(52, 84, 120, 0.12);
+  transition: box-shadow 0.22s ease;
+}
+
+.hi-float-halo {
+  position: absolute;
+  inset: -11px;
+  border-radius: 50%;
+  background: radial-gradient(
+    circle,
+    color-mix(in srgb, var(--fm-primary) 46%, transparent) 0%,
+    transparent 68%
+  );
+  filter: blur(3px);
+  animation: hi-halo 4.2s ease-in-out infinite;
+  pointer-events: none;
+}
+
+.hi-bot {
+  position: relative;
+  width: 40px;
+  height: 40px;
+  animation: hi-bob 4.2s ease-in-out infinite;
+  will-change: transform;
+}
+
+.hi-eyes {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: hi-blink 5.4s steps(1) infinite;
+}
+
+.hi-eyes path {
+  filter: drop-shadow(0 0 2.5px rgba(126, 231, 255, 0.85));
+}
+
+.hi-antenna {
+  fill: #38d9a9;
+  animation: hi-antenna 2.8s ease-in-out infinite;
+}
+
+.hi-float:hover {
+  transform: translateY(-2px) scale(1.06);
+}
+
+.hi-float:hover::before {
+  box-shadow: 0 14px 30px rgba(52, 84, 120, 0.28), 0 3px 8px rgba(52, 84, 120, 0.14);
+}
+
+.hi-float:active {
+  transform: scale(0.96);
+}
+
+.hi-float:hover .hi-bot,
+.hi-float:hover .hi-float-halo {
+  animation-play-state: paused;
+}
+
+.hi-float-tip {
+  position: absolute;
+  right: 64px;
+  top: 50%;
+  padding: 5px 10px;
+  border-radius: 8px;
+  background: rgba(17, 23, 34, 0.92);
+  color: #fff;
+  font-size: 12px;
+  white-space: nowrap;
+  opacity: 0;
+  transform: translateY(-50%) translateX(6px);
+  transition: opacity 0.18s ease, transform 0.18s ease;
+  pointer-events: none;
+}
+
+.hi-float:hover .hi-float-tip {
+  opacity: 1;
+  transform: translateY(-50%) translateX(0);
+}
+
+.hi-float-dot {
+  position: absolute;
+  right: 2px;
+  bottom: 4px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #38d9a9;
+  border: 2px solid #fff;
+  animation: hi-dot 2.6s ease-out infinite;
+}
+
+@keyframes hi-bob {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-3.5px);
+  }
+}
+
+@keyframes hi-halo {
+  0%,
+  100% {
+    opacity: 0.36;
+    transform: scale(0.96);
+  }
+  50% {
+    opacity: 0.68;
+    transform: scale(1.04);
+  }
+}
+
+@keyframes hi-blink {
+  0%,
+  92%,
+  100% {
+    transform: scaleY(1);
+  }
+  94%,
+  97% {
+    transform: scaleY(0.12);
+  }
+}
+
+@keyframes hi-antenna {
+  0%,
+  100% {
+    fill: #38d9a9;
+    opacity: 1;
+  }
+  50% {
+    fill: #5ce8bd;
+    opacity: 0.55;
+  }
+}
+
+@keyframes hi-dot {
+  0% {
+    box-shadow: 0 0 0 0 rgba(56, 217, 169, 0.55);
+  }
+  70% {
+    box-shadow: 0 0 0 7px rgba(56, 217, 169, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(56, 217, 169, 0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hi-bot,
+  .hi-float-halo,
+  .hi-eyes,
+  .hi-antenna,
+  .hi-float-dot {
+    animation: none;
+  }
 }
 
 .zoom-fade-enter-active,
@@ -647,6 +906,11 @@ const theme = computed(() => {
   height: 100%;
   overflow: auto;
   background: var(--fm-bg);
+}
+
+/* 为右下角悬浮机器人预留空间，保证内容能滚动到按钮上方 */
+.main-dock {
+  padding-bottom: 62px;
 }
 
 /* ---------- 命令面板 ---------- */

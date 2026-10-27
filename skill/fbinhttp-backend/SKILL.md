@@ -28,6 +28,7 @@ description: FbinHttp 的 Rust/Tauri 后端开发规范。改数据库 schema、
 | `commands/settings.rs` | 代理与客户端证书设置 |
 | `commands/system.rs` / `commands/winstats.rs` | 应用信息、工作区统计、首页数据大屏聚合（`dashboard_metrics`）、Windows 进程指标 |
 | `commands/update.rs` | 版本检查与下载 |
+| `commands/ai.rs` | AI 助手「小HI」：服务商、流式对话、会话消息、工具流水（详见 `fbinhttp-ai`） |
 | `state.rs` | AppState、连接池、reqwest 客户端（普通/忽略证书） |
 | `models.rs` | 全部前后端数据模型 |
 | `util.rs` | `err`、`now_ms`、`render` 等工具 |

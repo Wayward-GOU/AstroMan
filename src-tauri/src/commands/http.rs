@@ -18,6 +18,14 @@ pub async fn send_http_request(
     state: State<'_, AppState>,
     payload: SendRequestPayload,
 ) -> Result<HttpResult, String> {
+    execute(state.inner(), payload).await
+}
+
+/// 真正发请求的实现：手动发送与 AI 执行共用，保证历史、Cookie、快照逻辑完全一致
+pub(crate) async fn execute(
+    state: &AppState,
+    payload: SendRequestPayload,
+) -> Result<HttpResult, String> {
     let vars = match payload.env_id {
         Some(env_id) => {
             let conn = state.pool.get().map_err(err)?;
@@ -214,14 +222,14 @@ pub async fn send_http_request(
                 }
             }
             record_history(
-                &state,
+                state,
                 &payload,
                 &url_for_history,
                 Some(result.status as i64),
                 result.duration_ms as i64,
             );
             record_run_snapshot(
-                &state,
+                state,
                 &payload,
                 &url_for_history,
                 &applied_headers,
@@ -232,7 +240,7 @@ pub async fn send_http_request(
         }
         Err(error) => {
             let duration = started.elapsed().as_millis() as i64;
-            record_history(&state, &payload, &url_for_history, None, duration);
+            record_history(state, &payload, &url_for_history, None, duration);
             let result = HttpResult {
                 status: 0,
                 status_text: String::new(),
@@ -244,7 +252,7 @@ pub async fn send_http_request(
                 error: Some(error.to_string()),
             };
             record_run_snapshot(
-                &state,
+                state,
                 &payload,
                 &url_for_history,
                 &applied_headers,

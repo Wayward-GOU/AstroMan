@@ -637,3 +637,179 @@ pub struct StressDone {
     pub elapsed_sec: u64,
     pub message: Option<String>,
 }
+
+fn default_ai_kind() -> String {
+    "openai".to_string()
+}
+
+/// AI 服务商配置，kind 决定协议：openai / anthropic / gemini
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiProvider {
+    #[serde(default)]
+    pub id: Option<i64>,
+    pub name: String,
+    #[serde(default = "default_ai_kind")]
+    pub kind: String,
+    pub base_url: String,
+    pub model: String,
+    /// 明文只在内存与传输层出现，落库前统一加密
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    #[serde(default)]
+    pub is_default: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiMessage {
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiChatPayload {
+    pub provider_id: i64,
+    pub messages: Vec<AiMessage>,
+    #[serde(default)]
+    pub temperature: Option<f64>,
+}
+
+/// 流式事件：delta 增量文本 / done 结束 / error 错误
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiStreamEvent {
+    pub kind: String,
+    pub text: String,
+}
+
+/// AI 会话：一次连续对话
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiSession {
+    pub id: i64,
+    pub title: String,
+    pub provider_id: Option<i64>,
+    pub message_count: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiStoredMessage {
+    pub id: i64,
+    pub session_id: i64,
+    pub role: String,
+    pub content: String,
+    /// 模型思考过程（仅助手消息），用于 Agent 行为回溯
+    pub reasoning: Option<String>,
+    pub created_at: i64,
+}
+
+/// AI 工具调用流水
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiToolLog {
+    pub id: i64,
+    pub session_id: Option<i64>,
+    pub tool: String,
+    pub args: String,
+    pub ok: bool,
+    pub duration_ms: i64,
+    pub result_preview: String,
+    pub created_at: i64,
+}
+
+/// 工具流水分页结果
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiToolLogPage {
+    pub items: Vec<AiToolLog>,
+    pub total: i64,
+}
+
+/// 工具流水按天汇总
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiToolDayStat {
+    /// 形如 2026-10-27
+    pub date: String,
+    pub total: i64,
+    pub failed: i64,
+}
+
+/// 工具流水按工具汇总
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiToolUsageStat {
+    pub tool: String,
+    pub total: i64,
+    pub failed: i64,
+    pub avg_duration_ms: i64,
+}
+
+/// 工具流水看板
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiToolLogStats {
+    pub total: i64,
+    pub ok: i64,
+    pub failed: i64,
+    pub avg_duration_ms: i64,
+    pub last_24h: i64,
+    pub days: Vec<AiToolDayStat>,
+    pub tools: Vec<AiToolUsageStat>,
+}
+
+/// 单个模型（服务商）的用量与准确率
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiUsageStat {
+    pub provider_id: Option<i64>,
+    pub provider_name: String,
+    pub model: String,
+    pub calls: i64,
+    pub ok_calls: i64,
+    /// 成功调用占比 0~1
+    pub success_rate: f64,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub total_tokens: i64,
+    pub avg_latency_ms: i64,
+    /// 该模型所在会话产生的工具调用数
+    pub tool_calls: i64,
+    pub tool_ok: i64,
+    pub tool_success_rate: f64,
+    pub last_used_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiUsageDay {
+    pub day: String,
+    pub calls: i64,
+    pub total_tokens: i64,
+}
+
+/// 模型用量看板
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiUsageStats {
+    pub days: i64,
+    pub total_calls: i64,
+    pub ok_calls: i64,
+    pub success_rate: f64,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub total_tokens: i64,
+    pub avg_latency_ms: i64,
+    pub tool_calls: i64,
+    pub tool_ok: i64,
+    pub tool_success_rate: f64,
+    pub items: Vec<AiUsageStat>,
+    pub daily: Vec<AiUsageDay>,
+}

@@ -42,6 +42,8 @@ fn migrate(pool: &DbPool) -> Result<(), String> {
         "ALTER TABLE requests ADD COLUMN auth TEXT",
         "ALTER TABLE test_plans ADD COLUMN config_json TEXT",
         "ALTER TABLE test_plans ADD COLUMN updated_at INTEGER DEFAULT 0",
+        "ALTER TABLE ai_providers ADD COLUMN kind TEXT NOT NULL DEFAULT 'openai'",
+        "ALTER TABLE ai_messages ADD COLUMN reasoning TEXT",
     ];
     for sql in statements {
         let _ = conn.execute(sql, []);

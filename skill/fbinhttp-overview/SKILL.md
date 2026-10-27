@@ -22,8 +22,8 @@ FbinHttp/
 │  ├─ styles/main.css # 设计系统：--fm-* 变量
 │  ├─ tools/          # 离线工具注册表（registry.ts）与各工具组件
 │  ├─ types/models.ts # 与 Rust models.rs 对应的 TS 类型
-│  ├─ utils/          # scriptRunner（脚本引擎）、cryptoScript、rsa、curl、reportExport、xlsx、diff、mybatis
-│  └─ views/          # Dashboard / Project / RequestEditor / StressTest / Runner / Reports / History / Tools / SystemMonitor / Settings / Environment / ReportDetail
+│  ├─ utils/          # scriptRunner（脚本引擎）、cryptoScript、rsa、curl、reportExport、xlsx、diff、mybatis、aiTools（AI 工具注册表）、markdown
+│  └─ views/          # Dashboard / Project / RequestEditor / StressTest / Runner / Reports / History / Tools / SystemMonitor / Settings / Environment / ReportDetail / AiAssistant / AiToolLogs
 ├─ src-tauri/
 │  ├─ src/commands/   # 每个文件一个业务域，全部 #[tauri::command]
 │  ├─ src/db/         # schema.sql + mod.rs（init → migrate → seed）+ seed.rs
@@ -97,4 +97,5 @@ Windows 下 `cargo check` 在受限沙箱里会命中 `D:\Software\Rust\cargo\.g
 | `fbinhttp-backend` | Rust 命令、SQLite 迁移、压测引擎规范 |
 | `fbinhttp-frontend` | 页面骨架、主题变量、脚本引擎、导出 |
 | `fbinhttp-dashboard` | 首页数据大屏口径、CSS 图表约定、Runner 介绍文案 |
+| `fbinhttp-ai` | AI 助手「小HI」：协议接入、会话、工具注册表、工具调用记录 |
 | `fbinhttp-build-release` | 构建、打包与发布 |

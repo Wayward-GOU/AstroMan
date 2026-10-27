@@ -1,5 +1,13 @@
-import { invoke } from '@tauri-apps/api/core'
+import { Channel, invoke } from '@tauri-apps/api/core'
 import type {
+  AiChatPayload,
+  AiProvider,
+  AiSession,
+  AiStoredMessage,
+  AiStreamEvent,
+  AiToolLogPage,
+  AiToolLogStats,
+  AiUsageStats,
   AppSettings,
   CleanupResult,
   CollectionNode,
@@ -109,7 +117,16 @@ export const envScriptSave = (id: number, script: string) =>
   invoke<void>('env_script_save', { id, script })
 
 // 历史
-export const historyList = (limit = 100) => invoke<HistoryItem[]>('history_list', { limit })
+export const historyList = (
+  limit = 100,
+  requestId?: number | null,
+  projectId?: number | null,
+) =>
+  invoke<HistoryItem[]>('history_list', {
+    limit,
+    requestId: requestId ?? null,
+    projectId: projectId ?? null,
+  })
 
 export const historyStats = () => invoke<HistoryStats>('history_stats')
 
@@ -250,6 +267,100 @@ export const toolHash = (text: string, algorithm: string) =>
 
 export const toolHmac = (text: string, key: string, algorithm: string) =>
   invoke<string>('tool_hmac', { text, key, algorithm })
+
+// AI 助手
+export const aiProviderList = () => invoke<AiProvider[]>('ai_provider_list')
+
+export const aiProviderSave = (provider: AiProvider) =>
+  invoke<AiProvider>('ai_provider_save', { provider })
+
+export const aiProviderDelete = (id: number) => invoke<void>('ai_provider_delete', { id })
+
+export const aiProviderTest = (id: number) => invoke<string>('ai_provider_test', { id })
+
+/** 流式对话：边收边回调，结束后 invoke 才 resolve */
+export const aiChat = async (
+  payload: AiChatPayload,
+  onEvent: (event: AiStreamEvent) => void,
+) => {
+  const channel = new Channel<AiStreamEvent>()
+  channel.onmessage = onEvent
+  await invoke<void>('ai_chat', { payload, onEvent: channel })
+}
+
+/** AI 生成的请求直接执行，与手动发送共用同一链路 */
+export const aiExecute = (payload: SendRequestPayload) =>
+  invoke<HttpResult>('ai_execute', { payload })
+
+// AI 会话记录
+export const aiSessionList = () => invoke<AiSession[]>('ai_session_list')
+
+export const aiSessionCreate = (title?: string, providerId?: number | null) =>
+  invoke<AiSession>('ai_session_create', { title: title ?? null, providerId: providerId ?? null })
+
+export const aiSessionRename = (id: number, title: string) =>
+  invoke<void>('ai_session_rename', { id, title })
+
+export const aiSessionDelete = (id: number) => invoke<void>('ai_session_delete', { id })
+
+export const aiMessageList = (sessionId: number) =>
+  invoke<AiStoredMessage[]>('ai_message_list', { sessionId })
+
+export const aiMessageAdd = (
+  sessionId: number,
+  role: string,
+  content: string,
+  reasoning?: string,
+) => invoke<AiStoredMessage>('ai_message_add', { sessionId, role, content, reasoning: reasoning ?? null })
+
+export const aiMessageClear = (sessionId: number) =>
+  invoke<void>('ai_message_clear', { sessionId })
+
+// AI 工具调用流水
+export const aiToolLogAdd = (log: {
+  sessionId?: number | null
+  tool: string
+  args: string
+  ok: boolean
+  durationMs: number
+  resultPreview: string
+}) =>
+  invoke<void>('ai_tool_log_add', {
+    sessionId: log.sessionId ?? null,
+    tool: log.tool,
+    args: log.args,
+    ok: log.ok,
+    durationMs: log.durationMs,
+    resultPreview: log.resultPreview,
+  })
+
+export const aiToolLogList = (query: {
+  sessionId?: number | null
+  tool?: string | null
+  ok?: boolean | null
+  days?: number
+  page?: number
+  pageSize?: number
+}) =>
+  invoke<AiToolLogPage>('ai_tool_log_list', {
+    sessionId: query.sessionId ?? null,
+    tool: query.tool || null,
+    ok: query.ok ?? null,
+    days: query.days ?? 365,
+    page: query.page ?? 1,
+    pageSize: query.pageSize ?? 20,
+  })
+
+export const aiToolLogStats = (days = 30) =>
+  invoke<AiToolLogStats>('ai_tool_log_stats', { days })
+
+export const aiToolLogClear = (sessionId?: number | null, days?: number | null) =>
+  invoke<number>('ai_tool_log_clear', { sessionId: sessionId ?? null, days: days ?? null })
+
+// 模型用量统计
+export const aiUsageStats = (days = 30) => invoke<AiUsageStats>('ai_usage_stats', { days })
+
+export const aiUsageClear = (all = false) => invoke<number>('ai_usage_clear', { all })
 
 // 系统监视
 export const winstatsSnapshot = () => invoke<MonitorSnapshot>('winstats_snapshot')

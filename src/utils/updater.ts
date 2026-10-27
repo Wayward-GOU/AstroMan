@@ -1,6 +1,7 @@
 import { h } from 'vue'
 import { message, Modal } from 'ant-design-vue'
 import * as api from '@/api'
+import { isMac } from '@/utils/platform'
 import type { UpdateInfo } from '@/types/models'
 
 export const AUTO_UPDATE_KEY = 'fm-auto-update'
@@ -16,7 +17,10 @@ export function setAutoUpdateEnabled(enabled: boolean) {
 let checking = false
 
 async function downloadAndInstall(info: UpdateInfo) {
-  if (!info.assetUrl || !info.assetName) {
+  const urls = [info.assetApiUrl, info.assetUrl].filter(
+    (url): url is string => typeof url === 'string' && url.startsWith('https://'),
+  )
+  if (!urls.length || !info.assetName) {
     try {
       await api.openExternal(info.releaseUrl)
     } catch (e) {
@@ -26,13 +30,27 @@ async function downloadAndInstall(info: UpdateInfo) {
   }
   const hide = message.loading('正在从 GitHub 下载安装包…', 0)
   try {
-    const path = await api.updateDownload(info.assetUrl, info.assetName)
+    const path = await api.updateDownload(urls, info.assetName)
     hide()
     await api.openExternal(path)
-    message.success('安装包已下载，按安装向导完成升级即可')
+    message.success(
+      isMac
+        ? '安装包已下载并打开，将 FbinHttp 拖入「应用程序」即可完成升级'
+        : '安装包已下载，按安装向导完成升级即可',
+    )
   } catch (e) {
     hide()
-    message.error(String(e))
+    // 下载失败时直接打开发布页，避免用户卡在报错上
+    Modal.confirm({
+      title: '自动下载失败',
+      content: h('div', { style: 'font-size:12px;line-height:1.8' }, [
+        h('div', `当前网络无法直连 GitHub 下载域名：${String(e)}`),
+        h('div', '可改用浏览器打开发布页手动下载安装包，或配置代理后重试。'),
+      ]),
+      okText: '打开发布页',
+      cancelText: '关闭',
+      onOk: () => api.openExternal(info.releaseUrl),
+    })
   }
 }
 
@@ -54,7 +72,7 @@ function promptUpdate(info: UpdateInfo) {
         '在浏览器中查看发布说明',
       ),
     ]),
-    okText: '下载并安装',
+    okText: isMac ? '下载安装包' : '下载并安装',
     cancelText: '稍后',
     onOk: () => downloadAndInstall(info),
   })

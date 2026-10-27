@@ -219,7 +219,7 @@ async function copyOutput() {
 
 function loadSample() {
   input.value = `{
-  "name": "FinkMeter",
+  "name": "FbinHttp",
   "version": "1.0.0",
   "local": true,
   "tools": ["json", "aes", "mybatis"],

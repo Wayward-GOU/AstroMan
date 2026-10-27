@@ -79,7 +79,31 @@ pub struct KeyValueItem {
     pub enabled: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// 认证配置（Bearer / Basic / API Key），随请求保存
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RequestAuth {
+    /// none / bearer / basic / apikey / oauth2
+    pub kind: String,
+    pub token: String,
+    pub username: String,
+    pub password: String,
+    pub key: String,
+    pub value: String,
+    /// header / query
+    pub add_to: String,
+    /// OAuth2 Client Credentials
+    #[serde(default)]
+    pub token_url: String,
+    #[serde(default)]
+    pub client_id: String,
+    #[serde(default)]
+    pub client_secret: String,
+    #[serde(default)]
+    pub scope: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HttpRequestDetail {
     #[serde(default)]
@@ -104,6 +128,8 @@ pub struct HttpRequestDetail {
     pub post_script: String,
     #[serde(default)]
     pub assertions: String,
+    #[serde(default)]
+    pub auth: RequestAuth,
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,6 +155,38 @@ pub struct SendRequestPayload {
     pub insecure: bool,
     #[serde(default = "default_timeout")]
     pub timeout_ms: u64,
+    /// 认证配置，为空表示不使用
+    #[serde(default)]
+    pub auth: Option<RequestAuth>,
+    /// 是否自动携带本机 Cookie，默认开启
+    #[serde(default)]
+    pub cookie_enabled: Option<bool>,
+}
+
+/// multipart/form-data 的表单字段
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct FormField {
+    pub key: String,
+    pub value: String,
+    pub enabled: bool,
+    /// text / file
+    pub kind: String,
+}
+
+/// 本机保存的 Cookie
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CookieItem {
+    pub id: i64,
+    pub domain: String,
+    pub path: String,
+    pub name: String,
+    pub value: String,
+    pub secure: bool,
+    pub http_only: bool,
+    pub expires_at: Option<i64>,
+    pub updated_at: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -185,6 +243,24 @@ pub struct HistoryItem {
     pub created_at: i64,
 }
 
+/// 请求历史统计（用于清理前预览数据规模）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryStats {
+    pub total: i64,
+    pub oldest_at: Option<i64>,
+    pub newest_at: Option<i64>,
+    pub runs_total: i64,
+}
+
+/// 历史数据清理结果
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupResult {
+    pub history: u32,
+    pub runs: u32,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RequestRun {
@@ -228,6 +304,80 @@ pub struct WorkspaceStats {
     pub report_success_total: i64,
     pub recent_history: i64,
     pub recent_reports: i64,
+}
+
+/// 数据大屏：按日请求趋势
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DailyPoint {
+    pub date: String,
+    pub total: i64,
+    pub success: i64,
+    pub avg_rt: f64,
+}
+
+/// 数据大屏：状态码分组
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodeBucket {
+    pub label: String,
+    pub count: i64,
+}
+
+/// 数据大屏：调用最频繁的接口
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TopRequest {
+    pub name: String,
+    pub method: String,
+    pub url: String,
+    pub count: i64,
+    pub avg_rt: f64,
+    pub success_rate: f64,
+}
+
+/// 数据大屏：最近压测报告走势
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportPoint {
+    pub id: i64,
+    pub name: String,
+    pub p95_rt: f64,
+    pub error_rate: f64,
+    pub total_requests: i64,
+    pub created_at: i64,
+}
+
+/// 数据大屏：按小时请求量
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HourPoint {
+    pub hour: i64,
+    pub count: i64,
+}
+
+/// 数据大屏：项目维度的调用量
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectPoint {
+    pub name: String,
+    pub count: i64,
+    pub avg_rt: f64,
+    pub success_rate: f64,
+}
+
+/// 数据大屏聚合结果
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DashboardMetrics {
+    pub days: Vec<DailyPoint>,
+    pub code_buckets: Vec<CodeBucket>,
+    pub top_requests: Vec<TopRequest>,
+    pub report_points: Vec<ReportPoint>,
+    pub method_buckets: Vec<CodeBucket>,
+    pub hour_buckets: Vec<HourPoint>,
+    pub latency_buckets: Vec<CodeBucket>,
+    pub top_projects: Vec<ProjectPoint>,
 }
 
 fn default_concurrent() -> u32 {

@@ -7,7 +7,7 @@ use rusqlite::params;
 use tauri::State;
 
 /// 单个接口最多保留的运行记录条数
-const MAX_RUNS: i64 = 50;
+const MAX_RUNS: i64 = 200;
 /// 响应体入库上限，避免大响应撑大数据库
 const MAX_STORED_BODY: usize = 256 * 1024;
 

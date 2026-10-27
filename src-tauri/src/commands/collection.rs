@@ -134,3 +134,28 @@ pub fn collection_delete(state: State<'_, AppState>, id: i64) -> Result<(), Stri
         .map_err(err)?;
     Ok(())
 }
+
+/// 按给定顺序重排同级集合（拖拽排序）。ids 为同一父集合下集合 id 的新顺序。
+#[tauri::command]
+pub fn collection_reorder(
+    state: State<'_, AppState>,
+    project_id: i64,
+    parent_id: Option<i64>,
+    ids: Vec<i64>,
+) -> Result<(), String> {
+    if ids.is_empty() {
+        return Err("排序列表为空".to_string());
+    }
+    let mut conn = state.pool.get().map_err(err)?;
+    let tx = conn.transaction().map_err(err)?;
+    for (index, id) in ids.iter().enumerate() {
+        tx.execute(
+            "UPDATE collections SET sort_order = ?1, updated_at = ?2
+             WHERE id = ?3 AND project_id = ?4 AND parent_id IS ?5",
+            params![index as i64, now_ms(), id, project_id, parent_id],
+        )
+        .map_err(err)?;
+    }
+    tx.commit().map_err(err)?;
+    Ok(())
+}

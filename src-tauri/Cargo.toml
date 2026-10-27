@@ -1,23 +1,25 @@
 [package]
-name = "finkmeter"
-version = "1.0.4"
-description = "FinkMeter - 本地 API 调试与压测工具"
+name = "fbinhttp"
+version = "1.0.5"
+description = "FbinHttp - 本地 API 调试与压测工具"
 edition = "2021"
 
 [lib]
-name = "finkmeter_lib"
+name = "fbinhttp_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["compression"] }
+tauri = { version = "2", features = ["compression", "tray-icon", "image-png"] }
 tauri-plugin-dialog = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-window-state = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = [
-  "json", "native-tls", "gzip"
+  "json", "native-tls", "gzip", "multipart", "socks"
 ] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 r2d2 = "0.8"

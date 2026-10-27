@@ -1,4 +1,4 @@
-/* ============ FinkMeter 设计系统 ============ */
+/* ============ FbinHttp 设计系统 ============ */
 :root {
   --fm-primary: #3d6b8f;
   --fm-primary-dark: #305670;
@@ -93,8 +93,8 @@ body {
 /* ---------- 页面骨架 ---------- */
 .page {
   padding: 18px 22px 30px;
-  max-width: 1440px;
-  margin: 0 auto;
+  /* 宽屏铺满内容区，避免最大化后右侧留白 */
+  max-width: none;
   animation: fm-fade-in 0.24s ease;
 }
 

@@ -1,27 +1,39 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { message, Modal } from 'ant-design-vue'
+import { message } from 'ant-design-vue'
+import type { Dayjs } from 'dayjs'
 import { ClockCircleOutlined, DeleteOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons-vue'
 import PageHeader from '@/components/PageHeader.vue'
 import { useTabsStore } from '@/stores/tabs'
 import { formatDateTime } from '@/utils/datetime'
 import * as api from '@/api'
-import type { HistoryItem } from '@/types/models'
+import type { CleanupResult, HistoryItem, HistoryStats } from '@/types/models'
 
 const router = useRouter()
 const tabs = useTabsStore()
 
 const items = ref<HistoryItem[]>([])
+const stats = ref<HistoryStats | null>(null)
 const loading = ref(true)
 const keyword = ref('')
+const displayLimit = ref(500)
 
 onMounted(load)
+
+watch(displayLimit, () => {
+  void load()
+})
 
 async function load() {
   loading.value = true
   try {
-    items.value = await api.historyList(500)
+    const [list, overview] = await Promise.all([
+      api.historyList(displayLimit.value),
+      api.historyStats(),
+    ])
+    items.value = list
+    stats.value = overview
   } catch (e) {
     message.error(String(e))
   } finally {
@@ -42,7 +54,7 @@ const rows = computed(() => {
 })
 
 const summary = computed(() => {
-  const total = items.value.length
+  const total = stats.value?.total ?? items.value.length
   const failed = items.value.filter(
     (item) => item.statusCode === null || item.statusCode === undefined || item.statusCode >= 400,
   ).length
@@ -53,11 +65,16 @@ const summary = computed(() => {
   const avg = durations.length
     ? durations.reduce((sum, value) => sum + value, 0) / durations.length
     : 0
-  return { total, failed, avg }
+  return { total, failed, avg, runs: stats.value?.runsTotal ?? 0 }
 })
 
 function fmtTime(ts: number) {
   return formatDateTime(ts)
+}
+
+function fmtDay(ts?: number | null) {
+  if (!ts) return '-'
+  return formatDateTime(ts).slice(0, 10)
 }
 
 function fmtMs(value?: number | null) {
@@ -65,19 +82,110 @@ function fmtMs(value?: number | null) {
   return value >= 1000 ? `${(value / 1000).toFixed(2)} s` : `${value} ms`
 }
 
-function clearAll() {
-  Modal.confirm({
-    title: '清空全部请求历史？',
-    content: '只会删除本机保存的历史记录，项目与接口配置不受影响。',
-    okText: '清空',
-    okType: 'danger',
-    cancelText: '取消',
-    async onOk() {
-      await api.historyClear()
-      await load()
-      message.success('已清空请求历史')
-    },
-  })
+/* ---------- 清理历史数据 ---------- */
+type CleanupRange = '1d' | '7d' | '30d' | '90d' | 'all' | 'custom'
+type CleanupScope = 'history' | 'runs'
+
+const RANGE_DAYS: Record<Exclude<CleanupRange, 'all' | 'custom'>, number> = {
+  '1d': 1,
+  '7d': 7,
+  '30d': 30,
+  '90d': 90,
+}
+
+const cleanupOpen = ref(false)
+const cleanupRange = ref<CleanupRange>('30d')
+const customRange = ref<[Dayjs, Dayjs] | null>(null)
+const cleanupScope = ref<CleanupScope[]>(['history'])
+const cleanupVacuum = ref(true)
+const preview = ref<CleanupResult | null>(null)
+const previewLoading = ref(false)
+const cleaning = ref(false)
+
+const hasData = computed(() => (stats.value?.total ?? 0) + (stats.value?.runsTotal ?? 0) > 0)
+const canClean = computed(
+  () => cleanupScope.value.length > 0 && (cleanupRange.value !== 'custom' || !!customRange.value),
+)
+
+function rangeBounds(): { from: number | null; to: number | null } {
+  if (cleanupRange.value === 'all') return { from: null, to: null }
+  if (cleanupRange.value === 'custom') {
+    if (!customRange.value) return { from: null, to: null }
+    return { from: customRange.value[0].valueOf(), to: customRange.value[1].valueOf() }
+  }
+  const days = RANGE_DAYS[cleanupRange.value]
+  return { from: Date.now() - days * 86_400_000, to: null }
+}
+
+const previewText = computed(() => {
+  if (!canClean.value) return '请至少选择一项清理内容'
+  if (previewLoading.value) return '正在统计…'
+  if (!preview.value) return ''
+  const parts: string[] = []
+  if (cleanupScope.value.includes('history')) parts.push(`请求历史 ${preview.value.history} 条`)
+  if (cleanupScope.value.includes('runs')) parts.push(`接口运行记录 ${preview.value.runs} 条`)
+  if (!parts.length) return '请至少选择一项清理内容'
+  return `将删除 ${parts.join('、')}`
+})
+
+async function refreshPreview() {
+  if (!cleanupOpen.value || !canClean.value) {
+    preview.value = null
+    return
+  }
+  previewLoading.value = true
+  try {
+    const { from, to } = rangeBounds()
+    preview.value = await api.dataCleanup({
+      from,
+      to,
+      history: cleanupScope.value.includes('history'),
+      runs: cleanupScope.value.includes('runs'),
+      dryRun: true,
+    })
+  } catch {
+    preview.value = null
+  } finally {
+    previewLoading.value = false
+  }
+}
+
+watch([cleanupOpen, cleanupRange, customRange, cleanupScope], () => {
+  void refreshPreview()
+})
+
+function openCleanup() {
+  cleanupRange.value = '30d'
+  customRange.value = null
+  cleanupScope.value = ['history']
+  cleanupVacuum.value = true
+  preview.value = null
+  cleanupOpen.value = true
+}
+
+async function runCleanup() {
+  if (!canClean.value) return
+  cleaning.value = true
+  try {
+    const { from, to } = rangeBounds()
+    const result = await api.dataCleanup({
+      from,
+      to,
+      history: cleanupScope.value.includes('history'),
+      runs: cleanupScope.value.includes('runs'),
+      vacuum: cleanupVacuum.value,
+    })
+    const parts: string[] = []
+    if (cleanupScope.value.includes('history')) parts.push(`请求历史 ${result.history} 条`)
+    if (cleanupScope.value.includes('runs')) parts.push(`接口运行记录 ${result.runs} 条`)
+    message.success(`已清理 ${parts.join('、')}`)
+    cleanupOpen.value = false
+    await load()
+  } catch (e) {
+    message.error(String(e))
+  } finally {
+    cleaning.value = false
+  }
 }
 
 async function openItem(item: HistoryItem) {
@@ -108,21 +216,21 @@ const columns = [
     <PageHeader
       eyebrow="History"
       title="请求历史"
-      subtitle="本机保留最近 5000 条发送记录，此处展示最新 500 条，点击可跳回原接口"
+      subtitle="本机保留最近 100000 条发送记录，默认展示最新 500 条，点击可跳回原接口；支持按时间范围清理"
     >
       <a-button :loading="loading" @click="load">
         <template #icon><ReloadOutlined /></template>
         刷新
       </a-button>
-      <a-button danger :disabled="!items.length" @click="clearAll">
+      <a-button danger :disabled="!hasData" @click="openCleanup">
         <template #icon><DeleteOutlined /></template>
-        清空历史
+        清理历史
       </a-button>
     </PageHeader>
 
     <div class="summary">
       <div class="summary-item">
-        <span class="summary-label">记录总数</span>
+        <span class="summary-label">请求历史总数</span>
         <span class="summary-value mono">{{ summary.total }}</span>
       </div>
       <div class="summary-divider" />
@@ -135,12 +243,28 @@ const columns = [
         <span class="summary-label">平均耗时</span>
         <span class="summary-value mono">{{ summary.avg.toFixed(0) }}<i>ms</i></span>
       </div>
+      <div class="summary-divider" />
+      <div class="summary-item">
+        <span class="summary-label">接口运行记录</span>
+        <span class="summary-value mono">{{ summary.runs }}</span>
+      </div>
+      <div class="summary-divider" />
+      <div class="summary-item">
+        <span class="summary-label">最早记录</span>
+        <span class="summary-value mono date">{{ fmtDay(stats?.oldestAt) }}</span>
+      </div>
     </div>
 
     <div class="toolbar">
       <a-input v-model:value="keyword" allow-clear placeholder="搜索接口名称、URL、方法或状态码" class="search">
         <template #prefix><SearchOutlined /></template>
       </a-input>
+      <a-select v-model:value="displayLimit" class="limit-select">
+        <a-select-option :value="500">展示最近 500 条</a-select-option>
+        <a-select-option :value="1000">展示最近 1000 条</a-select-option>
+        <a-select-option :value="2000">展示最近 2000 条</a-select-option>
+        <a-select-option :value="5000">展示最近 5000 条</a-select-option>
+      </a-select>
       <span class="hint">
         <ClockCircleOutlined />
         共 {{ rows.length }} 条
@@ -199,6 +323,55 @@ const columns = [
         </div>
       </div>
     </a-spin>
+
+    <a-modal
+      v-model:open="cleanupOpen"
+      title="清理历史数据"
+      :width="560"
+      ok-text="开始清理"
+      cancel-text="取消"
+      :confirm-loading="cleaning"
+      :ok-button-props="{ danger: true, disabled: !canClean || previewLoading }"
+      @ok="runCleanup"
+    >
+      <div class="cleanup-tip">
+        只清理本机保存的请求历史与接口运行记录，项目、集合、接口、环境变量与压测报告不受影响。
+      </div>
+
+      <div class="cleanup-field">
+        <div class="cleanup-label">清理范围</div>
+        <a-radio-group v-model:value="cleanupRange" button-style="solid" class="cleanup-radios">
+          <a-radio-button value="1d">最近 1 天</a-radio-button>
+          <a-radio-button value="7d">最近 7 天</a-radio-button>
+          <a-radio-button value="30d">最近 30 天</a-radio-button>
+          <a-radio-button value="90d">最近 90 天</a-radio-button>
+          <a-radio-button value="all">全部清除</a-radio-button>
+          <a-radio-button value="custom">自定义</a-radio-button>
+        </a-radio-group>
+        <a-range-picker
+          v-if="cleanupRange === 'custom'"
+          v-model:value="customRange"
+          show-time
+          :allow-clear="false"
+          format="YYYY-MM-DD HH:mm:ss"
+          class="cleanup-range"
+        />
+      </div>
+
+      <div class="cleanup-field">
+        <div class="cleanup-label">清理内容</div>
+        <a-checkbox-group v-model:value="cleanupScope">
+          <a-checkbox value="history">请求历史</a-checkbox>
+          <a-checkbox value="runs">接口运行记录</a-checkbox>
+        </a-checkbox-group>
+      </div>
+
+      <div class="cleanup-field">
+        <a-checkbox v-model:checked="cleanupVacuum">清理后压缩数据库文件，释放磁盘空间（耗时稍长）</a-checkbox>
+      </div>
+
+      <div class="cleanup-preview">{{ previewText }}</div>
+    </a-modal>
   </div>
 </template>
 
@@ -239,6 +412,47 @@ const columns = [
   margin-left: 2px;
 }
 
+.summary-value.date {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.cleanup-tip {
+  font-size: 12px;
+  color: var(--fm-muted);
+  line-height: 1.7;
+  margin-bottom: 16px;
+}
+
+.cleanup-field {
+  margin-bottom: 14px;
+}
+
+.cleanup-label {
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.cleanup-radios :deep(.ant-radio-button-wrapper) {
+  padding-inline: 12px;
+}
+
+.cleanup-range {
+  display: block;
+  width: 100%;
+  margin-top: 10px;
+}
+
+.cleanup-preview {
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--fm-surface-2, rgba(127, 127, 127, 0.08));
+  border: 1px dashed var(--fm-border);
+  font-size: 12px;
+  color: var(--fm-text-2);
+}
+
 .summary-divider {
   width: 1px;
   height: 26px;
@@ -254,6 +468,10 @@ const columns = [
 
 .search {
   max-width: 320px;
+}
+
+.limit-select {
+  width: 158px;
 }
 
 .hint {

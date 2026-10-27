@@ -331,7 +331,7 @@ function codeTone(code: number) {
 type ExportFormat = 'json' | 'html' | 'excel'
 
 const EXPORT_META: Record<ExportFormat, { extension: string; filterName: string; label: string }> = {
-  json: { extension: 'json', filterName: 'FinkMeter 压测报告', label: 'JSON 归档' },
+  json: { extension: 'json', filterName: 'FbinHttp 压测报告', label: 'JSON 归档' },
   html: { extension: 'html', filterName: 'HTML 报告', label: 'HTML 报告' },
   excel: { extension: 'xlsx', filterName: 'Excel 工作簿', label: 'Excel 表格' },
 }

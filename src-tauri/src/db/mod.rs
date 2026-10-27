@@ -39,10 +39,19 @@ fn migrate(pool: &DbPool) -> Result<(), String> {
         "ALTER TABLE report_requests ADD COLUMN res_headers TEXT",
         "ALTER TABLE report_requests ADD COLUMN res_body TEXT",
         "ALTER TABLE environments ADD COLUMN script TEXT",
+        "ALTER TABLE requests ADD COLUMN auth TEXT",
+        "ALTER TABLE test_plans ADD COLUMN config_json TEXT",
+        "ALTER TABLE test_plans ADD COLUMN updated_at INTEGER DEFAULT 0",
     ];
     for sql in statements {
         let _ = conn.execute(sql, []);
     }
+    // 依赖 updated_at 的索引必须在补列之后创建，否则老库会在建索引时报「no such column」
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_plans_project ON test_plans(project_id, updated_at DESC)",
+        [],
+    )
+    .map_err(err)?;
     Ok(())
 }
 

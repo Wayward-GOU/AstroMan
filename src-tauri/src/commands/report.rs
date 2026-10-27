@@ -1,4 +1,4 @@
-use crate::models::{
+﻿use crate::models::{
     ErrorTypeCount, HistogramBucket, ReportDetail, ReportError, ReportRequestRecord,
     ReportRequestsPage, ReportSample, StageSummary, StatusCount, StressReport,
 };
@@ -188,7 +188,7 @@ pub fn report_export(state: State<'_, AppState>, id: i64, path: String) -> Resul
     }
 
     let bundle = ExportBundle {
-        format: "finkmeter.report".to_string(),
+        format: "fbinhttp.report".to_string(),
         version: 2,
         exported_at: now_ms(),
         detail,

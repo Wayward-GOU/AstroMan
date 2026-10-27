@@ -1,13 +1,17 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crate::models::{HttpResult, SendRequestPayload};
+use crate::commands::cookie;
+use crate::models::{FormField, HttpResult, SendRequestPayload};
 use crate::state::AppState;
 use crate::util::{err, now_ms, render};
 use rusqlite::{params, Connection};
 use tauri::State;
 
 const MAX_BODY: usize = 5 * 1024 * 1024;
+/// 请求历史最多保留最近 10 万条
+const MAX_HISTORY: i64 = 100_000;
 
 #[tauri::command]
 pub async fn send_http_request(
@@ -44,17 +48,28 @@ pub async fn send_http_request(
             pairs.append_pair(&key, &render(&item.value, &vars));
         }
     }
+
+    // API Key 认证可以放在查询参数上
+    let auth = payload.auth.clone().unwrap_or_default();
+    if auth.kind == "apikey" && auth.add_to == "query" && !auth.key.trim().is_empty() {
+        let mut pairs = parsed.query_pairs_mut();
+        pairs.append_pair(&render(auth.key.trim(), &vars), &render(&auth.value, &vars));
+    }
     let url_for_history = parsed.as_str().to_string();
 
     let method = reqwest::Method::from_bytes(payload.method.trim().to_uppercase().as_bytes())
         .map_err(|_| format!("不支持的请求方法：{}", payload.method))?;
 
+    let body_type = payload.body_type.as_str();
+
     let mut builder = state
         .client(payload.insecure)
-        .request(method, parsed)
+        .request(method, parsed.clone())
         .timeout(Duration::from_millis(payload.timeout_ms.max(500)));
 
     let mut has_content_type = false;
+    let mut has_authorization = false;
+    let mut has_cookie = false;
     let mut applied_headers: Vec<(String, String)> = Vec::new();
     for item in &payload.headers {
         if !item.enabled {
@@ -64,34 +79,140 @@ pub async fn send_http_request(
         if key.is_empty() {
             continue;
         }
-        if key.eq_ignore_ascii_case("content-type") {
+        let lower = key.to_ascii_lowercase();
+        if lower == "content-type" {
+            // multipart 的 Content-Type 必须由 reqwest 自动生成（带 boundary）
+            if body_type == "multipart" {
+                continue;
+            }
             has_content_type = true;
+        }
+        if lower == "authorization" {
+            has_authorization = true;
+        }
+        if lower == "cookie" {
+            has_cookie = true;
         }
         let value = render(&item.value, &vars);
         applied_headers.push((key.clone(), value.clone()));
         builder = builder.header(key, value);
     }
 
-    let body_type = payload.body_type.as_str();
+    // 认证头：用户手动配置的 Authorization 优先
+    if !has_authorization {
+        match auth.kind.as_str() {
+            "bearer" | "oauth2" if !auth.token.trim().is_empty() => {
+                let value = format!("Bearer {}", render(auth.token.trim(), &vars));
+                applied_headers.push(("Authorization".to_string(), value.clone()));
+                builder = builder.header(reqwest::header::AUTHORIZATION, value);
+            }
+            "basic" => {
+                let raw = format!(
+                    "{}:{}",
+                    render(&auth.username, &vars),
+                    render(&auth.password, &vars)
+                );
+                let value = format!("Basic {}", base64_encode(raw.as_bytes()));
+                applied_headers.push(("Authorization".to_string(), value.clone()));
+                builder = builder.header(reqwest::header::AUTHORIZATION, value);
+            }
+            "apikey" if auth.add_to != "query" && !auth.key.trim().is_empty() => {
+                let key = render(auth.key.trim(), &vars);
+                let value = render(&auth.value, &vars);
+                applied_headers.push((key.clone(), value.clone()));
+                builder = builder.header(key, value);
+            }
+            _ => {}
+        }
+    }
+
+    // 自动携带本机 Cookie
+    if payload.cookie_enabled.unwrap_or(true) && !has_cookie {
+        if let Ok(conn) = state.pool.get() {
+            let cookies = cookie::cookies_for_url(&conn, &parsed);
+            if !cookies.is_empty() {
+                let value = cookies.join("; ");
+                applied_headers.push(("Cookie".to_string(), value.clone()));
+                builder = builder.header(reqwest::header::COOKIE, value);
+            }
+        }
+    }
+
     let mut sent_body = String::new();
     if !body_type.is_empty() && body_type != "none" {
-        if !has_content_type {
-            let content_type = match body_type {
-                "json" => "application/json",
-                "form" => "application/x-www-form-urlencoded",
-                _ => "text/plain; charset=utf-8",
-            };
-            applied_headers.push(("Content-Type".to_string(), content_type.to_string()));
-            builder = builder.header(reqwest::header::CONTENT_TYPE, content_type);
+        match body_type {
+            "multipart" => {
+                let fields: Vec<FormField> =
+                    serde_json::from_str(payload.body.as_deref().unwrap_or("[]")).unwrap_or_default();
+                let mut form = reqwest::multipart::Form::new();
+                for field in fields.iter().filter(|f| f.enabled) {
+                    let key = render(field.key.trim(), &vars);
+                    if key.is_empty() {
+                        continue;
+                    }
+                    if field.kind == "file" {
+                        let path = render(field.value.trim(), &vars);
+                        if path.is_empty() {
+                            continue;
+                        }
+                        let bytes = std::fs::read(&path)
+                            .map_err(|e| format!("读取上传文件失败（{path}）：{e}"))?;
+                        let filename = Path::new(&path)
+                            .file_name()
+                            .map(|name| name.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "file".to_string());
+                        form = form.part(
+                            key,
+                            reqwest::multipart::Part::bytes(bytes).file_name(filename),
+                        );
+                    } else {
+                        form = form.text(key, render(&field.value, &vars));
+                    }
+                }
+                sent_body = serde_json::to_string(&fields).unwrap_or_default();
+                builder = builder.multipart(form);
+            }
+            "binary" => {
+                let path = render(payload.body.as_deref().unwrap_or("").trim(), &vars);
+                if path.is_empty() {
+                    return Err("请选择要上传的二进制文件".to_string());
+                }
+                let bytes = std::fs::read(&path)
+                    .map_err(|e| format!("读取上传文件失败（{path}）：{e}"))?;
+                if !has_content_type {
+                    applied_headers
+                        .push(("Content-Type".to_string(), "application/octet-stream".to_string()));
+                    builder = builder.header(reqwest::header::CONTENT_TYPE, "application/octet-stream");
+                }
+                sent_body = format!("[二进制文件] {path}（{} 字节）", bytes.len());
+                builder = builder.body(bytes);
+            }
+            _ => {
+                if !has_content_type {
+                    let content_type = match body_type {
+                        "json" => "application/json",
+                        "graphql" => "application/json",
+                        "form" => "application/x-www-form-urlencoded",
+                        _ => "text/plain; charset=utf-8",
+                    };
+                    applied_headers.push(("Content-Type".to_string(), content_type.to_string()));
+                    builder = builder.header(reqwest::header::CONTENT_TYPE, content_type);
+                }
+                sent_body = render(payload.body.as_deref().unwrap_or(""), &vars);
+                builder = builder.body(sent_body.clone());
+            }
         }
-        sent_body = render(payload.body.as_deref().unwrap_or(""), &vars);
-        builder = builder.body(sent_body.clone());
     }
 
     let started = Instant::now();
     match builder.send().await {
         Ok(response) => {
-            let result = read_response(response, started).await;
+            let (result, set_cookies) = read_response(response, started).await;
+            if payload.cookie_enabled.unwrap_or(true) && !set_cookies.is_empty() {
+                if let Ok(conn) = state.pool.get() {
+                    cookie::store_response_cookies(&conn, &parsed, &set_cookies);
+                }
+            }
             record_history(
                 &state,
                 &payload,
@@ -158,16 +279,21 @@ fn record_run_snapshot(
     );
 }
 
-async fn read_response(response: reqwest::Response, started: Instant) -> HttpResult {
+async fn read_response(response: reqwest::Response, started: Instant) -> (HttpResult, Vec<String>) {
     let status = response.status();
     let status_text = status.canonical_reason().unwrap_or_default().to_string();
 
     let mut headers = HashMap::new();
+    let mut set_cookies = Vec::new();
     for (name, value) in response.headers().iter() {
-        headers.insert(
-            name.as_str().to_string(),
-            value.to_str().unwrap_or_default().to_string(),
-        );
+        if name.as_str().eq_ignore_ascii_case("set-cookie") {
+            if let Ok(text) = value.to_str() {
+                set_cookies.push(text.to_string());
+            }
+        }
+        headers
+            .entry(name.as_str().to_string())
+            .or_insert_with(|| value.to_str().unwrap_or_default().to_string());
     }
 
     let mut response = response;
@@ -194,16 +320,44 @@ async fn read_response(response: reqwest::Response, started: Instant) -> HttpRes
         }
     }
 
-    HttpResult {
-        status: status.as_u16(),
-        status_text,
-        duration_ms: started.elapsed().as_millis() as u64,
-        size_bytes: buffer.len(),
-        headers,
-        body: String::from_utf8_lossy(&buffer).into_owned(),
-        truncated,
-        error: read_error,
+    (
+        HttpResult {
+            status: status.as_u16(),
+            status_text,
+            duration_ms: started.elapsed().as_millis() as u64,
+            size_bytes: buffer.len(),
+            headers,
+            body: String::from_utf8_lossy(&buffer).into_owned(),
+            truncated,
+            error: read_error,
+        },
+        set_cookies,
+    )
+}
+
+/// 标准 Base64 编码（Basic 认证使用）
+fn base64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let value = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((value >> 18) & 63) as usize] as char);
+        out.push(TABLE[((value >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((value >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(value & 63) as usize] as char
+        } else {
+            '='
+        });
     }
+    out
 }
 
 pub(crate) fn load_vars(conn: &Connection, env_id: i64) -> Result<HashMap<String, String>, String> {
@@ -267,11 +421,11 @@ fn record_history(
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM request_history", [], |row| row.get(0))
         .unwrap_or(0);
-    if count > 5000 {
+    if count > MAX_HISTORY {
         let _ = conn.execute(
             "DELETE FROM request_history
              WHERE id IN (SELECT id FROM request_history ORDER BY id ASC LIMIT ?1)",
-            params![count - 5000],
+            params![count - MAX_HISTORY],
         );
     }
 }

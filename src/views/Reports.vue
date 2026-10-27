@@ -8,6 +8,7 @@ import {
   DeleteOutlined,
   ThunderboltOutlined,
   ClockCircleOutlined,
+  SwapOutlined,
 } from '@ant-design/icons-vue'
 import PageHeader from '@/components/PageHeader.vue'
 import { formatDateTime } from '@/utils/datetime'
@@ -56,10 +57,54 @@ function remove(report: StressReport) {
     cancelText: '取消',
     async onOk() {
       await api.reportDelete(report.id)
+      selectedIds.value = selectedIds.value.filter((id) => id !== report.id)
       await load()
       message.success('已删除')
     },
   })
+}
+
+/* ---------- 报告横向对比 ---------- */
+const selectedIds = ref<number[]>([])
+const compareOpen = ref(false)
+
+function toggleSelect(id: number, checked: boolean) {
+  if (checked) {
+    if (selectedIds.value.length >= 4) {
+      message.warning('最多选择 4 份报告对比')
+      return
+    }
+    selectedIds.value = [...selectedIds.value, id]
+  } else {
+    selectedIds.value = selectedIds.value.filter((item) => item !== id)
+  }
+}
+
+const compareReports = computed(() =>
+  selectedIds.value
+    .map((id) => reports.value.find((item) => item.id === id))
+    .filter((item): item is StressReport => Boolean(item)),
+)
+
+function compareMetricRows() {
+  const list = compareReports.value
+  if (!list.length) return []
+  const percent = (value: number) => `${value.toFixed(1)}%`
+  const ms = (value: number) => `${fmtNum(value)} ms`
+  return [
+    { label: '总请求', values: list.map((r) => r.totalRequests.toLocaleString()) },
+    { label: '成功率', values: list.map((r) => percent(100 - r.errorRate)) },
+    { label: '错误率', values: list.map((r) => percent(r.errorRate)) },
+    { label: '平均延迟', values: list.map((r) => ms(r.avgRt)) },
+    { label: 'P95', values: list.map((r) => ms(r.p95Rt)) },
+    { label: 'P99', values: list.map((r) => ms(r.p99Rt)) },
+    { label: '平均 QPS', values: list.map((r) => fmtNum(r.avgQps)) },
+    { label: '最大 QPS', values: list.map((r) => fmtNum(r.maxQps)) },
+    { label: 'APDEX', values: list.map((r) => r.apdex.toFixed(3)) },
+    { label: '并发', values: list.map((r) => String(r.concurrency)) },
+    { label: '状态', values: list.map((r) => (r.status === 'stopped' ? '已停止' : '已完成')) },
+    { label: '时间', values: list.map((r) => fmtTime(r.createdAt)) },
+  ]
 }
 </script>
 
@@ -71,6 +116,10 @@ function remove(report: StressReport) {
       subtitle="每次压测结束后自动生成，包含吞吐、延迟分位与错误明细"
     >
       <a-button @click="router.push('/')">去工作台</a-button>
+      <a-button :disabled="selectedIds.length < 2" @click="compareOpen = true">
+        <template #icon><SwapOutlined /></template>
+        对比{{ selectedIds.length ? `（${selectedIds.length}）` : '' }}
+      </a-button>
       <a-button type="primary" @click="router.push('/')">
         <template #icon><ThunderboltOutlined /></template>
         发起压测
@@ -99,6 +148,10 @@ function remove(report: StressReport) {
         <div v-for="r in reports" :key="r.id" class="fm-card report-card">
           <div class="report-head">
             <div class="report-title">
+              <a-checkbox
+                :checked="selectedIds.includes(r.id)"
+                @change="toggleSelect(r.id, !selectedIds.includes(r.id))"
+              />
               <span class="status-dot" :class="{ stopped: r.status === 'stopped' }" />
               <span class="name">{{ r.planName }}</span>
               <span class="status-pill" :class="{ stopped: r.status === 'stopped' }">
@@ -167,6 +220,28 @@ function remove(report: StressReport) {
         <a-button type="primary" @click="router.push('/')">去工作台选请求</a-button>
       </div>
     </a-spin>
+
+    <a-modal
+      v-model:open="compareOpen"
+      title="压测报告对比"
+      :footer="null"
+      width="860px"
+    >
+      <div v-if="compareReports.length" class="compare-table">
+        <div class="compare-row compare-head">
+          <span class="compare-label">指标</span>
+          <span v-for="r in compareReports" :key="r.id" class="compare-col">
+            <b>{{ r.planName }}</b>
+            <i>{{ fmtTime(r.createdAt) }}</i>
+          </span>
+        </div>
+        <div v-for="row in compareMetricRows()" :key="row.label" class="compare-row">
+          <span class="compare-label">{{ row.label }}</span>
+          <span v-for="(value, index) in row.values" :key="index" class="compare-col mono">{{ value }}</span>
+        </div>
+        <div class="compare-tip">勾选报告卡片左上角即可加入对比，最多 4 份。</div>
+      </div>
+    </a-modal>
   </div>
 </template>
 
@@ -395,5 +470,71 @@ function remove(report: StressReport) {
   .report-metrics {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
+}
+
+/* ---------- 报告对比 ---------- */
+.compare-table {
+  border: 1px solid var(--fm-border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.compare-row {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 1fr);
+  grid-template-columns: 110px;
+  border-bottom: 1px solid var(--fm-border);
+}
+
+.compare-row:last-of-type {
+  border-bottom: none;
+}
+
+.compare-head {
+  background: var(--fm-surface-alt);
+}
+
+.compare-label {
+  padding: 9px 12px;
+  font-size: 11.5px;
+  color: var(--fm-muted);
+  border-right: 1px solid var(--fm-border);
+}
+
+.compare-col {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 9px 12px;
+  font-size: 12px;
+  border-right: 1px solid var(--fm-border);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.compare-col:last-child {
+  border-right: none;
+}
+
+.compare-head .compare-col b {
+  font-size: 12.5px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.compare-head .compare-col i {
+  font-style: normal;
+  font-size: 10.5px;
+  color: var(--fm-muted);
+}
+
+.compare-tip {
+  padding: 8px 12px;
+  font-size: 10.5px;
+  color: var(--fm-muted);
+  background: var(--fm-surface-alt);
 }
 </style>

@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import { useRoute } from 'vue-router'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { theme as AntTheme } from 'ant-design-vue'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import {
@@ -12,13 +12,17 @@ import {
   LineChartOutlined,
   ToolOutlined,
   ThunderboltOutlined,
+  PlayCircleOutlined,
+  SearchOutlined,
+  EnterOutlined,
 } from '@ant-design/icons-vue'
 import AppLogo from '@/components/AppLogo.vue'
-import { currentTheme } from '@/stores/theme'
+import { currentTheme, currentThemeId, setTheme, themes } from '@/stores/theme'
 import { isMac, shortcutText } from '@/utils/platform'
 import { checkForUpdates, isAutoUpdateEnabled } from '@/utils/updater'
 
 const route = useRoute()
+const router = useRouter()
 
 const ZOOM_KEY = 'fm-zoom'
 const ZOOM_MIN = 0.5
@@ -83,10 +87,154 @@ function onZoomHotkey(event: KeyboardEvent) {
   }
 }
 
+/* ---------- 侧边栏导航 ---------- */
+// 必须声明在命令面板的 computed / watch 之前，否则 watch 首次求值会触发 TDZ
+const navs = [
+  { key: 'home', label: '工作台', hint: '项目与请求调试', to: '/', icon: AppstoreOutlined },
+  { key: 'stress', label: '压测', hint: '选择接口发起压测', to: '/stress', icon: ThunderboltOutlined },
+  { key: 'runner', label: '批量运行', hint: '集合 Runner · 数据驱动', to: '/runner', icon: PlayCircleOutlined },
+  { key: 'reports', label: '压测报告', hint: '历史压测结果', to: '/reports', icon: FundProjectionScreenOutlined },
+  { key: 'history', label: '请求历史', hint: '最近发送记录', to: '/history', icon: HistoryOutlined },
+  { key: 'monitor', label: '系统监视', hint: 'CPU · 内存 · 磁盘 · 网络', to: '/monitor', icon: LineChartOutlined },
+  { key: 'tools', label: '工具箱', hint: 'JSON · 加解密 · 时间戳', to: '/tools', icon: ToolOutlined },
+  { key: 'settings', label: '设置', hint: '应用与数据', to: '/settings', icon: SettingOutlined },
+]
+
+/* ---------- 命令面板 ---------- */
+interface PaletteItem {
+  key: string
+  label: string
+  hint: string
+  group: string
+  run: () => void
+}
+
+const paletteOpen = ref(false)
+const paletteQuery = ref('')
+const paletteIndex = ref(0)
+const paletteInput = ref<{ focus: () => void } | null>(null)
+
+function go(path: string) {
+  router.push(path)
+}
+
+function cycleTheme() {
+  const index = themes.findIndex((item) => item.id === currentThemeId.value)
+  const next = themes[(index + 1) % themes.length]
+  setTheme(next.id)
+}
+
+const paletteCommands = computed<PaletteItem[]>(() => [
+  ...navs.map((item) => ({
+    key: `nav-${item.key}`,
+    label: item.label,
+    hint: item.hint,
+    group: '页面',
+    run: () => go(item.to),
+  })),
+  {
+    key: 'theme',
+    label: '切换主题',
+    hint: `当前：${currentTheme.value.name}`,
+    group: '外观',
+    run: cycleTheme,
+  },
+  { key: 'zoom-in', label: '放大界面', hint: shortcutText('+'), group: '外观', run: zoomIn },
+  { key: 'zoom-out', label: '缩小界面', hint: shortcutText('-'), group: '外观', run: zoomOut },
+  { key: 'zoom-reset', label: '恢复 100%', hint: shortcutText('0'), group: '外观', run: resetZoom },
+  {
+    key: 'update',
+    label: '检查更新',
+    hint: '从 GitHub 获取最新版本',
+    group: '应用',
+    run: () => {
+      checkForUpdates({ silent: false })
+    },
+  },
+])
+
+const paletteFiltered = computed(() => {
+  const query = paletteQuery.value.trim().toLowerCase()
+  if (!query) return paletteCommands.value
+  return paletteCommands.value.filter(
+    (item) => item.label.toLowerCase().includes(query) || item.hint.toLowerCase().includes(query),
+  )
+})
+
+watch(paletteFiltered, () => {
+  paletteIndex.value = 0
+})
+
+function openPalette() {
+  paletteQuery.value = ''
+  paletteIndex.value = 0
+  paletteOpen.value = true
+  nextTick(() => paletteInput.value?.focus())
+}
+
+function runPalette(index: number) {
+  const item = paletteFiltered.value[index]
+  if (!item) return
+  paletteOpen.value = false
+  item.run()
+}
+
+function onPaletteKeydown(event: KeyboardEvent) {
+  if (event.key === 'ArrowDown') {
+    event.preventDefault()
+    if (!paletteFiltered.value.length) return
+    paletteIndex.value = (paletteIndex.value + 1) % paletteFiltered.value.length
+  } else if (event.key === 'ArrowUp') {
+    event.preventDefault()
+    if (!paletteFiltered.value.length) return
+    paletteIndex.value =
+      (paletteIndex.value - 1 + paletteFiltered.value.length) % paletteFiltered.value.length
+  } else if (event.key === 'Enter') {
+    event.preventDefault()
+    runPalette(paletteIndex.value)
+  }
+}
+
+function onGlobalHotkey(event: KeyboardEvent) {
+  const modifier = isMac ? event.metaKey : event.ctrlKey
+  if (!modifier || event.altKey) return
+  const key = event.key.toLowerCase()
+  if (key === 'k') {
+    event.preventDefault()
+    if (paletteOpen.value) {
+      paletteOpen.value = false
+    } else {
+      openPalette()
+    }
+    return
+  }
+  // Ctrl / ⌘ + 1..8 直达对应页面
+  if (/^[1-9]$/.test(key)) {
+    const target = navs[Number(key) - 1]
+    if (!target) return
+    event.preventDefault()
+    go(target.to)
+  }
+}
+
+function groupPalette(items: PaletteItem[]) {
+  const groups: { group: string; items: { item: PaletteItem; index: number }[] }[] = []
+  items.forEach((item, index) => {
+    let bucket = groups.find((entry) => entry.group === item.group)
+    if (!bucket) {
+      bucket = { group: item.group, items: [] }
+      groups.push(bucket)
+    }
+    bucket.items.push({ item, index })
+  })
+  return groups
+}
+
 onMounted(() => {
   const stored = Number(localStorage.getItem(ZOOM_KEY) ?? '1')
   applyZoom(Number.isFinite(stored) && stored > 0 ? stored : 1, false)
   window.addEventListener('keydown', onZoomHotkey)
+  window.addEventListener('keydown', onGlobalHotkey)
 
   // 启动后静默检查一次 GitHub 最新版本，有更新才提示
   if (isAutoUpdateEnabled()) {
@@ -98,22 +246,14 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onZoomHotkey)
+  window.removeEventListener('keydown', onGlobalHotkey)
   if (noticeTimer) window.clearTimeout(noticeTimer)
 })
-
-const navs = [
-  { key: 'home', label: '工作台', hint: '项目与请求调试', to: '/', icon: AppstoreOutlined },
-  { key: 'stress', label: '压测', hint: '选择接口发起压测', to: '/stress', icon: ThunderboltOutlined },
-  { key: 'reports', label: '压测报告', hint: '历史压测结果', to: '/reports', icon: FundProjectionScreenOutlined },
-  { key: 'history', label: '请求历史', hint: '最近发送记录', to: '/history', icon: HistoryOutlined },
-  { key: 'monitor', label: '系统监视', hint: 'CPU · 内存 · 磁盘 · 网络', to: '/monitor', icon: LineChartOutlined },
-  { key: 'tools', label: '工具箱', hint: 'JSON · 加解密 · 时间戳', to: '/tools', icon: ToolOutlined },
-  { key: 'settings', label: '设置', hint: '应用与数据', to: '/settings', icon: SettingOutlined },
-]
 
 const activeKey = computed(() => {
   const path = route.path
   if (path.startsWith('/stress')) return 'stress'
+  if (path.startsWith('/runner')) return 'runner'
   if (path.startsWith('/reports')) return 'reports'
   if (path.startsWith('/history')) return 'history'
   if (path.startsWith('/monitor')) return 'monitor'
@@ -165,7 +305,7 @@ const theme = computed(() => {
         <div class="brand">
           <AppLogo :size="38" />
           <div class="brand-text">
-            <span class="brand-name">FinkMeter</span>
+            <span class="brand-name">FbinHttp</span>
             <span class="brand-sub">API 调试 · 压测</span>
           </div>
         </div>
@@ -218,7 +358,7 @@ const theme = computed(() => {
               <div class="local-desc">数据只保存在这台电脑</div>
             </div>
           </div>
-          <div class="version">FinkMeter v1.0 · Desktop</div>
+          <div class="version">FbinHttp v1.0 · Desktop</div>
         </div>
       </aside>
 
@@ -229,6 +369,47 @@ const theme = computed(() => {
       <transition name="zoom-fade">
         <div v-if="zoomNotice" class="zoom-notice">{{ Math.round(zoom * 100) }}%</div>
       </transition>
+
+      <a-modal
+        v-model:open="paletteOpen"
+        :footer="null"
+        :closable="false"
+        :width="560"
+        wrap-class-name="palette-wrap"
+      >
+        <div class="palette">
+          <div class="palette-search">
+            <SearchOutlined class="palette-icon" />
+            <input
+              ref="paletteInput"
+              v-model="paletteQuery"
+              class="palette-input"
+              placeholder="搜索页面或操作…"
+              @keydown="onPaletteKeydown"
+            />
+            <span class="palette-kbd">{{ shortcutText('K') }}</span>
+          </div>
+          <div class="palette-list">
+            <template v-for="group in groupPalette(paletteFiltered)" :key="group.group">
+              <div class="palette-group">{{ group.group }}</div>
+              <button
+                v-for="entry in group.items"
+                :key="entry.item.key"
+                type="button"
+                class="palette-item"
+                :class="{ active: entry.index === paletteIndex }"
+                @mouseenter="paletteIndex = entry.index"
+                @click="runPalette(entry.index)"
+              >
+                <span class="palette-label">{{ entry.item.label }}</span>
+                <span class="palette-hint">{{ entry.item.hint }}</span>
+                <EnterOutlined v-if="entry.index === paletteIndex" class="palette-enter" />
+              </button>
+            </template>
+            <div v-if="!paletteFiltered.length" class="palette-empty">没有匹配的命令</div>
+          </div>
+        </div>
+      </a-modal>
     </div>
   </a-config-provider>
 </template>
@@ -466,5 +647,99 @@ const theme = computed(() => {
   height: 100%;
   overflow: auto;
   background: var(--fm-bg);
+}
+
+/* ---------- 命令面板 ---------- */
+.palette {
+  margin: -8px -8px 0;
+}
+
+.palette-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--fm-border);
+}
+
+.palette-icon {
+  color: var(--fm-muted);
+  font-size: 14px;
+}
+
+.palette-input {
+  flex: 1;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--fm-text);
+  font-size: 14px;
+}
+
+.palette-kbd {
+  padding: 2px 6px;
+  border: 1px solid var(--fm-border);
+  border-radius: 4px;
+  font-size: 10px;
+  color: var(--fm-muted);
+}
+
+.palette-list {
+  max-height: 380px;
+  overflow: auto;
+  padding: 6px;
+}
+
+.palette-group {
+  padding: 8px 10px 4px;
+  font-size: 10px;
+  letter-spacing: 0.4px;
+  color: var(--fm-muted);
+}
+
+.palette-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--fm-text-2);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.palette-item.active {
+  background: var(--fm-primary-soft);
+  color: var(--fm-primary);
+}
+
+.palette-label {
+  flex-shrink: 0;
+  font-weight: 500;
+}
+
+.palette-hint {
+  flex: 1;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 11px;
+  color: var(--fm-muted);
+}
+
+.palette-enter {
+  font-size: 11px;
+  color: var(--fm-primary);
+}
+
+.palette-empty {
+  padding: 22px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--fm-muted);
 }
 </style>

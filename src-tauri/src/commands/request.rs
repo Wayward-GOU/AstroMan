@@ -24,6 +24,7 @@ fn map_summary(row: &Row<'_>) -> rusqlite::Result<RequestSummary> {
 fn map_detail(row: &Row<'_>) -> rusqlite::Result<HttpRequestDetail> {
     let headers: Option<String> = row.get(5)?;
     let query: Option<String> = row.get(6)?;
+    let auth: Option<String> = row.get(12)?;
     Ok(HttpRequestDetail {
         id: Some(row.get(0)?),
         collection_id: row.get(1)?,
@@ -37,13 +38,16 @@ fn map_detail(row: &Row<'_>) -> rusqlite::Result<HttpRequestDetail> {
         pre_script: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
         post_script: row.get::<_, Option<String>>(10)?.unwrap_or_default(),
         assertions: row.get::<_, Option<String>>(11)?.unwrap_or_default(),
+        auth: auth
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default(),
     })
 }
 
 fn find_request(conn: &Connection, id: i64) -> Result<HttpRequestDetail, String> {
     conn.query_row(
         "SELECT id, collection_id, name, method, url, headers, params,
-                body_type, body, pre_script, post_script, assertions
+                body_type, body, pre_script, post_script, assertions, auth
          FROM requests WHERE id = ?1",
         params![id],
         map_detail,
@@ -162,6 +166,7 @@ pub fn request_save(
     };
     let headers = serde_json::to_string(&request.headers).map_err(err)?;
     let query = serde_json::to_string(&request.params).map_err(err)?;
+    let auth = serde_json::to_string(&request.auth).map_err(err)?;
     let now = now_ms();
 
     let conn = state.pool.get().map_err(err)?;
@@ -172,8 +177,8 @@ pub fn request_save(
                 .execute(
                     "UPDATE requests SET name = ?1, method = ?2, url = ?3, headers = ?4,
                         params = ?5, body_type = ?6, body = ?7, pre_script = ?8,
-                        post_script = ?9, assertions = ?10, updated_at = ?11
-                     WHERE id = ?12",
+                        post_script = ?9, assertions = ?10, auth = ?11, updated_at = ?12
+                     WHERE id = ?13",
                     params![
                         name,
                         request.method,
@@ -185,6 +190,7 @@ pub fn request_save(
                         request.pre_script,
                         request.post_script,
                         request.assertions,
+                        auth,
                         now,
                         id
                     ],
@@ -199,8 +205,8 @@ pub fn request_save(
             conn.execute(
                 "INSERT INTO requests
                     (collection_id, name, method, url, headers, params, body_type, body,
-                     pre_script, post_script, assertions, sort_order, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12, ?12)",
+                     pre_script, post_script, assertions, auth, sort_order, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0, ?13, ?13)",
                 params![
                     request.collection_id,
                     name,
@@ -213,6 +219,7 @@ pub fn request_save(
                     request.pre_script,
                     request.post_script,
                     request.assertions,
+                    auth,
                     now
                 ],
             )
@@ -227,5 +234,29 @@ pub fn request_delete(state: State<'_, AppState>, id: i64) -> Result<(), String>
     let conn = state.pool.get().map_err(err)?;
     conn.execute("DELETE FROM requests WHERE id = ?1", params![id])
         .map_err(err)?;
+    Ok(())
+}
+
+/// 按给定顺序重排某集合下的请求（拖拽排序）。
+#[tauri::command]
+pub fn request_reorder(
+    state: State<'_, AppState>,
+    collection_id: i64,
+    ids: Vec<i64>,
+) -> Result<(), String> {
+    if ids.is_empty() {
+        return Err("排序列表为空".to_string());
+    }
+    let mut conn = state.pool.get().map_err(err)?;
+    let tx = conn.transaction().map_err(err)?;
+    for (index, id) in ids.iter().enumerate() {
+        tx.execute(
+            "UPDATE requests SET sort_order = ?1, updated_at = ?2
+             WHERE id = ?3 AND collection_id = ?4",
+            params![index as i64, now_ms(), id, collection_id],
+        )
+        .map_err(err)?;
+    }
+    tx.commit().map_err(err)?;
     Ok(())
 }

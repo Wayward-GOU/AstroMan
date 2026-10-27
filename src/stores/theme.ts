@@ -1,6 +1,14 @@
 import { computed, ref } from 'vue'
 
-export type ThemeId = 'ocean' | 'graphite' | 'forest' | 'midnight'
+export type ThemeId =
+  | 'ocean'
+  | 'graphite'
+  | 'forest'
+  | 'midnight'
+  | 'amber'
+  | 'teal'
+  | 'rose'
+  | 'dusk'
 
 export interface ThemeDefinition {
   id: ThemeId
@@ -191,9 +199,199 @@ const midnight: ThemeDefinition = {
   },
 }
 
-export const themes: ThemeDefinition[] = [ocean, graphite, forest, midnight]
+const amber: ThemeDefinition = {
+  id: 'amber',
+  name: '琥珀橙',
+  desc: '暖调 · 品牌同色',
+  dark: false,
+  swatches: ['#fdfbf7', '#f7f1e8', '#b4692a', '#22190f'],
+  vars: {
+    '--fm-primary': '#b4692a',
+    '--fm-primary-dark': '#96531d',
+    '--fm-primary-soft': '#fdf1e6',
+    '--fm-success': '#4a7d55',
+    '--fm-success-soft': '#eef5ef',
+    '--fm-warning': '#a97a1f',
+    '--fm-warning-soft': '#faf3e4',
+    '--fm-danger': '#b0504a',
+    '--fm-danger-soft': '#f9efee',
+    '--fm-purple': '#6b5b83',
+    '--fm-purple-soft': '#f4f1f7',
+    '--fm-bg': '#fdfbf7',
+    '--fm-surface': '#ffffff',
+    '--fm-surface-alt': '#f7f1e8',
+    '--fm-border': '#ece2d5',
+    '--fm-border-strong': '#d9cbb8',
+    '--fm-text': '#22190f',
+    '--fm-text-2': '#4a3a29',
+    '--fm-muted': '#7a6a58',
+    '--fm-sidebar': '#f8f2e8',
+    '--fm-sidebar-hover': '#f1e8da',
+    '--fm-sidebar-active': '#ebdfcc',
+    '--fm-sidebar-text': '#6d5c48',
+    '--fm-sidebar-icon': '#8b7861',
+    '--fm-sidebar-active-text': '#a85618',
+    '--fm-code-bg': '#fdfbf7',
+    '--fm-gutter-bg': '#f7f1e8',
+    '--fm-json-key': '#7a3f16',
+    '--fm-json-string': '#3f6d4a',
+    '--fm-json-number': '#9c6218',
+    '--fm-json-bool': '#6a4c7d',
+    '--fm-json-punct': '#9a8b78',
+    '--fm-shadow-sm': '0 1px 2px rgba(34, 25, 15, 0.05)',
+    '--fm-shadow': '0 1px 2px rgba(34, 25, 15, 0.05), 0 1px 3px rgba(34, 25, 15, 0.04)',
+    '--fm-shadow-lg': '0 8px 20px rgba(34, 25, 15, 0.1)',
+  },
+}
 
-const STORAGE_KEY = 'finkmeter.theme'
+const teal: ThemeDefinition = {
+  id: 'teal',
+  name: '青碧',
+  desc: '清爽 · 冷绿调',
+  dark: false,
+  swatches: ['#f6fbfa', '#edf6f5', '#2f7a75', '#0c1e1c'],
+  vars: {
+    '--fm-primary': '#2f7a75',
+    '--fm-primary-dark': '#24635f',
+    '--fm-primary-soft': '#e9f4f3',
+    '--fm-success': '#3f7f5f',
+    '--fm-success-soft': '#edf5f0',
+    '--fm-warning': '#b07d33',
+    '--fm-warning-soft': '#faf4e9',
+    '--fm-danger': '#b0524d',
+    '--fm-danger-soft': '#f9efee',
+    '--fm-purple': '#615c80',
+    '--fm-purple-soft': '#f2f1f7',
+    '--fm-bg': '#f6fbfa',
+    '--fm-surface': '#ffffff',
+    '--fm-surface-alt': '#edf6f5',
+    '--fm-border': '#d9e9e7',
+    '--fm-border-strong': '#bcd6d3',
+    '--fm-text': '#0c1e1c',
+    '--fm-text-2': '#2f4744',
+    '--fm-muted': '#5d7a77',
+    '--fm-sidebar': '#eff7f6',
+    '--fm-sidebar-hover': '#e4f1ef',
+    '--fm-sidebar-active': '#d9ece9',
+    '--fm-sidebar-text': '#547370',
+    '--fm-sidebar-icon': '#6f8c89',
+    '--fm-sidebar-active-text': '#2f7a75',
+    '--fm-code-bg': '#fbfdfd',
+    '--fm-gutter-bg': '#eff7f6',
+    '--fm-json-key': '#1d5450',
+    '--fm-json-string': '#2f7d5b',
+    '--fm-json-number': '#b26a1f',
+    '--fm-json-bool': '#5a4c80',
+    '--fm-json-punct': '#77908d',
+    '--fm-shadow-sm': '0 1px 2px rgba(12, 30, 28, 0.04)',
+    '--fm-shadow': '0 1px 2px rgba(12, 30, 28, 0.04), 0 1px 3px rgba(12, 30, 28, 0.03)',
+    '--fm-shadow-lg': '0 8px 20px rgba(12, 30, 28, 0.08)',
+  },
+}
+
+const rose: ThemeDefinition = {
+  id: 'rose',
+  name: '玫瑰',
+  desc: '柔和 · 暖粉调',
+  dark: false,
+  swatches: ['#fdf9fa', '#f9eff2', '#a3566b', '#241318'],
+  vars: {
+    '--fm-primary': '#a3566b',
+    '--fm-primary-dark': '#8a4557',
+    '--fm-primary-soft': '#fbeef1',
+    '--fm-success': '#4a7d63',
+    '--fm-success-soft': '#eef5f1',
+    '--fm-warning': '#ab7b35',
+    '--fm-warning-soft': '#faf4e9',
+    '--fm-danger': '#b04a4a',
+    '--fm-danger-soft': '#faeceb',
+    '--fm-purple': '#6f5480',
+    '--fm-purple-soft': '#f5f0f8',
+    '--fm-bg': '#fdf9fa',
+    '--fm-surface': '#ffffff',
+    '--fm-surface-alt': '#f9eff2',
+    '--fm-border': '#f0dde2',
+    '--fm-border-strong': '#dcbfc8',
+    '--fm-text': '#241318',
+    '--fm-text-2': '#4c3038',
+    '--fm-muted': '#7d5e67',
+    '--fm-sidebar': '#fbf1f4',
+    '--fm-sidebar-hover': '#f6e6eb',
+    '--fm-sidebar-active': '#f1dbe2',
+    '--fm-sidebar-text': '#775a63',
+    '--fm-sidebar-icon': '#93757f',
+    '--fm-sidebar-active-text': '#a3566b',
+    '--fm-code-bg': '#fefcfd',
+    '--fm-gutter-bg': '#fbf1f4',
+    '--fm-json-key': '#7a3247',
+    '--fm-json-string': '#3f7a5e',
+    '--fm-json-number': '#a96b28',
+    '--fm-json-bool': '#62497d',
+    '--fm-json-punct': '#9a8188',
+    '--fm-shadow-sm': '0 1px 2px rgba(36, 19, 24, 0.04)',
+    '--fm-shadow': '0 1px 2px rgba(36, 19, 24, 0.04), 0 1px 3px rgba(36, 19, 24, 0.03)',
+    '--fm-shadow-lg': '0 8px 20px rgba(36, 19, 24, 0.08)',
+  },
+}
+
+const dusk: ThemeDefinition = {
+  id: 'dusk',
+  name: '暮色',
+  desc: '深色 · 紫蓝夜空',
+  dark: true,
+  swatches: ['#0f1218', '#161b24', '#a3b8dd', '#e8edf5'],
+  vars: {
+    '--fm-primary': '#a3b8dd',
+    '--fm-primary-dark': '#c3d2ef',
+    '--fm-primary-soft': '#232a3a',
+    '--fm-success': '#7fb79a',
+    '--fm-success-soft': '#1a2a24',
+    '--fm-warning': '#d3a866',
+    '--fm-warning-soft': '#2b2519',
+    '--fm-danger': '#d1847c',
+    '--fm-danger-soft': '#2e2021',
+    '--fm-purple': '#b8a6df',
+    '--fm-purple-soft': '#262239',
+    '--fm-bg': '#0f1218',
+    '--fm-surface': '#161b24',
+    '--fm-surface-alt': '#1d232e',
+    '--fm-border': '#2b3340',
+    '--fm-border-strong': '#3d4655',
+    '--fm-text': '#e8edf5',
+    '--fm-text-2': '#c3cad6',
+    '--fm-muted': '#8b93a3',
+    '--fm-sidebar': '#131821',
+    '--fm-sidebar-hover': '#1d2632',
+    '--fm-sidebar-active': '#253040',
+    '--fm-sidebar-text': '#96a0b0',
+    '--fm-sidebar-icon': '#828c9c',
+    '--fm-sidebar-active-text': '#c3d2ef',
+    '--fm-code-bg': '#10141b',
+    '--fm-gutter-bg': '#141a22',
+    '--fm-json-key': '#93b3d8',
+    '--fm-json-string': '#8fc9a6',
+    '--fm-json-number': '#d9ad72',
+    '--fm-json-bool': '#bfa9e6',
+    '--fm-json-punct': '#7f8794',
+    '--fm-shadow-sm': '0 1px 2px rgba(0, 0, 0, 0.32)',
+    '--fm-shadow': '0 1px 2px rgba(0, 0, 0, 0.32), 0 1px 3px rgba(0, 0, 0, 0.26)',
+    '--fm-shadow-lg': '0 8px 20px rgba(0, 0, 0, 0.46)',
+  },
+}
+
+export const themes: ThemeDefinition[] = [
+  ocean,
+  graphite,
+  forest,
+  midnight,
+  amber,
+  teal,
+  rose,
+  dusk,
+]
+
+const STORAGE_KEY = 'fbinhttp.theme'
+const LEGACY_STORAGE_KEY = 'finkmeter.theme'
 
 export function findTheme(id: string | null | undefined): ThemeDefinition {
   return themes.find((item) => item.id === id) ?? ocean
@@ -208,7 +406,7 @@ export function applyTheme(theme: ThemeDefinition) {
 
 export function loadThemeId(): ThemeId {
   try {
-    const stored = localStorage.getItem(STORAGE_KEY)
+    const stored = localStorage.getItem(STORAGE_KEY) ?? localStorage.getItem(LEGACY_STORAGE_KEY)
     if (stored && themes.some((item) => item.id === stored)) return stored as ThemeId
   } catch {
     // localStorage 不可用时回退默认主题
@@ -219,6 +417,7 @@ export function loadThemeId(): ThemeId {
 export function saveThemeId(id: ThemeId) {
   try {
     localStorage.setItem(STORAGE_KEY, id)
+    localStorage.removeItem(LEGACY_STORAGE_KEY)
   } catch {
     // 忽略存储失败
   }

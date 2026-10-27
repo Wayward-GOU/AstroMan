@@ -163,6 +163,7 @@ unsafe fn sockaddr_to_string(addr: *const windows_sys::Win32::Networking::WinSoc
 }
 
 /// IPv6 文本化：合并最长连续 0 段，兼容 IPv4 映射地址
+#[cfg(windows)]
 fn format_ipv6(segments: &[u16; 8]) -> String {
     if segments[..5].iter().all(|v| *v == 0) && segments[5] == 0xffff {
         let b = &segments[6..8];

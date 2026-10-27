@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# FinkMeter macOS 一键安装脚本
+# FbinHttp macOS 一键安装脚本
 #
 # 用法：
 #   bash install-macos.sh            # 安装 GitHub 上最新的正式版
@@ -12,8 +12,8 @@
 
 set -euo pipefail
 
-REPO="Wayward-GOU/FinkMeter"
-APP_NAME="FinkMeter"
+REPO="Wayward-GOU/FbinHttp"
+APP_NAME="FbinHttp"
 APP_BUNDLE="${APP_NAME}.app"
 INSTALL_DIR="/Applications"
 
@@ -122,7 +122,7 @@ DMG_URL="$(printf '%s' "${RELEASE_JSON}" \
 
 [ -n "${DMG_URL}" ] || error "该版本未提供 dmg 安装包，请到 Releases 页面检查。"
 
-TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/finkmeter.XXXXXX")"
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fbinhttp.XXXXXX")"
 DMG_PATH="${TMP_DIR}/${APP_NAME}.dmg"
 
 info "下载 ${TAG_NAME} ..."

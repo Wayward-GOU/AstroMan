@@ -52,45 +52,62 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: 'FinkMeter ${{ github.ref_name }}'
+          releaseName: 'FbinHttp ${{ github.ref_name }}'
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
           releaseBody: |
-            FinkMeter ${{ github.ref_name }} — 纯本地运行的 API 调试、压测与开发工具箱。
+            FbinHttp ${{ github.ref_name }} — 纯本地运行的 API 调试、压测与开发工具箱。
 
             ### 下载
-            - macOS 11+（Apple Silicon / Intel 通用）：`FinkMeter_*_universal.dmg` + 一键安装脚本 `install-macos.sh`
-            - Windows 10/11（x64）：`FinkMeter_*_x64-setup.exe`
+            - macOS 11+（Apple Silicon / Intel 通用）：`FbinHttp_*_universal.dmg` + 一键安装脚本 `install-macos.sh`
+            - Windows 10/11（x64）：`FbinHttp_*_x64-setup.exe`
 
             > macOS 的 dmg 是通用包，已内置 Intel（`x86_64`）与 Apple Silicon（`arm64`）两个切片，**Intel Mac 无需单独下载 Intel 版**。
-            > 若出现「Apple 无法验证 FinkMeter.app 是否包含可能危害 Mac 安全或泄漏隐私的恶意软件」，这是系统对未公证应用的拦截，与芯片架构无关。
+            > 若出现「Apple 无法验证 FbinHttp.app 是否包含可能危害 Mac 安全或泄漏隐私的恶意软件」，这是系统对未公证应用的拦截，与芯片架构无关。
 
             ### macOS 安装（推荐一键脚本）
             脚本会自动校验本机架构、安装到「应用程序」、清除隔离属性、ad-hoc 重新签名并启动：
 
             ```bash
-            curl -fLO https://github.com/Wayward-GOU/FinkMeter/releases/download/${{ github.ref_name }}/install-macos.sh
+            curl -fLO https://github.com/Wayward-GOU/FbinHttp/releases/download/${{ github.ref_name }}/install-macos.sh
             bash install-macos.sh ${{ github.ref_name }}
             ```
 
-            手动安装：把应用拖到「应用程序」后，打开「系统设置 → 隐私与安全性」，在「安全性」一栏点击「仍要打开」并输入密码（macOS 15 起右键「打开」不再能绕过该提示）；或在终端执行 `sudo xattr -dr com.apple.quarantine /Applications/FinkMeter.app`。
+            手动安装：把应用拖到「应用程序」后，打开「系统设置 → 隐私与安全性」，在「安全性」一栏点击「仍要打开」并输入密码（macOS 15 起右键「打开」不再能绕过该提示）；或在终端执行 `sudo xattr -dr com.apple.quarantine /Applications/FbinHttp.app`。
 
             ### Windows 安装
             双击安装，可选语言与安装目录，当前用户安装无需管理员权限；缺少 WebView2 时安装器会自动联网安装。
 
             > 安装包已做 ad-hoc 签名但未做 Apple 公证，SmartScreen / Gatekeeper 首次提示属正常现象。
 
-            ### 本次更新
-            - 示例项目新增 6 个场景集合、约 30 个接口，覆盖各请求方法、认证方式、Body 类型、变量脚本、状态码与压测；旧数据库启动时自动补齐，不覆盖已有修改
-            - 内置变量扩容：时间类（timestamp / isoTime / datetime / yyyyMMdd 等）与随机类（uuid / randomInt / randomFloat / randomString / randomEmail / randomPhone / randomIPv4 等），兼容 `{{$timestamp}}` 写法
-            - 新增环境脚本：每个环境可写一段请求前执行的脚本，用 `vars.set()` 生成运行时变量；变量优先级为运行时变量 > 环境变量 > 内置变量
-            - 新增代码片段：一键查看并复制 cURL / HTTP 原始报文 / JavaScript fetch / Python requests，环境变量按当前环境替换
-            - 新增请求历史页：最近 500 条发送记录，支持搜索、失败数与平均耗时统计，点击可回到原接口
-            - 新增自动更新：启动静默检查 GitHub Release，可一键下载对应平台安装包，设置页支持开关与手动检查
-            - 工具箱新增「文本一键处理」（SQL IN 自动加单引号、去重排序、表格转 Markdown/HTML、MyBatis 日志提取 SQL 等）与「二维码生成 / 识别」，共 9 大类 75 个工具
-            - 修复 macOS 安装问题：ad-hoc 签名避免被判定为「已损坏」，通用包同时包含 Intel 与 Apple Silicon 切片并在 CI 校验，安装脚本增加架构检查与 Gatekeeper 放行指引
-            - 修复项目导入导出遗漏环境脚本、旧库缺少脚本字段等问题
+            ### 本次更新（1.0.5）
+            **品牌与数据迁移**
+            - 全套品牌改名 FbinHttp：应用图标、安装器图标、macOS 图标、托盘图标全部重制，界面 Logo 使用新的 `logo.png`，去掉了源图四周的白边
+            - 数据目录与数据库文件改名为 `FbinHttp` / `fbinhttp.db`；首次启动自动把旧 `FinkMeter` 目录的数据复制过来，目标已存在则不覆盖，原目录保留
+            - 配置目录随 identifier 迁到 `com.fbinhttp.app`，启动时自动复制旧的 `storage.json`、`settings.json` 与窗口状态；裸可执行文件名改为 `fbinhttp.exe`
+
+            **新增功能**
+            - 新增「批量运行」页：多选接口、按迭代次数或 CSV 每行参数化（`{{列名}}`）批量发送，环境变量、前置 / 后置脚本与断言全部生效，单次上限 5000 个请求，结果可导出
+            - 首页新增「数据大屏」：近 14 天请求趋势、状态码分布、请求方法分布、今日各时段请求量、响应耗时分布、项目调用量 Top 5、高频接口 Top 5、最近压测 P95 走势，共 8 张图表，数据全部来自本机请求历史与压测报告
+            - 首页新增批量运行介绍与示例（CSV 参数化、断言失败示例、与压测的区别）
+            - 主题从 4 套扩到 8 套：新增琥珀橙、青碧、玫瑰、暮色
+
+            **体验与稳定性**
+            - 请求历史保留上限从 20000 条提升到 100000 条
+            - 设置页在最大化窗口下撑满宽度，主题卡片一行 4 个展示
+            - 新增单实例限制：重复启动只唤出已有窗口，避免多个进程抢占同一个 SQLite 库
+            - 新增窗口状态记忆：退出后恢复上次的位置、尺寸与最大化状态
+            - 首页布局重排：数据大屏移到「最近请求」之前，信息密度更紧凑
+            - 前端按 vendor 分包（`vue` / `antd`），入口 chunk 从 200KB+ 降到约 47KB，业务代码更新不再让整个组件库缓存失效
+
+            **问题修复**
+            - 修复启动即崩溃：`test_plans` 索引依赖 `updated_at`，而旧库没有该列，导致建索引失败并回退默认目录；索引改为在 `migrate()` 补列之后创建
+            - 修复打开应用白屏：`App.vue` 中 `navs` 在 `watch` 之后声明触发 TDZ `ReferenceError`，setup 中断导致整页空白
+            - 修复图标四周白边：先按真实圆角拟合 alpha 蒙版，再清理最外几像素的浅色描边，小尺寸下不再出现灰边
+            - 修复未知路由直接白屏：统一重定向到首页
+            - 修复未捕获异常导致界面静默失效：新增全局错误兜底，弹一次提示并写日志
+            - 升级提示按平台区分文案，macOS 提示拖入「应用程序」，Windows 提示走安装向导
 
             ### 1.0.4 更新（RSA 公钥解析修复）
             - 修复脚本里使用 `rsa.publicEncrypt` 时报 `Failed to execute 'atob' on 'Window': The string to be decoded is not correctly encoded`

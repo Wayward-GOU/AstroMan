@@ -54,17 +54,39 @@ function headerList(request: HttpRequestDetail): KeyValueItem[] {
   const list = enabled(request.headers).map((item) => ({ ...item }))
   const bodyType = request.bodyType ?? 'none'
   const body = (request.body ?? '').trim()
-  if (body && bodyType !== 'none') {
+  // multipart 的 Content-Type 必须由工具自动生成 boundary，不能手写
+  if (body && bodyType !== 'none' && bodyType !== 'multipart') {
     const hasContentType = list.some((item) => item.key.toLowerCase() === 'content-type')
     if (!hasContentType) {
       list.push({
         key: 'Content-Type',
-        value: bodyType === 'form' ? 'application/x-www-form-urlencoded' : 'application/json',
+        value:
+          bodyType === 'form'
+            ? 'application/x-www-form-urlencoded'
+            : bodyType === 'binary'
+              ? 'application/octet-stream'
+              : 'application/json',
         enabled: true,
       })
     }
   }
   return list
+}
+
+function parseFormFields(body: string): { key: string; value: string; kind: string }[] {
+  try {
+    const parsed = JSON.parse(body || '[]')
+    if (!Array.isArray(parsed)) return []
+    return parsed
+      .filter((item) => item && item.enabled !== false && String(item.key ?? '').trim())
+      .map((item) => ({
+        key: String(item.key).trim(),
+        value: String(item.value ?? ''),
+        kind: item.kind === 'file' ? 'file' : 'text',
+      }))
+  } catch {
+    return []
+  }
 }
 
 /** 把请求配置转换成可分享的 cURL 命令；传入环境变量时会替换 {{变量}}，敏感变量保持占位符 */
@@ -83,6 +105,16 @@ export function buildCurl(request: HttpRequestDetail, variables?: EnvVariable[])
       for (const pair of formPairs(body)) {
         parts.push(`  --data-urlencode ${quote(pair)}`)
       }
+    } else if (bodyType === 'multipart') {
+      for (const field of parseFormFields(body)) {
+        parts.push(
+          field.kind === 'file'
+            ? `  -F ${quote(`${field.key}=@${field.value}`)}`
+            : `  -F ${quote(`${field.key}=${field.value}`)}`,
+        )
+      }
+    } else if (bodyType === 'binary') {
+      parts.push(`  --data-binary ${quote(`@${body}`)}`)
     } else {
       parts.push(`  --data-raw ${quote(body)}`)
     }
@@ -127,7 +159,23 @@ export function buildFetch(request: HttpRequestDetail, variables?: EnvVariable[]
   const body = (request.body ?? '').trim()
   const options: string[] = [`  method: ${quoteJs(method)},`]
   if (headerEntries) options.push(`  headers: {\n${headerEntries}\n  },`)
-  if (bodyType === 'form' && body) {
+  if (bodyType === 'multipart') {
+    const appends = parseFormFields(body)
+      .map((field) =>
+        field.kind === 'file'
+          ? `  form.append(${quoteJs(field.key)}, fileInput.files[0])`
+          : `  form.append(${quoteJs(field.key)}, ${quoteJs(field.value)})`,
+      )
+      .join('\n')
+    if (appends) {
+      options.push('  body: form,')
+      const code = `const form = new FormData()\n${appends}\n\nconst response = await fetch(${quoteJs(buildUrl(request))}, {\n${options.join('\n')}\n})\n\nconst data = await response.text()\nconsole.log(response.status, data)`
+      return resolveVariables(code, variables)
+    }
+  }
+  if (bodyType === 'binary') {
+    options.push(`  body: binaryBody, // 需自行读取本地文件：${body}`)
+  } else if (bodyType === 'form' && body) {
     const pairs = formPairs(body)
       .map((pair) => {
         const index = pair.indexOf('=')
@@ -156,7 +204,28 @@ export function buildPython(request: HttpRequestDetail, variables?: EnvVariable[
   const body = (request.body ?? '').trim()
   const args = ['url']
   if (headerEntries) args.push('headers=headers')
-  if (bodyType === 'form' && body) {
+  if (bodyType === 'multipart') {
+    const fields = parseFormFields(body)
+    const dataLines = fields
+      .filter((field) => field.kind !== 'file')
+      .map((field) => `    ${quoteJs(field.key)}: ${quoteJs(field.value)},`)
+      .join('\n')
+    const fileLines = fields
+      .filter((field) => field.kind === 'file')
+      .map((field) => `    ${quoteJs(field.key)}: open(${quoteJs(field.value)}, 'rb'),`)
+      .join('\n')
+    if (dataLines) {
+      lines.push(`data = {\n${dataLines}\n}`)
+      args.push('data=data')
+    }
+    if (fileLines) {
+      lines.push(`files = {\n${fileLines}\n}`)
+      args.push('files=files')
+    }
+  } else if (bodyType === 'binary') {
+    lines.push(`with open(${quoteJs(body)}, 'rb') as file:`, '    payload = file.read()')
+    args.push('data=payload')
+  } else if (bodyType === 'form' && body) {
     const pairs = formPairs(body)
       .map((pair) => {
         const index = pair.indexOf('=')

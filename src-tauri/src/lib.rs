@@ -5,23 +5,76 @@ mod netinfo;
 mod state;
 mod util;
 
-use tauri::Manager;
+use tauri::{
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    Manager,
+};
+
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+/// 系统托盘：左键点击显示主窗口，右键菜单可显示或退出
+fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "退出 FbinHttp", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &quit])?;
+
+    TrayIconBuilder::with_id("main-tray")
+        .icon(tauri::image::Image::from_bytes(include_bytes!(
+            "../icons/tray.png"
+        ))?)
+        .tooltip("FbinHttp")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "show" => show_main_window(app),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main_window(tray.app_handle());
+            }
+        })
+        .build(app)?;
+
+    Ok(())
+}
 
 pub fn run() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     tauri::Builder::default()
+        // 单实例必须最先注册：重复启动时不再开新进程，直接唤出已有窗口
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            show_main_window(app);
+        }))
         .plugin(tauri_plugin_dialog::init())
+        // 记住窗口尺寸/位置/最大化状态，下次启动原样恢复
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .setup(|app| {
             let state = state::AppState::new(app.handle())?;
-            log::info!("FinkMeter 数据目录: {:?}", state.data_dir);
+            log::info!("FbinHttp 数据目录: {:?}", state.data_dir);
             app.manage(state);
             app.manage(commands::winstats::WinStatsState::new());
+            setup_tray(app.handle())?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::system::app_info,
             commands::system::workspace_stats,
+            commands::system::dashboard_metrics,
             commands::project::project_list,
             commands::project::project_create,
             commands::project::project_update,
@@ -30,12 +83,14 @@ pub fn run() {
             commands::collection::collection_create,
             commands::collection::collection_rename,
             commands::collection::collection_delete,
+            commands::collection::collection_reorder,
             commands::request::request_list,
             commands::request::request_search,
             commands::request::request_options,
             commands::request::request_get,
             commands::request::request_save,
             commands::request::request_delete,
+            commands::request::request_reorder,
             commands::environment::env_list,
             commands::environment::env_create,
             commands::environment::env_activate,
@@ -43,8 +98,22 @@ pub fn run() {
             commands::environment::env_var_save,
             commands::environment::env_script_save,
             commands::http::send_http_request,
+            commands::oauth::oauth2_token,
+            commands::cookie::cookie_list,
+            commands::cookie::cookie_save,
+            commands::cookie::cookie_delete,
+            commands::cookie::cookie_clear,
+            commands::settings::settings_get,
+            commands::settings::settings_set,
+            commands::plan::plan_list,
+            commands::plan::plan_get,
+            commands::plan::plan_save,
+            commands::plan::plan_delete,
+            commands::files::file_read_text,
+            commands::files::file_write_text,
             commands::history::history_list,
-            commands::history::history_clear,
+            commands::history::history_stats,
+            commands::history::data_cleanup,
             commands::run::run_list,
             commands::run::run_clear,
             commands::stress::stress_start,
@@ -58,6 +127,8 @@ pub fn run() {
             commands::curl::curl_parse,
             commands::transfer::project_export,
             commands::transfer::project_import,
+            commands::transfer::openapi_export,
+            commands::transfer::openapi_import,
             commands::update::update_check,
             commands::update::update_download,
             commands::update::open_external,
@@ -74,25 +145,19 @@ pub fn run() {
             commands::storage::app_restart,
         ])
         .on_window_event(|window, event| {
-            // macOS 点击关闭按钮时只隐藏窗口，保留实例，便于从 Dock 再次打开
-            #[cfg(target_os = "macos")]
+            // 关闭主窗口时隐藏到托盘，从托盘菜单「退出 FbinHttp」才会真正结束进程
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();
             }
-            #[cfg(not(target_os = "macos"))]
-            let _ = (window, event);
         })
         .build(tauri::generate_context!())
-        .expect("启动 FinkMeter 失败")
+        .expect("启动 FbinHttp 失败")
         .run(|app_handle, event| {
             // macOS 点击 Dock 图标时把隐藏的主窗口重新显示出来
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen { .. } = event {
-                if let Some(window) = app_handle.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                }
+                show_main_window(app_handle);
             }
             #[cfg(not(target_os = "macos"))]
             let _ = (app_handle, event);

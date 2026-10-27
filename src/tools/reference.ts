@@ -145,7 +145,7 @@ export const HEADER_ROWS: HeaderRow[] = [
   { header: 'If-None-Match', desc: '条件请求（ETag）', example: '"33a64df551425fcc"' },
   { header: 'Origin', desc: '跨域来源', example: 'https://example.com' },
   { header: 'Referer', desc: '来源页面', example: 'https://example.com/page' },
-  { header: 'User-Agent', desc: '客户端标识', example: 'FinkMeter/1.0' },
+  { header: 'User-Agent', desc: '客户端标识', example: 'FbinHttp/1.0' },
   { header: 'X-Request-Id', desc: '链路追踪 ID', example: '9f1c2e5b' },
   { header: 'X-Forwarded-For', desc: '真实客户端 IP 链', example: '203.0.113.7' },
 ]

@@ -21,5 +21,14 @@ export default defineConfig({
   build: {
     target: 'es2021',
     chunkSizeWarningLimit: 1500,
+    rollupOptions: {
+      output: {
+        // 框架与组件库单独分包：升级业务代码时这两块可复用浏览器缓存
+        manualChunks: {
+          vue: ['vue', 'vue-router', 'pinia'],
+          antd: ['ant-design-vue', '@ant-design/icons-vue'],
+        },
+      },
+    },
   },
 })

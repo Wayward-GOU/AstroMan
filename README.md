@@ -1,4 +1,4 @@
-# FinkMeter
+# FbinHttp
 
 > 一个装在电脑上的 API 调试工具。打开就能发请求、看响应，数据全部留在本机。
 > 无需注册、无需登录、无需后端服务。
@@ -17,12 +17,12 @@
 
 | 平台 | 安装包 | 说明 |
 |---|---|---|
-| Windows 10/11（x64） | `FinkMeter_*_x64-setup.exe` | 双击安装，当前用户安装无需管理员权限 |
-| macOS 11+（Apple Silicon / Intel） | `FinkMeter_*_universal.dmg` | 通用包，自带 `arm64` 与 `x86_64` 两个切片，**Intel Mac 无需单独下载 Intel 版** |
+| Windows 10/11（x64） | `FbinHttp_*_x64-setup.exe` | 双击安装，当前用户安装无需管理员权限 |
+| macOS 11+（Apple Silicon / Intel） | `FbinHttp_*_universal.dmg` | 通用包，自带 `arm64` 与 `x86_64` 两个切片，**Intel Mac 无需单独下载 Intel 版** |
 
 macOS 首次打开若出现下面这个提示（按钮只有「完成 / 移到废纸篓」），是系统对未公证应用的 Gatekeeper 拦截，**不是芯片架构不兼容**：
 
-> Apple 无法验证「FinkMeter.app」是否包含可能危害 Mac 安全或泄漏隐私的恶意软件。
+> Apple 无法验证「FbinHttp.app」是否包含可能危害 Mac 安全或泄漏隐私的恶意软件。
 
 按下方「[macOS 安装](#macos-安装)」中的方式一（一键安装脚本）或方式二（系统设置放行）处理即可。
 
@@ -32,33 +32,33 @@ macOS 首次打开若出现下面这个提示（按钮只有「完成 / 移到�
 
 最低支持 macOS 11.0。Release 中的 dmg 是通用包，同时包含 Intel（`x86_64`）与 Apple Silicon（`arm64`）切片，安装脚本会自动校验本机架构是否被支持。
 
-安装包做的是 ad-hoc 签名、未做 Apple 公证，因此首次打开会触发 Gatekeeper 提示「Apple 无法验证 FinkMeter.app」。这是签名 / 隔离属性问题，不是芯片不兼容，按下面任一方式放行即可。
+安装包做的是 ad-hoc 签名、未做 Apple 公证，因此首次打开会触发 Gatekeeper 提示「Apple 无法验证 FbinHttp.app」。这是签名 / 隔离属性问题，不是芯片不兼容，按下面任一方式放行即可。
 
 **方式一：一键安装脚本（推荐）**
 
 仓库提供了 [scripts/install-macos.sh](scripts/install-macos.sh)，发布时由 [release.yml](.github/workflows/release.yml) 上传到 Release 附件，一条命令完成下载、架构校验、安装、清除隔离属性、ad-hoc 签名与启动：
 
 ```bash
-curl -fLO https://github.com/Wayward-GOU/FinkMeter/releases/latest/download/install-macos.sh
-bash install-macos.sh v1.0.4
+curl -fLO https://github.com/Wayward-GOU/FbinHttp/releases/latest/download/install-macos.sh
+bash install-macos.sh v1.0.5
 ```
 
 不带参数执行时安装最新正式版。仓库若为私有，需要先提供 Token：
 
 ```bash
-GITHUB_TOKEN=ghp_xxx bash install-macos.sh v1.0.4
+GITHUB_TOKEN=ghp_xxx bash install-macos.sh v1.0.5
 ```
 
 **方式二：手动安装**
 
-1. 打开 dmg，把 `FinkMeter.app` 拖到「应用程序」
+1. 打开 dmg，把 `FbinHttp.app` 拖到「应用程序」
 2. 双击打开，若提示「Apple 无法验证」：打开「系统设置 → 隐私与安全性」，在「安全性」区域点击「仍要打开」，输入密码确认（macOS 15 起右键「打开」不再能绕过该提示，必须走这一步）
 3. 也可以直接在终端手动放行：
 
 ```bash
-sudo xattr -dr com.apple.quarantine /Applications/FinkMeter.app
-sudo codesign --force --deep --sign - /Applications/FinkMeter.app
-open /Applications/FinkMeter.app
+sudo xattr -dr com.apple.quarantine /Applications/FbinHttp.app
+sudo codesign --force --deep --sign - /Applications/FbinHttp.app
+open /Applications/FbinHttp.app
 ```
 
 > Gatekeeper 只认 Apple 签发的 Developer ID 证书 + 公证票据，GitHub Actions 无法替代签发，只能执行 `codesign` / `notarytool`。如需彻底消除提示，准备 Apple Developer Program 账号后在 workflow 中配置 `APPLE_CERTIFICATE`、`APPLE_ID`、`APPLE_PASSWORD`、`APPLE_TEAM_ID` 等 secrets 即可。当前仓库已配置 ad-hoc 签名（`signingIdentity: "-"`），可避免系统把应用判定为「已损坏」。
@@ -95,7 +95,7 @@ open /Applications/FinkMeter.app
 ```mermaid
 graph LR
     UI["Vue 3 + Ant Design Vue"] -->|"Tauri IPC invoke"| CMD["Rust 命令层"]
-    CMD --> DB[("SQLite<br/>finkmeter.db")]
+    CMD --> DB[("SQLite<br/>fbinhttp.db")]
     CMD --> HTTP["reqwest HTTP 引擎"]
     HTTP --> TARGET[("目标 API")]
 ```
@@ -105,7 +105,7 @@ graph LR
 ## 目录结构
 
 ```text
-FinkMeter/
+FbinHttp/
 ├─ src/                     # 前端
 │  ├─ api/                  # IPC 调用封装
 │  ├─ components/           # 通用组件（Key-Value 编辑器、折线图、页头）
@@ -224,17 +224,17 @@ npm.cmd run build:win
 
 | 产物 | 路径 |
 |---|---|
-| **exe 安装包** | `src-tauri\target\release\bundle\nsis\FinkMeter_1.0.0_x64-setup.exe` |
-| msi 安装包 | `src-tauri\target\release\bundle\msi\FinkMeter_1.0.0_x64_en-US.msi` |
-| 免安装可执行文件 | `src-tauri\target\release\finkmeter.exe` |
+| **exe 安装包** | `src-tauri\target\release\bundle\nsis\FbinHttp_1.0.0_x64-setup.exe` |
+| msi 安装包 | `src-tauri\target\release\bundle\msi\FbinHttp_1.0.0_x64_en-US.msi` |
+| 免安装可执行文件 | `src-tauri\target\release\fbinhttp.exe` |
 
 安装向导内置语言与路径选择：
 
 - 首屏可选安装语言（简体中文 / English），卸载程序同样支持
-- 随后在「选择安装位置」页可修改安装目录，默认 `%LOCALAPPDATA%\FinkMeter`
+- 随后在「选择安装位置」页可修改安装目录，默认 `%LOCALAPPDATA%\FbinHttp`
 - 采用当前用户安装模式，全程无需管理员权限
 
-**分发方式**：把 `FinkMeter_1.0.0_x64-setup.exe` 发给对方，双击安装即可使用。`finkmeter.exe` 只是免安装可执行文件，没有卸载入口和开始菜单快捷方式，不建议直接分发。
+**分发方式**：把 `FbinHttp_1.0.0_x64-setup.exe` 发给对方，双击安装即可使用。`fbinhttp.exe` 只是免安装可执行文件，没有卸载入口和开始菜单快捷方式，不建议直接分发。
 
 安装器默认在缺少 WebView2 时联网下载安装；目标机器完全离线时，请先手动安装 Microsoft Edge WebView2 Runtime。
 
@@ -249,7 +249,7 @@ npm.cmd run build:win
 | TLS 后端 | reqwest `native-tls` | 复用系统证书库，移除 rustls / ring 依赖 |
 | 安装器压缩 | NSIS `compression = "lzma"` | 安装包使用 LZMA 最高压缩 |
 
-实测体积：`finkmeter.exe` 约 6.07 MB，`FinkMeter_1.0.0_x64-setup.exe` 约 2.68 MB。
+实测体积：`fbinhttp.exe` 约 6.07 MB，`FbinHttp_1.0.0_x64-setup.exe` 约 2.68 MB。
 
 > 国内网络首次打包时，下载 NSIS 工具容易超时（`timeout: global`）。可先设置镜像再执行：
 >
@@ -282,9 +282,9 @@ npm run tauri build
 
 | 产物 | 路径 |
 |---|---|
-| **dmg 安装包** | `src-tauri/target/universal-apple-darwin/release/bundle/dmg/FinkMeter_*_universal.dmg` |
-| 应用程序 | `src-tauri/target/universal-apple-darwin/release/bundle/macos/FinkMeter.app` |
-| 当前架构可执行文件 | `src-tauri/target/release/bundle/macos/FinkMeter.app` |
+| **dmg 安装包** | `src-tauri/target/universal-apple-darwin/release/bundle/dmg/FbinHttp_*_universal.dmg` |
+| 应用程序 | `src-tauri/target/universal-apple-darwin/release/bundle/macos/FbinHttp.app` |
+| 当前架构可执行文件 | `src-tauri/target/release/bundle/macos/FbinHttp.app` |
 
 最低支持 macOS 11.0。Release 中的 dmg 是通用包，同时包含 Intel（`x86_64`）与 Apple Silicon（`arm64`）切片；安装、放行与 Gatekeeper 说明见 [macOS 安装](#macos-安装)。
 
@@ -294,9 +294,13 @@ npm run tauri build
 
 | 内容 | Windows | macOS |
 |---|---|---|
-| 数据库 | `%APPDATA%\FinkMeter\finkmeter.db` | `~/Library/Application Support/FinkMeter/finkmeter.db` |
-| WAL 临时文件 | `finkmeter.db-wal` / `finkmeter.db-shm`（同目录） | 同目录 |
-| 存储位置配置 | `%APPDATA%\com.finkmeter.app\storage.json` | `~/Library/Application Support/com.finkmeter.app/storage.json` |
+| 数据库 | `%APPDATA%\FbinHttp\fbinhttp.db` | `~/Library/Application Support/FbinHttp/fbinhttp.db` |
+| WAL 临时文件 | `fbinhttp.db-wal` / `fbinhttp.db-shm`（同目录） | 同目录 |
+| 存储位置配置 | `%APPDATA%\com.fbinhttp.app\storage.json` | `~/Library/Application Support/com.fbinhttp.app/storage.json` |
+
+> 从旧版本升级时会自动把 `%APPDATA%\FinkMeter\finkmeter.db` 复制到 `%APPDATA%\FbinHttp\fbinhttp.db`（目标已存在则不覆盖），原目录保留，确认数据无误后可自行删除。配置文件目录已随 identifier 迁到 `com.fbinhttp.app`，首次启动会从旧的 `com.finkmeter.app` 目录自动复制 `storage.json`、`settings.json` 与窗口状态，不覆盖已有文件。
+>
+> Windows 上 identifier 变更会让「应用和功能」里残留一条旧卸载登记，卸载旧条目不影响已迁移的数据，可手动清理。
 
 首次启动会自动建库，并写入一份可直接试用的示例数据：
 
@@ -421,7 +425,8 @@ console.log('解密结果：' + plain)
 - 接口多标签页：同一项目内可像 Postman 一样同时打开最多 20 个接口，标签按项目记忆（重启后恢复），支持点击切换、中键 / 关闭按钮关闭、一键关闭全部；编辑内容自动保存（停止输入约 1 秒后写入，切换标签、关闭标签或离开页面时立即保存），无需手动点保存即可在接口间复制参数
 - 代码片段（Postman 式）：请求栏「代码」按钮打开右侧抽屉，可按 cURL / HTTP 原始报文 / JavaScript fetch / Python requests 四种格式查看并一键复制；环境变量按当前环境替换，敏感变量保持占位符，请求头缺少 Content-Type 时自动补齐
 - 自动更新：启动约 5 秒后静默查询 GitHub Release 最新版本，发现新版本弹窗展示发布说明与版本号，可一键下载对应平台安装包（Windows `setup.exe` / macOS `dmg`）并启动安装；设置页可手动检查、开关启动自动检查、打开发布页
-- 请求历史页：侧边栏「请求历史」集中查看最近发送记录（最新 500 条），支持按接口名 / URL / 方法 / 状态码搜索，展示总数、失败数与平均耗时，点击任意记录可直接跳回原接口继续编辑
+- 请求历史页：侧边栏「请求历史」集中查看最近发送记录（默认展示最新 500 条，可切换 500 / 1000 / 2000 / 5000 条），支持按接口名 / URL / 方法 / 状态码搜索，展示总数、失败数与平均耗时，点击任意记录可直接跳回原接口继续编辑
+- 历史数据清理：请求历史页「清理历史」支持全部清除或按时间范围清理（最近 1 / 7 / 30 / 90 天与自定义起止时间），可勾选清理请求历史与接口运行记录，清理前实时预览将删除的条数，可选清理后压缩数据库文件回收磁盘空间；项目、集合、接口、环境变量与压测报告不受影响
 - 脚本执行：发送前运行前置脚本（可读写 `request.method / url / headers / params / body`，用 `vars.set()` 生成变量并渲染进 URL、Header、Body），收到响应后运行后置脚本（`response.status / headers / body / json()`，`test(name, fn)` + `assert()` 断言，`vars` 提取变量供后续请求复用）；脚本页内置「插入示例」，覆盖时间戳、MD5 / HMAC 签名、AES 加密、RSA 加密、断言与提取 Token 等常用写法；响应区「测试」页展示断言通过率、失败原因、控制台输出与运行时变量
 - 脚本加密能力：`cipher.aes / des / tripleDes`（CBC / ECB / CFB / OFB / CTR，PKCS7 / Zero / None 填充，支持 hex、base64 密钥与 IV）、`cipher.md5 / sha1 / sha256`、`cipher.hmacSha1 / hmacSha256`、`cipher.base64 / hex` 编解码，以及 `rsa.publicEncrypt`（PKCS#1 v1.5，兼容 Java 默认 RSA 加密）
 - 本地发送 HTTP 请求，展示状态码、耗时、大小、响应头、响应体
@@ -431,7 +436,7 @@ console.log('解密结果：' + plain)
 - 内置时间变量：`{{timestamp}}`（毫秒）、`{{timestampSec}}`、`{{isoTime}}`、`{{datetime}}`、`{{date}}`、`{{time}}`、`{{yyyyMMdd}}`、`{{yyyyMMddHHmmss}}`，同时兼容 Postman 的 `{{$timestamp}}` 写法
 - 内置随机变量：`{{uuid}}`、`{{uuidNoDash}}`、`{{randomInt(1,100)}}`、`{{randomFloat(1,10,2)}}`、`{{randomString(8)}}`、`{{randomString(8, hex)}}`、`{{randomHex(16)}}`、`{{randomNumber(6)}}`、`{{randomBool}}`、`{{randomEmail}}`、`{{randomPhone}}`、`{{randomIPv4}}`
 - 环境脚本：每个环境可编写一段每次请求前执行的脚本，用 `vars.set('key', value)` 生成运行时变量（如签名、traceId、nonce），请求里用 `{{key}}` 引用；脚本运行日志会并入请求编辑器的「脚本」页
-- 请求历史（本地保留最近 5000 条）
+- 请求历史（本地保留最近 100000 条）
 - 本地压测引擎：固定并发与阶梯加压两种模式，支持并发数、压测时长、Ramp-Up 预热、思考时间、连接超时、请求超时、跟随重定向、忽略证书、目标 RPS 限速与错误率自动停止
 - 压测配置入口：点击侧边栏「压测」或页面「新建压测」，弹窗内先选项目、环境，再选接口，后按 JMeter 线程组风格分组填写参数（线程组 / HTTP 请求默认值 / 流量与节奏 / 自动停止 / SLA 验收），一步完成配置并开始压测；也可从请求编辑器直接带入配置
 - 流量整形：目标 RPS 令牌桶限速，可按秒精确控制发出速率
@@ -445,10 +450,18 @@ console.log('解密结果：' + plain)
 - 压测中可随时停止，已产生的数据仍会保存成报告
 - cURL 一键导入：粘贴命令自动解析方法、URL、Header、Params 与 Body，可直接选定目标集合
 - 项目内接口搜索：在项目页按接口名称或 URL 跨集合检索，结果直接打开编辑
-- 单接口运行历史：每次发送自动记录请求参数（Params / Headers / Body）、响应状态、响应头、响应体与耗时，在编辑器底部展开查看，每个接口保留最近 50 条并可一键清空
-- 完整删除能力：项目、集合、请求（列表与编辑器内均可删）、环境与变量、压测报告均支持删除，请求历史支持一键清空，删除前统一二次确认
+- 单接口运行历史：每次发送自动记录请求参数（Params / Headers / Body）、响应状态、响应头、响应体与耗时，在编辑器底部展开查看，每个接口保留最近 200 条并可一键清空
+- 完整删除能力：项目、集合、请求（列表与编辑器内均可删）、环境与变量、压测报告均支持删除，请求历史支持全部清除与按时间范围清理，删除前统一二次确认
 - 常用请求头预设：请求编辑器内置 Postman 风格分组下拉（常用/认证/内容协商/客户端信息/条件请求），选中即追加，同名自动覆盖
-- 项目 JSON 导出/导入（迁移用）：项目页顶部或工作台项目卡片菜单可一键导出为 `*.finkmeter.json`，包含项目信息、嵌套集合、全部请求（含请求头、参数、Body、脚本、断言）与环境变量；在工作台「导入项目 → 导入项目 JSON」选择文件即可复原为新项目，项目重名时自动追加「（导入）」后缀
+- 项目 JSON 导出/导入（迁移用）：项目页顶部或工作台项目卡片菜单可一键导出为 `*.fbinhttp.json`，包含项目信息、嵌套集合、全部请求（含请求头、参数、Body、脚本、断言）与环境变量；在工作台「导入项目 → 导入项目 JSON」选择文件即可复原为新项目，项目重名时自动追加「（导入）」后缀
+- 请求能力扩展：Body 支持 Form-Data（multipart 文件上传）、Binary（本地文件二进制上传）与 GraphQL（Query + Variables 自动封装）；认证页支持 Bearer / Basic / API Key（Header 或 Query）/ OAuth2（Client Credentials 一键获取令牌）；Cookie 按 RFC 6265 自动接收 Set-Cookie 并在后续请求中按域名与路径自动携带，也可在 Cookie 面板手动维护；设置页可启用 HTTP / SOCKS5 代理与客户端证书（mTLS，`*.pfx` / `*.p12`），保存后即时对全部请求生效
+- 集合批量 Runner：侧边栏「批量运行」按集合顺序执行接口，支持多次迭代、请求间隔、JSON / CSV 数据驱动（每轮按行替换变量）、前置/后置脚本与断言，执行结果逐条汇总（状态、耗时、断言通过数），可一键导出 JSON 执行报告
+- 压测计划：压测弹窗内可把当前线程组、流量、SLA 与接口保存为计划，下次直接载入复用，计划可按项目管理并随时删除
+- 响应对比与另存：响应区「另存为」可把响应体保存到本地文件；「对比」以任意一条历史运行或自定义文本为基准，按行展示新增与删除差异
+- OpenAPI / Swagger：项目页可把当前集合树导出为 OpenAPI 3.0 文档，也可导入 OpenAPI 3.0 / Swagger 2.0（自动按 tag 建集合、按参数生成 Params / Headers 与请求体示例）
+- 集合与请求拖拽排序：集合树同一层级内拖拽调整顺序，接口列表也可拖拽排序（同级集合、同一集合内）
+- 命令面板：`Ctrl / ⌘ + K` 快速搜索页面与操作（切换主题、缩放、检查更新），`Ctrl / ⌘ + 1..8` 直达对应页面
+- 压测报告横向对比：报告列表勾选 2–4 份报告，对比总请求、成功率、P95/P99、QPS、APDEX 与并发等关键指标
 - 工具箱（参考 tool.aiapaas.com，目录式布局，共 9 大分类 75 个工具，支持关键词全局搜索与懒加载）
   - JSON 工具（18）：JSON 格式化 / 压缩 / 校验 / 转义（树形与文本双视图、行号与字符统计、报错行列定位）、JSON → Java / C# / Go / TypeScript 实体类、SQL CREATE TABLE → Java 实体类、JSON ↔ YAML / XML / CSV / GET 查询参数、JSON → SQL（逐条 / 批量 INSERT，标识符与字符串自动转义）、JSON → Markdown 表格、JSON ↔ JSON Lines（转换出错定位行号）
   - 格式化转换（1）：HTML / XML / CSS / JavaScript / Java / C# / Go / PHP / C / SQL 代码美化与压缩（可调缩进，JS 注释与正则字面量安全）
@@ -467,6 +480,7 @@ console.log('解密结果：' + plain)
 - 四步上手引导与常见问题，覆盖环境变量、并发建议、报告导出与停止压测
 - 应用信息页（版本、数据目录、数据库路径）
 - 数据存储位置自定义：设置页可切换 SQLite 数据目录，支持把现有数据库迁移到新目录（WAL 先合并再复制）、恢复默认位置、打开目录，重启应用后生效；自定义目录失效时自动回退默认目录
+- 系统托盘：关闭窗口最小化到托盘，左键点击托盘图标恢复主窗口，右键菜单可「显示主窗口」或「退出 FbinHttp」
 - 桌面化图标导航栏（64px 窄侧栏）+ 仪表盘风格应用 Logo，界面元素全部走设计令牌
 - 四套可切换配色主题：深海蓝（默认）、石墨灰、森林绿、暗夜（深色模式），设置页即时切换并记忆选择
 
@@ -526,18 +540,18 @@ npm.cmd run tauri build -- --bundles nsis
 关闭应用后删除数据库文件（连同 `-wal`、`-shm`），下次启动会重新建库并写入示例数据：
 
 ```text
-Windows: %APPDATA%\FinkMeter\finkmeter.db
-macOS:   ~/Library/Application Support/FinkMeter/finkmeter.db
+Windows: %APPDATA%\FbinHttp\fbinhttp.db
+macOS:   ~/Library/Application Support/FbinHttp/fbinhttp.db
 ```
 
-**6. macOS 提示「无法打开，因为无法验证开发者」或「未打开 FinkMeter.app」**
+**6. macOS 提示「无法打开，因为无法验证开发者」或「未打开 FbinHttp.app」**
 
 安装包未签名、未公证，属于 Gatekeeper 的正常拦截。**不要点「移到废纸篓」**，用以下任一方式放行：
 
 - 使用 Release 附件里的 `install-macos.sh`（自动下载、安装并移除隔离属性）：`bash install-macos.sh`
-- 右键点击 `FinkMeter.app` → 打开 → 再次点击「打开」
+- 右键点击 `FbinHttp.app` → 打开 → 再次点击「打开」
 - 打开「系统设置 → 隐私与安全性」，拉到最下方点击「仍要打开」
-- 终端执行 `xattr -dr com.apple.quarantine /Applications/FinkMeter.app`
+- 终端执行 `xattr -dr com.apple.quarantine /Applications/FbinHttp.app`
 
 **7. macOS 构建报缺少 SDK / linker**
 

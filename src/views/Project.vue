@@ -1,4 +1,4 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
@@ -325,12 +325,12 @@ async function submitCurl() {
 }
 
 async function exportProject() {
-  const safeName = (store.currentProject?.name || 'finkmeter-project').replace(/[\\/:*?"<>|]/g, '_')
+  const safeName = (store.currentProject?.name || 'fbinhttp-project').replace(/[\\/:*?"<>|]/g, '_')
   try {
     const path = await save({
       title: '导出项目 JSON',
-      defaultPath: `${safeName}.finkmeter.json`,
-      filters: [{ name: 'FinkMeter 项目文件', extensions: ['json'] }],
+      defaultPath: `${safeName}.fbinhttp.json`,
+      filters: [{ name: 'FbinHttp 项目文件', extensions: ['json'] }],
     })
     if (!path) return
     await api.projectExport(projectId.value, path)
@@ -341,6 +341,105 @@ async function exportProject() {
 }
 
 const importingApi = ref(false)
+
+/* ---------- 拖拽排序 ---------- */
+const dragCollectionId = ref<number | null>(null)
+const dragRequestId = ref<number | null>(null)
+
+function siblingsOf(node: CollectionNode): CollectionNode[] {
+  if (!node.parentId) return store.tree
+  return findNode(store.tree, node.parentId)?.children ?? []
+}
+
+function onCollectionDragStart(node: CollectionNode) {
+  dragCollectionId.value = node.id
+}
+
+async function onCollectionDrop(target: CollectionNode) {
+  const sourceId = dragCollectionId.value
+  dragCollectionId.value = null
+  if (!sourceId || sourceId === target.id) return
+  const source = findNode(store.tree, sourceId)
+  if (!source) return
+  if ((source.parentId ?? null) !== (target.parentId ?? null)) {
+    message.warning('暂只支持同级集合排序')
+    return
+  }
+  const ids = siblingsOf(target).map((item) => item.id)
+  const from = ids.indexOf(sourceId)
+  const to = ids.indexOf(target.id)
+  if (from < 0 || to < 0) return
+  ids.splice(to, 0, ids.splice(from, 1)[0])
+  try {
+    await api.collectionReorder(projectId.value, target.parentId ?? null, ids)
+    await store.refreshTree(projectId.value)
+  } catch (e) {
+    message.error(String(e))
+  }
+}
+
+function onRequestDragStart(record: RequestSummary) {
+  dragRequestId.value = record.id
+}
+
+async function onRequestDrop(target: RequestSummary) {
+  const sourceId = dragRequestId.value
+  dragRequestId.value = null
+  if (!sourceId || sourceId === target.id || searchMode.value) return
+  const collectionId = selectedCollection.value?.id ?? target.collectionId
+  const ids = requests.value.map((item) => item.id)
+  const from = ids.indexOf(sourceId)
+  const to = ids.indexOf(target.id)
+  if (from < 0 || to < 0) return
+  ids.splice(to, 0, ids.splice(from, 1)[0])
+  try {
+    await api.requestReorder(collectionId, ids)
+    await loadRequests(collectionId)
+  } catch (e) {
+    message.error(String(e))
+  }
+}
+
+async function exportOpenapi() {
+  const safeName = (store.currentProject?.name || 'openapi').replace(/[\\/:*?"<>|]/g, '_')
+  try {
+    const path = await save({
+      title: '导出 OpenAPI 3.0',
+      defaultPath: `${safeName}.openapi.json`,
+      filters: [{ name: 'OpenAPI JSON', extensions: ['json'] }],
+    })
+    if (!path) return
+    await api.openapiExport(projectId.value, path)
+    message.success('已导出 OpenAPI 3.0 文档，可导入 Apifox / Swagger 等工具')
+  } catch (e) {
+    message.error(String(e))
+  }
+}
+
+async function importOpenapiFile() {
+  try {
+    const path = await open({
+      title: '导入 OpenAPI / Swagger 文档',
+      multiple: false,
+      filters: [{ name: 'OpenAPI JSON', extensions: ['json'] }],
+    })
+    if (!path) return
+    importingApi.value = true
+    const project = await api.openapiImport(path, projectId.value)
+    await store.refreshTree(project.id)
+    requests.value = []
+    selectedKeys.value = []
+    if (store.tree.length) {
+      selectedKeys.value = [String(store.tree[0].id)]
+      await loadRequests(store.tree[0].id)
+    }
+    message.success(`已按 tag 导入到项目「${project.name}」`)
+  } catch (e) {
+    message.error(String(e))
+  } finally {
+    importingApi.value = false
+  }
+}
 
 async function importApiFile() {
   try {
@@ -366,6 +465,23 @@ async function importApiFile() {
     message.error(String(e))
   } finally {
     importingApi.value = false
+  }
+}
+
+function requestRowProps(record: RequestSummary | RequestSearchHit) {
+  if (searchMode.value) {
+    return { onClick: () => openRequest(record), style: 'cursor:pointer' }
+  }
+  return {
+    onClick: () => openRequest(record),
+    style: 'cursor:pointer',
+    draggable: 'true',
+    onDragstart: () => onRequestDragStart(record as RequestSummary),
+    onDragover: (event: DragEvent) => event.preventDefault(),
+    onDrop: (event: DragEvent) => {
+      event.preventDefault()
+      void onRequestDrop(record as RequestSummary)
+    },
   }
 }
 
@@ -426,11 +542,19 @@ const columns = computed(() =>
         </a-button>
         <a-button size="small" :loading="importingApi" @click="importApiFile">
           <template #icon><ImportOutlined /></template>
-          导入 Postman/Apifox
+          导入 Postman
+        </a-button>
+        <a-button size="small" :loading="importingApi" @click="importOpenapiFile">
+          <template #icon><ImportOutlined /></template>
+          导入 OpenAPI
         </a-button>
         <a-button size="small" @click="exportProject">
           <template #icon><ExportOutlined /></template>
           导出项目 JSON
+        </a-button>
+        <a-button size="small" @click="exportOpenapi">
+          <template #icon><ExportOutlined /></template>
+          导出 OpenAPI
         </a-button>
         <a-button size="small" @click="router.push(`/environment/${projectId}`)">
           <template #icon><SettingOutlined /></template>
@@ -458,7 +582,13 @@ const columns = computed(() =>
             @select="onSelect"
           >
             <template #title="node">
-              <div class="tree-node">
+              <div
+                class="tree-node"
+                draggable="true"
+                @dragstart.stop="onCollectionDragStart((node as TreeNode).raw)"
+                @dragover.prevent.stop
+                @drop.stop="onCollectionDrop((node as TreeNode).raw)"
+              >
                 <FolderOutlined class="folder" />
                 <span class="node-title">{{ (node as TreeNode).title }}</span>
                 <span class="node-ops" @click.stop>
@@ -474,7 +604,7 @@ const columns = computed(() =>
             <a-button size="small" type="primary" ghost @click="addCollection(null)">新建集合</a-button>
           </div>
         </div>
-        <div class="tree-foot">拖拽排序将在后续版本开放</div>
+        <div class="tree-foot">拖拽集合或请求可调整顺序（同级）</div>
       </aside>
 
       <section class="list-pane fm-card">
@@ -520,7 +650,7 @@ const columns = computed(() =>
             :pagination="false"
             row-key="id"
             size="middle"
-            :custom-row="(record: RequestSummary | RequestSearchHit) => ({ onClick: () => openRequest(record), style: 'cursor:pointer' })"
+            :custom-row="requestRowProps"
           >
             <template #bodyCell="{ column, record }">
               <template v-if="column.key === 'name'">

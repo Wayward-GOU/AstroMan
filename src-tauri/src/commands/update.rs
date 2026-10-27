@@ -1,7 +1,7 @@
-use serde::{Deserialize, Serialize};
+﻿use serde::{Deserialize, Serialize};
 
-const RELEASE_API: &str = "https://api.github.com/repos/Wayward-GOU/FinkMeter/releases/latest";
-const USER_AGENT: &str = "FinkMeter-Desktop";
+const RELEASE_API: &str = "https://api.github.com/repos/Wayward-GOU/FbinHttp/releases/latest";
+const USER_AGENT: &str = "FbinHttp-Desktop";
 
 #[derive(Deserialize)]
 struct GithubRelease {
@@ -21,6 +21,9 @@ struct GithubAsset {
     name: String,
     #[serde(default)]
     browser_download_url: String,
+    /// API 资源地址，走 api.github.com，可在 github.com 直连受限时下载
+    #[serde(default)]
+    url: String,
     #[serde(default)]
     size: u64,
 }
@@ -36,6 +39,7 @@ pub struct UpdateInfo {
     published_at: String,
     asset_name: Option<String>,
     asset_url: Option<String>,
+    asset_api_url: Option<String>,
     asset_size: Option<u64>,
 }
 
@@ -119,6 +123,9 @@ pub async fn update_check() -> Result<UpdateInfo, String> {
         published_at: release.published_at,
         asset_name: asset.map(|item| item.name.clone()),
         asset_url: asset.map(|item| item.browser_download_url.clone()),
+        asset_api_url: asset
+            .map(|item| item.url.clone())
+            .filter(|url| url.starts_with("https://")),
         asset_size: asset.map(|item| item.size),
     })
 }
@@ -127,7 +134,7 @@ fn safe_file_name(name: &str) -> String {
     let base = name
         .rsplit(['/', '\\'])
         .next()
-        .unwrap_or("finkmeter-update")
+        .unwrap_or("fbinhttp-update")
         .trim();
     let cleaned: String = base
         .chars()
@@ -137,17 +144,23 @@ fn safe_file_name(name: &str) -> String {
         })
         .collect();
     if cleaned.is_empty() {
-        "finkmeter-update".to_string()
+        "fbinhttp-update".to_string()
     } else {
         cleaned
     }
 }
 
-/// 下载新版本安装包到系统临时目录，返回本地文件路径
+/// 下载新版本安装包到系统临时目录，返回本地文件路径。
+/// urls 按优先级依次尝试：先 API 资源地址（api.github.com），再浏览器下载地址（github.com），
+/// 后者的域名在部分网络环境下无法直连。
 #[tauri::command]
-pub async fn update_download(url: String, file_name: String) -> Result<String, String> {
-    let url = url.trim();
-    if !url.starts_with("https://") {
+pub async fn update_download(urls: Vec<String>, file_name: String) -> Result<String, String> {
+    let candidates: Vec<&str> = urls
+        .iter()
+        .map(|url| url.trim())
+        .filter(|url| url.starts_with("https://"))
+        .collect();
+    if candidates.is_empty() {
         return Err("下载地址无效".to_string());
     }
 
@@ -157,25 +170,46 @@ pub async fn update_download(url: String, file_name: String) -> Result<String, S
         .build()
         .map_err(|e| format!("初始化网络请求失败：{e}"))?;
 
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| format!("下载安装包失败：{e}"))?;
-    if !response.status().is_success() {
-        return Err(format!("下载安装包失败，服务器返回 {}", response.status()));
+    let mut last_error = String::new();
+    for url in candidates {
+        let response = match client
+            .get(url)
+            .header(reqwest::header::ACCEPT, "application/octet-stream")
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                last_error = format!("{error}");
+                continue;
+            }
+        };
+        if !response.status().is_success() {
+            last_error = format!("服务器返回 {}", response.status());
+            continue;
+        }
+        let bytes = match response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                last_error = format!("读取安装包失败：{error}");
+                continue;
+            }
+        };
+        if bytes.is_empty() {
+            last_error = "下载内容为空".to_string();
+            continue;
+        }
+
+        let dir = std::env::temp_dir().join("fbinhttp-update");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败：{e}"))?;
+        let target = dir.join(safe_file_name(&file_name));
+        std::fs::write(&target, &bytes).map_err(|e| format!("保存安装包失败：{e}"))?;
+        return Ok(target.to_string_lossy().to_string());
     }
 
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| format!("读取安装包失败：{e}"))?;
-
-    let dir = std::env::temp_dir().join("finkmeter-update");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败：{e}"))?;
-    let target = dir.join(safe_file_name(&file_name));
-    std::fs::write(&target, &bytes).map_err(|e| format!("保存安装包失败：{e}"))?;
-    Ok(target.to_string_lossy().to_string())
+    Err(format!(
+        "下载安装包失败：{last_error}。当前网络可能无法直连 GitHub 下载域名，可在浏览器中打开发布页手动下载"
+    ))
 }
 
 /// 打开已下载的安装包或系统允许的外部链接

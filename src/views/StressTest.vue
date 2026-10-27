@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { message } from 'ant-design-vue'
+import { message, Modal } from 'ant-design-vue'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import {
   ThunderboltOutlined,
@@ -12,6 +12,8 @@ import {
   InfoCircleOutlined,
   PlusOutlined,
   FolderOpenOutlined,
+  SaveOutlined,
+  DeleteOutlined,
 } from '@ant-design/icons-vue'
 import PageHeader from '@/components/PageHeader.vue'
 import LineChart from '@/components/LineChart.vue'
@@ -20,6 +22,7 @@ import * as api from '@/api'
 import type {
   Environment,
   HttpRequestDetail,
+  PlanSummary,
   RequestSearchHit,
   StressDone,
   StressProgress,
@@ -91,12 +94,19 @@ watch(targetProjectId, async (id) => {
   choices.value = []
   modalEnvironments.value = []
   modalEnvId.value = null
+  plans.value = []
+  activePlanId.value = null
   if (!id) return
   choicesLoading.value = true
   try {
-    const [list, envs] = await Promise.all([api.requestOptions(id), api.envList(id)])
+    const [list, envs, planList] = await Promise.all([
+      api.requestOptions(id),
+      api.envList(id),
+      api.planList(id),
+    ])
     choices.value = list
     modalEnvironments.value = envs
+    plans.value = planList
     const active = envs.find((env) => env.isActive) ?? envs[0]
     modalEnvId.value = active?.id ?? null
   } catch (e) {
@@ -105,6 +115,92 @@ watch(targetProjectId, async (id) => {
     choicesLoading.value = false
   }
 })
+
+/* ---------- 压测计划 ---------- */
+const plans = ref<PlanSummary[]>([])
+const activePlanId = ref<number | null>(null)
+const planName = ref('')
+const planSaving = ref(false)
+
+function currentPlanConfig() {
+  return {
+    settings: { ...settings },
+    stages: stages.value.map((item) => ({ ...item })),
+    envId: modalEnvId.value,
+  }
+}
+
+async function applyPlan(id: number | null) {
+  if (!id) {
+    activePlanId.value = null
+    planName.value = ''
+    return
+  }
+  try {
+    const plan = await api.planGet(id)
+    const config = plan.config as {
+      settings?: Record<string, unknown>
+      stages?: StressStage[]
+      envId?: number | null
+    } | null
+    if (config?.settings) Object.assign(settings, config.settings)
+    if (Array.isArray(config?.stages) && config.stages.length) {
+      stages.value = config.stages.map((item) => ({
+        concurrent: Number(item.concurrent) || 1,
+        durationSec: Number(item.durationSec) || 1,
+      }))
+    }
+    if (config?.envId !== undefined) modalEnvId.value = config.envId ?? null
+    if (plan.requestId) targetRequestId.value = plan.requestId
+    activePlanId.value = plan.id
+    planName.value = plan.name
+    message.success(`已载入计划「${plan.name}」`)
+  } catch (e) {
+    message.error(String(e))
+  }
+}
+
+async function savePlan() {
+  if (!targetProjectId.value) return
+  const name = planName.value.trim() || `${selectedChoice.value?.name ?? '压测'} 计划`
+  planSaving.value = true
+  try {
+    const saved = await api.planSave({
+      id: activePlanId.value,
+      projectId: targetProjectId.value,
+      requestId: targetRequestId.value,
+      name,
+      config: currentPlanConfig(),
+    })
+    activePlanId.value = saved.id
+    planName.value = saved.name
+    plans.value = await api.planList(targetProjectId.value)
+    message.success('计划已保存，可在下次压测时直接载入')
+  } catch (e) {
+    message.error(String(e))
+  } finally {
+    planSaving.value = false
+  }
+}
+
+function removePlan() {
+  if (!activePlanId.value) return
+  const id = activePlanId.value
+  Modal.confirm({
+    title: '删除该压测计划？',
+    content: '只删除保存的压测配置，已生成的压测报告不受影响。',
+    okText: '删除',
+    okType: 'danger',
+    cancelText: '取消',
+    async onOk() {
+      await api.planDelete(id)
+      plans.value = plans.value.filter((item) => item.id !== id)
+      activePlanId.value = null
+      planName.value = ''
+      message.success('计划已删除')
+    },
+  })
+}
 
 async function startFromConfig() {
   if (!targetProjectId.value) {
@@ -736,6 +832,44 @@ function backToRequest() {
       @ok="startFromConfig"
     >
       <div class="modal-body">
+        <div class="modal-section plan-section">
+          <div class="section-title">
+            <span class="step">0</span>压测计划
+            <span class="section-sub">Plan</span>
+          </div>
+          <div class="plan-row">
+            <a-select
+              :value="activePlanId"
+              size="large"
+              allow-clear
+              placeholder="载入已保存的压测计划"
+              class="plan-select"
+              :options="plans.map((item) => ({ value: item.id, label: `${item.name}${item.requestName ? ` · ${item.requestName}` : ''}` }))"
+              @change="applyPlan"
+            />
+            <a-input
+              v-model:value="planName"
+              size="large"
+              class="plan-name"
+              placeholder="计划名称（留空自动命名）"
+            />
+            <a-button size="large" :loading="planSaving" :disabled="!targetProjectId" @click="savePlan">
+              <template #icon><SaveOutlined /></template>
+              保存计划
+            </a-button>
+            <a-button
+              v-if="activePlanId"
+              size="large"
+              danger
+              type="text"
+              @click="removePlan"
+            >
+              <template #icon><DeleteOutlined /></template>
+              删除
+            </a-button>
+          </div>
+        </div>
+
         <div class="modal-section">
           <div class="section-title">
             <span class="step">1</span>选择目标接口
@@ -1618,6 +1752,28 @@ function backToRequest() {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 14px;
+}
+
+.plan-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.plan-row .plan-select {
+  flex: 1 1 240px;
+  min-width: 200px;
+}
+
+.plan-row .plan-name {
+  flex: 1 1 180px;
+  min-width: 160px;
+}
+
+.plan-section {
+  padding-bottom: 18px;
+  border-bottom: 1px dashed var(--fm-border);
 }
 
 .target-grid .field,

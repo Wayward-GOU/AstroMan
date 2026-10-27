@@ -1,4 +1,4 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
@@ -21,12 +21,16 @@ import {
   ApiOutlined,
   SafetyCertificateOutlined,
   RocketOutlined,
+  PlayCircleOutlined,
+  BarChartOutlined,
+  FileTextOutlined,
 } from '@ant-design/icons-vue'
 import PageHeader from '@/components/PageHeader.vue'
 import { formatDateTime } from '@/utils/datetime'
 import { useProjectStore } from '@/stores/project'
 import * as api from '@/api'
 import type {
+  DashboardMetrics,
   HistoryItem,
   MonitorSnapshot,
   StorageInfo,
@@ -46,6 +50,7 @@ const submitting = ref(false)
 const history = ref<HistoryItem[]>([])
 const reports = ref<StressReport[]>([])
 const stats = ref<WorkspaceStats | null>(null)
+const metrics = ref<DashboardMetrics | null>(null)
 const storage = ref<StorageInfo | null>(null)
 const snapshot = ref<MonitorSnapshot | null>(null)
 const monitorLoading = ref(false)
@@ -115,7 +120,7 @@ const kpis = computed(() => {
       key: 'history',
       label: '历史请求',
       value: s?.historyCount ?? null,
-      note: s ? `近 7 天 ${s.recentHistory} 次` : '本机保留最近 5000 条',
+      note: s ? `近 7 天 ${s.recentHistory} 次` : '本机保留最近 100000 条',
       go: () => router.push('/history'),
     },
   ]
@@ -220,6 +225,159 @@ const highlights = computed(() => {
   ]
 })
 
+/* ---------- 数据大屏 ---------- */
+
+const dashDays = computed(() => metrics.value?.days ?? [])
+const codeBuckets = computed(() => metrics.value?.codeBuckets ?? [])
+const topRequests = computed(() => metrics.value?.topRequests ?? [])
+const reportPoints = computed(() => metrics.value?.reportPoints ?? [])
+const methodBuckets = computed(() => metrics.value?.methodBuckets ?? [])
+const hourBuckets = computed(() => metrics.value?.hourBuckets ?? [])
+const latencyBuckets = computed(() => metrics.value?.latencyBuckets ?? [])
+const topProjects = computed(() => metrics.value?.topProjects ?? [])
+
+const trendTotal = computed(() => dashDays.value.reduce((sum, d) => sum + d.total, 0))
+const trendSuccess = computed(() => dashDays.value.reduce((sum, d) => sum + d.success, 0))
+const trendRate = computed(() =>
+  trendTotal.value ? (trendSuccess.value / trendTotal.value) * 100 : 0,
+)
+const trendAvgRt = computed(() => {
+  const weighted = dashDays.value.reduce((sum, d) => sum + d.avgRt * d.total, 0)
+  return trendTotal.value ? weighted / trendTotal.value : 0
+})
+const trendPeak = computed(() => Math.max(1, ...dashDays.value.map((d) => d.total)))
+
+const historyTotal = computed(() => codeBuckets.value.reduce((sum, b) => sum + b.count, 0))
+const reportPeak = computed(() =>
+  Math.max(1, ...reportPoints.value.map((r) => r.p95Rt)),
+)
+const todayTotal = computed(() => hourBuckets.value.reduce((sum, h) => sum + h.count, 0))
+const hourPeak = computed(() => Math.max(1, ...hourBuckets.value.map((h) => h.count)))
+const methodPeak = computed(() => Math.max(1, ...methodBuckets.value.map((b) => b.count)))
+const latencyTotal = computed(() => latencyBuckets.value.reduce((sum, b) => sum + b.count, 0))
+const latencyPeak = computed(() => Math.max(1, ...latencyBuckets.value.map((b) => b.count)))
+const projectPeak = computed(() => Math.max(1, ...topProjects.value.map((p) => p.count)))
+const todayPeakHour = computed(() => {
+  const peak = hourBuckets.value.reduce(
+    (best, item) => (item.count > best.count ? item : best),
+    hourBuckets.value[0] ?? { hour: 0, count: 0 },
+  )
+  return peak.count ? `${String(peak.hour).padStart(2, '0')}:00` : '—'
+})
+
+function trendBarHeight(point: { total: number }) {
+  return point.total ? Math.max(6, (point.total / trendPeak.value) * 100) : 0
+}
+
+function trendSegment(point: { total: number }, value: number) {
+  return point.total ? (value / point.total) * 100 : 0
+}
+
+function monthDay(date: string) {
+  return date.slice(5)
+}
+
+function trendTitle(point: { date: string; total: number; success: number; avgRt: number }) {
+  const rate = point.total ? ((point.success / point.total) * 100).toFixed(0) : 0
+  return `${point.date} · ${point.total} 次请求 · 成功率 ${rate}% · 平均 ${fmtMs(point.avgRt)}`
+}
+
+function bucketClass(label: string) {
+  if (label === '2xx') return 'ok'
+  if (label === '3xx') return 'info'
+  if (label === '4xx') return 'warn'
+  if (label === '5xx') return 'danger'
+  return 'other'
+}
+
+function bucketPercent(count: number) {
+  return historyTotal.value ? `${((count / historyTotal.value) * 100).toFixed(2)}%` : '0%'
+}
+
+function bucketText(count: number) {
+  if (!historyTotal.value) return '0%'
+  return `${((count / historyTotal.value) * 100).toFixed(1)}%`
+}
+
+function reportBarWidth(report: { p95Rt: number }) {
+  return `${Math.max(6, (report.p95Rt / reportPeak.value) * 100)}%`
+}
+
+function reportTone(report: { errorRate: number }) {
+  if (report.errorRate >= 1) return 'danger'
+  if (report.errorRate >= 0.1) return 'warn'
+  return 'ok'
+}
+
+function hourHeight(point: { count: number }) {
+  return point.count ? Math.max(4, (point.count / hourPeak.value) * 100) : 0
+}
+
+function hourTitle(point: { hour: number; count: number }) {
+  return `${String(point.hour).padStart(2, '0')}:00 - ${String(point.hour).padStart(2, '0')}:59 · ${point.count} 次`
+}
+
+function methodWidth(bucket: { count: number }) {
+  return `${bucket.count ? Math.max(6, (bucket.count / methodPeak.value) * 100) : 0}%`
+}
+
+function methodTone(label: string) {
+  if (label === 'GET') return 'ok'
+  if (label === 'POST') return 'info'
+  if (label === 'PUT' || label === 'PATCH') return 'warn'
+  if (label === 'DELETE') return 'danger'
+  return 'other'
+}
+
+function latencyWidth(bucket: { count: number }) {
+  return `${bucket.count ? Math.max(6, (bucket.count / latencyPeak.value) * 100) : 0}%`
+}
+
+function latencyTone(index: number) {
+  return ['ok', 'ok', 'info', 'warn', 'danger'][index] ?? 'other'
+}
+
+function latencyText(bucket: { count: number }) {
+  if (!latencyTotal.value) return '0%'
+  return `${((bucket.count / latencyTotal.value) * 100).toFixed(1)}%`
+}
+
+function projectWidth(item: { count: number }) {
+  return `${Math.max(6, (item.count / projectPeak.value) * 100)}%`
+}
+
+const runnerSteps = [
+  {
+    title: '选择项目与环境',
+    desc: '进入批量运行页，选好项目后会自动带出该项目已激活的环境与变量。',
+  },
+  {
+    title: '勾选要跑的接口',
+    desc: '支持关键字过滤与多选，第一次跑建议先选 1～2 个接口确认参数。',
+  },
+  {
+    title: '决定数据来源',
+    desc: '填迭代次数，或导入 CSV 文件；表头即变量名，每一行驱动一轮请求。',
+  },
+  {
+    title: '运行并导出结果',
+    desc: '设置请求间隔后开始，随时可停止；结果表汇总状态码、耗时与断言。',
+  },
+]
+
+// 示例内容放在常量里，避免模板把 {{变量}} 当成插值
+const csvExample = `username,password
+alice,Passw0rd!
+bob,Hello@2024
+carol,Fbin@2026`
+const bodyExample = `{
+  "username": "{{username}}",
+  "password": "{{password}}"
+}`
+const runnerUrlExample = '{{base_url}}/api/login'
+const runnerVarExample = '{{username}}'
+const runnerEnvExample = '{{base_url}}'
+
 const steps = computed(() => [
   {
     key: '01',
@@ -315,7 +473,7 @@ const tips = [
   },
   {
     title: '数据备份与迁移',
-    desc: '项目页或卡片菜单导出 *.finkmeter.json 交给同事；设置页可查看数据库路径并迁移数据目录。',
+    desc: '项目页或卡片菜单导出 *.fbinhttp.json 交给同事；设置页可查看数据库路径并迁移数据目录。',
     code: '',
   },
 ]
@@ -342,8 +500,12 @@ const faqs = [
     a: '在项目页点「导入接口」，把浏览器 Network 里复制的 cURL 命令粘进去，会自动解析出方法、URL、请求头、查询参数与 Body，再选目标集合即可。反过来，请求栏「代码」按钮可以把当前请求生成 cURL / 原始报文 / fetch / Python 代码。',
   },
   {
+    q: '批量运行（Runner）和压测有什么区别？',
+    a: '批量运行按顺序发送：一次选中多个接口，配合迭代次数或 CSV 数据逐轮跑，适合回归与数据驱动场景，每条结果都能单独查看；压测是在固定并发下持续施压，关注 QPS、P95/P99 与错误率。需要按数据批量跑接口用「批量运行」，需要并发能力去「压测」。',
+  },
+  {
     q: '怎么把项目分享给同事？',
-    a: '项目页顶部或工作台项目卡片菜单里选「导出项目」，会得到 *.finkmeter.json（含集合、接口、脚本与断言）。对方在工作台点「导入项目 → 导入项目 JSON」即可复原；重名时会自动加「（导入）」后缀，不影响原有项目。',
+    a: '项目页顶部或工作台项目卡片菜单里选「导出项目」，会得到 *.fbinhttp.json（含集合、接口、脚本与断言）。对方在工作台点「导入项目 → 导入项目 JSON」即可复原；重名时会自动加「（导入）」后缀，不影响原有项目。',
   },
   {
     q: '变量没生效怎么排查？',
@@ -376,18 +538,20 @@ onMounted(async () => {
     loading.value = false
   }
 
-  const [his, reps, st, storageInfo, info] = await Promise.allSettled([
+  const [his, reps, st, storageInfo, info, dash] = await Promise.allSettled([
     api.historyList(8),
     api.reportList(4),
     api.workspaceStats(),
     api.storageInfo(),
     api.appInfo(),
+    api.dashboardMetrics(),
   ])
   if (his.status === 'fulfilled') history.value = his.value
   if (reps.status === 'fulfilled') reports.value = reps.value
   if (st.status === 'fulfilled') stats.value = st.value
   if (storageInfo.status === 'fulfilled') storage.value = storageInfo.value
   if (info.status === 'fulfilled') appVersion.value = info.value.version
+  if (dash.status === 'fulfilled') metrics.value = dash.value
 
   await loadMonitor()
 })
@@ -440,11 +604,9 @@ async function createProject() {
 }
 
 async function refreshStats() {
-  try {
-    stats.value = await api.workspaceStats()
-  } catch {
-    /* 统计失败不影响主流程 */
-  }
+  const [s, m] = await Promise.allSettled([api.workspaceStats(), api.dashboardMetrics()])
+  if (s.status === 'fulfilled') stats.value = s.value
+  if (m.status === 'fulfilled') metrics.value = m.value
 }
 
 function removeProject(id: number, name: string) {
@@ -466,9 +628,9 @@ function removeProject(id: number, name: string) {
 async function importProject() {
   try {
     const path = await open({
-      title: '导入 FinkMeter 项目',
+      title: '导入 FbinHttp 项目',
       multiple: false,
-      filters: [{ name: 'FinkMeter 项目文件', extensions: ['json'] }],
+      filters: [{ name: 'FbinHttp 项目文件', extensions: ['json'] }],
     })
     if (!path) return
     const project = await api.projectImport(path)
@@ -486,8 +648,8 @@ async function exportProjectJson(id: number, name: string) {
   try {
     const path = await save({
       title: '导出项目 JSON',
-      defaultPath: `${safeName}.finkmeter.json`,
-      filters: [{ name: 'FinkMeter 项目文件', extensions: ['json'] }],
+      defaultPath: `${safeName}.fbinhttp.json`,
+      filters: [{ name: 'FbinHttp 项目文件', extensions: ['json'] }],
     })
     if (!path) return
     await api.projectExport(id, path)
@@ -521,19 +683,19 @@ async function importApiProject() {
 }
 
 function onImportMenu(info: { key: string | number }) {
-  if (info.key === 'finkmeter') importProject()
+  if (info.key === 'fbinhttp') importProject()
   else if (info.key === 'api') importApiProject()
 }
 
 function clearHistory() {
   Modal.confirm({
     title: '清空全部请求历史？',
-    content: '只删除本机记录的请求历史，不会影响项目、接口与压测报告。',
+    content: '只删除本机记录的请求历史，不会影响项目、接口与压测报告。按时间范围清理请前往「请求历史」页。',
     okText: '清空',
     okType: 'danger',
     cancelText: '取消',
     async onOk() {
-      await api.historyClear()
+      await api.dataCleanup({ history: true, vacuum: true })
       history.value = []
       refreshStats()
       message.success('历史已清空')
@@ -629,7 +791,7 @@ function statusColor(code?: number | null) {
         </a-button>
         <template #overlay>
           <a-menu @click="onImportMenu">
-            <a-menu-item key="finkmeter">导入项目 JSON</a-menu-item>
+            <a-menu-item key="fbinhttp">导入项目 JSON</a-menu-item>
             <a-menu-item key="api">导入 Postman / Apifox 数据</a-menu-item>
           </a-menu>
         </template>
@@ -675,7 +837,7 @@ function statusColor(code?: number | null) {
         </div>
         <div class="console-meta">
           <DatabaseOutlined />
-          <span>FinkMeter v{{ appVersion || '1.0.0' }}</span>
+          <span>FbinHttp v{{ appVersion || '1.0.0' }}</span>
           <span class="meta-dot" />
           <a @click="goSettings">数据位置与设置</a>
         </div>
@@ -702,6 +864,75 @@ function statusColor(code?: number | null) {
       </button>
     </div>
 
+    <!-- 批量运行介绍 -->
+    <section class="runner-band fm-card">
+      <div class="runner-copy">
+        <span class="runner-eyebrow"><PlayCircleOutlined /> 批量运行 · Runner</span>
+        <h2 class="runner-title">一次跑完一组接口，用 CSV 给每一轮换数据</h2>
+        <p class="runner-desc">
+          批量运行把「一次发一个请求」变成「一次跑一批」：勾选项目里任意多个接口，设定迭代次数，
+          或导入一份 CSV 让每一行驱动一轮请求。每个请求的状态码、耗时、断言结果与错误都会汇总到结果表，
+          跑完还能导出留档。环境变量、前置/后置脚本与断言照常生效。
+        </p>
+        <div class="runner-tags">
+          <span>多接口勾选</span>
+          <span>迭代次数 / CSV 参数化</span>
+          <span>环境与脚本生效</span>
+          <span>逐条结果可导出</span>
+        </div>
+        <div class="runner-actions">
+          <a-button type="primary" @click="router.push('/runner')">
+            <template #icon><PlayCircleOutlined /></template>
+            进入批量运行
+          </a-button>
+          <a-button :disabled="!recentProject" @click="goProject">先准备接口</a-button>
+        </div>
+      </div>
+
+      <div class="runner-steps">
+        <div v-for="(s, i) in runnerSteps" :key="s.title" class="runner-step">
+          <span class="runner-step-index mono">0{{ i + 1 }}</span>
+          <div class="runner-step-body">
+            <div class="runner-step-title">{{ s.title }}</div>
+            <div class="runner-step-desc">{{ s.desc }}</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 批量运行示例 -->
+    <div class="fm-card runner-example">
+      <div class="example-head">
+        <span class="example-title"><FileTextOutlined /> 示例：用 CSV 批量登录 3 个账号</span>
+        <span class="example-note">CSV 表头就是变量名，每行跑一轮</span>
+      </div>
+      <div class="example-grid">
+        <div class="example-col">
+          <div class="example-label">users.csv</div>
+          <pre class="example-code mono">{{ csvExample }}</pre>
+        </div>
+        <div class="example-col">
+          <div class="example-label">
+            POST <span class="mono">{{ runnerUrlExample }}</span>（Body 为 JSON）
+          </div>
+          <pre class="example-code mono">{{ bodyExample }}</pre>
+        </div>
+        <div class="example-col">
+          <div class="example-label">运行结果（3 轮）</div>
+          <div class="example-results">
+            <div><b class="mono">第 1 轮</b> alice → 200 · 断言通过</div>
+            <div><b class="mono">第 2 轮</b> bob → 200 · 断言通过</div>
+            <div class="fail"><b class="mono">第 3 轮</b> carol → 401 · 断言失败</div>
+          </div>
+        </div>
+      </div>
+      <div class="example-foot">
+        在 URL、Header、Body 里用 <code class="mono">{{ runnerVarExample }}</code> 引用 CSV 列，
+        <code class="mono">{{ runnerEnvExample }}</code> 等环境变量仍会照常替换。单次任务最多 5000 个请求
+        （接口数 × 迭代轮数），超过会被拦截；需要高并发施压请改用「压测」。
+      </div>
+    </div>
+
     <!-- 产品介绍 -->
     <section class="intro-band fm-card">
       <div class="intro-copy">
@@ -711,7 +942,7 @@ function statusColor(code?: number | null) {
         </span>
         <h2 class="intro-title">调试、压测与工具箱，一个桌面应用全部搞定</h2>
         <p class="intro-desc">
-          FinkMeter 面向需要频繁调试 HTTP 接口的开发者：界面参考 Postman，压测参数参考 JMeter，
+          FbinHttp 面向需要频繁调试 HTTP 接口的开发者：界面参考 Postman，压测参数参考 JMeter，
           日常格式化与转换工具集中在一起。不用在浏览器插件和在线站点之间来回切换，也不用把接口数据交给第三方服务。
         </p>
         <div class="intro-tags">
@@ -733,7 +964,7 @@ function statusColor(code?: number | null) {
     <!-- 功能能力 -->
     <div class="section-head feature-head">
       <div>
-        <h2 class="section-title">FinkMeter 能做什么</h2>
+        <h2 class="section-title">FbinHttp 能做什么</h2>
         <div class="section-desc">从接口调试到压力测试，再到日常开发小工具，全部离线可用</div>
       </div>
     </div>
@@ -807,7 +1038,7 @@ function statusColor(code?: number | null) {
           <div v-else class="fm-card panel-empty">
             <div class="empty-mark">📁</div>
             <div class="empty-title">还没有项目</div>
-            <div class="empty-desc">创建一个项目开始调试，或者导入 FinkMeter 项目、Postman 集合或 Apifox 数据。</div>
+            <div class="empty-desc">创建一个项目开始调试，或者导入 FbinHttp 项目、Postman 集合或 Apifox 数据。</div>
             <div class="empty-actions">
               <a-button type="primary" @click="createOpen = true">新建项目</a-button>
               <a-button @click="importProject">导入项目 JSON</a-button>
@@ -913,11 +1144,227 @@ function statusColor(code?: number | null) {
       </aside>
     </div>
 
+    <!-- 数据大屏 -->
+    <div class="section-head dash-head">
+      <div>
+        <h2 class="section-title">数据大屏</h2>
+        <div class="section-desc">根据本机请求历史与压测报告实时汇总，清空历史后同步归零</div>
+      </div>
+      <div class="dash-legend">
+        <span class="legend-dot ok" />成功
+        <span class="legend-dot err" />失败
+      </div>
+    </div>
+
+    <div class="dash-grid">
+      <!-- 请求趋势 -->
+      <div class="fm-card dash-card trend-card">
+        <div class="dash-card-head">
+          <div>
+            <div class="dash-title">近 14 天请求趋势</div>
+            <div class="dash-sub">按发送时间统计，包含单接口调试与批量运行</div>
+          </div>
+          <div class="dash-kpis">
+            <span><b class="mono">{{ fmtInt(trendTotal) }}</b> 次请求</span>
+            <span><b class="mono">{{ trendRate.toFixed(1) }}%</b> 成功率</span>
+            <span><b class="mono">{{ fmtMs(trendAvgRt) }}</b> 平均耗时</span>
+          </div>
+        </div>
+        <div v-if="trendTotal" class="trend-plot">
+          <div v-for="d in dashDays" :key="d.date" class="trend-col" :title="trendTitle(d)">
+            <div class="trend-slot">
+              <div class="trend-bar" :style="{ height: `${trendBarHeight(d)}%` }">
+                <span class="trend-seg ok" :style="{ height: `${trendSegment(d, d.success)}%` }" />
+                <span
+                  class="trend-seg err"
+                  :style="{ height: `${trendSegment(d, d.total - d.success)}%` }"
+                />
+              </div>
+            </div>
+            <span class="trend-day mono">{{ monthDay(d.date) }}</span>
+          </div>
+        </div>
+        <div v-else class="dash-empty">
+          还没有请求记录。发送一次请求或跑一轮批量运行后，这里会自动生成趋势图。
+        </div>
+      </div>
+
+      <!-- 状态码分布 -->
+      <div class="fm-card dash-card">
+        <div class="dash-card-head">
+          <div class="dash-title">状态码分布</div>
+          <span class="dash-total mono">{{ fmtInt(historyTotal) }} 次</span>
+        </div>
+        <div v-if="historyTotal" class="code-stack">
+          <span
+            v-for="b in codeBuckets"
+            :key="b.label"
+            class="code-seg"
+            :class="bucketClass(b.label)"
+            :style="{ width: bucketPercent(b.count) }"
+          />
+        </div>
+        <div class="code-legend">
+          <div v-for="b in codeBuckets" :key="b.label" class="code-row">
+            <span class="legend-dot" :class="bucketClass(b.label)" />
+            <span class="code-label">{{ b.label }}</span>
+            <span class="code-count mono">{{ fmtInt(b.count) }}</span>
+            <span class="code-pct mono">{{ bucketText(b.count) }}</span>
+          </div>
+        </div>
+        <div v-if="!historyTotal" class="dash-empty">暂无请求记录。</div>
+      </div>
+
+      <!-- 方法分布 -->
+      <div class="fm-card dash-card">
+        <div class="dash-card-head">
+          <div class="dash-title">请求方法分布</div>
+          <span class="dash-total mono">{{ fmtInt(historyTotal) }} 次</span>
+        </div>
+        <div v-if="historyTotal" class="bar-list">
+          <div v-for="b in methodBuckets" :key="b.label" class="bar-row">
+            <span class="bar-label method-label" :class="`tone-text-${methodTone(b.label)}`">
+              {{ b.label }}
+            </span>
+            <span class="bar-track">
+              <span
+                class="bar-fill"
+                :class="methodTone(b.label)"
+                :style="{ width: methodWidth(b) }"
+              />
+            </span>
+            <span class="bar-value mono">{{ fmtInt(b.count) }}</span>
+          </div>
+        </div>
+        <div v-else class="dash-empty">暂无请求记录。</div>
+      </div>
+
+      <!-- 今日时段分布 -->
+      <div class="fm-card dash-card hour-card">
+        <div class="dash-card-head">
+          <div>
+            <div class="dash-title">今日各时段请求量</div>
+            <div class="dash-sub">按本地时间 0-23 点，峰值时段 {{ todayPeakHour }}</div>
+          </div>
+          <div class="dash-kpis">
+            <span><b class="mono">{{ fmtInt(todayTotal) }}</b> 次</span>
+          </div>
+        </div>
+        <div v-if="todayTotal" class="hour-plot">
+          <div v-for="h in hourBuckets" :key="h.hour" class="hour-col" :title="hourTitle(h)">
+            <div class="hour-slot">
+              <div class="hour-bar" :style="{ height: `${hourHeight(h)}%` }" />
+            </div>
+            <span v-if="h.hour % 3 === 0" class="hour-tick mono">{{ h.hour }}</span>
+            <span v-else class="hour-tick mono" />
+          </div>
+        </div>
+        <div v-else class="dash-empty">今天还没有请求，发一次就会出现在这里。</div>
+      </div>
+
+      <!-- 耗时分布 -->
+      <div class="fm-card dash-card">
+        <div class="dash-card-head">
+          <div class="dash-title">响应耗时分布</div>
+          <span class="dash-total mono">共 {{ fmtInt(latencyTotal) }} 次</span>
+        </div>
+        <div v-if="latencyTotal" class="bar-list">
+          <div v-for="(b, i) in latencyBuckets" :key="b.label" class="bar-row">
+            <span class="bar-label">{{ b.label }}</span>
+            <span class="bar-track">
+              <span
+                class="bar-fill"
+                :class="latencyTone(i)"
+                :style="{ width: latencyWidth(b) }"
+              />
+            </span>
+            <span class="bar-value mono">{{ latencyText(b) }}</span>
+          </div>
+        </div>
+        <div v-else class="dash-empty">暂无请求记录。</div>
+      </div>
+
+      <!-- 项目调用量 -->
+      <div class="fm-card dash-card">
+        <div class="dash-card-head">
+          <div class="dash-title">项目调用量 Top 5</div>
+          <a class="dash-link" @click="router.push('/projects')">我的项目</a>
+        </div>
+        <div v-if="topProjects.length" class="bar-list">
+          <div v-for="p in topProjects" :key="p.name" class="bar-row">
+            <span class="bar-label project-label" :title="p.name">{{ p.name }}</span>
+            <span class="bar-track">
+              <span class="bar-fill ok" :style="{ width: projectWidth(p) }" />
+            </span>
+            <span class="bar-value mono">{{ fmtInt(p.count) }}</span>
+            <span class="bar-value mono" :class="{ 'tone-danger': p.successRate < 95 }">
+              {{ p.successRate.toFixed(0) }}%
+            </span>
+          </div>
+        </div>
+        <div v-else class="dash-empty">还没有调用记录。</div>
+      </div>
+
+      <!-- 高频接口 -->
+      <div class="fm-card dash-card top-card">
+        <div class="dash-card-head">
+          <div class="dash-title">高频接口 Top 5</div>
+          <a class="dash-link" @click="router.push('/history')">全部历史</a>
+        </div>
+        <div v-if="topRequests.length" class="top-list">
+          <div v-for="(t, i) in topRequests" :key="`${t.method}-${t.url}`" class="top-row">
+            <span class="top-rank mono">{{ i + 1 }}</span>
+            <span class="method-tag" :class="`method-${t.method}`">{{ t.method }}</span>
+            <span class="top-name" :title="t.url">{{ t.name }}</span>
+            <span class="top-meta mono">{{ fmtInt(t.count) }} 次</span>
+            <span class="top-meta mono">{{ fmtMs(t.avgRt) }}</span>
+            <span class="top-rate mono" :class="{ low: t.successRate < 95 }">
+              {{ t.successRate.toFixed(0) }}%
+            </span>
+          </div>
+        </div>
+        <div v-else class="dash-empty">还没有调用记录。</div>
+      </div>
+
+      <!-- 压测走势 -->
+      <div class="fm-card dash-card report-card">
+        <div class="dash-card-head">
+          <div class="dash-title">最近压测 P95 走势</div>
+          <a class="dash-link" @click="router.push('/reports')">全部报告</a>
+        </div>
+        <div v-if="reportPoints.length" class="report-chart">
+          <div
+            v-for="r in reportPoints"
+            :key="r.id"
+            class="report-chart-row"
+            @click="router.push(`/reports/${r.id}`)"
+          >
+            <span class="report-chart-name" :title="r.name">{{ r.name }}</span>
+            <span class="report-chart-track">
+              <span
+                class="report-chart-fill"
+                :class="reportTone(r)"
+                :style="{ width: reportBarWidth(r) }"
+              />
+            </span>
+            <span class="report-chart-value mono">{{ fmtMs(r.p95Rt) }}</span>
+            <span class="report-chart-value mono" :class="`tone-${reportTone(r)}`">
+              {{ r.errorRate.toFixed(1) }}%
+            </span>
+          </div>
+          <div class="report-chart-foot">柱长为 P95 延迟，右侧为错误率；红色表示错误率 ≥ 1%</div>
+        </div>
+        <div v-else class="dash-empty">
+          还没有压测报告。<a class="dash-link" @click="router.push('/stress')">去发起压测</a>
+        </div>
+      </div>
+    </div>
+
     <!-- 最近请求 -->
     <div id="recent-history" class="section-head">
       <div>
         <h2 class="section-title">最近请求</h2>
-        <div class="section-desc">每次发送自动记录，最多保留最近 5000 条</div>
+        <div class="section-desc">每次发送自动记录，最多保留最近 100000 条</div>
       </div>
       <div v-if="history.length" class="head-actions">
         <a-button size="small" @click="clearHistory">清空历史</a-button>
@@ -1983,6 +2430,697 @@ function statusColor(code?: number | null) {
   color: var(--fm-text-2);
 }
 
+/* ---------- 数据大屏 ---------- */
+.dash-head {
+  margin-top: 20px;
+  margin-bottom: 12px;
+}
+
+.dash-legend {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--fm-muted);
+}
+
+.legend-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: var(--fm-border-strong);
+}
+
+.legend-dot.ok {
+  background: var(--fm-success);
+}
+
+.legend-dot.err {
+  background: var(--fm-danger);
+}
+
+.legend-dot.info {
+  background: var(--fm-primary);
+}
+
+.legend-dot.warn {
+  background: var(--fm-warning);
+}
+
+.legend-dot.danger {
+  background: var(--fm-danger);
+}
+
+.legend-dot.other {
+  background: var(--fm-border-strong);
+}
+
+.dash-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+/* 宽图占两列，其余卡片一列，整体更紧凑 */
+.trend-card,
+.hour-card,
+.top-card,
+.report-card {
+  grid-column: span 2;
+}
+
+.dash-card {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding: 13px 15px;
+}
+
+.dash-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.dash-title {
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.dash-sub {
+  margin-top: 2px;
+  font-size: 10.5px;
+  color: var(--fm-muted);
+}
+
+.dash-kpis {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-size: 10.5px;
+  color: var(--fm-muted);
+}
+
+.dash-kpis b {
+  color: var(--fm-text);
+  font-weight: 600;
+}
+
+.dash-total {
+  font-size: 11px;
+  color: var(--fm-muted);
+}
+
+.dash-link {
+  font-size: 11px;
+  color: var(--fm-primary);
+  cursor: pointer;
+}
+
+.dash-empty {
+  padding: 28px 0 14px;
+  font-size: 11.5px;
+  line-height: 1.7;
+  color: var(--fm-muted);
+  text-align: center;
+}
+
+/* 通用横向条形图：方法 / 耗时 / 项目共用 */
+.bar-list {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin-top: 12px;
+}
+
+.bar-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.bar-label {
+  flex: 0 0 62px;
+  overflow: hidden;
+  font-size: 10.5px;
+  color: var(--fm-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.method-label {
+  font-weight: 600;
+  color: var(--fm-text);
+}
+
+.project-label {
+  flex: 0 0 78px;
+  color: var(--fm-text);
+}
+
+.bar-track {
+  position: relative;
+  flex: 1 1 auto;
+  height: 7px;
+  overflow: hidden;
+  border-radius: 4px;
+  background: var(--fm-surface-alt);
+}
+
+.bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: 4px;
+  background: var(--fm-border-strong);
+  transition: width 0.35s ease;
+}
+
+.bar-fill.ok {
+  background: var(--fm-success);
+}
+
+.bar-fill.info {
+  background: var(--fm-primary);
+}
+
+.bar-fill.warn {
+  background: var(--fm-warning);
+}
+
+.bar-fill.danger {
+  background: var(--fm-danger);
+}
+
+.bar-value {
+  flex: 0 0 42px;
+  font-size: 10.5px;
+  color: var(--fm-muted);
+  text-align: right;
+}
+
+.tone-text-ok {
+  color: var(--fm-success);
+}
+
+.tone-text-info {
+  color: var(--fm-primary);
+}
+
+.tone-text-warn {
+  color: var(--fm-warning);
+}
+
+.tone-text-danger {
+  color: var(--fm-danger);
+}
+
+.tone-danger {
+  color: var(--fm-danger);
+}
+
+/* 今日各时段柱状图 */
+.hour-plot {
+  display: flex;
+  gap: 2px;
+  height: 96px;
+  margin-top: 12px;
+}
+
+.hour-col {
+  display: flex;
+  flex: 1 1 0;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+
+.hour-slot {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.hour-bar {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  border-radius: 3px 3px 1px 1px;
+  background: var(--fm-primary);
+  opacity: 0.85;
+  transition: height 0.35s ease;
+}
+
+.hour-tick {
+  height: 12px;
+  font-size: 9px;
+  color: var(--fm-muted);
+  text-align: center;
+}
+
+/* 请求趋势 */
+.trend-plot {
+  display: flex;
+  gap: 6px;
+  height: 128px;
+  margin-top: 12px;
+}
+
+.trend-col {
+  display: flex;
+  flex: 1 1 0;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.trend-slot {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.trend-bar {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  width: 100%;
+  max-width: 24px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column-reverse;
+  overflow: hidden;
+  border-radius: 4px 4px 2px 2px;
+  background: var(--fm-surface-alt);
+  transition: height 0.35s ease;
+}
+
+.trend-seg {
+  display: block;
+  width: 100%;
+  flex-shrink: 0;
+}
+
+.trend-seg.ok {
+  background: var(--fm-primary);
+}
+
+.trend-seg.err {
+  background: var(--fm-danger);
+}
+
+.trend-day {
+  font-size: 9.5px;
+  color: var(--fm-muted);
+  text-align: center;
+  white-space: nowrap;
+}
+
+/* 状态码分布 */
+.code-stack {
+  display: flex;
+  height: 8px;
+  margin: 14px 0 12px;
+  border-radius: 4px;
+  overflow: hidden;
+  background: var(--fm-surface-alt);
+}
+
+.code-seg {
+  height: 100%;
+  transition: width 0.3s;
+}
+
+.code-seg.ok {
+  background: var(--fm-success);
+}
+
+.code-seg.info {
+  background: var(--fm-primary);
+}
+
+.code-seg.warn {
+  background: var(--fm-warning);
+}
+
+.code-seg.danger {
+  background: var(--fm-danger);
+}
+
+.code-seg.other {
+  background: var(--fm-border-strong);
+}
+
+.code-legend {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.code-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+}
+
+.code-label {
+  width: 34px;
+  color: var(--fm-text-2);
+}
+
+.code-count {
+  flex: 1;
+  text-align: right;
+  color: var(--fm-text-2);
+}
+
+.code-pct {
+  width: 48px;
+  text-align: right;
+  color: var(--fm-muted);
+}
+
+/* 高频接口 */
+.top-list {
+  display: flex;
+  flex-direction: column;
+  margin-top: 10px;
+}
+
+.top-row {
+  display: grid;
+  grid-template-columns: 16px 46px minmax(0, 1fr) 54px 58px 40px;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--fm-border);
+  font-size: 11px;
+}
+
+.top-row:last-child {
+  border-bottom: none;
+}
+
+.top-rank {
+  font-size: 10px;
+  color: var(--fm-muted);
+}
+
+.top-row .method-tag {
+  justify-self: start;
+}
+
+.top-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fm-text);
+}
+
+.top-meta {
+  font-size: 10.5px;
+  color: var(--fm-muted);
+  text-align: right;
+}
+
+.top-rate {
+  font-size: 10.5px;
+  color: var(--fm-success);
+  text-align: right;
+}
+
+.top-rate.low {
+  color: var(--fm-danger);
+}
+
+/* 压测走势 */
+.report-chart {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.report-chart-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 86px 66px 46px;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.report-chart-name {
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.report-chart-row:hover .report-chart-name {
+  color: var(--fm-primary);
+}
+
+.report-chart-track {
+  height: 6px;
+  border-radius: 4px;
+  overflow: hidden;
+  background: var(--fm-surface-alt);
+}
+
+.report-chart-fill {
+  display: block;
+  height: 100%;
+  border-radius: 4px;
+  background: var(--fm-primary);
+}
+
+.report-chart-fill.warn {
+  background: var(--fm-warning);
+}
+
+.report-chart-fill.danger {
+  background: var(--fm-danger);
+}
+
+.report-chart-value {
+  font-size: 10.5px;
+  color: var(--fm-muted);
+  text-align: right;
+}
+
+.report-chart-value.tone-ok {
+  color: var(--fm-success);
+}
+
+.report-chart-value.tone-warn {
+  color: var(--fm-warning);
+}
+
+.report-chart-value.tone-danger {
+  color: var(--fm-danger);
+}
+
+.report-chart-foot {
+  margin-top: 2px;
+  font-size: 10px;
+  color: var(--fm-muted);
+}
+
+/* ---------- 批量运行 ---------- */
+.runner-band {
+  display: grid;
+  grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
+  gap: 24px;
+  margin-top: 16px;
+  padding: 20px 22px;
+  background:
+    radial-gradient(120% 160% at 0% 0%, var(--fm-primary-soft) 0%, transparent 60%),
+    var(--fm-surface);
+}
+
+.runner-eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  color: var(--fm-primary);
+}
+
+.runner-title {
+  margin: 9px 0 8px;
+  font-size: 16.5px;
+  font-weight: 650;
+  letter-spacing: -0.2px;
+  line-height: 1.4;
+}
+
+.runner-desc {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.8;
+  color: var(--fm-muted);
+}
+
+.runner-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 12px;
+}
+
+.runner-tags span {
+  padding: 2px 9px;
+  border-radius: 20px;
+  border: 1px solid var(--fm-border);
+  background: var(--fm-surface-alt);
+  font-size: 10.5px;
+  color: var(--fm-text-2);
+}
+
+.runner-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.runner-steps {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+
+.runner-step {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px dashed var(--fm-border);
+}
+
+.runner-step:last-child {
+  border-bottom: none;
+}
+
+.runner-step-index {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  border-radius: 6px;
+  background: var(--fm-primary-soft);
+  color: var(--fm-primary);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.runner-step-title {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.runner-step-desc {
+  margin-top: 2px;
+  font-size: 10.5px;
+  line-height: 1.6;
+  color: var(--fm-muted);
+}
+
+.runner-example {
+  margin-top: 12px;
+  padding: 15px 17px;
+}
+
+.example-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.example-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.example-note {
+  font-size: 10.5px;
+  color: var(--fm-muted);
+}
+
+.example-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.example-label {
+  margin-bottom: 6px;
+  font-size: 10.5px;
+  color: var(--fm-muted);
+}
+
+.example-code {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--fm-border);
+  border-radius: 6px;
+  background: var(--fm-surface-alt);
+  color: var(--fm-text);
+  font-size: 11px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.example-results {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 10px 12px;
+  border: 1px solid var(--fm-border);
+  border-radius: 6px;
+  background: var(--fm-surface-alt);
+  font-size: 11px;
+  color: var(--fm-text-2);
+}
+
+.example-results .fail {
+  color: var(--fm-danger);
+}
+
+.example-foot {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--fm-border);
+  font-size: 10.5px;
+  line-height: 1.7;
+  color: var(--fm-muted);
+}
+
+.example-foot code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--fm-surface-alt);
+  color: var(--fm-text-2);
+  font-size: 10.5px;
+}
+
 /* ---------- 响应式 ---------- */
 @media (max-width: 1180px) {
   .console {
@@ -2003,12 +3141,37 @@ function statusColor(code?: number | null) {
     grid-template-columns: repeat(auto-fit, minmax(258px, 1fr));
     align-items: start;
   }
+
+  .dash-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 @media (max-width: 980px) {
+  .dash-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .trend-card,
+  .hour-card,
+  .top-card,
+  .report-card {
+    grid-column: auto;
+  }
+
   .intro-band {
     grid-template-columns: minmax(0, 1fr);
     gap: 18px;
+  }
+
+  .runner-band {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 16px;
+    padding: 18px;
+  }
+
+  .example-grid {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .intro-stats {

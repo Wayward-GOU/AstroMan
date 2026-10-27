@@ -54,6 +54,21 @@ export interface CurlParsed {
   warnings: string[]
 }
 
+export interface RequestAuth {
+  kind: 'none' | 'bearer' | 'basic' | 'apikey' | 'oauth2'
+  token: string
+  username: string
+  password: string
+  key: string
+  value: string
+  addTo: 'header' | 'query'
+  /** OAuth2 Client Credentials */
+  tokenUrl?: string
+  clientId?: string
+  clientSecret?: string
+  scope?: string
+}
+
 export interface HttpRequestDetail {
   id?: number
   collectionId: number
@@ -67,6 +82,53 @@ export interface HttpRequestDetail {
   preScript: string
   postScript: string
   assertions: string
+  auth?: RequestAuth
+}
+
+/** multipart/form-data 的表单字段 */
+export interface FormField {
+  key: string
+  value: string
+  enabled: boolean
+  kind: 'text' | 'file'
+}
+
+export interface CookieItem {
+  id: number
+  domain: string
+  path: string
+  name: string
+  value: string
+  secure: boolean
+  httpOnly: boolean
+  expiresAt?: number | null
+  updatedAt: number
+}
+
+/** 全局网络与安全设置 */
+export interface AppSettings {
+  proxyEnabled: boolean
+  proxyUrl: string
+  certPath: string
+  certPassword: string
+}
+
+export interface PlanSummary {
+  id: number
+  projectId: number
+  requestId?: number | null
+  requestName?: string | null
+  name: string
+  updatedAt: number
+}
+
+export interface TestPlan {
+  id: number
+  projectId: number
+  requestId?: number | null
+  name: string
+  config: unknown
+  updatedAt: number
 }
 
 export interface SendRequestPayload {
@@ -81,6 +143,8 @@ export interface SendRequestPayload {
   envId?: number | null
   insecure?: boolean
   timeoutMs?: number
+  auth?: RequestAuth | null
+  cookieEnabled?: boolean
 }
 
 export interface HttpResult {
@@ -124,6 +188,18 @@ export interface HistoryItem {
   createdAt: number
 }
 
+export interface HistoryStats {
+  total: number
+  oldestAt?: number | null
+  newestAt?: number | null
+  runsTotal: number
+}
+
+export interface CleanupResult {
+  history: number
+  runs: number
+}
+
 export interface AppInfo {
   version: string
   dataDir: string
@@ -141,6 +217,66 @@ export interface WorkspaceStats {
   reportSuccessTotal: number
   recentHistory: number
   recentReports: number
+}
+
+/** 数据大屏：按日请求趋势 */
+export interface DailyPoint {
+  date: string
+  total: number
+  success: number
+  avgRt: number
+}
+
+/** 数据大屏：状态码分组 */
+export interface CodeBucket {
+  label: string
+  count: number
+}
+
+/** 数据大屏：调用最频繁的接口 */
+export interface TopRequest {
+  name: string
+  method: string
+  url: string
+  count: number
+  avgRt: number
+  successRate: number
+}
+
+/** 数据大屏：最近压测报告走势 */
+export interface ReportPoint {
+  id: number
+  name: string
+  p95Rt: number
+  errorRate: number
+  totalRequests: number
+  createdAt: number
+}
+
+/** 数据大屏：按小时请求量 */
+export interface HourPoint {
+  hour: number
+  count: number
+}
+
+/** 数据大屏：项目维度调用量 */
+export interface ProjectPoint {
+  name: string
+  count: number
+  avgRt: number
+  successRate: number
+}
+
+/** 数据大屏聚合结果 */
+export interface DashboardMetrics {
+  days: DailyPoint[]
+  codeBuckets: CodeBucket[]
+  topRequests: TopRequest[]
+  reportPoints: ReportPoint[]
+  methodBuckets: CodeBucket[]
+  hourBuckets: HourPoint[]
+  latencyBuckets: CodeBucket[]
+  topProjects: ProjectPoint[]
 }
 
 export interface RequestRun {
@@ -446,6 +582,8 @@ export interface UpdateInfo {
   publishedAt: string
   assetName?: string | null
   assetUrl?: string | null
+  /** API 资源地址（api.github.com），github.com 直连受限时优先使用 */
+  assetApiUrl?: string | null
   assetSize?: number | null
 }
 

@@ -1,4 +1,4 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
 import { message } from 'ant-design-vue'
 import { save } from '@tauri-apps/plugin-dialog'
@@ -24,14 +24,14 @@ const type = ref<QrContentType>('text')
 
 const content = reactive<QrContent>({
   text: 'https://example.com',
-  wifiSsid: 'FinkMeter-WiFi',
-  wifiPassword: 'finkmeter2026',
+  wifiSsid: 'FbinHttp-WiFi',
+  wifiPassword: 'fbinhttp2026',
   wifiSecurity: 'WPA',
   wifiHidden: false,
   vName: '张三',
   vPhone: '13800138000',
   vEmail: 'zhangsan@example.com',
-  vOrg: 'FinkMeter',
+  vOrg: 'FbinHttp',
   vTitle: '开发工程师',
   vUrl: 'https://example.com',
   vAddress: '浙江省杭州市',

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { message, Modal } from 'ant-design-vue'
 import { open } from '@tauri-apps/plugin-dialog'
 import {
@@ -15,27 +15,65 @@ import {
   LoginOutlined,
   SwapOutlined,
   CloudDownloadOutlined,
+  GlobalOutlined,
+  KeyOutlined,
 } from '@ant-design/icons-vue'
 import PageHeader from '@/components/PageHeader.vue'
 import * as api from '@/api'
 import { themes, currentThemeId, setTheme } from '@/stores/theme'
 import { isMac, openDirLabel, platformLabel, shortcutText } from '@/utils/platform'
 import { checkForUpdates, isAutoUpdateEnabled, setAutoUpdateEnabled } from '@/utils/updater'
-import type { AppInfo, StorageInfo, UpdateInfo } from '@/types/models'
+import type { AppInfo, AppSettings, StorageInfo, UpdateInfo } from '@/types/models'
 
 const info = ref<AppInfo | null>(null)
 const storage = ref<StorageInfo | null>(null)
 const storageLoading = ref(false)
 
+const network = reactive<AppSettings>({
+  proxyEnabled: false,
+  proxyUrl: '',
+  certPath: '',
+  certPassword: '',
+})
+const networkLoading = ref(false)
+
 onMounted(async () => {
   try {
-    const [app, dir] = await Promise.all([api.appInfo(), api.storageInfo()])
+    const [app, dir, settings] = await Promise.all([
+      api.appInfo(),
+      api.storageInfo(),
+      api.settingsGet(),
+    ])
     info.value = app
     storage.value = dir
+    Object.assign(network, settings)
   } catch (e) {
     message.error(String(e))
   }
 })
+
+async function saveNetwork() {
+  networkLoading.value = true
+  try {
+    const saved = await api.settingsSet({ ...network })
+    Object.assign(network, saved)
+    message.success('网络设置已保存并立即生效')
+  } catch (e) {
+    message.error(String(e))
+  } finally {
+    networkLoading.value = false
+  }
+}
+
+async function pickCert() {
+  const picked = await open({
+    directory: false,
+    multiple: false,
+    title: '选择客户端证书（.pfx / .p12）',
+    filters: [{ name: 'PKCS#12 证书', extensions: ['pfx', 'p12'] }],
+  })
+  if (typeof picked === 'string') network.certPath = picked
+}
 
 async function copy(text?: string) {
   if (!text) return
@@ -182,7 +220,7 @@ async function manualCheck() {
 
 async function openReleasePage() {
   try {
-    await api.openExternal(updateInfo.value?.releaseUrl || 'https://github.com/Wayward-GOU/FinkMeter/releases')
+    await api.openExternal(updateInfo.value?.releaseUrl || 'https://github.com/Wayward-GOU/FbinHttp/releases')
   } catch (e) {
     message.error(String(e))
   }
@@ -296,6 +334,73 @@ async function openReleasePage() {
         </a-spin>
       </div>
 
+      <div class="fm-card block network-block">
+        <div class="block-head">
+          <span class="block-icon blue"><GlobalOutlined /></span>
+          <div>
+            <div class="block-title">网络与安全</div>
+            <div class="block-desc">代理与客户端证书对全部请求生效，配置仅保存在本机</div>
+          </div>
+        </div>
+        <div class="rows">
+          <div class="row net-row">
+            <span class="label">启用代理</span>
+            <span class="value">
+              <a-switch v-model:checked="network.proxyEnabled" size="small" />
+            </span>
+          </div>
+          <div class="row net-row">
+            <span class="label">代理地址</span>
+            <span class="value">
+              <a-input
+                v-model:value="network.proxyUrl"
+                size="small"
+                :disabled="!network.proxyEnabled"
+                placeholder="http://127.0.0.1:7890 或 socks5h://127.0.0.1:1080"
+              />
+            </span>
+          </div>
+          <div class="row net-row">
+            <span class="label">客户端证书</span>
+            <span class="value cert-value">
+              <a-input
+                v-model:value="network.certPath"
+                size="small"
+                readonly
+                placeholder="未选择（仅支持 PKCS#12 的 .pfx / .p12）"
+              />
+              <a-button size="small" @click="pickCert">
+                <template #icon><KeyOutlined /></template>
+                选择
+              </a-button>
+              <a-button v-if="network.certPath" size="small" type="text" danger @click="network.certPath = ''">
+                清除
+              </a-button>
+            </span>
+          </div>
+          <div class="row net-row">
+            <span class="label">证书密码</span>
+            <span class="value">
+              <a-input-password
+                v-model:value="network.certPassword"
+                size="small"
+                :disabled="!network.certPath"
+                placeholder="PKCS#12 密码，没有可留空"
+              />
+            </span>
+          </div>
+        </div>
+        <div class="storage-actions">
+          <a-button type="primary" :loading="networkLoading" @click="saveNetwork">保存并生效</a-button>
+        </div>
+        <div class="storage-tip">
+          <SafetyCertificateOutlined />
+          <span>
+            证书用于双向 TLS（mTLS）鉴权；代理支持 HTTP / HTTPS / SOCKS5。若填写有误，保存时会直接提示原因且不会覆盖当前生效配置。
+          </span>
+        </div>
+      </div>
+
       <div class="fm-card block update-block">
         <div class="block-head">
           <span class="block-icon blue"><CloudDownloadOutlined /></span>
@@ -333,8 +438,8 @@ async function openReleasePage() {
         <div v-if="isMac" class="storage-tip">
           <SafetyCertificateOutlined />
           <span>
-            macOS 首次打开或覆盖升级后若提示「Apple 无法验证 FinkMeter.app」，是系统对未公证应用的拦截，与 Intel / Apple Silicon 架构无关：到「系统设置 → 隐私与安全性」点击「仍要打开」，或在终端执行
-            <code>sudo xattr -dr com.apple.quarantine /Applications/FinkMeter.app</code>。
+            macOS 首次打开或覆盖升级后若提示「Apple 无法验证 FbinHttp.app」，是系统对未公证应用的拦截，与 Intel / Apple Silicon 架构无关：到「系统设置 → 隐私与安全性」点击「仍要打开」，或在终端执行
+            <code>sudo xattr -dr com.apple.quarantine /Applications/FbinHttp.app</code>。
           </span>
         </div>
         <div class="storage-tip">
@@ -356,7 +461,7 @@ async function openReleasePage() {
         <div class="rows">
           <div class="row">
             <span class="label">版本</span>
-            <span class="value mono">FinkMeter {{ info?.version || '-' }}</span>
+            <span class="value mono">FbinHttp {{ info?.version || '-' }}</span>
           </div>
           <div class="row">
             <span class="label">运行模式</span>
@@ -441,25 +546,48 @@ async function openReleasePage() {
 </template>
 
 <style scoped>
+/* 设置页内容较多，占满可用宽度，不沿用全局 1440px 上限 */
+.page {
+  max-width: none;
+}
+
 .grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 16px;
   align-items: start;
+  width: 100%;
 }
 
 .block {
   padding: 20px 22px;
+  min-width: 0;
 }
 
-.theme-block {
+/* 主题、存储、网络、更新需要整行宽度 */
+.theme-block,
+.storage-block,
+.network-block,
+.update-block {
   grid-column: 1 / -1;
+}
+
+@media (max-width: 900px) {
+  .grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 .theme-list {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 12px;
+}
+
+@media (max-width: 1180px) {
+  .theme-list {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 .theme-item {
@@ -637,6 +765,17 @@ async function openReleasePage() {
   flex-shrink: 0;
   color: var(--fm-muted);
   font-size: 11px;
+}
+
+.net-row .value {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+}
+
+.cert-value {
+  gap: 8px;
 }
 
 .value {

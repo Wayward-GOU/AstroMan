@@ -2,6 +2,7 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
+import { open, save as saveFile } from '@tauri-apps/plugin-dialog'
 import {
   ArrowLeftOutlined,
   ThunderboltOutlined,
@@ -11,6 +12,7 @@ import {
   CloseOutlined,
   CopyOutlined,
   CodeOutlined,
+  PlusOutlined,
 } from '@ant-design/icons-vue'
 import KeyValueEditor from '@/components/KeyValueEditor.vue'
 import CodeArea from '@/components/CodeArea.vue'
@@ -18,11 +20,15 @@ import { useProjectStore } from '@/stores/project'
 import { MAX_REQUEST_TABS, useTabsStore } from '@/stores/tabs'
 import { formatDateTime } from '@/utils/datetime'
 import { buildSnippets, type Snippet } from '@/utils/curl'
+import { diffLines, diffStats, type DiffLine } from '@/utils/diff'
 import * as api from '@/api'
 import type {
+  CookieItem,
+  FormField,
   HttpRequestDetail,
   HttpResult,
   KeyValueItem,
+  RequestAuth,
   RequestRun,
   RequestSearchHit,
   SendRequestPayload,
@@ -48,6 +54,22 @@ const tabStore = useTabsStore()
 const requestId = computed(() => Number(route.params.id))
 const projectId = computed(() => Number(route.query.projectId || 0))
 
+function emptyAuth(): RequestAuth {
+  return {
+    kind: 'none',
+    token: '',
+    username: '',
+    password: '',
+    key: '',
+    value: '',
+    addTo: 'header',
+    tokenUrl: '',
+    clientId: '',
+    clientSecret: '',
+    scope: '',
+  }
+}
+
 const form = ref<HttpRequestDetail>({
   collectionId: 0,
   name: '',
@@ -60,6 +82,7 @@ const form = ref<HttpRequestDetail>({
   preScript: '',
   postScript: '',
   assertions: '',
+  auth: emptyAuth(),
 })
 
 const loading = ref(true)
@@ -183,11 +206,222 @@ const bodyTypes = [
   { label: 'JSON', value: 'json' },
   { label: 'Raw', value: 'raw' },
   { label: 'Form', value: 'form' },
+  { label: 'Form-Data', value: 'multipart' },
+  { label: 'Binary', value: 'binary' },
+  { label: 'GraphQL', value: 'graphql' },
   { label: '无', value: 'none' },
 ]
 
 const enabledParams = computed(() => form.value.params.filter((p) => p.enabled && p.key).length)
 const enabledHeaders = computed(() => form.value.headers.filter((h) => h.enabled && h.key).length)
+
+/* ---------- 认证 ---------- */
+const authKinds = [
+  { label: '无认证', value: 'none' },
+  { label: 'Bearer Token', value: 'bearer' },
+  { label: 'Basic Auth', value: 'basic' },
+  { label: 'API Key', value: 'apikey' },
+  { label: 'OAuth2', value: 'oauth2' },
+]
+
+const authKind = computed({
+  get: () => form.value.auth?.kind ?? 'none',
+  set: (value: RequestAuth['kind']) => {
+    if (!form.value.auth) form.value.auth = emptyAuth()
+    form.value.auth.kind = value
+  },
+})
+
+const authActive = computed(() => authKind.value !== 'none')
+
+const oauthLoading = ref(false)
+
+async function fetchOauthToken() {
+  const auth = form.value.auth
+  if (!auth) return
+  if (!auth.tokenUrl?.trim()) {
+    message.warning('请填写 Token URL')
+    return
+  }
+  oauthLoading.value = true
+  try {
+    const token = await api.oauth2Token(
+      {
+        tokenUrl: renderRuntimeVars(auth.tokenUrl.trim()),
+        clientId: renderRuntimeVars(auth.clientId ?? ''),
+        clientSecret: renderRuntimeVars(auth.clientSecret ?? ''),
+        scope: renderRuntimeVars(auth.scope ?? ''),
+      },
+      insecure.value,
+    )
+    auth.token = token
+    message.success('已获取访问令牌，发送请求时将自动使用')
+  } catch (e) {
+    message.error(String(e))
+  } finally {
+    oauthLoading.value = false
+  }
+}
+
+/* ---------- multipart / binary / GraphQL ---------- */
+const multipartFields = computed<FormField[]>({
+  get() {
+    if (form.value.bodyType !== 'multipart') return []
+    try {
+      const parsed = JSON.parse(form.value.body || '[]')
+      return Array.isArray(parsed) ? (parsed as FormField[]) : []
+    } catch {
+      return []
+    }
+  },
+  set(fields) {
+    form.value.body = JSON.stringify(fields)
+  },
+})
+
+function addMultipartField(kind: 'text' | 'file') {
+  multipartFields.value = [
+    ...multipartFields.value,
+    { key: '', value: '', enabled: true, kind },
+  ]
+}
+
+function removeMultipartField(index: number) {
+  const fields = [...multipartFields.value]
+  fields.splice(index, 1)
+  multipartFields.value = fields
+}
+
+async function pickFileForField(index: number) {
+  const picked = await open({ multiple: false, directory: false })
+  if (typeof picked !== 'string') return
+  const fields = [...multipartFields.value]
+  const field = fields[index]
+  if (!field) return
+  fields[index] = { ...field, value: picked, kind: 'file' }
+  multipartFields.value = fields
+}
+
+const binaryPath = computed({
+  get: () => (form.value.bodyType === 'binary' ? form.value.body || '' : ''),
+  set: (value: string) => {
+    form.value.body = value
+  },
+})
+
+async function pickBinaryFile() {
+  const picked = await open({ multiple: false, directory: false })
+  if (typeof picked === 'string') binaryPath.value = picked
+}
+
+const gqlQuery = ref('')
+const gqlVarsText = ref('')
+const gqlVarsError = ref('')
+let gqlSyncing = false
+
+function loadGraphqlBody() {
+  if (form.value.bodyType !== 'graphql') return
+  gqlSyncing = true
+  try {
+    const parsed = JSON.parse(form.value.body || '{}')
+    gqlQuery.value = typeof parsed.query === 'string' ? parsed.query : ''
+    gqlVarsText.value =
+      parsed.variables && Object.keys(parsed.variables).length
+        ? JSON.stringify(parsed.variables, null, 2)
+        : ''
+    gqlVarsError.value = ''
+  } catch {
+    gqlQuery.value = form.value.body || ''
+    gqlVarsText.value = ''
+  } finally {
+    gqlSyncing = false
+  }
+}
+
+function applyGraphqlBody() {
+  if (gqlSyncing || form.value.bodyType !== 'graphql') return
+  let variables: Record<string, unknown> = {}
+  const text = gqlVarsText.value.trim()
+  if (text) {
+    try {
+      const parsed = JSON.parse(text)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        variables = parsed as Record<string, unknown>
+        gqlVarsError.value = ''
+      } else {
+        gqlVarsError.value = '变量需为 JSON 对象，已按空对象发送'
+      }
+    } catch {
+      gqlVarsError.value = '变量不是合法 JSON，已按空对象发送'
+    }
+  } else {
+    gqlVarsError.value = ''
+  }
+  form.value.body = JSON.stringify({ query: gqlQuery.value, variables })
+}
+
+watch([gqlQuery, gqlVarsText], applyGraphqlBody)
+
+watch(
+  () => form.value.bodyType,
+  (type, previous) => {
+    if (type === previous) return
+    if (type === 'multipart') {
+      try {
+        const parsed = JSON.parse(form.value.body || '[]')
+        if (!Array.isArray(parsed)) form.value.body = '[]'
+      } catch {
+        form.value.body = '[]'
+      }
+    } else if (type === 'binary') {
+      form.value.body = ''
+    } else if (type === 'graphql') {
+      loadGraphqlBody()
+    }
+  },
+)
+
+/* ---------- Cookie 管理 ---------- */
+const cookieOpen = ref(false)
+const cookieLoading = ref(false)
+const cookies = ref<CookieItem[]>([])
+
+async function openCookies() {
+  cookieOpen.value = true
+  await loadCookies()
+}
+
+async function loadCookies() {
+  cookieLoading.value = true
+  try {
+    cookies.value = await api.cookieList()
+  } catch (e) {
+    message.error(String(e))
+  } finally {
+    cookieLoading.value = false
+  }
+}
+
+async function removeCookie(id: number) {
+  await api.cookieDelete(id)
+  await loadCookies()
+  message.success('已删除 Cookie')
+}
+
+function clearCookies() {
+  Modal.confirm({
+    title: '清空本机全部 Cookie？',
+    content: '清空后需要重新登录才能恢复会话态，项目与接口配置不受影响。',
+    okText: '清空',
+    okType: 'danger',
+    cancelText: '取消',
+    async onOk() {
+      await api.cookieClear()
+      await loadCookies()
+      message.success('已清空 Cookie')
+    },
+  })
+}
 
 interface HeaderPreset {
   id: number
@@ -199,7 +433,7 @@ interface HeaderPreset {
 const headerPresets: HeaderPreset[] = [
   { id: 1, group: '常用', key: 'Accept', value: 'application/json' },
   { id: 2, group: '常用', key: 'Content-Type', value: 'application/json' },
-  { id: 3, group: '常用', key: 'User-Agent', value: 'FinkMeter/1.0' },
+  { id: 3, group: '常用', key: 'User-Agent', value: 'FbinHttp/1.0' },
   { id: 4, group: '常用', key: 'Cache-Control', value: 'no-cache' },
   { id: 5, group: '常用', key: 'Connection', value: 'keep-alive' },
   { id: 6, group: '认证', key: 'Authorization', value: 'Bearer {{token}}' },
@@ -261,7 +495,9 @@ async function loadRequest(id: number) {
   hydrating = true
   try {
     const detail = await api.requestGet(id)
+    if (!detail.auth) detail.auth = emptyAuth()
     form.value = detail
+    if (detail.bodyType === 'graphql') loadGraphqlBody()
     lastSaved = JSON.stringify(detail)
     autoState.value = 'saved'
     tabStore.ensureProject(projectId.value)
@@ -506,6 +742,8 @@ async function send() {
       envId: envId.value,
       insecure: insecure.value,
       timeoutMs: 30000,
+      auth: form.value.auth ?? null,
+      cookieEnabled: true,
     }
 
     result.value = await api.sendRequest(payload)
@@ -538,7 +776,7 @@ async function loadRuns() {
   if (!form.value.id) return
   runsLoading.value = true
   try {
-    runs.value = await api.runList(form.value.id, 50)
+    runs.value = await api.runList(form.value.id, 200)
   } catch (e) {
     message.error(String(e))
   } finally {
@@ -558,6 +796,10 @@ function runStatusColor(status: number) {
 }
 
 function fmtRunTime(ts: number) {
+  return formatDateTime(ts)
+}
+
+function fmtTimeOf(ts: number) {
   return formatDateTime(ts)
 }
 
@@ -590,6 +832,66 @@ function clearRuns() {
     },
   })
 }
+
+/* ---------- 响应体另存为 / 响应对比 ---------- */
+const diffOpen = ref(false)
+const diffBaseRunId = ref<number | null>(null)
+const diffCustomText = ref('')
+const diffUseCustom = ref(false)
+
+const diffRunOptions = computed(() =>
+  runs.value.map((run) => ({
+    value: run.id,
+    label: `#${run.id} · ${run.responseStatus || 'ERR'} · ${fmtRunTime(run.createdAt)}`,
+  })),
+)
+
+function responseFileName() {
+  const base = (form.value.name || 'response').replace(/[\\/:*?"<>|]/g, '_')
+  const ext = prettyBody.value.trim().startsWith('{') || prettyBody.value.trim().startsWith('[') ? 'json' : 'txt'
+  return `${base}.${ext}`
+}
+
+async function saveResponseBody() {
+  if (!result.value) return
+  try {
+    const path = await saveFile({
+      title: '保存响应体',
+      defaultPath: responseFileName(),
+      filters: [
+        { name: 'JSON', extensions: ['json'] },
+        { name: '文本', extensions: ['txt'] },
+      ],
+    })
+    if (!path) return
+    await api.fileWriteText(path, result.value.body)
+    message.success('响应体已保存')
+  } catch (e) {
+    message.error(String(e))
+  }
+}
+
+function openDiff() {
+  diffUseCustom.value = runs.value.length === 0
+  diffBaseRunId.value = runs.value[0]?.id ?? null
+  diffCustomText.value = ''
+  diffOpen.value = true
+}
+
+const diffBaseText = computed(() => {
+  if (diffUseCustom.value) return diffCustomText.value
+  const run = runs.value.find((item) => item.id === diffBaseRunId.value)
+  return run ? prettyRunBody(run.responseBody) : ''
+})
+
+const diffCurrentText = computed(() => (bodyView.value === 'pretty' ? prettyBody.value : result.value?.body ?? ''))
+
+const diffResult = computed<DiffLine[]>(() => {
+  if (!diffOpen.value || !result.value) return []
+  return diffLines(diffBaseText.value, diffCurrentText.value)
+})
+
+const diffSummary = computed(() => diffStats(diffResult.value))
 
 async function openStress() {
   if (!form.value.url.trim()) {
@@ -713,6 +1015,7 @@ const responseHeaders = computed(() => {
             <template #icon><DeleteOutlined /></template>
             删除
           </a-button>
+          <a-button @click="openCookies">Cookie</a-button>
           <a-button @click="openCode">
             <template #icon><CodeOutlined /></template>
             代码
@@ -859,6 +1162,69 @@ const responseHeaders = computed(() => {
                 <KeyValueEditor v-model="form.headers" key-placeholder="Header 名" value-placeholder="Header 值" />
               </div>
             </a-tab-pane>
+            <a-tab-pane key="auth">
+              <template #tab>
+                Auth <span class="tab-count" :class="{ off: !authActive }">{{ authActive ? authKind : '无' }}</span>
+              </template>
+              <div class="tab-body auth-tab">
+                <a-radio-group v-model:value="authKind" size="small" button-style="solid">
+                  <a-radio-button v-for="item in authKinds" :key="item.value" :value="item.value">
+                    {{ item.label }}
+                  </a-radio-button>
+                </a-radio-group>
+
+                <div v-if="authKind === 'bearer'" class="auth-form">
+                  <a-input-password
+                    v-model:value="form.auth!.token"
+                    placeholder="Token，支持环境变量引用"
+                    allow-clear
+                  />
+                  <span class="header-hint">发送时自动添加请求头 Authorization: Bearer &lt;token&gt;</span>
+                </div>
+
+                <div v-else-if="authKind === 'basic'" class="auth-form">
+                  <a-input v-model:value="form.auth!.username" placeholder="用户名" allow-clear />
+                  <a-input-password v-model:value="form.auth!.password" placeholder="密码" allow-clear />
+                  <span class="header-hint">发送时自动生成 Basic 认证头（用户名:密码 的 Base64）</span>
+                </div>
+
+                <div v-else-if="authKind === 'apikey'" class="auth-form">
+                  <a-input v-model:value="form.auth!.key" placeholder="Key（如 X-API-Key）" allow-clear />
+                  <a-input-password v-model:value="form.auth!.value" placeholder="Value" allow-clear />
+                  <a-radio-group v-model:value="form.auth!.addTo" size="small">
+                    <a-radio value="header">添加到 Header</a-radio>
+                    <a-radio value="query">添加到 Query 参数</a-radio>
+                  </a-radio-group>
+                </div>
+
+                <div v-else-if="authKind === 'oauth2'" class="auth-form">
+                  <a-input
+                    v-model:value="form.auth!.tokenUrl"
+                    placeholder="Token URL，如 https://auth.example.com/oauth/token"
+                    allow-clear
+                  />
+                  <a-input v-model:value="form.auth!.clientId" placeholder="Client ID" allow-clear />
+                  <a-input-password
+                    v-model:value="form.auth!.clientSecret"
+                    placeholder="Client Secret"
+                    allow-clear
+                  />
+                  <a-input v-model:value="form.auth!.scope" placeholder="Scope（可选，空格分隔）" allow-clear />
+                  <div class="oauth-row">
+                    <a-button size="small" :loading="oauthLoading" @click="fetchOauthToken">
+                      获取令牌
+                    </a-button>
+                    <span class="header-hint">
+                      {{ form.auth!.token ? '已获取令牌，发送时自动带 Authorization: Bearer' : 'Client Credentials 模式，令牌仅保存在本机' }}
+                    </span>
+                  </div>
+                </div>
+
+                <div v-else class="empty-hint">该请求未使用认证，可直接在 Headers 中手动添加 Authorization</div>
+
+                <div class="auth-tip">若 Headers 中已手动填写 Authorization，则以手动填写的内容为准。</div>
+              </div>
+            </a-tab-pane>
             <a-tab-pane key="body">
               <template #tab>
                 Body <span class="tab-count" :class="{ off: form.bodyType === 'none' }">{{ form.bodyType }}</span>
@@ -881,8 +1247,58 @@ const responseHeaders = computed(() => {
                   </a-button>
                   <span v-if="form.body" class="body-size mono">{{ fmtSize(bodySize) }}</span>
                 </div>
+
+                <div v-if="form.bodyType === 'multipart'" class="multipart">
+                  <div class="multipart-head">
+                    <span>字段</span>
+                    <span>类型</span>
+                    <span>值 / 文件</span>
+                    <span />
+                    <a-button size="small" @click="addMultipartField('text')">
+                      <template #icon><PlusOutlined /></template>
+                      文本字段
+                    </a-button>
+                    <a-button size="small" @click="addMultipartField('file')">
+                      <template #icon><PlusOutlined /></template>
+                      文件字段
+                    </a-button>
+                  </div>
+                  <div v-for="(field, index) in multipartFields" :key="index" class="multipart-row">
+                    <a-checkbox v-model:checked="field.enabled" />
+                    <a-input v-model:value="field.key" size="small" placeholder="字段名" />
+                    <a-select v-model:value="field.kind" size="small" class="multipart-kind">
+                      <a-select-option value="text">文本</a-select-option>
+                      <a-select-option value="file">文件</a-select-option>
+                    </a-select>
+                    <template v-if="field.kind === 'file'">
+                      <a-input v-model:value="field.value" size="small" placeholder="文件路径" readonly />
+                      <a-button size="small" @click="pickFileForField(index)">选择</a-button>
+                    </template>
+                    <a-input v-else v-model:value="field.value" size="small" placeholder="字段值" />
+                    <a-button size="small" danger type="text" @click="removeMultipartField(index)">
+                      <template #icon><DeleteOutlined /></template>
+                    </a-button>
+                  </div>
+                  <div v-if="!multipartFields.length" class="empty-hint">还没有字段，点击右上角添加</div>
+                  <div class="header-hint">Content-Type 会自动设为 multipart/form-data（含 boundary），无需手动填写</div>
+                </div>
+
+                <div v-else-if="form.bodyType === 'binary'" class="binary">
+                  <a-input v-model:value="binaryPath" placeholder="选择要上传的文件" readonly />
+                  <a-button @click="pickBinaryFile">选择文件</a-button>
+                  <span class="header-hint">默认以 application/octet-stream 发送，可在 Headers 中覆盖 Content-Type</span>
+                </div>
+
+                <div v-else-if="form.bodyType === 'graphql'" class="graphql">
+                  <div class="script-label">Query</div>
+                  <CodeArea v-model="gqlQuery" fill :rows="9" placeholder="query { user(id: 1) { id name } }" />
+                  <div class="script-label">Variables（JSON 对象，可留空）</div>
+                  <CodeArea v-model="gqlVarsText" fill :rows="5" placeholder='{"id": 1}' />
+                  <div v-if="gqlVarsError" class="gql-error">{{ gqlVarsError }}</div>
+                </div>
+
                 <CodeArea
-                  v-if="form.bodyType !== 'none'"
+                  v-else-if="form.bodyType !== 'none'"
                   v-model="form.body"
                   fill
                   :rows="14"
@@ -970,6 +1386,8 @@ const responseHeaders = computed(() => {
                 <a-radio-button value="raw">Raw</a-radio-button>
               </a-radio-group>
               <a-button size="small" type="text" @click="copyBody">复制</a-button>
+              <a-button size="small" type="text" @click="saveResponseBody">另存为</a-button>
+              <a-button size="small" type="text" :disabled="!runs.length && !result.body" @click="openDiff">对比</a-button>
             </template>
           </div>
 
@@ -1068,7 +1486,7 @@ const responseHeaders = computed(() => {
             运行历史
             <span class="runs-count">{{ runs.length }}</span>
           </button>
-          <span class="runs-hint">每次发送自动记录请求参数、响应与耗时，该接口保留最近 50 条</span>
+          <span class="runs-hint">每次发送自动记录请求参数、响应与耗时，该接口保留最近 200 条</span>
           <div class="runs-actions">
             <a-spin v-if="runsLoading" size="small" />
             <a v-if="runs.length" class="runs-clear" @click="clearRuns">清空</a>
@@ -1179,6 +1597,88 @@ const responseHeaders = computed(() => {
       </div>
       <pre class="code-block mono">{{ activeSnippet.code }}</pre>
     </a-drawer>
+
+    <a-modal
+      v-model:open="cookieOpen"
+      title="本机 Cookie"
+      :width="760"
+      :footer="null"
+    >
+      <div class="cookie-hint">
+        响应中的 Set-Cookie 会自动保存到本机，发送请求时按域名与路径自动携带；也可手动添加用于登录态调试。
+      </div>
+      <div class="cookie-actions">
+        <a-button size="small" :loading="cookieLoading" @click="loadCookies">刷新</a-button>
+        <a-button size="small" danger @click="clearCookies">清空全部</a-button>
+      </div>
+      <a-table
+        :data-source="cookies"
+        :pagination="false"
+        size="small"
+        row-key="id"
+        :scroll="{ y: 360 }"
+        :locale="{ emptyText: '暂无 Cookie' }"
+      >
+        <a-table-column title="域名" data-index="domain" key="domain" ellipsis />
+        <a-table-column title="路径" data-index="path" key="path" width="100" />
+        <a-table-column title="名称" data-index="name" key="name" ellipsis />
+        <a-table-column title="值" data-index="value" key="value" ellipsis />
+        <a-table-column title="过期时间" key="expiresAt" width="170">
+          <template #default="{ record }">
+            <span class="mono">{{ record.expiresAt ? fmtTimeOf(record.expiresAt) : '会话' }}</span>
+          </template>
+        </a-table-column>
+        <a-table-column title="操作" key="action" width="80">
+          <template #default="{ record }">
+            <a-button type="link" size="small" danger @click="removeCookie(record.id)">删除</a-button>
+          </template>
+        </a-table-column>
+      </a-table>
+    </a-modal>
+
+    <a-modal
+      v-model:open="diffOpen"
+      title="响应对比"
+      :width="980"
+      :footer="null"
+      class="diff-modal"
+    >
+      <div class="diff-toolbar">
+        <a-radio-group v-model:value="diffUseCustom" size="small" button-style="solid">
+          <a-radio-button :value="false" :disabled="!runs.length">对比历史运行</a-radio-button>
+          <a-radio-button :value="true">对比自定义文本</a-radio-button>
+        </a-radio-group>
+        <a-select
+          v-if="!diffUseCustom"
+          v-model:value="diffBaseRunId"
+          :options="diffRunOptions"
+          size="small"
+          class="diff-select"
+          placeholder="选择基准运行"
+        />
+        <span class="diff-stat">
+          <span class="add">+{{ diffSummary.added }}</span>
+          <span class="del">-{{ diffSummary.removed }}</span>
+        </span>
+      </div>
+      <a-textarea
+        v-if="diffUseCustom"
+        v-model:value="diffCustomText"
+        class="mono diff-input"
+        :rows="5"
+        placeholder="粘贴基准响应体，与当前响应逐行对比"
+      />
+      <div class="diff-view">
+        <pre v-if="diffResult.length" class="mono diff-pre"><span
+          v-for="(line, index) in diffResult"
+          :key="index"
+          class="diff-line"
+          :class="line.type"
+        >{{ line.type === 'add' ? '+' : line.type === 'del' ? '-' : ' ' }} {{ line.text }}
+</span></pre>
+        <div v-else class="diff-empty">暂无可对比内容</div>
+      </div>
+    </a-modal>
   </a-spin>
 </template>
 
@@ -1650,6 +2150,172 @@ const responseHeaders = computed(() => {
 
 .header-hint {
   font-size: 10px;
+  color: var(--fm-muted);
+}
+
+/* ---------- 认证 ---------- */
+.auth-tab {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.auth-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 520px;
+}
+
+.oauth-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.auth-tip {
+  font-size: 11px;
+  color: var(--fm-muted);
+}
+
+/* ---------- multipart / binary / GraphQL ---------- */
+.multipart {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.multipart-head {
+  display: grid;
+  grid-template-columns: 20px 1fr 96px 1fr auto;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--fm-muted);
+}
+
+.multipart-head > span:nth-child(4) {
+  display: none;
+}
+
+.multipart-row {
+  display: grid;
+  grid-template-columns: 20px 1fr 96px 1fr auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.multipart-row .ant-input {
+  width: 100%;
+}
+
+.multipart-kind {
+  width: 96px;
+}
+
+.binary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.graphql {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.gql-error {
+  font-size: 11px;
+  color: var(--fm-danger);
+}
+
+.cookie-hint {
+  font-size: 12px;
+  color: var(--fm-muted);
+  line-height: 1.7;
+  margin-bottom: 10px;
+}
+
+.cookie-actions {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+/* ---------- 响应对比 ---------- */
+.diff-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.diff-select {
+  flex: 1;
+  min-width: 200px;
+}
+
+.diff-stat {
+  display: flex;
+  gap: 8px;
+  font-size: 11.5px;
+  font-family: var(--fm-mono, ui-monospace, monospace);
+}
+
+.diff-stat .add {
+  color: var(--fm-success);
+}
+
+.diff-stat .del {
+  color: var(--fm-danger);
+}
+
+.diff-input {
+  margin-bottom: 10px;
+  font-size: 12px;
+}
+
+.diff-view {
+  max-height: 460px;
+  overflow: auto;
+  border: 1px solid var(--fm-border);
+  border-radius: 6px;
+  background: var(--fm-surface-alt);
+}
+
+.diff-pre {
+  margin: 0;
+  padding: 8px 0;
+  font-size: 11.5px;
+  line-height: 1.55;
+}
+
+.diff-line {
+  display: block;
+  padding: 0 10px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--fm-text-2);
+}
+
+.diff-line.add {
+  background: color-mix(in srgb, var(--fm-success) 14%, transparent);
+  color: var(--fm-success);
+}
+
+.diff-line.del {
+  background: color-mix(in srgb, var(--fm-danger) 14%, transparent);
+  color: var(--fm-danger);
+}
+
+.diff-empty {
+  padding: 22px;
+  text-align: center;
+  font-size: 12px;
   color: var(--fm-muted);
 }
 

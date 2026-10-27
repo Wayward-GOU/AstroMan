@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS requests (
     pre_script    TEXT,
     post_script   TEXT,
     assertions    TEXT,
+    auth          TEXT,
     sort_order    INTEGER DEFAULT 0,
     created_at    INTEGER NOT NULL,
     updated_at    INTEGER NOT NULL
@@ -74,7 +75,9 @@ CREATE TABLE IF NOT EXISTS test_plans (
     think_time_ms   INTEGER DEFAULT 0,
     timeout_ms      INTEGER DEFAULT 30000,
     params_config   TEXT,
-    created_at      INTEGER NOT NULL
+    config_json     TEXT,
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL DEFAULT 0
 );
 
 -- 压测报告
@@ -169,7 +172,7 @@ CREATE TABLE IF NOT EXISTS report_requests (
 
 CREATE INDEX IF NOT EXISTS idx_report_requests_report ON report_requests(report_id, id);
 
--- 请求历史（本地，最多保留最近 5000 条）
+-- 请求历史（本地，最多保留最近 100000 条）
 CREATE TABLE IF NOT EXISTS request_history (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     request_id   INTEGER,
@@ -181,7 +184,7 @@ CREATE TABLE IF NOT EXISTS request_history (
     created_at   INTEGER NOT NULL
 );
 
--- 单接口运行记录（每次发送的完整快照，最多保留最近 50 条/接口）
+-- 单接口运行记录（每次发送的完整快照，最多保留最近 200 条/接口）
 CREATE TABLE IF NOT EXISTS request_runs (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     request_id        INTEGER NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
@@ -228,6 +231,21 @@ CREATE TABLE IF NOT EXISTS ai_conversations (
     created_at   INTEGER NOT NULL
 );
 
+-- 本机 Cookie（响应 Set-Cookie 自动写入，发送请求时按域自动携带）
+CREATE TABLE IF NOT EXISTS cookies (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    domain     TEXT NOT NULL,
+    path       TEXT NOT NULL DEFAULT '/',
+    name       TEXT NOT NULL,
+    value      TEXT NOT NULL,
+    secure     INTEGER DEFAULT 0,
+    http_only  INTEGER DEFAULT 0,
+    expires_at INTEGER,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(domain, path, name)
+);
+
 -- 索引
 CREATE INDEX IF NOT EXISTS idx_collections_project ON collections(project_id, parent_id);
 CREATE INDEX IF NOT EXISTS idx_requests_collection ON requests(collection_id);
@@ -237,3 +255,5 @@ CREATE INDEX IF NOT EXISTS idx_errors_report ON report_errors(report_id);
 CREATE INDEX IF NOT EXISTS idx_history_created ON request_history(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_runs_request ON request_runs(request_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_reports_created ON test_reports(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_cookies_domain ON cookies(domain);
+-- idx_plans_project 依赖 updated_at 列，老库需先补列，因此放在 migrate() 中创建

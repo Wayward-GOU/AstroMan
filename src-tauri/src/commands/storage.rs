@@ -1,4 +1,4 @@
-use crate::state::{AppState, StorageConfig};
+use crate::state::{AppState, StorageConfig, DB_FILE};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use tauri::State;
@@ -61,7 +61,7 @@ fn write_config(config_file: &Path, data_dir: Option<&Path>) -> Result<(), Strin
 /// 校验目录可写：实际创建一次临时文件
 fn ensure_writable(dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|error| format!("无法创建目录：{error}"))?;
-    let probe = dir.join(".finkmeter-write-test");
+    let probe = dir.join(".fbinhttp-write-test");
     std::fs::write(&probe, b"ok").map_err(|error| format!("目录不可写：{error}"))?;
     let _ = std::fs::remove_file(&probe);
     Ok(())
@@ -95,7 +95,7 @@ pub fn storage_set(
         }
         let source = &state.db_path;
         if source.exists() {
-            let destination = target.join("finkmeter.db");
+            let destination = target.join(DB_FILE);
             if destination.exists() && destination != *source {
                 return Err(format!(
                     "目标目录已存在数据库文件：{}",

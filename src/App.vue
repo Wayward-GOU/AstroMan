@@ -19,6 +19,7 @@ import {
 } from '@ant-design/icons-vue'
 import AppLogo from '@/components/AppLogo.vue'
 import AiAssistDrawer from '@/components/AiAssistDrawer.vue'
+import ErrorDialog from '@/components/ErrorDialog.vue'
 import { currentTheme, currentThemeId, setTheme, themes } from '@/stores/theme'
 import { isMac, shortcutText } from '@/utils/platform'
 import { checkForUpdates, isAutoUpdateEnabled } from '@/utils/updater'
@@ -481,6 +482,7 @@ const theme = computed(() => {
       </a-modal>
 
       <AiAssistDrawer />
+      <ErrorDialog />
     </div>
   </a-config-provider>
 </template>

@@ -3,7 +3,8 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
 import type { Dayjs } from 'dayjs'
-import { ClockCircleOutlined, DeleteOutlined, ReloadOutlined, RobotOutlined, SearchOutlined } from '@ant-design/icons-vue'
+import { ClockCircleOutlined, DeleteOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons-vue'
+import AiSparkIcon from '@/components/AiSparkIcon.vue'
 import PageHeader from '@/components/PageHeader.vue'
 import { useAiAssistStore } from '@/stores/aiAssist'
 import { useTabsStore } from '@/stores/tabs'
@@ -235,7 +236,7 @@ const columns = [
       subtitle="本机保留最近 100000 条发送记录，默认展示最新 500 条，点击可跳回原接口；支持按时间范围清理"
     >
       <a-button :disabled="!rows.length" @click="aiAnalyze">
-        <template #icon><RobotOutlined /></template>
+        <template #icon><AiSparkIcon /></template>
         AI 分析
       </a-button>
       <a-button :loading="loading" @click="load">

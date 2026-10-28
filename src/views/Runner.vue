@@ -10,13 +10,14 @@ import {
   FolderOpenOutlined,
   ReloadOutlined,
   StopOutlined,
-  RobotOutlined,
 } from '@ant-design/icons-vue'
+import AiSparkIcon from '@/components/AiSparkIcon.vue'
 import PageHeader from '@/components/PageHeader.vue'
 import { useAiAssistStore } from '@/stores/aiAssist'
 import { runnerAnalyzePrompt } from '@/utils/aiScenarios'
 import * as api from '@/api'
 import { useProjectStore } from '@/stores/project'
+import { useErrorDialogStore } from '@/stores/errorDialog'
 import { formatDateTime } from '@/utils/datetime'
 import {
   clearRuntimeVars,
@@ -30,6 +31,7 @@ import type { HttpRequestDetail, HttpResult, RequestSearchHit } from '@/types/mo
 
 const router = useRouter()
 const store = useProjectStore()
+const errorDialog = useErrorDialogStore()
 
 const projectId = ref<number | null>(null)
 const envId = ref<number | null>(null)
@@ -328,7 +330,18 @@ async function start() {
     if (stopFlag.value) message.info('已停止执行')
     else message.success('批量执行完成')
   } catch (e) {
-    message.error(String(e))
+    const env = store.environments.find((item) => item.id === envId.value)
+    errorDialog.show({
+      title: '批量执行失败',
+      error: e,
+      context: [
+        { label: '项目', value: store.currentProject?.name ?? '—' },
+        { label: '接口数', value: `${selected.value.length} 个` },
+        { label: '轮次', value: `${dataRows.value.length || iterations.value} 轮` },
+        { label: '环境', value: env?.name ?? '未选择' },
+        { label: '数据文件', value: dataPath.value || '未使用' },
+      ],
+    })
   } finally {
     running.value = false
   }
@@ -489,7 +502,7 @@ function openRequest(id: number) {
       subtitle="按顺序批量执行接口，支持 CSV / JSON 数据驱动与脚本断言汇总"
     >
       <a-button :disabled="!results.length" @click="aiAnalyzeResults">
-        <template #icon><RobotOutlined /></template>
+        <template #icon><AiSparkIcon /></template>
         AI 分析结果
       </a-button>
       <a-button :disabled="running" @click="router.push('/history')">查看请求历史</a-button>

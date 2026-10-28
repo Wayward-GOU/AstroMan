@@ -2,7 +2,8 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
-import { PlusOutlined, CheckCircleFilled, RobotOutlined } from '@ant-design/icons-vue'
+import { PlusOutlined, CheckCircleFilled } from '@ant-design/icons-vue'
+import AiSparkIcon from '@/components/AiSparkIcon.vue'
 import PageHeader from '@/components/PageHeader.vue'
 import { useAiAssistStore } from '@/stores/aiAssist'
 import { envAuditPrompt } from '@/utils/aiScenarios'
@@ -150,7 +151,7 @@ function removeEnv(env: Environment) {
       subtitle="请求里的 {{变量名}} 会被替换成当前环境变量、环境脚本或内置变量的值"
     >
       <a-button :disabled="!current" @click="aiAudit">
-        <template #icon><RobotOutlined /></template>
+        <template #icon><AiSparkIcon /></template>
         AI 体检
       </a-button>
       <a-button @click="router.push(`/project/${projectId}`)">返回项目</a-button>

@@ -24,8 +24,8 @@ import {
   PlayCircleOutlined,
   BarChartOutlined,
   FileTextOutlined,
-  RobotOutlined,
 } from '@ant-design/icons-vue'
+import AiSparkIcon from '@/components/AiSparkIcon.vue'
 import PageHeader from '@/components/PageHeader.vue'
 import { formatDateTime } from '@/utils/datetime'
 import { useProjectStore } from '@/stores/project'
@@ -851,7 +851,7 @@ function statusColor(code?: number | null) {
         </template>
       </a-dropdown>
       <a-button @click="aiInsight">
-        <template #icon><RobotOutlined /></template>
+        <template #icon><AiSparkIcon /></template>
         AI 洞察
       </a-button>
       <a-button @click="router.push('/stress')">

@@ -12,8 +12,8 @@ import {
   DownOutlined,
   EyeOutlined,
   CopyOutlined,
-  RobotOutlined,
 } from '@ant-design/icons-vue'
+import AiSparkIcon from '@/components/AiSparkIcon.vue'
 import PageHeader from '@/components/PageHeader.vue'
 import LineChart from '@/components/LineChart.vue'
 import { useAiAssistStore } from '@/stores/aiAssist'
@@ -419,7 +419,7 @@ function remove() {
       subtitle="吞吐、延迟分位、状态码与错误分布的完整记录"
     >
       <a-button :disabled="!detail" @click="aiReview">
-        <template #icon><RobotOutlined /></template>
+        <template #icon><AiSparkIcon /></template>
         AI 解读
       </a-button>
       <a-button @click="router.push('/reports')">

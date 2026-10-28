@@ -49,11 +49,23 @@ description: FbinHttp 前端开发规范（Vue 3 + Ant Design Vue + Pinia + 设�
 
 新增/调整图表的完整约定见 skill `fbinhttp-dashboard`。
 
+## 页面内 AI 入口（AiAssist）
+
+给任意页面加「用 AI 分析当前内容」的能力，不需要新建页面或弹窗，统一复用全局抽屉：
+
+1. 在 `src/utils/aiScenarios.ts` 加一个 `xxxPrompt(...)` 构造器，用 `detailBlock()` / `resultBlock()` 拼上下文，认证字段与密钥一律打码，长文本 `clip()`
+2. 页面里 `const aiAssist = useAiAssistStore()`，用 `aiAssist.show({ title, prompt, hint })` 打开抽屉
+3. 页头右侧加 `RobotOutlined` 按钮，与现有 `PageHeader` 的 `actions` 并列
+4. 需要异步取数据再分析时，先 `await` 拿到数据再 `void aiAssist.show(...)`，失败用 `message.error`
+
+约定：页面内 AI 是**只读建议**，`stores/aiAssist.ts` 的 `SYSTEM_PROMPT` 已禁止调用工具，所以不会触发写操作；抽屉的流式渲染由 store 统一处理，页面不要自己再写一份。
+
 ## 状态管理
 
 | store | 职责 |
 |---|---|
 | `stores/project.ts` | 项目列表、当前项目、集合树、环境列表、激活环境；`refresh*` 方法负责重新拉取 |
+| `stores/aiAssist.ts` | 页面内 AI 抽屉：`open/title/hint/messages/streaming`、`show()` 与 `ask()`，负责服务商选择与流式渲染 |
 | `stores/tabs.ts` | 请求标签页（打开/切换/关闭），持久化到 localStorage |
 | `stores/theme.ts` | 主题定义、`applyTheme`、初始化与持久化 |
 

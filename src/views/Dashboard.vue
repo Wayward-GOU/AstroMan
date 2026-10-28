@@ -24,10 +24,13 @@ import {
   PlayCircleOutlined,
   BarChartOutlined,
   FileTextOutlined,
+  RobotOutlined,
 } from '@ant-design/icons-vue'
 import PageHeader from '@/components/PageHeader.vue'
 import { formatDateTime } from '@/utils/datetime'
 import { useProjectStore } from '@/stores/project'
+import { useAiAssistStore } from '@/stores/aiAssist'
+import { dashboardInsightPrompt } from '@/utils/aiScenarios'
 import * as api from '@/api'
 import type {
   DashboardMetrics,
@@ -51,6 +54,18 @@ const history = ref<HistoryItem[]>([])
 const reports = ref<StressReport[]>([])
 const stats = ref<WorkspaceStats | null>(null)
 const metrics = ref<DashboardMetrics | null>(null)
+
+const aiAssist = useAiAssistStore()
+
+function aiInsight() {
+  void aiAssist.show({
+    title: '工作台洞察',
+    prompt: dashboardInsightPrompt(stats.value, metrics.value),
+    hint: stats.value
+      ? `${stats.value.projectCount} 个项目 · ${stats.value.requestCount} 个接口 · ${stats.value.historyCount} 条历史`
+      : '数据加载中',
+  })
+}
 const storage = ref<StorageInfo | null>(null)
 const snapshot = ref<MonitorSnapshot | null>(null)
 const monitorLoading = ref(false)
@@ -480,8 +495,13 @@ const tips = [
   },
   {
     title: 'AI 助手：自然语言操作',
-    desc: '点右侧屏幕中间的机器人进入小HI。先在小HI 顶部「模型服务」里配置一家服务商（如 DeepSeek / Kimi / 智谱 / Claude），之后直接说需求即可，工具调用会先请你确认敏感操作。',
+    desc: '点右侧屏幕中间的机器人进入小HI。先在小HI 顶部「模型服务」里配置一家服务商（如 DeepSeek / Kimi / 智谱 / Claude），之后直接说需求即可。写入类操作会先给计划、等你确认后再执行。',
     code: '列出本机所有项目，并按请求数量排序\n在第一个项目里新建登录接口，发送并分析返回\n给接口写一个前置签名脚本，再发一次验证',
+  },
+  {
+    title: 'AI 助手：聊天与出方案',
+    desc: '小HI 也能当日常助手：解释概念、给压测方案、做错误诊断、写脚本草稿，这类问答不会去翻你的项目数据。',
+    code: 'HTTP/2 和 HTTP/1.1 有什么区别\n给我一份下单接口的压测方案，含并发与 SLA\n这个 401 报错一般怎么排查',
   },
   {
     title: 'AI 助手：写脚本与查数据',
@@ -551,7 +571,7 @@ const faqs = [
   },
   {
     q: '小HI 能帮我做什么？',
-    a: '它可以直接操作本机数据：新建项目 / 集合 / 接口、真实发送请求并解读响应、写前置与后置脚本、批量执行、启动压测、查询历史与压测报告、导出执行记录，还能查工作台与大屏统计。删除、导出、压测这类操作会先弹确认，你点了才会执行。',
+    a: '两个模式：一是聊天答疑、出方案（压测方案、测试策略、脚本写法、错误诊断），只给建议不动数据；二是操作本机——新建项目 / 集合 / 接口、真实发送请求并解读响应、写前置与后置脚本、批量执行、生成压测计划、查询历史与报告、导出执行记录。凡是要新建、修改、删除、导入导出或发起压测，它都会先把完整计划列出来，你确认后才弹执行框。',
   },
   {
     q: 'AI 服务怎么配置？密钥安全吗？',
@@ -830,6 +850,10 @@ function statusColor(code?: number | null) {
           </a-menu>
         </template>
       </a-dropdown>
+      <a-button @click="aiInsight">
+        <template #icon><RobotOutlined /></template>
+        AI 洞察
+      </a-button>
       <a-button @click="router.push('/stress')">
         <template #icon><ThunderboltOutlined /></template>
         发起压测

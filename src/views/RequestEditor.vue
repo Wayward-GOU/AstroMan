@@ -13,9 +13,18 @@ import {
   CopyOutlined,
   CodeOutlined,
   PlusOutlined,
+  RobotOutlined,
+  DownOutlined,
 } from '@ant-design/icons-vue'
 import KeyValueEditor from '@/components/KeyValueEditor.vue'
 import CodeArea from '@/components/CodeArea.vue'
+import { useAiAssistStore } from '@/stores/aiAssist'
+import {
+  requestAssertionPrompt,
+  requestExplainPrompt,
+  requestOptimizePrompt,
+  requestPostScriptPrompt,
+} from '@/utils/aiScenarios'
 import { useProjectStore } from '@/stores/project'
 import { MAX_REQUEST_TABS, useTabsStore } from '@/stores/tabs'
 import { formatDateTime } from '@/utils/datetime'
@@ -93,6 +102,29 @@ const activeTab = ref('params')
 const responseTab = ref('body')
 const insecure = ref(false)
 const envId = ref<number | null>(null)
+
+/* ---------- 页面内 AI 分析 ---------- */
+const aiAssist = useAiAssistStore()
+
+function runAi(kind: string) {
+  const detail = form.value
+  if (!detail.url?.trim()) {
+    message.warning('先填写接口 URL 再做分析')
+    return
+  }
+  const options: Record<string, { title: string; prompt: string }> = {
+    explain: { title: '接口响应分析', prompt: requestExplainPrompt(detail, result.value) },
+    assert: { title: '生成断言脚本', prompt: requestAssertionPrompt(detail, result.value) },
+    post: { title: '生成后置脚本', prompt: requestPostScriptPrompt(detail, result.value) },
+    optimize: { title: '接口定义优化', prompt: requestOptimizePrompt(detail) },
+  }
+  const picked = options[kind]
+  if (!picked) return
+  void aiAssist.show({
+    ...picked,
+    hint: `${detail.method} ${detail.url}${result.value ? ` · 最近响应 ${result.value.status}` : ' · 未发送过请求'}`,
+  })
+}
 
 /* ---------- 自动保存 ---------- */
 const autoState = ref<'saved' | 'dirty' | 'saving' | 'error'>('saved')
@@ -1015,6 +1047,21 @@ const responseHeaders = computed(() => {
             <template #icon><DeleteOutlined /></template>
             删除
           </a-button>
+          <a-dropdown :trigger="['click']" placement="bottomRight">
+            <a-button>
+              <template #icon><RobotOutlined /></template>
+              AI 分析
+              <DownOutlined class="ai-caret" />
+            </a-button>
+            <template #overlay>
+              <a-menu @click="(info: any) => runAi(String(info.key))">
+                <a-menu-item key="explain">解释这次请求 / 响应</a-menu-item>
+                <a-menu-item key="assert">生成断言脚本</a-menu-item>
+                <a-menu-item key="post">生成后置提取脚本</a-menu-item>
+                <a-menu-item key="optimize">优化这个接口定义</a-menu-item>
+              </a-menu>
+            </template>
+          </a-dropdown>
           <a-button @click="openCookies">Cookie</a-button>
           <a-button @click="openCode">
             <template #icon><CodeOutlined /></template>
@@ -1689,6 +1736,11 @@ const responseHeaders = computed(() => {
   height: 100%;
   display: flex;
   flex-direction: column;
+}
+
+.ai-caret {
+  font-size: 10px;
+  margin-left: 4px;
 }
 
 :deep(.ant-spin-nested-loading),

@@ -12,8 +12,11 @@ import {
   ImportOutlined,
   ExportOutlined,
   SearchOutlined,
+  RobotOutlined,
 } from '@ant-design/icons-vue'
 import { useProjectStore } from '@/stores/project'
+import { useAiAssistStore } from '@/stores/aiAssist'
+import { projectAuditPrompt } from '@/utils/aiScenarios'
 import { MAX_REQUEST_TABS, useTabsStore } from '@/stores/tabs'
 import { formatDateTime } from '@/utils/datetime'
 import { buildCurl } from '@/utils/curl'
@@ -40,6 +43,21 @@ const selectedCollection = computed(() => {
 })
 const requests = ref<RequestSummary[]>([])
 const loadingRequests = ref(false)
+
+const aiAssist = useAiAssistStore()
+
+async function aiAudit() {
+  try {
+    const items = await api.requestOptions(projectId.value)
+    void aiAssist.show({
+      title: '项目结构体检',
+      prompt: projectAuditPrompt(store.currentProject?.name ?? '当前项目', store.tree, items),
+      hint: `${items.length} 个接口 · ${store.tree.length} 个顶层集合`,
+    })
+  } catch (e) {
+    message.error(String(e))
+  }
+}
 
 const keyword = ref('')
 const searchHits = ref<RequestSearchHit[]>([])
@@ -536,6 +554,10 @@ const columns = computed(() =>
             {{ env.name }}
           </a-select-option>
         </a-select>
+        <a-button size="small" @click="aiAudit">
+          <template #icon><RobotOutlined /></template>
+          AI 体检
+        </a-button>
         <a-button size="small" @click="openCurl">
           <template #icon><ImportOutlined /></template>
           导入 cURL

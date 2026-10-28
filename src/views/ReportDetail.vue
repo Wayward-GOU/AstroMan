@@ -12,9 +12,12 @@ import {
   DownOutlined,
   EyeOutlined,
   CopyOutlined,
+  RobotOutlined,
 } from '@ant-design/icons-vue'
 import PageHeader from '@/components/PageHeader.vue'
 import LineChart from '@/components/LineChart.vue'
+import { useAiAssistStore } from '@/stores/aiAssist'
+import { reportReviewPrompt } from '@/utils/aiScenarios'
 import { formatDateTime } from '@/utils/datetime'
 import * as api from '@/api'
 import type { ReportDetail, ReportRequestRecord, ReportRequestsPage } from '@/types/models'
@@ -154,6 +157,21 @@ onMounted(async () => {
 })
 
 const report = computed(() => detail.value?.report ?? null)
+
+const aiAssist = useAiAssistStore()
+
+function aiReview() {
+  if (!detail.value) {
+    message.warning('报告还在加载中')
+    return
+  }
+  const current = detail.value.report
+  void aiAssist.show({
+    title: '压测报告解读',
+    prompt: reportReviewPrompt(detail.value),
+    hint: `${current.planName} · ${current.concurrency} 并发 · ${current.totalRequests} 次请求 · 错误率 ${((current.errorRate ?? 0) * 100).toFixed(2)}%`,
+  })
+}
 const samples = computed(() => detail.value?.samples ?? [])
 const errors = computed(() => detail.value?.errors ?? [])
 const statusCodes = computed(() => detail.value?.statusCodes ?? [])
@@ -400,6 +418,10 @@ function remove() {
       title="压测报告详情"
       subtitle="吞吐、延迟分位、状态码与错误分布的完整记录"
     >
+      <a-button :disabled="!detail" @click="aiReview">
+        <template #icon><RobotOutlined /></template>
+        AI 解读
+      </a-button>
       <a-button @click="router.push('/reports')">
         <template #icon><ArrowLeftOutlined /></template>
         返回列表

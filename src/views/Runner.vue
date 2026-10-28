@@ -10,8 +10,11 @@ import {
   FolderOpenOutlined,
   ReloadOutlined,
   StopOutlined,
+  RobotOutlined,
 } from '@ant-design/icons-vue'
 import PageHeader from '@/components/PageHeader.vue'
+import { useAiAssistStore } from '@/stores/aiAssist'
+import { runnerAnalyzePrompt } from '@/utils/aiScenarios'
 import * as api from '@/api'
 import { useProjectStore } from '@/stores/project'
 import { formatDateTime } from '@/utils/datetime'
@@ -129,6 +132,20 @@ const summary = computed(() => {
   const avg = total ? list.reduce((sum, item) => sum + item.durationMs, 0) / total : 0
   return { total, passed, failed, assertions, assertionFailed, avg }
 })
+
+const aiAssist = useAiAssistStore()
+
+function aiAnalyzeResults() {
+  if (!results.value.length) {
+    message.warning('还没有可分析的执行结果')
+    return
+  }
+  void aiAssist.show({
+    title: '批量执行结果分析',
+    prompt: runnerAnalyzePrompt({ ...summary.value }, results.value),
+    hint: `共 ${summary.value.total} 次执行，失败 ${summary.value.failed} 次，断言失败 ${summary.value.assertionFailed} 条`,
+  })
+}
 
 const plannedTasks = computed(() => {
   const rows = dataRows.value.length
@@ -471,6 +488,10 @@ function openRequest(id: number) {
       title="批量运行"
       subtitle="按顺序批量执行接口，支持 CSV / JSON 数据驱动与脚本断言汇总"
     >
+      <a-button :disabled="!results.length" @click="aiAnalyzeResults">
+        <template #icon><RobotOutlined /></template>
+        AI 分析结果
+      </a-button>
       <a-button :disabled="running" @click="router.push('/history')">查看请求历史</a-button>
     </PageHeader>
 

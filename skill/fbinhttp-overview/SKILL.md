@@ -98,5 +98,5 @@ Windows 下 `cargo check` 在受限沙箱里会命中 `D:\Software\Rust\cargo\.g
 | `fbinhttp-backend` | Rust 命令、SQLite 迁移、压测引擎规范 |
 | `fbinhttp-frontend` | 页面骨架、主题变量、脚本引擎、导出 |
 | `fbinhttp-dashboard` | 首页数据大屏口径、CSS 图表约定、Runner 介绍文案 |
-| `fbinhttp-ai` | AI 助手「小HI」：协议接入、会话、工具注册表、工具调用记录 |
+| `fbinhttp-ai` | AI 助手「小HI」：双模式（聊天 / 操作）、协议接入、流式渲染、会话、工具注册表、写操作确认、工具调用记录 |
 | `fbinhttp-build-release` | 构建、打包与发布 |

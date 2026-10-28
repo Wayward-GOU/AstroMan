@@ -16,14 +16,18 @@ description: FbinHttp 内置 AI 助手「小HI」的开发与维护规范。接�
 | `src-tauri/src/commands/ai.rs` | 服务商 CRUD 与测试、流式对话、工具执行代理、会话/消息、工具流水、用量统计、报错中文化 |
 | `src-tauri/src/models.rs` | `AiProvider`、`AiMessage`、`AiChatPayload`、`AiStreamEvent`、`AiSession`、`AiStoredMessage`、`AiToolLog`、`AiUsageLog` / `AiUsagePage` / `AiUsageDay` |
 | `src-tauri/src/db/schema.sql` | `ai_providers`、`ai_sessions`、`ai_messages`、`ai_tool_logs`、`ai_usage_logs` 五张表 |
-| `src/utils/aiTools.ts` | **工具注册表**：39 个工具的声明、参数解析、执行、中文名、敏感标记 |
+| `src/utils/aiTools.ts` | **工具注册表**：42 个工具的声明、参数解析、执行、中文名、`danger` 标记、`isWriteTool()` 写操作判定 |
 | `src/utils/aiPricing.ts` | 模型价格表与费用估算：`estimateCost / fmtUsd / fmtCny / fmtUnit`，`USD_TO_CNY` |
+| `src/utils/promptText.ts` | 发给模型前的空白压缩 `compactPrompt()`、入库截断 `clipStoredPrompt()`（默认 1000 字） |
+| `src/utils/aiScenarios.ts` | 页面内 AI 的上下文构造器（接口解释 / 断言 / 后置脚本 / 优化 / 历史诊断 / 报告解读 / 压测计划 / 环境体检 / 运行分析 / 工作台洞察 / 项目体检），敏感字段打码 |
+| `src/stores/aiAssist.ts` | 页面内 AI 的全局状态与流式请求：`show({title,prompt,hint})` / `ask()` / 服务商选择 |
+| `src/components/AiAssistDrawer.vue` | 全局右侧 640px 抽屉，`App.vue` 挂载，所有页面 AI 入口共用 |
 | `src/views/AiAssistant.vue` | 对话页：会话侧栏 + 消息气泡 + 工具卡片 + 模型服务抽屉 |
 | `src/views/AiUsage.vue` | 用量统计独立页（`/ai/usage`）：6 张指标卡 + 每日 token 柱 + 调用记录 / 模型汇总 / 工具准确率三 Tab + 右侧抽屉 |
 | `src/views/AiToolLogs.vue` | 工具调用记录页（`/ai/logs`）：指标卡、趋势柱、表格、详情抽屉 |
 | `src/views/Settings.vue` | 设置页「AI 辅助（小HI）」卡片：已上线说明 + 「打开小HI」「用量统计」 |
 | `src/views/Dashboard.vue` | 首页使用说明：第 07 步「用小HI 提效」、3 张 AI 技巧卡、3 条 AI FAQ |
-| `src/App.vue` | 右侧屏幕垂直居中的悬浮机器人入口（54px，`right: 14px` + `top: 50%`，`/ai` 页隐藏） |
+| `src/App.vue` | 右侧屏幕垂直居中的悬浮机器人入口（54px，`right: 14px` + `top: 50%`，`/ai` 页隐藏）+ 挂载全局 `<AiAssistDrawer />` |
 | `src/api/index.ts` | `aiProvider*`、`aiChat`、`aiExecute`、`aiSession*`、`aiMessage*`、`aiToolLog*`、`aiUsage*` |
 
 ## 三种协议
@@ -45,6 +49,18 @@ description: FbinHttp 内置 AI 助手「小HI」的开发与维护规范。接�
 - 列表接口永远返回掩码（只留尾部若干位），前端不得回显明文
 - 用户没配置任何可用服务商时，整块 AI 功能不可用——页面给出「去配置」引导，不能静默失败
 
+## 双模式人格（聊天 / 操作）
+
+小HI 不是只会操作软件的执行器，必须在两种模式间自动分流，规则同时写在两份提示词里（后端 md 是权威，前端 `SYSTEM_PROMPT` 只保留协议与判定）：
+
+| 用户意图 | 行为 |
+|---|---|
+| 闲聊、知识问答、概念解释、解释代码、写文案、翻译、润色 | 直接回答，**不调用任何工具**，不问「你要操作哪个项目」 |
+| 要「方案 / 思路 / 模板 / 建议」（压测方案、测试策略、接口设计、排障思路、脚本写法） | 直接给完整可执行方案，**即使话题与本软件相关也不为凑方案去调工具**；末尾可问「要不要我按这个方案建一份计划」 |
+| 明确指向本机某个项目 / 接口 / 报告，或说「帮我查 / 改 / 跑 / 导出」 | 进入操作模式，先只读工具取真实数据，再按写入确认流程执行 |
+
+不要靠关键词硬匹配实现分流，分流靠提示词；前端只负责协议解析与安全兜底。
+
 ## 流式对话
 
 ```ts
@@ -53,14 +69,18 @@ channel.onmessage = (event) => { /* delta 追加 / error 标红 */ }
 await aiChat({ providerId, messages, temperature }, channel)
 ```
 
-Rust 侧 `ai_chat(payload, on_event: Channel<AiStreamEvent>)`，逐块 `on_event.send(...)`，结束发 `done`，异常发 `error` 且不 panic。前端把流式消息累积到最后一个 `ChatItem`，`streaming` 期间禁止再次发送。
+Rust 侧 `ai_chat(payload, on_event: Channel<AiStreamEvent>)`，逐块 `on_event.send(...)`，结束发 `done`，异常发 `error` 且不 panic。
+
+**前端必须边收边渲染**：累积用的消息对象要用 `reactive()` 包一层再入列表，直接改普通对象不会触发渲染，会退化成「全部生成完才一次性出现」。增量先入 buffer，每 50ms 合并 flush 一次（`paint()`），`reasoning`、`error` 与 `finally` 都强制 flush，避免丢尾。两处都要遵循：`AiAssistant.vue` 的 `ask()` 与 `stores/aiAssist.ts` 的 `send()`。
 
 ## 会话与消息
 
 - 新建会话时标题为「新对话」；**首条用户消息**写入时后端自动截取前 24 字符作标题（`truncate_title`）
 - 每条用户消息与最终助手回复都要 `aiMessageAdd` 落库；流式过程中的半成品不入库
-- 切换会话时用 `aiMessageList` 重建消息列表，并从内容里重新解析工具块（保持卡片可再执行）
-- 上下文只带最近 12 轮 + system prompt，避免长会话把 token 打爆
+- 用户提问入库前先 `clipStoredPrompt()` 截到 **1000 字**，超出直接丢弃；发模型用压缩后的全文，两者互不影响
+- 工具结果、纠正指令这类内部回灌消息同样要进 `messages`（标 `hidden` 只影响显示）并落库，否则模型下一轮看不到执行结果，会反复调用同一工具
+- 切换会话时用 `aiMessageList` 重建消息列表，并从内容里重新解析工具块（保持卡片可再执行）；`isControlMessage()` 识别内部回灌、`isExecutionNote()` / `isToolLeakNote()` 识别过程残渣，一律隐藏
+- 上下文带最近 20 条消息 + system prompt（`toHistory()` 的 `slice(-20)`），避免长会话把 token 打爆
 
 ## 工具调用（核心机制）
 
@@ -72,7 +92,27 @@ Rust 侧 `ai_chat(payload, on_event: Channel<AiStreamEvent>)`，逐块 `on_event
 ```
 ````
 
-流程：模型输出块 → 前端正则切分消息为 `text` / `code` / `tool` 三种 segment → `executeTool(name, args)` → 结果文本回灌给模型 → 模型继续总结。自动链路最多 5 轮（`MAX_TOOL_ROUNDS` / `autoDepth`），每轮只执行 1 个工具，超出后由用户点卡片「运行」手动推进。
+流程：模型输出块 → 前端正则切分消息为 `text` / `code` / `tool` 三种 segment → `executeTool(name, args)` → 结果文本回灌给模型 → 模型继续总结。
+
+### 原生标记兜底（模型不听话时的最后一道）
+
+模型偶尔会漏出原生工具语法，形态包括 `<| DSLM | tool_calls>`、全角 `<｜DSML｜tool_calls>`、`<{tool_call}>`，甚至把围栏写成 `<fbin-tool>{"tool":...}</fbin-tool>`。处理顺序：
+
+1. `normalizePseudoFence()`：把 `<fbin-tool>` / `<fbin_tool>` / 闭合标签统一还原成标准 ```fbin-tool 围栏（这一步不做会漏掉，后续解析、隐藏、执行全失效）
+2. `liftNativeCalls()`：扫描正文里的平衡 JSON（兼容 `tool/args`、`name/arguments|parameters|args`），还原成 fbin-tool 块，再 `stripNativeTags()` 清掉标记；**跳过 ``` 代码块**，无标记时只接受已知工具名，避免把普通 JSON 误判成调用
+3. 救不回来 → `isToolLeakNote()` 隐藏该条，`afterReply` 自动纠正重试，最多 2 次（`repairs`）
+4. `parseSegmentsRaw()` 丢弃空的 fbin-tool 块，不要把它当正文展示
+
+### 自动执行的安全阀
+
+| 阀 | 行为 |
+|---|---|
+| `MAX_TOOL_ROUNDS = 8` + `autoDepth` | 轮次将达到上限时不再直接掐断：先置 `forcedFinal` 并要求模型「禁止再调工具、立刻输出结论」，仍不收敛才 `notifyTerminated()` |
+| `callCache` + `repeats` | 同一工具 + 同一参数重复调用时复用上次结果并提醒换路；连续两次直接进入 `forcedFinal`，防止原地打转烧轮次 |
+| `isWriteTool()` + `Modal.confirm` | 写入 / 触发类工具一律先弹确认框，框内用 `previewArgs()` 展示人类可读的计划（压测计划会逐项列出模式、并发、时长、阶段、SLA） |
+| `rejections` | 一轮吐多个工具被全部拒绝时累计，达到 2 次终止并提示手动点卡片运行 |
+
+自动链路每轮只执行 1 个工具，超出后由用户点卡片「运行」手动推进。
 
 ### 系统提示词注入（后端强制）
 
@@ -80,7 +120,7 @@ Rust 侧 `ai_chat(payload, on_event: Channel<AiStreamEvent>)`，逐块 `on_event
 - 每次 `ai_chat` 都会把 `XIAO_HI_SYSTEM_PROMPT` **插到 messages[0]**，并剔除客户端传来的同内容副本；前端无法覆盖、删除或改写这套规则
 - 前端的 `SYSTEM_PROMPT` 只保留「工具协议 + 脚本引擎」这类随代码动态生成的内容（`TOOL_CATALOG` 来自注册表），不得再写身份与业务流程，避免与后端 prompt 冲突
 - 改行为（轮次上限、确认策略、输出格式）时：先改 md，再同步前端协议文案与 `MAX_TOOL_ROUNDS`、`isDangerousTool` 等常量
-- md 里的「单轮最多 1 个工具」由 `afterReply` 只取第一个 idle 安全工具来落实；「最多 5 轮」由 `autoDepth` 拦截
+- md 里的「单轮最多 1 个工具」由 `afterReply` 只取第一个 idle 安全工具来落实；「最多 8 轮」由 `autoDepth` / `forcedFinal` 拦截
 
 ### 代码层硬规则（`src-tauri/src/docx/agent_hard_rules.md`）
 
@@ -88,18 +128,20 @@ Rust 侧 `ai_chat(payload, on_event: Channel<AiStreamEvent>)`，逐块 `on_event
 
 | 规则 | 落点 |
 |---|---|
-| 1. 最多连续 5 次工具调用，超限终止并提示「已达到最大执行轮次，本次任务终止，请调整你的需求重试」 | `MAX_TOOL_ROUNDS` + `autoDepth`，超限走 `notifyTerminated()`；`send()` 每次用户发言重置 |
+| 1. 最多连续 8 次工具调用；接近上限先要求直接给结论，仍不收敛才终止并提示「已达到最大执行轮次，本次任务终止，请调整你的需求重试」 | `MAX_TOOL_ROUNDS = 8` + `autoDepth` / `forcedFinal`；`send()` 每次用户发言重置 |
 | 2. 一轮输出多个 tool_call 直接拒绝，错误回灌「单次仅允许调用一个工具，请重新选择工具与参数」 | `afterReply` 的 `tools.length > 1` 分支 |
 | 3. 入参 JSON Schema 校验（类型 / 必填 / 正则 / 枚举 / 数值与数组范围），非法不调底层 | `SCHEMAS` + `validateToolArgs()`，`executeTool` 入口拦截，错误作为 Observation 回灌 |
-| 4. 高危工具不直接执行，弹窗等用户确认；确认或拒绝都进上下文 | `danger: true`（16 个）+ `runToolSegment` 的 `Modal.confirm` |
+| 4. **所有写入 / 触发类工具**先弹确认框，框内展示计划预览；确认或拒绝都进上下文 | `isWriteTool()`（= `danger` 标记 ∪ `WRITE_TOOLS`）+ `runToolSegment` 的 `Modal.confirm` + `previewArgs()` |
 | 5. HTTP 类 30 秒超时 | `send_request` / `run_batch` 的 `timeoutMs` schema `max: 30000`，超时按工具失败回灌 |
 | 6. 回灌前脱敏 | `executeTool` 末尾 `maskSensitive()`（Bearer/Basic、api_key/token/secret/password/cookie 等） |
 | 7. Trace 落库 | `ai_messages` 增加 `reasoning` 列（老库 `ALTER TABLE` 迁移），助手思考过程随消息持久化；工具入参/结果/成败在 `ai_tool_logs` |
-| 7.1 落库裁剪（防膨胀） | 消息正文 `clip_trace` 上限 8000 字、思考 2000 字，超限追加「…（已截断，原长度 N 字）」；附件 `` ```fbin-file `` 块由 `strip_file_blocks` 换成「文件名 + 字符数」摘要，正文只用于当轮推理；工具流水 `args` / `result_preview` 各 2000 字 |
+| 7.1 落库裁剪（防膨胀） | 助手正文 `clip_trace` 上限 8000 字、思考 2000 字；**前端用户提问另行截到 1000 字**（`clipStoredPrompt`）；附件 `` ```fbin-file `` 块由 `strip_file_blocks` 换成「文件名 + 字符数」摘要；工具流水 `args` / `result_preview` 各 2000 字 |
+| 8. 重复调用拦截 | `callKey()` 生成「工具 + 规范化参数」指纹，`callCache` 复用结果，`repeats` 连续两次进入 `forcedFinal` |
+| 9. 工具结果进上下文 | `ask(extra)` 把结果 / 纠正指令写入 `messages`（`hidden: true`）并落库，否则模型看不到上轮结果会无限重查 |
 
-改规则时的顺序：`agent_hard_rules.md`（需求） → `SCHEMAS` / `MAX_TOOL_ROUNDS` / `danger` 标记 → 前端提示文案 → 本表。
+改规则时的顺序：`agent_hard_rules.md`（需求） → `SCHEMAS` / `MAX_TOOL_ROUNDS` / `danger` / `WRITE_TOOLS` → 前端提示文案 → 本表。
 
-### 工具清单（39）
+### 工具清单（42）
 
 | 分类 | 工具 |
 |---|---|
@@ -107,19 +149,29 @@ Rust 侧 `ai_chat(payload, on_event: Channel<AiStreamEvent>)`，逐块 `on_event
 | 集合 | `collection_tree` `collection_create` `collection_rename` `collection_delete` |
 | 请求 | `request_list` `request_get` `request_search` `request_options` `request_create` `request_update` `request_script_save` `request_delete` `curl_import` `send_request` `run_batch` |
 | 环境 | `env_list` `env_create` `env_var_save` `env_activate` |
-| 压测 | `plan_list` `stress_start` `stress_stop` `report_list` `report_get` `report_export` |
+| 压测 | `plan_list` `plan_get` `plan_save` `plan_delete` `stress_start` `stress_stop` `report_list` `report_get` `report_export` |
 | 数据 | `history_list` `history_export` `workspace_stats` `dashboard_metrics` |
 | 导入导出 | `api_import` `openapi_import` `openapi_export` |
 
-### 敏感操作（`danger: true`）
+压测计划三件套与 `stress_start` 的约定：
 
-`project_update` `project_delete` `collection_rename` `collection_delete` `request_update` `request_script_save` `request_delete` `env_var_save` `stress_start` `stress_stop` `run_batch` `history_export` `project_export` `openapi_export` `report_export`
+- `plan_save` 生成的结构必须与「压测」页 `currentPlanConfig()` 完全一致（`settings` / `stages` / `envId`），否则载入后参数会丢
+- `settings.stages` 只在 `mode === 'stages'` 时写入，`slaEnabled` 由是否传 SLA 决定；`stress_start` 同样支持 `stages` 与 `slaP95/P99/ErrorRate/MinRps`
+- 顺序固定：读接口 → 用文字给完整计划 → 用户确认 → `plan_save` → 再单独问是否 `stress_start`
+
+### 需要确认的操作
+
+**两层判定**：`isDangerousTool(tool)` 看工具自带的 `danger: true`；`isWriteTool(tool)` = `danger` ∪ `WRITE_TOOLS`。后者覆盖所有会新建 / 保存 / 修改 / 删除 / 导入导出 / 开压测的工具（如 `project_create`、`collection_create`、`request_create`、`plan_save`、`plan_get` 之外的写操作），即使没打 `danger` 也必须先确认。
+
+`danger: true` 清单：
+
+`project_update` `project_delete` `collection_rename` `collection_delete` `request_update` `request_script_save` `request_delete` `env_var_save` `stress_start` `stress_stop` `run_batch` `history_export` `project_export` `openapi_export` `report_export` `plan_delete`
 
 规则：
-1. 敏感工具**不参与自动执行**——`afterReply` 过滤掉，卡片显示橙色「需确认」
-2. 点「运行」时 `Modal.confirm` 二次确认，取消则不执行
-3. system prompt 强制要求：先说明影响对象与范围、一次只做一件、删除前先核对 id 与名称
-4. 新增工具时，只要会改数据/删数据/打流量/写文件，一律 `danger: true`
+1. 写入类工具**不参与自动执行**——`afterReply` 过滤掉，卡片显示橙色「需确认」
+2. 点「运行」或自动链路命中时，`Modal.confirm` 弹出**计划预览**：`describeWrite()` 说清影响，`previewArgs()` 把参数整理成人类可读（压测计划逐项列出模式 / 并发 / 时长 / 阶段 / SLA），取消则不执行
+3. 提示词强制要求：先给完整方案 → 问「是否确认执行」→ 用户同意后才输出工具块；未确认前只允许只读工具
+4. 新增工具时，只要会改数据 / 删数据 / 打流量 / 写文件，一律 `danger: true`，并同步补进 `WRITE_TOOLS` 与 `CONFIRM_TEXT`
 
 ### 新增一个工具
 
@@ -129,8 +181,9 @@ Rust 侧 `ai_chat(payload, on_event: Channel<AiStreamEvent>)`，逐块 `on_event
    - 参数解析统一用 `str` / `needNum` / `optionalNum` / `toItems` / `needPath`，不要直接强转
    - 返回对象会被 JSON 美化回灌；长文本类（HTTP 结果）给 `format` 自定义摘要
 3. 在 `TOOL_LABELS` 补中文名（`TOOL_CATALOG` 由 `SPECS` 自动生成，system prompt 随之更新）
-4. 若涉及新命令，记得 `lib.rs::generate_handler!` 注册 + `models.rs` 建模
-5. 更新本文档的工具清单
+4. 写入类工具同时补 `WRITE_TOOLS`（若未标 `danger`）与 `AiAssistant.vue` 的 `CONFIRM_TEXT` 文案
+5. 若涉及新命令，记得 `lib.rs::generate_handler!` 注册 + `models.rs` 建模
+6. 更新本文档的工具清单与数量
 
 ### 工具流水
 
@@ -182,14 +235,26 @@ Rust 侧 `ai_chat(payload, on_event: Channel<AiStreamEvent>)`，逐块 `on_event
 
 ## 模型目录与报错中文化
 
-模型服务抽屉（`AiAssistant.vue`）里的四处要保持一致，别只改其一：
+模型服务抽屉（`AiAssistant.vue`）里的几处要保持一致，别只改其一：
 
 | 行为 | 实现 |
 |---|---|
-| 服务商 → 预置模型 | `presetModels`：OpenAI / DeepSeek / Kimi / 智谱 / 通义千问 / 硅基流动 / OpenRouter / Ollama 本地 / Claude / Gemini，用户从下拉选，避免手填错模型名 |
+| 服务商 → 预置模型 | `presetModels` 只列官方文档确认过的模型 ID；**DeepSeek 只有 `deepseek-chat` / `deepseek-reasoner`**，没有 flash / pro / turbo 分支，别凭印象加 |
 | Base URL 识别服务商 | `hostHints` 按域名匹配（`api.openai.com`、`deepseek.com` 等），粘贴地址后自动带出服务商 |
+| 模型下拉 | 用 `a-auto-complete` 的原生展开，**不要手动绑 `:open`**（焦点时序会让它打不开）；`filterModelOption()` 在当前值本身就是完整模型名时不过滤，保证还能挑别的 |
+| 未识别服务商 | `modelOptions` 兜底返回全部内置模型，不能给空列表 |
 | 模型排序 | `naturalCompare()`：`localeCompare(..., { numeric: true })`，保证 `gpt-4o` 排在 `gpt-4` 之后 |
-| 模型名校验提示 | `modelHint`：命中预置给推荐说明，未命中提示「可能不被支持」，但仍允许保存 |
+| 模型名校验提示 | `modelHint`：命中预置给数量说明，未命中提示可直接手填，仍允许保存 |
+| 编辑服务商 | `openEdit` 必须带回已保存的 Key（后端一直返回明文），配合「留空则沿用原 Key」；`openCreate` 不能残留上一条的 Key |
+
+当前预置清单（改厂商或模型先核对官方文档）：
+
+- OpenAI：`gpt-4.1-mini` `gpt-4.1` `gpt-4.1-nano` `gpt-4o-mini` `gpt-4o` `o4-mini` `o3` `o3-mini`
+- DeepSeek：`deepseek-chat` `deepseek-reasoner`
+- Kimi：`kimi-latest` `kimi-k2-0711-preview` `moonshot-v1-8k/32k/128k`
+- 智谱：`glm-4-flash` `glm-4-flashx` `glm-4-air` `glm-4-plus` `glm-4-long` `glm-4.5` `glm-4.5-air` `glm-z1-air`
+- 通义千问：`qwen-plus` `qwen-turbo` `qwen-max` `qwen-long` `qwen3-max` `qwen3-235b-a22b` `qwen3-coder-plus`
+- 硅基流动 / OpenRouter / Ollama / Claude / Gemini：见 `presetModels`，Claude 用 `claude-sonnet-4-5` 一代，Gemini 用 `gemini-2.5-*`
 
 报错统一在 Rust 侧转中文（`commands/ai.rs`），前端不得各自拼状态码文案：
 
@@ -197,23 +262,54 @@ Rust 侧 `ai_chat(payload, on_event: Channel<AiStreamEvent>)`，逐块 `on_event
 - `humanize_network_error(raw)`：DNS 解析失败 / 连接被拒 / 请求超时 / 证书校验失败，中文说明后附原始错误，方便排查自建网关
 - 新增厂商或遇到新报错模式，先补这两个函数，再考虑前端提示
 
+## 页面内 AI（AiAssist）
+
+除对话页外，8 个业务页面共用同一个右侧抽屉，做「只读分析、不改数据」：
+
+| 页面 | 入口 | 上下文构造器 |
+|---|---|---|
+| 工作台 `Dashboard.vue` | AI 洞察 | `dashboardInsightPrompt` |
+| 项目 `Project.vue` | AI 体检 | `projectAuditPrompt` |
+| 接口编辑器 `RequestEditor.vue` | AI 分析（解释响应 / 生成断言 / 生成后置脚本 / 优化定义） | `requestExplainPrompt` / `requestAssertionPrompt` / `requestPostScriptPrompt` / `requestOptimizePrompt` |
+| 环境 `Environment.vue` | AI 体检 | `envAuditPrompt` |
+| 压测 `StressTest.vue` | AI 生成计划 | `stressPlanPrompt` |
+| 批量运行 `Runner.vue` | AI 分析结果 | `runnerAnalyzePrompt` |
+| 请求历史 `History.vue` | AI 分析 | `historyDiagnosePrompt` |
+| 报告详情 `ReportDetail.vue` | AI 解读 | `reportReviewPrompt` |
+
+约定：
+
+- 入口统一是页头的 `RobotOutlined` 按钮 + `useAiAssistStore().show({ title, prompt, hint })`
+- `SYSTEM_PROMPT`（store 内）明确「页面内分析模式，不调工具、不输出任何标记」，所以这些分析**不会**触发写操作
+- 上下文统一走 `aiScenarios.ts`：`detailBlock()` 把 auth 的 token / password / clientSecret 打码，`resultBlock()` 截断响应，密钥变量不回显
+- 该模式是「只读建议」，暂不支持一键把生成的脚本写回表单；要做回写需在页面侧接 `aiAssist` 结果并显式让用户确认
+- 流式渲染与对话页同一套（`reactive` + 50ms 合帧），改一处时两处一起改
+
 ## 常见坑
 
 | 现象 | 原因与处理 |
 |---|---|
 | 列表接口回显明文 Key | 忘了走掩码函数；检查 `ai_provider_list` 的序列化 |
+| 编辑服务商时 Key 是空的 | `openEdit` 里写了 `apiKey: ''`；后端本来就返回明文，直接 `Object.assign(form, provider)` |
+| 模型下拉点开没有候选 | 手动绑了 `:open="modelOpen"`；改用 `a-auto-complete` 原生展开，并给未识别服务商时兜底全量列表 |
+| DeepSeek 出现 flash / pro 选项 | `presetModels` 被凭印象写错；DeepSeek 只有 `deepseek-chat` / `deepseek-reasoner` |
 | Claude 400 `max_tokens` | anthropic 协议必须显式传 `max_tokens` |
 | Gemini 返回空 | 端点少了 `?alt=sse`，或 role 没映射成 `model` |
-| 工具结果回灌后模型重复调用同一工具 | `autoDepth` 用完仍继续；提示词补「结果已拿到，直接总结」 |
+| 工具结果回灌后模型重复调用同一工具 | 两个原因都要查：①`ask(extra)` 没把结果写进 `messages`（模型看不到上轮结果）②提示词没写「结果已拿到，直接总结」；现在有 `callCache` + `repeats` 兜底 |
+| 轮次用尽但什么结果都没有 | 旧逻辑直接 `notifyTerminated()`；现在先 `forcedFinal` 要求「禁止调工具、立刻给结论」，再不行才终止 |
 | Claude 收到 system 报错 | system 必须提到顶层 `system` 字段，不能留在 messages 里 |
 | 老库启动报 `no such column: kind` | 新列必须写进 `db/mod.rs::migrate()` |
 | 工具卡片点运行后卡住 | `sending` 未复位，或 `aiExecute` 抛异常未被 try/catch 包住 |
-| 模型输出 `<| DSLM | calls>` 等 XML 乱码 | 模型漏出原生工具语法；`liftNativeCalls()` 会抽出 JSON 还原成 fbin-tool 块，流式阶段在 `<\|` 处截断，prompt 里已明令禁用 |
+| 模型输出 `<\| DSLM \| calls>` / `<｜DSML｜tool_calls>` / `<{tool_call}>` | 模型漏出原生工具语法；先 `normalizePseudoFence()` 还原伪围栏，再 `liftNativeCalls()` 抽 JSON，救不回则隐藏并自动纠正（最多 2 次），prompt 已明令禁用 |
+| 正文里出现空 fbin-tool 块 | `parseSegmentsRaw()` 要把空块丢弃，不能当代码块渲染 |
 | 用户只看到「无法回答」 | 模型一轮吐多个 tool_call，被硬规则 2 全部拒绝后反复重试；`rejections` 达到 2 直接终止并提示，此时可手动点工具卡片运行 |
+| 回答要等全部生成完才出现 | 累积消息用了普通对象，非响应式；必须 `reactive()` + 50ms 合帧 `paint()`（对话页与 `aiAssist` 两处） |
 | 进入小HI 页面卡顿 | 旧实现 `onMounted` 自动打开最近会话并整段渲染；现只预取服务商/会话列表，消息改为点击会话时加载，`parseSegments` 结果按内容缓存 |
-| 对话里满屏「执行过程 · 1 个工具调用」 | 自动执行的中间轮被标记 `hidden`，模板只渲染 `visibleMessages`；历史会话按 `isExecutionNote()` 同样过滤，只回放最终回答 |
+| 对话里满屏「执行过程 · 1 个工具调用」 | 自动执行的中间轮被标记 `hidden`，模板只渲染 `visibleMessages`；历史会话按 `isExecutionNote()` / `isControlMessage()` 同样过滤，只回放最终回答 |
 | 模型把请求数量说错 / 说「列表被截断」 | 列表类工具统一走 `summarizeList()`：`total` 在前、明细限 50 条，模型直接引用 total；prompt 的「数据准确性」禁止数条数 |
+| 模型直接新建了东西，没先给方案 | 提示词「写入操作必须先给方案」缺失，或工具没进 `WRITE_TOOLS`；两道都要有 |
 | 改了 AI 页面但桌面客户端没变化 | 安装版把前端打进二进制，只更新 `dist/` 无效；要 `npm run build` 后重新 `npm run build:win` / `build:mac`，开发期用 `npm run tauri dev` |
+| 改了 prompt 但行为没变 | prompt 是 `include_str!` 编译期嵌入，必须重启 `tauri dev` 或重新打包 |
 | 服务商报「模型不存在」但列表里有 | 多半是手填了带版本后缀的名字；让用户从 `presetModels` 下拉重选，再触发 `humanize_api_error` 的中文提示 |
 
 ## 校验
@@ -223,7 +319,13 @@ cargo check          # 在 src-tauri
 npm.cmd run build    # 根目录，vue-tsc + vite build
 ```
 
-两条都过再交付；改动 AI 功能后，手动回归：发一条纯聊天、发一条会触发工具的消息、打开 `/ai/logs` 翻页并点开详情、打开 `/ai/usage` 切换 7/30/90/365 天并翻页。
+两条都过再交付；改动 AI 功能后，手动回归：
+
+1. 纯聊天（如「解释一下 HTTP/2 多路复用」）——不应出现任何工具卡片
+2. 只要方案（「给我一份下单接口压测方案」）——直接给方案，不调用工具
+3. 指向本机接口的压测——先出计划文字 + 「是否确认」，确认后才出现 `plan_save` 确认框，取消则无写入
+4. 打开 `/ai/providers` 编辑已有服务商——Key 应已回填；切换不同服务商，模型下拉有对应候选
+5. 任意一次分析类问答——文字应逐字出现，不是结束后整段蹦出
 
 ## 样式与文案
 

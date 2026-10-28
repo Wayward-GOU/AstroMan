@@ -17,6 +17,9 @@ import {
   openapiExport,
   openapiImport,
   planList,
+  planGet,
+  planDelete,
+  planSave,
   projectCreate,
   projectDelete,
   projectExport,
@@ -45,8 +48,10 @@ import type {
   ReportDetail,
   RequestAuth,
   SendRequestPayload,
+  SlaTargets,
   StressConfig,
   StressReport,
+  StressStage,
 } from '@/types/models'
 
 /** 工具参数：模型输出的 JSON 对象 */
@@ -208,6 +213,25 @@ const SCHEMAS: Record<string, Record<string, ArgRule>> = {
     id: { kind: 'number', required: true },
   },
   plan_list: { projectId: { kind: 'number', required: true } },
+  plan_get: { id: { kind: 'number', required: true } },
+  plan_delete: { id: { kind: 'number', required: true } },
+  plan_save: {
+    projectId: { kind: 'number', required: true },
+    requestId: { kind: 'number' },
+    name: { kind: 'string', required: true },
+    mode: { kind: 'string', enum: ['fixed', 'stages'] },
+    concurrent: { kind: 'number', min: 1, max: 500 },
+    durationSec: { kind: 'number', min: 1, max: 3600 },
+    rampUpSec: { kind: 'number', min: 0, max: 3600 },
+    thinkTimeMs: { kind: 'number', min: 0, max: 600000 },
+    targetRps: { kind: 'number', min: 1, max: 100000 },
+    stages: { kind: 'any' },
+    slaP95: { kind: 'number', min: 1 },
+    slaP99: { kind: 'number', min: 1 },
+    slaErrorRate: { kind: 'number', min: 0 },
+    slaMinRps: { kind: 'number', min: 0 },
+    envId: { kind: 'number' },
+  },
   stress_start: {
     requestId: { kind: 'number' },
     url: { kind: 'string' },
@@ -223,6 +247,11 @@ const SCHEMAS: Record<string, Record<string, ArgRule>> = {
     rampUpSec: { kind: 'number', min: 0, max: 3600 },
     thinkTimeMs: { kind: 'number', min: 0, max: 600000 },
     targetRps: { kind: 'number', min: 1, max: 100000 },
+    stages: { kind: 'any' },
+    slaP95: { kind: 'number', min: 1 },
+    slaP99: { kind: 'number', min: 1 },
+    slaErrorRate: { kind: 'number', min: 0 },
+    slaMinRps: { kind: 'number', min: 0 },
   },
   stress_stop: {},
   run_batch: {
@@ -762,6 +791,30 @@ function optionalNum(value: unknown): number | undefined {
   if (value === null || value === undefined || value === '') return undefined
   const parsed = typeof value === 'number' ? value : Number(value)
   return Number.isFinite(parsed) ? parsed : undefined
+}
+
+/** 压测阶段：最多 20 段，并发 1-500，时长 1-3600 秒 */
+function toStages(value: unknown): StressStage[] {
+  if (!Array.isArray(value)) return []
+  return value.slice(0, 20).map((item) => {
+    const stage = (item ?? {}) as Record<string, unknown>
+    return {
+      concurrent: Math.min(500, Math.max(1, Math.round(optionalNum(stage.concurrent) ?? 1))),
+      durationSec: Math.min(3600, Math.max(1, Math.round(optionalNum(stage.durationSec) ?? 30))),
+    }
+  })
+}
+
+/** SLA 目标：一个都没给时返回 null，避免空对象被当成启用了 SLA */
+function slaOf(args: ToolArgs): SlaTargets | null {
+  const p95 = optionalNum(args.slaP95)
+  const p99 = optionalNum(args.slaP99)
+  const errorRate = optionalNum(args.slaErrorRate)
+  const minRps = optionalNum(args.slaMinRps)
+  if (p95 === undefined && p99 === undefined && errorRate === undefined && minRps === undefined) {
+    return null
+  }
+  return { p95Ms: p95 ?? null, p99Ms: p99 ?? null, errorRate: errorRate ?? null, minRps: minRps ?? null }
 }
 
 function needNum(value: unknown, name: string): number {
@@ -1419,9 +1472,86 @@ const SPECS: ToolSpec[] = [
     },
   },
   {
+    name: 'plan_get',
+    desc: '读取某个压测计划的完整配置（参数、阶段、SLA、关联请求）',
+    args: '{ id }',
+    handler: async (args) => {
+      const plan = await planGet(needNum(args.id, 'id'))
+      return {
+        计划名称: plan.name,
+        关联请求: plan.requestId ?? '未关联',
+        更新时间: fmtTime(plan.updatedAt),
+        配置: plan.config,
+      }
+    },
+  },
+  {
+    name: 'plan_delete',
+    desc: '删除压测计划（危险操作，需用户确认）',
+    args: '{ id }',
+    danger: true,
+    handler: async (args) => {
+      const id = needNum(args.id, 'id')
+      await planDelete(id)
+      return `压测计划 #${id} 已删除`
+    },
+  },
+  {
+    name: 'plan_save',
+    desc: '保存压测计划到项目（固定并发或梯度阶段，可带 SLA），保存后可在「压测」页直接载入执行',
+    args: '{ projectId, name, requestId?, mode?: fixed|stages, concurrent?, durationSec?, rampUpSec?, thinkTimeMs?, targetRps?, stages?: [{ concurrent, durationSec }], slaP95?, slaP99?, slaErrorRate?, slaMinRps?, envId? }',
+    handler: async (args) => {
+      const projectId = needNum(args.projectId, 'projectId')
+      const name = str(args.name).trim()
+      if (!name) throw new Error('参数 name 不能为空')
+      const requestId = args.requestId === null || args.requestId === undefined ? null : needNum(args.requestId, 'requestId')
+      const mode = args.mode === 'stages' ? 'stages' : 'fixed'
+      const stages = toStages(args.stages)
+      if (mode === 'stages' && !stages.length) throw new Error('梯度模式需要提供 stages 数组')
+
+      const concurrent = Math.min(500, Math.max(1, Math.round(optionalNum(args.concurrent) ?? 10)))
+      const durationSec = Math.min(3600, Math.max(1, Math.round(optionalNum(args.durationSec) ?? 30)))
+      const sla = slaOf(args)
+      const config = {
+        settings: {
+          mode,
+          concurrent,
+          durationSec,
+          rampUpSec: Math.max(0, Math.round(optionalNum(args.rampUpSec) ?? 0)),
+          thinkTimeMs: Math.max(0, Math.round(optionalNum(args.thinkTimeMs) ?? 0)),
+          timeoutMs: 30000,
+          connectTimeoutMs: 10000,
+          followRedirects: true,
+          stopOnErrorRate: false,
+          stopErrorRate: 5,
+          stopMinRequests: 100,
+          insecure: false,
+          targetRps: Math.max(0, Math.round(optionalNum(args.targetRps) ?? 0)),
+          slaEnabled: sla !== null,
+          slaP95: sla?.p95Ms ?? 500,
+          slaP99: sla?.p99Ms ?? 1000,
+          slaErrorRate: sla?.errorRate ?? 1,
+          slaMinRps: sla?.minRps ?? 0,
+        },
+        stages: mode === 'stages' ? stages : [],
+        envId: optionalNum(args.envId) ?? null,
+      }
+
+      const saved = await planSave({ projectId, requestId, name, config })
+      const summary =
+        mode === 'stages'
+          ? `${stages.length} 个阶段：${stages.map((item) => `${item.concurrent} 并发 × ${item.durationSec}s`).join(' → ')}`
+          : `${concurrent} 并发 × ${durationSec}s`
+      const slaText = sla
+        ? `，SLA：P95 ≤ ${sla.p95Ms ?? '-'}ms、P99 ≤ ${sla.p99Ms ?? '-'}ms、错误率 ≤ ${sla.errorRate ?? '-'}%`
+        : ''
+      return `压测计划「${saved.name}」已保存（${summary}${slaText}）。到「压测」页选择该项目和接口后，在计划下拉里载入即可执行`
+    },
+  },
+  {
     name: 'stress_start',
-    desc: '启动压测：按已保存请求（requestId）或直接给 URL；默认 10 并发 × 30 秒',
-    args: '{ requestId?, url?, method?, name?, headers?, params?, bodyType?, body?, envId?, concurrent?, durationSec?, rampUpSec?, thinkTimeMs?, targetRps? }',
+    desc: '启动压测：按已保存请求（requestId）或直接给 URL；默认 10 并发 × 30 秒，支持梯度阶段与 SLA',
+    args: '{ requestId?, url?, method?, name?, headers?, params?, bodyType?, body?, envId?, concurrent?, durationSec?, rampUpSec?, thinkTimeMs?, targetRps?, stages?, slaP95?, slaP99?, slaErrorRate?, slaMinRps? }',
     danger: true,
     handler: async (args) => {
       const requestId = optionalNum(args.requestId)
@@ -1456,10 +1586,16 @@ const SPECS: ToolSpec[] = [
         }
       }
 
-      const concurrent = Math.min(500, Math.max(1, Math.round(optionalNum(args.concurrent) ?? 10)))
-      const durationSec = Math.min(3600, Math.max(1, Math.round(optionalNum(args.durationSec) ?? 30)))
+      const stages = toStages(args.stages)
+      const concurrent = stages.length
+        ? Math.max(...stages.map((item) => item.concurrent))
+        : Math.min(500, Math.max(1, Math.round(optionalNum(args.concurrent) ?? 10)))
+      const durationSec = stages.length
+        ? stages.reduce((sum, item) => sum + item.durationSec, 0)
+        : Math.min(3600, Math.max(1, Math.round(optionalNum(args.durationSec) ?? 30)))
       const rampUpSec = Math.max(0, Math.round(optionalNum(args.rampUpSec) ?? 0))
       const thinkTimeMs = Math.max(0, Math.round(optionalNum(args.thinkTimeMs) ?? 0))
+      const sla = slaOf(args)
 
       await stressStart({
         ...base,
@@ -1473,13 +1609,16 @@ const SPECS: ToolSpec[] = [
         durationSec,
         rampUpSec,
         thinkTimeMs,
-        stages: [],
+        stages,
         targetRps: optionalNum(args.targetRps) ?? null,
-        sla: null,
+        sla,
       })
-      return `已启动压测：${base.name}（${base.method} ${base.url}）${concurrent} 并发 × ${durationSec}s${
+      const shape = stages.length
+        ? `${stages.length} 个阶段（峰值 ${concurrent} 并发，累计 ${durationSec}s）`
+        : `${concurrent} 并发 × ${durationSec}s`
+      return `已启动压测：${base.name}（${base.method} ${base.url}）${shape}${
         rampUpSec ? `，爬坡 ${rampUpSec}s` : ''
-      }；结束后可用 report_list 取最新报告，再用 report_get 查看详情`
+      }${sla ? '，已启用 SLA 校验' : ''}；结束后可用 report_list 取最新报告，再用 report_get 查看详情`
     },
   },
   {
@@ -1671,6 +1810,9 @@ export const TOOL_LABELS: Record<string, string> = {
   openapi_import: '导入 OpenAPI',
   openapi_export: '导出 OpenAPI',
   plan_list: '读取压测计划',
+  plan_get: '读取压测计划详情',
+  plan_delete: '删除压测计划',
+  plan_save: '保存压测计划',
   stress_start: '启动压测',
   stress_stop: '停止压测',
   workspace_stats: '工作台统计',
@@ -1680,6 +1822,44 @@ export const TOOL_LABELS: Record<string, string> = {
 /** 该工具是否会改动数据，需要用户点击确认 */
 export function isDangerousTool(tool: string): boolean {
   return TOOL_MAP.get(tool)?.danger === true
+}
+
+/**
+ * 会写入 / 触发执行的工具：新建、保存、启动这类操作即使没标 danger，
+ * 也必须先把「将要做什么」摆给用户确认，不能由模型直接落库或开跑。
+ */
+const WRITE_TOOLS = new Set([
+  'project_create',
+  'project_update',
+  'project_delete',
+  'collection_create',
+  'collection_rename',
+  'collection_delete',
+  'request_create',
+  'request_update',
+  'request_delete',
+  'request_script_save',
+  'curl_import',
+  'env_create',
+  'env_var_save',
+  'env_activate',
+  'plan_save',
+  'plan_delete',
+  'stress_start',
+  'stress_stop',
+  'run_batch',
+  'history_export',
+  'report_export',
+  'project_import',
+  'project_export',
+  'api_import',
+  'openapi_import',
+  'openapi_export',
+])
+
+/** 需要用户先确认再执行的工具，判断统一走这里 */
+export function isWriteTool(tool: string): boolean {
+  return isDangerousTool(tool) || WRITE_TOOLS.has(tool)
 }
 
 export function toolLabel(tool: string): string {

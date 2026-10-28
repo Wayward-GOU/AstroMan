@@ -14,10 +14,13 @@ import {
   FolderOpenOutlined,
   SaveOutlined,
   DeleteOutlined,
+  RobotOutlined,
 } from '@ant-design/icons-vue'
 import PageHeader from '@/components/PageHeader.vue'
 import LineChart from '@/components/LineChart.vue'
 import { useProjectStore } from '@/stores/project'
+import { useAiAssistStore } from '@/stores/aiAssist'
+import { stressPlanPrompt } from '@/utils/aiScenarios'
 import * as api from '@/api'
 import type {
   Environment,
@@ -68,8 +71,25 @@ const selectedChoice = computed(
 )
 
 const currentProject = computed(
-  () => projectStore.projects.find((item) => item.id === (targetProjectId.value ?? activeProjectId.value)) ?? null,
+  () =>
+    projectStore.projects.find(
+      (item) => item.id === (targetProjectId.value ?? activeProjectId.value),
+    ) ?? null,
 )
+
+const aiAssist = useAiAssistStore()
+
+function aiPlan() {
+  if (!request.value) {
+    message.warning('先选择一个接口再做计划')
+    return
+  }
+  void aiAssist.show({
+    title: '压测计划建议',
+    prompt: stressPlanPrompt(request.value, settings, stages.value),
+    hint: `${request.value.method} ${request.value.url} · 当前 ${settings.concurrent} 并发 × ${settings.durationSec}s`,
+  })
+}
 
 async function openConfig() {
   if (running.value) {
@@ -507,6 +527,10 @@ function backToRequest() {
       title="接口压测"
       subtitle="选择项目与接口、配置压测参数，在本地发起真实并发请求"
     >
+      <a-button :disabled="!request" @click="aiPlan">
+        <template #icon><RobotOutlined /></template>
+        AI 生成计划
+      </a-button>
       <a-button type="primary" :disabled="running" @click="openConfig">
         <template #icon><PlusOutlined /></template>
         新建压测

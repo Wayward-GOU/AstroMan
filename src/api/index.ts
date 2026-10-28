@@ -7,6 +7,7 @@ import type {
   AiStreamEvent,
   AiToolLogPage,
   AiToolLogStats,
+  AiUsagePage,
   AiUsageStats,
   AppSettings,
   CleanupResult,
@@ -359,6 +360,10 @@ export const aiToolLogClear = (sessionId?: number | null, days?: number | null) 
 
 // 模型用量统计
 export const aiUsageStats = (days = 30) => invoke<AiUsageStats>('ai_usage_stats', { days })
+
+// 用量明细：每次模型调用一条，分页返回，ok 为空表示不筛状态
+export const aiUsageLogs = (days = 30, page = 1, pageSize = 10, ok: boolean | null = null) =>
+  invoke<AiUsagePage>('ai_usage_logs', { days, page, pageSize, ok })
 
 export const aiUsageClear = (all = false) => invoke<number>('ai_usage_clear', { all })
 

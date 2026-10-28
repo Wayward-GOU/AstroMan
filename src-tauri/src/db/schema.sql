@@ -273,6 +273,7 @@ CREATE TABLE IF NOT EXISTS ai_usage_logs (
     ok                INTEGER NOT NULL DEFAULT 1,
     latency_ms        INTEGER NOT NULL DEFAULT 0,
     error             TEXT,
+    request_preview   TEXT,
     created_at        INTEGER NOT NULL
 );
 

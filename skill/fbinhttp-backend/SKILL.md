@@ -13,7 +13,7 @@ description: FbinHttp 的 Rust/Tauri 后端开发规范。改数据库 schema、
 | `commands/collection.rs` | 集合树（支持无限嵌套、拖拽排序 `collection_reorder`） |
 | `commands/request.rs` | 接口 CRUD、搜索、排序 |
 | `commands/environment.rs` | 环境与变量、环境级脚本 |
-| `commands/http.rs` | 发送请求：变量渲染、认证、Cookie、body、历史入库与裁剪 |
+| `commands/http.rs` | 发送请求：变量渲染、认证、Cookie、body（JSON 注释剥离）、历史入库与裁剪 |
 | `commands/oauth.rs` | OAuth2 Client Credentials 取 token |
 | `commands/cookie.rs` | Cookie 存储 |
 | `commands/stress.rs` | 压测引擎（并发/阶梯/RPS 限速/SLA） |
@@ -31,7 +31,7 @@ description: FbinHttp 的 Rust/Tauri 后端开发规范。改数据库 schema、
 | `commands/ai.rs` | AI 助手「小HI」：服务商、流式对话、会话消息、工具流水（详见 `fbinhttp-ai`） |
 | `state.rs` | AppState、连接池、reqwest 客户端（普通/忽略证书） |
 | `models.rs` | 全部前后端数据模型 |
-| `util.rs` | `err`、`now_ms`、`render` 等工具 |
+| `util.rs` | `err`、`now_ms`、`render`、`strip_json_comments` 等工具 |
 | `netinfo.rs` | 本机 IP/网卡信息 |
 
 ## 错误处理
@@ -40,6 +40,19 @@ description: FbinHttp 的 Rust/Tauri 后端开发规范。改数据库 schema、
 - IO/DB/序列化错误：`.map_err(err)?`（`util::err` 会带上原始错误信息）
 - 业务校验：直接 `Err("...".to_string())` 或 `format!`
 - 文案中文、面向用户，说明「怎么改」而不只是「失败了」
+
+## 请求体处理（JSON 注释）
+
+请求 Body 允许像 Postman 一样写 `//` 行注释与 `/* */` 块注释，剥离发生在 Rust 侧，前端只负责编辑体验。
+
+- `util::strip_json_comments(input)`：按字符扫描，跟踪字符串与 `\` 转义，字符串里的 `https://a.com/x`、`"a//b"` 不会被误删；支持未闭合的块注释（吃到文本末尾）
+- **顺序固定：先剥注释，再 `render()` 渲染 `{{变量}}`**。反过来的话，被注释掉的行里的变量也会被替换，且注释内容进入渲染结果
+- 只在 `body_type == "json"` 时处理；`raw` / `form` / `multipart` / `binary` / `graphql` 原样发送（GraphQL 的 body 由前端 `JSON.stringify` 生成，本身不含注释）
+- 两个入口都要处理，漏一个就会出现"调试能发、压测报参数解析异常"：
+  - `commands/http.rs::execute`（手动发送与 AI `send_request` 共用）
+  - `commands/stress.rs::send_once`（压测）
+- `sent_body` 必须用剥离后的内容：`request_runs.body`、压测报告的请求明细、运行历史里展示的都应是**实际发出的字节**
+- 前端不要提前删注释，否则用户切回编辑器时原文丢失；编辑器里的注释由 `CodeArea` 的 `Ctrl / ⌘ + /` 维护
 
 ## 数据库
 
@@ -76,6 +89,7 @@ description: FbinHttp 的 Rust/Tauri 后端开发规范。改数据库 schema、
 - 进度推送：`app.emit("stress:progress", &progress)`，结构体 `StressProgress` 需实现 `Clone + Serialize`
 - 结束后写 `test_reports` / `report_samples` / `report_requests`，分位、状态码分布、错误类型、直方图以 JSON 列存储
 - 压测请求自身也会写历史，注意不要绕过 `MAX_HISTORY` 裁剪
+- 请求体与手动发送走同一套规则：`body_type == "json"` 时先 `strip_json_comments` 再渲染变量，保证「请求编辑器能发、压测也能发」
 
 ## 统计聚合
 

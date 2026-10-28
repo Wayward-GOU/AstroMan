@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
 import { open } from '@tauri-apps/plugin-dialog'
 import {
@@ -24,6 +25,8 @@ import { themes, currentThemeId, setTheme } from '@/stores/theme'
 import { isMac, openDirLabel, platformLabel, shortcutText } from '@/utils/platform'
 import { checkForUpdates, isAutoUpdateEnabled, setAutoUpdateEnabled } from '@/utils/updater'
 import type { AppInfo, AppSettings, StorageInfo, UpdateInfo } from '@/types/models'
+
+const router = useRouter()
 
 const info = ref<AppInfo | null>(null)
 const storage = ref<StorageInfo | null>(null)
@@ -511,16 +514,24 @@ async function openReleasePage() {
         <div class="block-head">
           <span class="block-icon purple"><ThunderboltOutlined /></span>
           <div>
-            <div class="block-title">AI 辅助</div>
-            <div class="block-desc">用自然语言生成请求与脚本</div>
+            <div class="block-title">AI 辅助（小HI）</div>
+            <div class="block-desc">用一句话描述需求，直接操作项目、请求与压测</div>
           </div>
-          <span class="soon">即将开放</span>
+          <span class="soon live">已上线</span>
         </div>
         <div class="ai-hint">
-          下一阶段将支持配置你自己的 OpenAI 兼容服务（Base URL / 模型 / API Key），
-          用一句话描述接口即可生成请求、参数与断言脚本。API Key 只会保存在本机系统钥匙串，不会上传。
+          点右侧屏幕中间的机器人即可打开小HI。先在顶部「模型服务」里配置一家服务商（DeepSeek / Kimi / 智谱 / 通义千问 / Claude / Gemini /
+          Ollama 等，兼容 OpenAI 协议的服务都能接），之后能建项目、写请求、发请求、生成签名脚本、查压测报告与导出记录。
+          敏感操作会先弹确认；密钥仅加密保存在本机数据库，不会上传到任何服务器。
         </div>
-        <a-button disabled>配置 AI</a-button>
+        <ul class="list">
+          <li>共 39 个工具，覆盖项目、请求、环境变量、历史记录、压测报告与脚本。</li>
+          <li>用量统计可按天查看调用次数、token 与预估费用，按模型和工具拆分明细。</li>
+        </ul>
+        <div class="ai-actions">
+          <a-button type="primary" @click="router.push({ name: 'ai' })">打开小HI</a-button>
+          <a-button @click="router.push({ name: 'ai-usage' })">用量统计</a-button>
+        </div>
       </div>
 
       <div class="fm-card block">
@@ -740,6 +751,18 @@ async function openReleasePage() {
   border: 1px solid var(--fm-border);
   padding: 1px 8px;
   border-radius: 999px;
+}
+
+.soon.live {
+  color: var(--fm-success);
+  background: var(--fm-success-soft);
+  border-color: transparent;
+}
+
+.ai-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 14px;
 }
 
 .rows {

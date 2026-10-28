@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use crate::commands::cookie;
 use crate::models::{FormField, HttpResult, SendRequestPayload};
 use crate::state::AppState;
-use crate::util::{err, now_ms, render};
+use crate::util::{err, now_ms, render, strip_json_comments};
 use rusqlite::{params, Connection};
 use tauri::State;
 
@@ -206,7 +206,14 @@ pub(crate) async fn execute(
                     applied_headers.push(("Content-Type".to_string(), content_type.to_string()));
                     builder = builder.header(reqwest::header::CONTENT_TYPE, content_type);
                 }
-                sent_body = render(payload.body.as_deref().unwrap_or(""), &vars);
+                let raw_body = payload.body.as_deref().unwrap_or("");
+                // JSON 允许写注释（Postman 的 raw/JSON 编辑器同样如此），发送前去掉，避免服务端解析失败
+                let source = if body_type == "json" {
+                    strip_json_comments(raw_body)
+                } else {
+                    raw_body.to_string()
+                };
+                sent_body = render(&source, &vars);
                 builder = builder.body(sent_body.clone());
             }
         }

@@ -390,7 +390,31 @@ export interface AiUsageStat {
 export interface AiUsageDay {
   day: string
   calls: number
+  promptTokens: number
+  completionTokens: number
   totalTokens: number
+}
+
+/** 单次模型调用记录 */
+export interface AiUsageLog {
+  id: number
+  providerName: string
+  model: string
+  promptTokens: number
+  completionTokens: number
+  totalTokens: number
+  ok: boolean
+  latencyMs: number
+  error: string
+  /** 这轮实际发给模型的内容（本轮提问；工具续跑时附带首问） */
+  requestPreview: string
+  createdAt: number
+}
+
+/** 用量明细分页 */
+export interface AiUsagePage {
+  items: AiUsageLog[]
+  total: number
 }
 
 export interface AiUsageStats {
@@ -581,6 +605,10 @@ export interface ReportConfigSnapshot {
   bodyType?: string
   envId?: number | null
   timeoutMs?: number
+  connectTimeoutMs?: number
+  followRedirects?: boolean
+  stopErrorRate?: number | null
+  stopMinRequests?: number | null
   thinkTimeMs?: number
   rampUpSec?: number
   targetRps?: number

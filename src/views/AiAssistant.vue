@@ -30,12 +30,13 @@ import {
   aiSessionList,
   aiSessionRename,
   aiUsageClear,
+  aiUsageLogs,
   aiUsageStats,
   fileReadText,
 } from '@/api'
 import { isDangerousTool, TOOL_CATALOG, executeTool, toolLabel, type ToolResult } from '@/utils/aiTools'
 import { renderMarkdown } from '@/utils/markdown'
-import type { AiMessage, AiProvider, AiSession, AiUsageStats } from '@/types/models'
+import type { AiMessage, AiProvider, AiSession, AiUsageLog, AiUsageStats } from '@/types/models'
 
 const router = useRouter()
 
@@ -75,6 +76,90 @@ const presets = [
   { label: 'Gemini', kind: 'gemini', baseUrl: 'https://generativelanguage.googleapis.com', model: 'gemini-2.0-flash' },
 ]
 
+/** 各服务商常用模型：下拉直接选，也可以手动输入未列出的模型名 */
+const presetModels: Record<string, string[]> = {
+  OpenAI: ['gpt-4o-mini', 'gpt-4o', 'gpt-4.1-mini', 'gpt-4.1', 'o3-mini', 'o3', 'o4-mini'],
+  DeepSeek: ['deepseek-chat', 'deepseek-reasoner'],
+  Kimi: ['moonshot-v1-8k', 'moonshot-v1-32k', 'moonshot-v1-128k', 'kimi-latest'],
+  智谱: ['glm-4-flash', 'glm-4-air', 'glm-4-plus', 'glm-4-long'],
+  通义千问: ['qwen-turbo', 'qwen-plus', 'qwen-max', 'qwen-long'],
+  硅基流动: [
+    'Qwen/Qwen2.5-7B-Instruct',
+    'Qwen/Qwen2.5-72B-Instruct',
+    'deepseek-ai/DeepSeek-V3',
+    'deepseek-ai/DeepSeek-R1',
+  ],
+  OpenRouter: [
+    'openai/gpt-4o-mini',
+    'anthropic/claude-3.5-sonnet',
+    'google/gemini-2.0-flash-001',
+    'deepseek/deepseek-chat',
+  ],
+  'Ollama 本地': ['qwen2.5:7b', 'qwen2.5:14b', 'llama3.1:8b', 'deepseek-r1:7b', 'gemma2:9b'],
+  Claude: [
+    'claude-3-5-haiku-latest',
+    'claude-3-5-sonnet-latest',
+    'claude-3-7-sonnet-latest',
+    'claude-sonnet-4-5',
+    'claude-opus-4-1',
+  ],
+  Gemini: [
+    'gemini-1.5-flash',
+    'gemini-1.5-pro',
+    'gemini-2.0-flash',
+    'gemini-2.5-flash',
+    'gemini-2.5-pro',
+  ],
+}
+
+/** Base URL 主机名 → 服务商，用于手动改地址后仍能给出模型候选 */
+const hostHints: [string, string][] = [
+  ['api.openai.com', 'OpenAI'],
+  ['deepseek.com', 'DeepSeek'],
+  ['moonshot.cn', 'Kimi'],
+  ['bigmodel.cn', '智谱'],
+  ['dashscope.aliyuncs.com', '通义千问'],
+  ['siliconflow.cn', '硅基流动'],
+  ['openrouter.ai', 'OpenRouter'],
+  ['11434', 'Ollama 本地'],
+  ['anthropic.com', 'Claude'],
+  ['generativelanguage.googleapis.com', 'Gemini'],
+]
+
+/** 模型下拉是否展开：聚焦即展示全部候选，方便直接选 */
+const modelOpen = ref(false)
+
+const matchedPreset = computed(() => {
+  const url = form.baseUrl.trim().toLowerCase()
+  if (!url) return null
+  const hint = hostHints.find(([host]) => url.includes(host))
+  if (hint) return presets.find((item) => item.label === hint[1]) ?? null
+  return presets.find((item) => item.baseUrl.toLowerCase() === url) ?? null
+})
+
+/** 版本号按数值比较：gemini-2.5 排在 gemini-2.10 前面，而不是按字符顺序 */
+function naturalCompare(left: string, right: string): number {
+  return left.localeCompare(right, 'en', { numeric: true, sensitivity: 'base' })
+}
+
+const modelOptions = computed(() => {
+  const label = matchedPreset.value?.label
+  const list = label ? presetModels[label] ?? [] : []
+  return [...list].sort(naturalCompare).map((value) => ({ value }))
+})
+
+const modelHint = computed(() => {
+  const preset = matchedPreset.value
+  if (!preset) return '未识别服务商，可直接输入服务商文档里的模型名'
+  const count = modelOptions.value.length
+  return `已列出 ${preset.label} 的 ${count} 个常用模型，也可直接输入其他模型名`
+})
+
+function filterModelOption(input: string, option: { value?: string | number }): boolean {
+  if (!input) return true
+  return String(option.value ?? '').toLowerCase().includes(input.toLowerCase())
+}
+
 function applyPreset(label: string) {
   const preset = presets.find((item) => item.label === label)
   if (!preset) return
@@ -86,12 +171,14 @@ function applyPreset(label: string) {
 
 function openCreate() {
   Object.assign(form, blank())
+  modelOpen.value = false
   if (providers.value.length === 0) form.isDefault = true
   modalOpen.value = true
 }
 
 function openEdit(provider: AiProvider) {
   Object.assign(form, { ...provider, apiKey: '' })
+  modelOpen.value = false
   modalOpen.value = true
 }
 
@@ -170,6 +257,8 @@ const providerOptions = computed(() =>
 const sessions = ref<AiSession[]>([])
 const sessionId = ref<number | null>(null)
 const messages = ref<ChatItem[]>([])
+/** 只渲染最终回答：中间那段「先查项目 → 再查请求」的执行过程全部隐藏 */
+const visibleMessages = computed(() => messages.value.filter((item) => !item.hidden))
 const input = ref('')
 const sending = ref(false)
 const autoRun = ref(true)
@@ -192,6 +281,8 @@ interface ChatItem {
   reasoning?: string
   streaming?: boolean
   failed?: boolean
+  /** 纯执行过程（调工具前的「我先获取…」）不展示，只留最终回答 */
+  hidden?: boolean
   createdAt: number
 }
 
@@ -548,6 +639,16 @@ async function ask(extra: AiMessage[] = []) {
   await afterReply(item)
 }
 
+/**
+ * 历史消息里只含一个工具块 + 少量过程说明（如「我先获取项目列表」）的，视为执行过程。
+ * 最终回答通常不含 fbin-tool 块，因此重开会话时也能保持「只看结果」。
+ */
+function isExecutionNote(content: string): boolean {
+  if (!content.includes('```fbin-tool')) return false
+  const rest = content.replace(/```fbin-tool[\s\S]*?```/g, '').trim()
+  return rest.length < 200
+}
+
 function registerRuns(item: ChatItem) {
   const found: { seg: Segment; index: number }[] = []
   parseSegments(item.content).forEach((seg, index) => {
@@ -615,6 +716,8 @@ async function afterReply(item: ChatItem) {
     return
   }
 
+  // 自动执行的这一轮只是过程说明，隐藏掉，只保留最终汇总
+  item.hidden = true
   const result = await execTool(item, index, seg)
   await ask([
     {
@@ -805,6 +908,8 @@ async function selectSession(id: number) {
         role: item.role === 'user' ? ('user' as const) : ('assistant' as const),
         content: item.content,
         reasoning: item.reasoning ?? undefined,
+        // 历史里的「调工具前的过程说明」同样隐藏，只回放最终回答
+        hidden: isExecutionNote(item.content),
         createdAt: item.createdAt,
       }))
   } catch (error) {
@@ -892,11 +997,23 @@ const usageOpen = ref(false)
 const usageLoading = ref(false)
 const usageDays = ref(30)
 const usage = ref<AiUsageStats | null>(null)
+/** 调用明细：调一次记一条，分页查看 */
+const usageTab = ref<'logs' | 'models'>('logs')
+const usagePage = ref(1)
+const usagePageSize = ref(20)
+const usageTotal = ref(0)
+const usageLogs = ref<AiUsageLog[]>([])
 
 async function loadUsage() {
   usageLoading.value = true
   try {
-    usage.value = await aiUsageStats(usageDays.value)
+    const [stats, page] = await Promise.all([
+      aiUsageStats(usageDays.value),
+      aiUsageLogs(usageDays.value, usagePage.value, usagePageSize.value),
+    ])
+    usage.value = stats
+    usageLogs.value = page.items
+    usageTotal.value = page.total
   } catch (error) {
     notify.error(`读取用量统计失败：${String(error)}`)
   } finally {
@@ -905,12 +1022,32 @@ async function loadUsage() {
 }
 
 function openUsage() {
-  usageOpen.value = true
-  void loadUsage()
+  // 用量统计已独立成页（/ai/usage），工具栏直接跳转，弹窗不再启用
+  void router.push({ name: 'ai-usage' })
 }
 
 watch(usageDays, () => {
+  if (!usageOpen.value) return
+  usagePage.value = 1
+  void loadUsage()
+})
+
+watch([usagePage, usagePageSize], () => {
   if (usageOpen.value) void loadUsage()
+})
+
+/** 每日趋势：柱高按 token 占比，悬停看当天调用次数 */
+const usageSeries = computed(() => {
+  const days = usage.value?.daily ?? []
+  const max = Math.max(...days.map((item) => item.totalTokens), 1)
+  const step = Math.max(1, Math.ceil(days.length / 10))
+  return days.map((item, index) => ({
+    day: item.day,
+    calls: item.calls,
+    height: item.totalTokens ? Math.max(4, Math.round((item.totalTokens / max) * 100)) : 0,
+    showLabel: index % step === 0 || index === days.length - 1,
+    title: `${item.day} · ${item.calls} 次 · ${item.totalTokens.toLocaleString()} token`,
+  }))
 })
 
 function pct(value: number): string {
@@ -921,12 +1058,26 @@ function fmtNum(value: number): string {
   return value >= 10000 ? `${(value / 1000).toFixed(1)}k` : String(value)
 }
 
+/** 统一使用完整的 YYYY-MM-DD HH:MM:SS，便于对账 */
 function fmtDate(ms: number): string {
   if (!ms) return '—'
   const date = new Date(ms)
   const pad = (value: number) => String(value).padStart(2, '0')
-  return `${date.getMonth() + 1}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+  const ymd = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+  return `${ymd} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
 }
+
+/** 每次模型调用的明细列 */
+const usageLogColumns = [
+  { title: '时间', dataIndex: 'createdAt', key: 'createdAt', width: 168 },
+  { title: '服务商', dataIndex: 'providerName', key: 'provider', width: 130, ellipsis: true },
+  { title: '模型', dataIndex: 'model', key: 'model', width: 180, ellipsis: true },
+  { title: '输入 token', key: 'prompt', width: 100, align: 'right' as const },
+  { title: '输出 token', key: 'completion', width: 100, align: 'right' as const },
+  { title: '合计', key: 'total', width: 90, align: 'right' as const },
+  { title: '耗时', key: 'latency', width: 88, align: 'right' as const },
+  { title: '结果', key: 'ok', width: 200, ellipsis: true },
+]
 
 const usageColumns = [
   { title: '服务商', dataIndex: 'providerName', key: 'provider', width: 130, ellipsis: true },
@@ -938,7 +1089,7 @@ const usageColumns = [
   { title: '输出 token', key: 'completion', width: 104, align: 'right' as const },
   { title: '合计', key: 'total', width: 92, align: 'right' as const },
   { title: '平均耗时', key: 'latency', width: 96, align: 'right' as const },
-  { title: '最近使用', key: 'last', width: 110, align: 'right' as const },
+  { title: '最近使用', key: 'last', width: 168, align: 'right' as const },
 ]
 
 async function clearUsage() {
@@ -1151,7 +1302,7 @@ onMounted(async () => {
               </div>
             </div>
 
-            <div v-for="item in messages" :key="item.id" class="bubble" :class="item.role">
+            <div v-for="item in visibleMessages" :key="item.id" class="bubble" :class="item.role">
               <div v-if="item.role === 'assistant'" class="bubble-avatar">HI</div>
               <div class="bubble-main">
                 <div class="bubble-meta">
@@ -1320,38 +1471,108 @@ onMounted(async () => {
         输入 / 输出 token 优先取厂商返回的 usage，未返回时按字符数估算（中文约 1 字 1 token）。
       </p>
 
-      <a-table
-        :data-source="usage?.items ?? []"
-        :columns="usageColumns"
-        row-key="providerId"
-        size="small"
-        :loading="usageLoading"
-        :pagination="false"
-        :scroll="{ x: 1000 }"
-        :locale="{ emptyText: '所选时间范围内还没有调用记录' }"
-      >
-        <template #bodyCell="{ column, record }">
-          <template v-if="column.key === 'rate'">
-            <span :class="record.successRate >= 0.9 ? 'ok-text' : 'warn-text'">
-              {{ pct(record.successRate) }}
-            </span>
-            <span class="sub-text"> ({{ record.okCalls }}/{{ record.calls }})</span>
-          </template>
-          <template v-else-if="column.key === 'toolRate'">
-            <span v-if="record.toolCalls">{{ pct(record.toolSuccessRate) }}</span>
-            <span v-else class="sub-text">—</span>
-          </template>
-          <template v-else-if="column.key === 'prompt'">{{ record.promptTokens.toLocaleString() }}</template>
-          <template v-else-if="column.key === 'completion'">
-            {{ record.completionTokens.toLocaleString() }}
-          </template>
-          <template v-else-if="column.key === 'total'">
-            <strong>{{ record.totalTokens.toLocaleString() }}</strong>
-          </template>
-          <template v-else-if="column.key === 'latency'">{{ record.avgLatencyMs }} ms</template>
-          <template v-else-if="column.key === 'last'">{{ fmtDate(record.lastUsedAt) }}</template>
-        </template>
-      </a-table>
+      <div class="usage-chart">
+        <div class="usage-chart-head">
+          <span>每日 token 消耗</span>
+          <span class="sub-text">共 {{ usageSeries.length }} 天 · 悬停查看当天调用次数</span>
+        </div>
+        <div class="usage-chart-body">
+          <div
+            v-for="point in usageSeries"
+            :key="point.day"
+            class="usage-chart-col"
+            :title="point.title"
+          >
+            <div class="usage-chart-bar" :style="{ height: `${point.height}%` }"></div>
+            <span class="usage-chart-tick">{{ point.showLabel ? point.day.slice(5) : '' }}</span>
+          </div>
+          <span v-if="!usageSeries.length" class="usage-chart-empty">暂无数据</span>
+        </div>
+      </div>
+
+      <a-tabs v-model:activeKey="usageTab" size="small">
+        <a-tab-pane key="logs" :tab="`调用记录（${usageTotal}）`">
+          <a-table
+            :data-source="usageLogs"
+            :columns="usageLogColumns"
+            row-key="id"
+            size="small"
+            :loading="usageLoading"
+            :pagination="false"
+            :scroll="{ x: 1000 }"
+            :locale="{ emptyText: '所选时间范围内还没有调用记录' }"
+          >
+            <template #bodyCell="{ column, record }">
+              <template v-if="column.key === 'createdAt'">{{ fmtDate(record.createdAt) }}</template>
+              <template v-else-if="column.key === 'prompt'">
+                {{ record.promptTokens.toLocaleString() }}
+              </template>
+              <template v-else-if="column.key === 'completion'">
+                {{ record.completionTokens.toLocaleString() }}
+              </template>
+              <template v-else-if="column.key === 'total'">
+                <strong>{{ record.totalTokens.toLocaleString() }}</strong>
+              </template>
+              <template v-else-if="column.key === 'latency'">{{ record.latencyMs }} ms</template>
+              <template v-else-if="column.key === 'ok'">
+                <span :class="record.ok ? 'ok-text' : 'warn-text'">
+                  {{ record.ok ? '成功' : '失败' }}
+                </span>
+                <span v-if="record.error" class="sub-text"> {{ record.error }}</span>
+              </template>
+            </template>
+          </a-table>
+          <div class="usage-pager">
+            <span class="sub-text">共 {{ usageTotal }} 条，每条代表一次模型调用</span>
+            <a-pagination
+              v-model:current="usagePage"
+              v-model:page-size="usagePageSize"
+              size="small"
+              :total="usageTotal"
+              :page-size-options="['20', '50', '100']"
+              show-size-changer
+              show-less-items
+            />
+          </div>
+        </a-tab-pane>
+
+        <a-tab-pane key="models" tab="模型汇总">
+          <a-table
+            :data-source="usage?.items ?? []"
+            :columns="usageColumns"
+            row-key="providerId"
+            size="small"
+            :loading="usageLoading"
+            :pagination="false"
+            :scroll="{ x: 1100 }"
+            :locale="{ emptyText: '所选时间范围内还没有调用记录' }"
+          >
+            <template #bodyCell="{ column, record }">
+              <template v-if="column.key === 'rate'">
+                <span :class="record.successRate >= 0.9 ? 'ok-text' : 'warn-text'">
+                  {{ pct(record.successRate) }}
+                </span>
+                <span class="sub-text"> ({{ record.okCalls }}/{{ record.calls }})</span>
+              </template>
+              <template v-else-if="column.key === 'toolRate'">
+                <span v-if="record.toolCalls">{{ pct(record.toolSuccessRate) }}</span>
+                <span v-else class="sub-text">—</span>
+              </template>
+              <template v-else-if="column.key === 'prompt'">
+                {{ record.promptTokens.toLocaleString() }}
+              </template>
+              <template v-else-if="column.key === 'completion'">
+                {{ record.completionTokens.toLocaleString() }}
+              </template>
+              <template v-else-if="column.key === 'total'">
+                <strong>{{ record.totalTokens.toLocaleString() }}</strong>
+              </template>
+              <template v-else-if="column.key === 'latency'">{{ record.avgLatencyMs }} ms</template>
+              <template v-else-if="column.key === 'last'">{{ fmtDate(record.lastUsedAt) }}</template>
+            </template>
+          </a-table>
+        </a-tab-pane>
+      </a-tabs>
     </a-modal>
 
     <!-- 模型服务配置 -->
@@ -1409,15 +1630,23 @@ onMounted(async () => {
       :confirm-loading="saving"
       ok-text="保存"
       cancel-text="取消"
-      width="560px"
+      width="620px"
+      wrap-class-name="provider-modal"
       @ok="saveProvider"
     >
       <a-form layout="vertical" class="provider-form">
         <a-form-item label="快速填充">
-          <a-space wrap>
-            <a-tag v-for="preset in presets" :key="preset.label" class="preset" @click="applyPreset(preset.label)">
+          <a-space wrap :size="[6, 6]">
+            <button
+              v-for="preset in presets"
+              :key="preset.label"
+              type="button"
+              class="preset"
+              :class="{ active: form.baseUrl === preset.baseUrl }"
+              @click="applyPreset(preset.label)"
+            >
               {{ preset.label }}
-            </a-tag>
+            </button>
           </a-space>
         </a-form-item>
         <a-form-item label="名称" required>
@@ -1434,16 +1663,44 @@ onMounted(async () => {
           <a-input v-model:value="form.baseUrl" placeholder="https://api.deepseek.com" />
         </a-form-item>
         <a-form-item label="模型" required>
-          <a-input v-model:value="form.model" placeholder="deepseek-chat" />
+          <a-auto-complete
+            v-model:value="form.model"
+            :options="modelOptions"
+            :open="modelOpen"
+            :filter-option="filterModelOption"
+            placeholder="从列表选择，或直接输入模型名"
+            @focus="modelOpen = true"
+            @blur="modelOpen = false"
+            @select="modelOpen = false"
+          >
+            <template #notFoundContent>
+              <span class="dialog-hint">列表里没有匹配项，可直接输入模型名</span>
+            </template>
+          </a-auto-complete>
+          <template #extra>
+            <span class="dialog-hint">{{ modelHint }}</span>
+          </template>
         </a-form-item>
         <a-form-item :label="isEdit ? 'API Key（留空表示不修改）' : 'API Key'">
           <a-input-password v-model:value="form.apiKey" placeholder="sk-..." />
         </a-form-item>
-        <a-form-item label="Temperature">
-          <a-slider v-model:value="form.temperature" :min="0" :max="2" :step="0.1" />
-        </a-form-item>
         <a-form-item>
+          <template #label>
+            <span class="label-row">
+              <span>Temperature</span>
+              <span class="temp-value">{{ Number(form.temperature ?? 0.3).toFixed(1) }}</span>
+            </span>
+          </template>
+          <a-slider v-model:value="form.temperature" :min="0" :max="2" :step="0.1" />
+          <div class="temp-axis">
+            <span>精确</span>
+            <span>平衡</span>
+            <span>发散</span>
+          </div>
+        </a-form-item>
+        <a-form-item class="default-item">
           <a-checkbox v-model:checked="form.isDefault">设为默认服务</a-checkbox>
+          <span class="default-desc">进入小HI 时自动使用该服务，也可在顶部随时切换</span>
         </a-form-item>
       </a-form>
     </a-modal>
@@ -2280,8 +2537,12 @@ onMounted(async () => {
 
 .service-tip {
   margin: 0;
-  font-size: 12px;
-  line-height: 1.75;
+  padding: 9px 11px;
+  border: 1px solid var(--fm-border);
+  border-radius: 8px;
+  background: var(--fm-surface-alt);
+  font-size: 11.5px;
+  line-height: 1.7;
   color: var(--fm-muted);
 }
 
@@ -2337,6 +2598,81 @@ onMounted(async () => {
   color: var(--fm-muted);
 }
 
+.usage-chart {
+  margin-bottom: 12px;
+  padding: 10px 12px 6px;
+  border: 1px solid var(--fm-border);
+  border-radius: 8px;
+  background: var(--fm-surface-alt);
+}
+
+.usage-chart-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--fm-text);
+  margin-bottom: 8px;
+}
+
+.usage-chart-body {
+  position: relative;
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 120px;
+}
+
+.usage-chart-col {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  height: 100%;
+  min-width: 2px;
+}
+
+.usage-chart-bar {
+  width: 100%;
+  max-width: 22px;
+  border-radius: 3px 3px 0 0;
+  background: linear-gradient(180deg, #60a5fa, #2563eb);
+  transition: opacity 0.15s ease;
+}
+
+.usage-chart-col:hover .usage-chart-bar {
+  opacity: 0.75;
+}
+
+.usage-chart-tick {
+  height: 14px;
+  margin-top: 4px;
+  font-size: 10px;
+  color: var(--fm-muted);
+  white-space: nowrap;
+}
+
+.usage-chart-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  color: var(--fm-muted);
+}
+
+.usage-pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-top: 10px;
+  flex-wrap: wrap;
+}
+
 .ok-text {
   color: #16a34a;
 }
@@ -2360,31 +2696,61 @@ onMounted(async () => {
 }
 
 .provider-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 11px 12px 11px 14px;
   border: 1px solid var(--fm-border);
-  border-radius: 8px;
-  padding: 8px 10px;
+  border-radius: 10px;
+  background: var(--fm-surface);
   cursor: pointer;
-  transition: border-color 0.15s ease, background 0.15s ease;
+  transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease;
+}
+
+.provider-item::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 50%;
+  width: 3px;
+  height: 0;
+  border-radius: 0 3px 3px 0;
+  background: var(--fm-primary);
+  transform: translateY(-50%);
+  transition: height 0.18s ease;
+}
+
+.provider-item:hover {
+  border-color: color-mix(in srgb, var(--fm-primary) 45%, var(--fm-border));
+  box-shadow: 0 4px 14px rgba(15, 23, 42, 0.06);
 }
 
 .provider-item.active {
   border-color: var(--fm-primary);
-  background: color-mix(in srgb, var(--fm-primary) 8%, transparent);
+  background: color-mix(in srgb, var(--fm-primary) 6%, var(--fm-surface));
+}
+
+.provider-item.active::before {
+  height: 22px;
 }
 
 .provider-main {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 3px;
   min-width: 0;
+  flex: 1;
 }
 
 .provider-name {
-  font-size: 13px;
+  font-size: 13.5px;
   font-weight: 600;
   display: flex;
   align-items: center;
   gap: 6px;
+  color: var(--fm-text);
 }
 
 .provider-meta {
@@ -2397,16 +2763,138 @@ onMounted(async () => {
 
 .provider-actions {
   display: flex;
-  justify-content: flex-end;
-  margin-top: 2px;
+  align-items: center;
+  gap: 2px;
+  margin-top: 0;
+  flex-shrink: 0;
+  opacity: 0.6;
+  transition: opacity 0.15s ease;
+}
+
+.provider-item:hover .provider-actions {
+  opacity: 1;
+}
+
+.provider-actions :deep(.ant-btn-link) {
+  padding-inline: 6px;
+  height: 24px;
+  font-size: 12px;
 }
 
 .provider-form :deep(.ant-form-item) {
-  margin-bottom: 12px;
+  margin-bottom: 14px;
+}
+
+.provider-form :deep(.ant-form-item-label > label) {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--fm-text-2);
+}
+
+.provider-form :deep(.ant-input),
+.provider-form :deep(.ant-input-affix-wrapper),
+.provider-form :deep(.ant-select-selector) {
+  border-radius: 8px;
+}
+
+.provider-form :deep(.ant-input),
+.provider-form :deep(.ant-input-affix-wrapper) {
+  padding-block: 7px;
 }
 
 .preset {
+  display: inline-flex;
+  align-items: center;
+  height: 26px;
+  padding: 0 11px;
+  border: 1px solid var(--fm-border);
+  border-radius: 13px;
+  background: var(--fm-surface-alt);
+  color: var(--fm-text-2);
+  font-size: 12px;
+  line-height: 1;
   cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.preset:hover {
+  border-color: color-mix(in srgb, var(--fm-primary) 55%, var(--fm-border));
+  color: var(--fm-primary);
+  background: color-mix(in srgb, var(--fm-primary) 7%, var(--fm-surface));
+}
+
+.preset.active {
+  border-color: var(--fm-primary);
+  background: color-mix(in srgb, var(--fm-primary) 12%, var(--fm-surface));
+  color: var(--fm-primary);
+  font-weight: 600;
+}
+
+.label-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.temp-value {
+  padding: 0 6px;
+  border-radius: 4px;
+  background: var(--fm-surface-alt);
+  color: var(--fm-primary);
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.temp-axis {
+  display: flex;
+  justify-content: space-between;
+  margin-top: -6px;
+  font-size: 10.5px;
+  color: var(--fm-muted);
+}
+
+.default-item :deep(.ant-form-item-control-input-content) {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.default-desc {
+  font-size: 11px;
+  color: var(--fm-muted);
+}
+
+.dialog-hint {
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--fm-muted);
+}
+
+.provider-form :deep(.ant-select),
+.provider-form :deep(.ant-select-selector) {
+  width: 100%;
+}
+
+.provider-modal :deep(.ant-modal-header) {
+  margin-bottom: 14px;
+}
+
+.provider-modal :deep(.ant-modal-title) {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.provider-modal :deep(.ant-modal-footer) {
+  margin-top: 6px;
+  padding-top: 12px;
+  border-top: 1px solid var(--fm-border);
+}
+
+.provider-modal :deep(.ant-modal-footer .ant-btn) {
+  border-radius: 8px;
+  min-width: 76px;
 }
 
 @media (max-width: 1080px) {

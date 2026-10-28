@@ -37,13 +37,16 @@ import {
   workspaceStats,
 } from '@/api'
 import type {
+  DashboardMetrics,
   EnvVariable,
   HttpRequestDetail,
   HttpResult,
   KeyValueItem,
+  ReportDetail,
   RequestAuth,
   SendRequestPayload,
   StressConfig,
+  StressReport,
 } from '@/types/models'
 
 /** 工具参数：模型输出的 JSON 对象 */
@@ -94,6 +97,7 @@ const ABS_PATH = /^(?:[A-Za-z]:[\\/]|\\\\|\/)/
 /** 每个工具的入参约束；未声明 kind 的字段一律按 any 处理，缺失即非法 */
 const SCHEMAS: Record<string, Record<string, ArgRule>> = {
   project_list: {},
+  project_request_counts: {},
   project_create: {
     name: { kind: 'string', required: true },
     description: { kind: 'string' },
@@ -360,10 +364,399 @@ function clip(text: string, limit: number): string {
   return `${text.slice(0, limit)}\n…（已截断，共 ${text.length} 字符）`
 }
 
+/**
+ * 列表类工具统一输出结构：明确给出 total，最多附 50 条明细。
+ * 模型可以直接引用 total，不需要逐条数，也不会把「截断」误当成真实数量。
+ */
+function summarizeList(list: unknown[]): Record<string, unknown> {
+  // 明细限 50 条：total 放在最前，即使输出被二次截断，模型也能拿到准确总数
+  const items = list.slice(0, 50)
+  return { total: list.length, shown: items.length, items }
+}
+
 function str(value: unknown, fallback = ''): string {
   if (value === null || value === undefined) return fallback
   return typeof value === 'string' ? value : String(value)
 }
+
+/* ---------------- 中文标签：英文枚举 / 数字 ID 一律先翻译再交给模型 ---------------- */
+
+const REPORT_STATUS_LABELS: Record<string, string> = {
+  completed: '已完成',
+  running: '运行中',
+  stopped: '已停止',
+  aborted: '已中止',
+  failed: '失败',
+  pending: '排队中',
+  queued: '排队中',
+  interrupted: '已中断',
+}
+
+const STRESS_MODE_LABELS: Record<string, string> = {
+  fixed: '固定并发',
+  ramp: '渐进加压',
+  rampup: '渐进加压',
+  stage: '分阶段加压',
+  stages: '分阶段加压',
+  duration: '定时长',
+  count: '定次数',
+}
+
+const BODY_TYPE_LABELS: Record<string, string> = {
+  none: '无请求体',
+  json: 'JSON',
+  form: '表单',
+  formdata: '表单',
+  'form-data': '表单文件上传',
+  multipart: '表单文件上传',
+  urlencoded: 'URL 编码表单',
+  'x-www-form-urlencoded': 'URL 编码表单',
+  raw: '原始文本',
+  text: '纯文本',
+  xml: 'XML',
+  binary: '二进制',
+  graphql: 'GraphQL',
+}
+
+const ERROR_TYPE_LABELS: Record<string, string> = {
+  http: 'HTTP 错误状态码',
+  timeout: '请求超时',
+  tls: '证书 / TLS 握手失败',
+  connect: '连接失败',
+  dns: 'DNS 解析失败',
+  network: '网络异常',
+  assertion: '断言失败',
+  unknown: '未知错误',
+}
+
+/** 命中映射就返回中文，否则原样返回（含空值兜底） */
+function cnLabel(map: Record<string, string>, value: unknown, fallback = ''): string {
+  const raw = str(value).trim()
+  if (!raw) return fallback
+  return map[raw.toLowerCase()] ?? raw
+}
+
+function fmtTime(ms?: number | null): string {
+  if (!ms) return '—'
+  const date = new Date(ms)
+  const pad = (value: number) => String(value).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+}
+
+function pct(part: number, total: number): string {
+  if (!total) return '0%'
+  return `${((part / total) * 100).toFixed(1)}%`
+}
+
+function fmtBytes(bytes: number): string {
+  if (!bytes) return '0 B'
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / 1024 / 1024).toFixed(2)} MB`
+}
+
+function flattenCollections(nodes: unknown[]): { id: number; name: string }[] {
+  const out: { id: number; name: string }[] = []
+  const walk = (list: unknown[]) => {
+    for (const entry of list) {
+      if (!entry || typeof entry !== 'object') continue
+      const node = entry as { id?: number; name?: string; children?: unknown[] }
+      if (typeof node.id === 'number') out.push({ id: node.id, name: str(node.name) })
+      if (Array.isArray(node.children)) walk(node.children)
+    }
+  }
+  walk(nodes)
+  return out
+}
+
+/** 报告里只有 requestId / envId，这里换成项目名 / 请求名 / 环境名，避免回答里出现裸数字 */
+async function describeReportTarget(requestId?: number | null, envId?: number | null) {
+  const target = { project: '', request: '', environment: '' }
+  let projectId: number | undefined
+
+  if (requestId) {
+    try {
+      const detail = await requestGet(requestId)
+      target.request = `${detail.method} ${detail.name}`
+      const projects = await projectList().catch(() => [])
+      for (const project of projects) {
+        const tree = await collectionTree(project.id).catch(() => [])
+        const hit = flattenCollections(tree).some((node) => node.id === detail.collectionId)
+        if (hit) {
+          projectId = project.id
+          target.project = project.name
+          break
+        }
+      }
+    } catch {
+      target.request = '请求已删除'
+    }
+  }
+
+  if (envId) {
+    const projects = projectId ? [{ id: projectId, name: target.project }] : await projectList().catch(() => [])
+    for (const project of projects) {
+      const envs = await envList(project.id).catch(() => [])
+      const hit = envs.find((item) => item.id === envId)
+      if (hit) {
+        target.environment = hit.name
+        if (!target.project) target.project = project.name
+        break
+      }
+    }
+    if (!target.environment) target.environment = '环境已删除'
+  }
+
+  return target
+}
+
+/** 执行记录：项目名替代 projectId，时间格式化，避免回答里出现裸数字 */
+function historyRows(
+  rows: {
+    requestName?: string | null
+    projectId?: number | null
+    method: string
+    url: string
+    statusCode?: number | null
+    durationMs?: number | null
+    createdAt: number
+  }[],
+  projectNames: Map<number, string>,
+) {
+  return rows.map((row) => ({
+    接口: row.requestName || '未命名接口',
+    方法: row.method,
+    URL: row.url,
+    状态码: row.statusCode ?? '无响应',
+    耗时:
+      row.durationMs === null || row.durationMs === undefined
+        ? '—'
+        : `${row.durationMs} 毫秒`,
+    时间: fmtTime(row.createdAt),
+    所属项目: row.projectId
+      ? projectNames.get(row.projectId) ?? '项目已删除'
+      : '未关联项目',
+  }))
+}
+
+/** 接口类列表：保留 id 供后续调用，时间换成可读格式 */
+function requestRows<
+  T extends {
+    id: number
+    name: string
+    method: string
+    url: string
+    updatedAt: number
+    collectionName?: string
+  },
+>(rows: T[]) {
+  return rows.map((row) => ({
+    id: row.id,
+    name: row.name,
+    method: row.method,
+    url: row.url,
+    ...(row.collectionName ? { 所属集合: row.collectionName } : {}),
+    更新时间: fmtTime(row.updatedAt),
+  }))
+}
+
+/** 工作台总览：字段名中文化，避免回答里出现 projectCount 这类 key */
+function workspaceDigest(stats: {
+  projectCount: number
+  collectionCount: number
+  requestCount: number
+  environmentCount: number
+  historyCount: number
+  reportCount: number
+  reportRequestTotal: number
+  reportSuccessTotal: number
+  recentHistory: number
+  recentReports: number
+}) {
+  return {
+    项目数: stats.projectCount,
+    集合数: stats.collectionCount,
+    接口数: stats.requestCount,
+    环境数: stats.environmentCount,
+    执行记录数: stats.historyCount,
+    压测报告数: stats.reportCount,
+    压测请求总数: stats.reportRequestTotal,
+    压测成功总数: stats.reportSuccessTotal,
+    压测整体成功率: pct(stats.reportSuccessTotal, stats.reportRequestTotal),
+    近7天请求数: stats.recentHistory,
+    近7天新增报告: stats.recentReports,
+  }
+}
+
+/** 数据大屏指标：分组标签、耗时、成功率全部转中文与可读单位 */
+function dashboardDigest(metrics: DashboardMetrics) {
+  return {
+    最近14天趋势: metrics.days.map((item) => ({
+      日期: item.date,
+      请求数: item.total,
+      成功数: item.success,
+      成功率: pct(item.success, item.total),
+      平均响应: `${Math.round(item.avgRt)} 毫秒`,
+    })),
+    状态码分布: metrics.codeBuckets.map((item) => ({ 区间: item.label, 次数: item.count })),
+    请求方法分布: metrics.methodBuckets.map((item) => ({ 方法: item.label, 次数: item.count })),
+    时段分布: metrics.hourBuckets.map((item) => ({ 时段: `${item.hour} 点`, 请求数: item.count })),
+    响应耗时分布: metrics.latencyBuckets.map((item) => ({ 区间: item.label, 次数: item.count })),
+    热门接口: metrics.topRequests.map((item) => ({
+      接口: item.name,
+      方法: item.method,
+      URL: item.url,
+      调用次数: item.count,
+      平均响应: `${Math.round(item.avgRt)} 毫秒`,
+      成功率: `${item.successRate.toFixed(1)}%`,
+    })),
+    最活跃项目: metrics.topProjects.map((item) => ({
+      项目: item.name,
+      调用次数: item.count,
+      平均响应: `${Math.round(item.avgRt)} 毫秒`,
+      成功率: `${item.successRate.toFixed(1)}%`,
+    })),
+    压测报告趋势: metrics.reportPoints.map((item) => ({
+      报告名称: item.name,
+      请求总数: item.totalRequests,
+      P95响应: `${Math.round(item.p95Rt)} 毫秒`,
+      错误率: `${item.errorRate.toFixed(1)}%`,
+      生成时间: fmtTime(item.createdAt),
+    })),
+  }
+}
+
+/** 压测报告列表：状态、时间、成功率全部转成人能直接读的中文 */
+function reportRows(list: StressReport[]): Record<string, unknown>[] {
+  return list.map((item) => ({
+    报告编号: item.id,
+    名称: item.planName,
+    状态: cnLabel(REPORT_STATUS_LABELS, item.status, '未知'),
+    请求总数: item.totalRequests,
+    成功数: item.successCount,
+    失败数: item.errorCount,
+    成功率: pct(item.successCount, item.totalRequests),
+    平均响应: `${Math.round(item.avgRt)} 毫秒`,
+    P95响应: `${Math.round(item.p95Rt)} 毫秒`,
+    平均QPS: Number((item.avgQps ?? 0).toFixed(1)),
+    并发数: item.concurrency,
+    开始时间: fmtTime(item.startTime),
+    创建时间: fmtTime(item.createdAt),
+  }))
+}
+
+/** 压测报告详情：字段名、枚举值全部中文，且不再暴露 requestId / envId 这类裸数字 */
+async function reportDigest(detail: ReportDetail) {
+  const report = detail.report
+  const config = detail.config
+  const target = await describeReportTarget(report.requestId, config?.envId ?? null)
+
+  const statusCodes = detail.statusCodes.map((item) => ({
+    状态码: item.code,
+    次数: item.count,
+    占比: pct(item.count, report.totalRequests),
+  }))
+
+  const errorTypes = detail.errorTypes.map((item) => ({
+    错误类型: cnLabel(ERROR_TYPE_LABELS, item.errorType, '未知错误'),
+    次数: item.count,
+    占比: pct(item.count, report.totalRequests),
+  }))
+
+  const histogram = detail.histogram.map((item) => ({
+    区间: item.label,
+    请求数: item.count,
+    占比: pct(item.count, report.totalRequests),
+  }))
+
+  const stages = detail.stages.map((item) => ({
+    阶段: item.index + 1,
+    并发数: item.concurrent,
+    时长: `${item.durationSec} 秒`,
+    请求数: item.requests,
+    失败数: item.errors,
+    平均QPS: item.avgQps,
+    平均响应: `${Math.round(item.avgRt)} 毫秒`,
+    P95响应: `${Math.round(item.p95Rt)} 毫秒`,
+  }))
+
+  const recentErrors = detail.errors.slice(0, 10).map((item) => ({
+    发生时间: `第 ${item.elapsedSec} 秒`,
+    错误类型: cnLabel(ERROR_TYPE_LABELS, item.errorType, '未知错误'),
+    错误信息: clip(item.errorMessage || '', 300),
+    请求地址: item.requestUrl,
+    响应状态码: item.responseStatus ?? '无响应',
+    响应内容: clip(item.responseBody || '', 300),
+  }))
+
+  const samples = detail.samples.slice(-30).map((item) => ({
+    第几秒: item.elapsedSec,
+    并发: item.concurrent,
+    QPS: item.qps,
+    平均响应: item.avgRt,
+    P95响应: item.p95Rt,
+    成功数: item.successCount,
+    失败数: item.errorCount,
+  }))
+
+  return {
+    报告编号: report.id,
+    报告名称: report.planName || target.request || '未命名报告',
+    状态: cnLabel(REPORT_STATUS_LABELS, report.status, '未知'),
+    压测目标: {
+      项目: target.project || '未关联项目',
+      请求: target.request || '未关联请求',
+      环境: target.environment || '未指定环境',
+    },
+    时间: {
+      开始: fmtTime(report.startTime),
+      结束: fmtTime(report.endTime),
+      生成: fmtTime(report.createdAt),
+    },
+    配置: config
+      ? {
+          加压模式: cnLabel(STRESS_MODE_LABELS, config.mode, '未记录'),
+          并发数: report.concurrency,
+          目标QPS: config.targetRps || '不限',
+          爬坡时间: config.rampUpSec ? `${config.rampUpSec} 秒` : '无',
+          请求体类型: cnLabel(BODY_TYPE_LABELS, config.bodyType, '未记录'),
+          连接超时: config.timeoutMs ? `${config.timeoutMs} 毫秒` : '默认',
+          建连超时: config.connectTimeoutMs ? `${config.connectTimeoutMs} 毫秒` : '默认',
+          跟随重定向: config.followRedirects === undefined ? '未记录' : config.followRedirects ? '开启' : '关闭',
+          请求间隔: config.thinkTimeMs ? `${config.thinkTimeMs} 毫秒` : '无',
+          自动停止条件: config.stopErrorRate
+            ? `错误率达到 ${config.stopErrorRate}%（且请求数 ≥ ${config.stopMinRequests ?? 0}）`
+            : '未设置',
+          请求头数量: config.headers ?? 0,
+          查询参数数量: config.params ?? 0,
+        }
+      : '无配置快照',
+    总体指标: {
+      请求总数: report.totalRequests,
+      成功数: report.successCount,
+      失败数: report.errorCount,
+      错误率: pct(report.errorCount, report.totalRequests),
+      平均响应: `${Math.round(report.avgRt)} 毫秒`,
+      最快响应: `${Math.round(report.minRt)} 毫秒`,
+      最慢响应: `${Math.round(report.maxRt)} 毫秒`,
+      P50: `${Math.round(report.p50Rt)} 毫秒`,
+      P95: `${Math.round(report.p95Rt)} 毫秒`,
+      P99: `${Math.round(report.p99Rt)} 毫秒`,
+      平均QPS: report.avgQps,
+      最高QPS: report.maxQps,
+      Apdex: report.apdex,
+      传输数据量: fmtBytes(report.bytesTotal),
+    },
+    状态码分布: statusCodes,
+    错误类型分布: errorTypes,
+    延迟直方图: histogram,
+    阶段明细: stages.length ? stages : '单阶段压测',
+    错误样本: recentErrors.length ? recentErrors : '无错误',
+    采样点总数: detail.samples.length,
+    最近采样: samples,
+  }
+}
+
 
 function optionalNum(value: unknown): number | undefined {
   if (value === null || value === undefined || value === '') return undefined
@@ -437,11 +830,43 @@ function pretty(value: unknown): string {
   }
 }
 
+/** 常见 HTTP 状态码 → 中文含义，避免回答里只剩 200 / 404 这样的数字 */
+const HTTP_STATUS_CN: Record<number, string> = {
+  200: '成功',
+  201: '已创建',
+  202: '已接受',
+  204: '无内容',
+  301: '永久重定向',
+  302: '临时重定向',
+  304: '未修改',
+  400: '请求参数错误',
+  401: '未授权 / 认证失败',
+  403: '禁止访问',
+  404: '资源不存在',
+  405: '请求方法不允许',
+  408: '请求超时',
+  409: '资源冲突',
+  413: '请求体过大',
+  415: '媒体类型不支持',
+  422: '参数校验失败',
+  429: '请求过于频繁',
+  500: '服务端内部错误',
+  502: '网关错误',
+  503: '服务不可用',
+  504: '网关超时',
+}
+
+function statusLabel(status: number): string {
+  if (!status) return '无响应'
+  const text = HTTP_STATUS_CN[status]
+  return text ? `${status} ${text}` : `${status}`
+}
+
 function formatHttpResult(value: unknown): string {
   const result = value as HttpResult
   const lines = [
-    `状态：${result.status || '无响应'} ${result.statusText ?? ''}`.trim(),
-    `耗时：${result.durationMs}ms　大小：${result.sizeBytes}B${result.truncated ? '（响应体已截断）' : ''}`,
+    `状态：${statusLabel(result.status)}`,
+    `耗时：${result.durationMs} 毫秒　大小：${fmtBytes(result.sizeBytes)}${result.truncated ? '（响应体已截断）' : ''}`,
   ]
   if (result.error) lines.push(`错误：${result.error}`)
   const headers = result.headers ?? {}
@@ -527,9 +952,46 @@ function detailPayload(
 const SPECS: ToolSpec[] = [
   {
     name: 'project_list',
-    desc: '列出本机全部项目（id / 名称 / 描述）',
+    desc: '列出本机全部项目（id / 名称 / 描述 / 时间）；回答里必须原样使用 name 字段',
     args: '无',
-    handler: () => projectList(),
+    handler: async () => {
+      const projects = await projectList()
+      return projects.map((item) => ({
+        id: item.id,
+        name: item.name,
+        description: item.description ?? '',
+        创建时间: fmtTime(item.createdAt),
+        更新时间: fmtTime(item.updatedAt),
+      }))
+    },
+  },
+  {
+    name: 'project_request_counts',
+    desc: '按项目统计请求数量，返回真实项目名称 + 请求数（数值降序）；问「各项目请求数」时必须用它',
+    args: '无',
+    handler: async () => {
+      const projects = await projectList()
+      const rows = await Promise.all(
+        projects.map(async (project) => {
+          const tree = await collectionTree(project.id).catch(() => [])
+          const ids: number[] = []
+          const walk = (nodes: { id: number; children?: unknown[] }[]) => {
+            for (const node of nodes) {
+              ids.push(node.id)
+              walk((node.children ?? []) as { id: number; children?: unknown[] }[])
+            }
+          }
+          walk(tree as { id: number; children?: unknown[] }[])
+          const lists = await Promise.all(ids.map((id) => requestList(id).catch(() => [])))
+          return {
+            id: project.id,
+            name: project.name,
+            请求数: lists.reduce((sum, list) => sum + list.length, 0),
+          }
+        }),
+      )
+      return rows.sort((a, b) => b.请求数 - a.请求数)
+    },
   },
   {
     name: 'project_create',
@@ -545,7 +1007,7 @@ const SPECS: ToolSpec[] = [
     handler: async (args) => {
       const id = needNum(args.id, 'id')
       const current = (await projectList()).find((item) => item.id === id)
-      if (!current) throw new Error(`项目 ${id} 不存在`)
+      if (!current) throw new Error('所选项目不存在，请先查询项目列表后再试')
       const name = str(args.name, current.name).trim() || current.name
       const description =
         args.description === undefined ? current.description : str(args.description)
@@ -608,9 +1070,10 @@ const SPECS: ToolSpec[] = [
   },
   {
     name: 'request_list',
-    desc: '列出某集合下的请求',
+    desc: '列出某集合下的请求（返回 total 总条数，items 最多前 50 条；时间为本地格式）',
     args: '{ collectionId }',
-    handler: (args) => requestList(needNum(args.collectionId, 'collectionId')),
+    handler: async (args) =>
+      summarizeList(requestRows(await requestList(needNum(args.collectionId, 'collectionId')))),
   },
   {
     name: 'request_get',
@@ -620,15 +1083,26 @@ const SPECS: ToolSpec[] = [
   },
   {
     name: 'request_search',
-    desc: '在项目内按关键字搜索请求',
+    desc: '在项目内按关键字搜索请求（返回 total 命中数，items 最多前 50 条，含所属集合与更新时间）',
     args: '{ projectId, keyword }',
-    handler: (args) => requestSearch(needNum(args.projectId, 'projectId'), str(args.keyword)),
+    handler: async (args) => {
+      const hits = await requestSearch(
+        needNum(args.projectId, 'projectId'),
+        str(args.keyword),
+      )
+      const result: Record<string, unknown> = summarizeList(requestRows(hits))
+      if (hits.length >= 100) {
+        result.说明 = '搜索结果达到 100 条查询上限，实际命中可能更多，请补充关键字'
+      }
+      return result
+    },
   },
   {
     name: 'request_options',
-    desc: '列出项目内全部请求的 id / 名称 / 方法 / URL，便于挑选',
+    desc: '列出项目内请求的 id / 名称 / 方法 / URL，便于挑选（返回 total 总条数，items 最多前 50 条）',
     args: '{ projectId }',
-    handler: (args) => requestOptions(needNum(args.projectId, 'projectId')),
+    handler: async (args) =>
+      summarizeList(requestRows(await requestOptions(needNum(args.projectId, 'projectId')))),
   },
   {
     name: 'request_create',
@@ -769,20 +1243,38 @@ const SPECS: ToolSpec[] = [
   },
   {
     name: 'env_list',
-    desc: '读取项目的环境与变量',
+    desc: '读取项目的环境与变量（密钥类变量的值会打码，不进入模型上下文）',
     args: '{ projectId }',
-    handler: (args) => envList(needNum(args.projectId, 'projectId')),
+    handler: async (args) => {
+      const envs = await envList(needNum(args.projectId, 'projectId'))
+      return envs.map((env) => ({
+        id: env.id,
+        环境名称: env.name,
+        是否当前环境: env.isActive ? '是' : '否',
+        变量数: env.variables.length,
+        变量: env.variables.map((item) => ({
+          变量名: item.key,
+          值: item.isSecret ? '******（密钥，已隐藏）' : item.value,
+          是否密钥: item.isSecret ? '是' : '否',
+        })),
+        环境脚本行数: env.script ? env.script.split('\n').length : 0,
+      }))
+    },
   },
   {
     name: 'history_list',
-    desc: '最近的请求历史，可按接口（requestId）或项目（projectId）过滤',
+    desc: '最近的请求历史，可按接口（requestId）或项目（projectId）过滤；返回接口名、项目名与本地时间',
     args: '{ limit?, requestId?, projectId? }',
-    handler: (args) =>
-      historyList(
-        Math.min(2000, Math.round(optionalNum(args.limit) ?? 20)),
-        optionalNum(args.requestId) ?? null,
-        optionalNum(args.projectId) ?? null,
-      ),
+    handler: async (args) => {
+      const limit = Math.min(2000, Math.round(optionalNum(args.limit) ?? 20))
+      const [rows, projects] = await Promise.all([
+        historyList(limit, optionalNum(args.requestId) ?? null, optionalNum(args.projectId) ?? null),
+        projectList().catch(() => []),
+      ])
+      const names = new Map(projects.map((item) => [item.id, item.name]))
+      const items = historyRows(rows.slice(0, 50), names)
+      return { total: rows.length, shown: items.length, items }
+    },
   },
   {
     name: 'history_export',
@@ -802,18 +1294,18 @@ const SPECS: ToolSpec[] = [
       if (format === 'json') {
         await fileWriteText(path, JSON.stringify(rows, null, 2))
       } else {
-        const header = ['id', '请求 ID', '项目 ID', '接口名称', '方法', 'URL', '状态码', '耗时(ms)', '时间']
+        const projects = await projectList().catch(() => [])
+        const names = new Map(projects.map((item) => [item.id, item.name]))
+        const header = ['接口名称', '所属项目', '方法', 'URL', '状态码', '耗时(ms)', '时间']
         const lines = rows.map((row) =>
           [
-            row.id,
-            row.requestId ?? '',
-            row.projectId ?? '',
-            row.requestName ?? '',
+            row.requestName ?? '未命名接口',
+            row.projectId ? names.get(row.projectId) ?? '项目已删除' : '未关联项目',
             row.method ?? '',
             row.url ?? '',
             row.statusCode ?? '',
             row.durationMs ?? '',
-            new Date(row.createdAt).toISOString(),
+            fmtTime(row.createdAt),
           ]
             .map((cell) => csvCell(String(cell)))
             .join(','),
@@ -826,15 +1318,15 @@ const SPECS: ToolSpec[] = [
   },
   {
     name: 'report_list',
-    desc: '压测报告列表',
+    desc: '压测报告列表（状态、时间、成功率已转中文）',
     args: '{ limit? }',
-    handler: (args) => reportList(optionalNum(args.limit) ?? 20),
+    handler: async (args) => reportRows(await reportList(optionalNum(args.limit) ?? 20)),
   },
   {
     name: 'report_get',
-    desc: '压测报告详情（含采样、错误、状态码）',
+    desc: '压测报告详情（指标、状态码、错误、阶段均已转中文标签，项目/请求/环境显示名称而非 ID）',
     args: '{ id }',
-    handler: (args) => reportGet(needNum(args.id, 'id')),
+    handler: async (args) => reportDigest(await reportGet(needNum(args.id, 'id'))),
   },
   {
     name: 'env_create',
@@ -856,7 +1348,7 @@ const SPECS: ToolSpec[] = [
       const projectId = needNum(args.projectId, 'projectId')
       const envId = needNum(args.envId, 'envId')
       const env = (await envList(projectId)).find((item) => item.id === envId)
-      if (!env) throw new Error(`环境 ${envId} 不属于项目 ${projectId}`)
+      if (!env) throw new Error('所选环境不属于该项目，请先查询项目环境后再试')
 
       const removeKeys = Array.isArray(args.removeKeys)
         ? args.removeKeys.map((key) => str(key)).filter(Boolean)
@@ -887,12 +1379,12 @@ const SPECS: ToolSpec[] = [
 
       await envVarSave(envId, merged)
       return {
-        envId,
-        total: merged.length,
-        variables: merged.map((item) => ({
-          key: item.key,
-          value: item.isSecret ? '******' : item.value,
-          isSecret: item.isSecret,
+        环境: env.name,
+        变量数: merged.length,
+        变量: merged.map((item) => ({
+          变量名: item.key,
+          值: item.isSecret ? '******（密钥，已隐藏）' : item.value,
+          是否密钥: item.isSecret ? '是' : '否',
         })),
       }
     },
@@ -906,14 +1398,25 @@ const SPECS: ToolSpec[] = [
       const id = needNum(args.id, 'id')
       await envActivate(projectId, id)
       const env = (await envList(projectId)).find((item) => item.id === id)
-      return { projectId, active: env?.name ?? `#${id}` }
+      const project = (await projectList()).find((item) => item.id === projectId)
+      return {
+        项目: project?.name ?? '未知项目',
+        当前环境: env?.name ?? '未知环境',
+      }
     },
   },
   {
     name: 'plan_list',
-    desc: '项目的压测计划列表',
+    desc: '项目的压测计划列表（含关联请求名与本地时间）',
     args: '{ projectId }',
-    handler: (args) => planList(needNum(args.projectId, 'projectId')),
+    handler: async (args) => {
+      const plans = await planList(needNum(args.projectId, 'projectId'))
+      return plans.map((item) => ({
+        计划名称: item.name,
+        关联请求: item.requestName || '未关联请求',
+        更新时间: fmtTime(item.updatedAt),
+      }))
+    },
   },
   {
     name: 'stress_start',
@@ -1015,7 +1518,7 @@ const SPECS: ToolSpec[] = [
       for (let round = 1; round <= rounds && !aborted; round += 1) {
         for (const detail of details) {
           total += 1
-          const label = `#${detail.id ?? '?'} ${detail.name} ${detail.method} ${detail.url}`
+          const label = `${detail.name} ${detail.method} ${detail.url}`
           try {
             const result = await aiExecute(detailPayload(detail, { envId, timeoutMs }))
             const good = result.status >= 200 && result.status < 400
@@ -1064,8 +1567,9 @@ const SPECS: ToolSpec[] = [
     handler: async (args) => {
       const projectId = needNum(args.projectId, 'projectId')
       const path = needPath(args.path)
+      const project = (await projectList()).find((item) => item.id === projectId)
       await projectExport(projectId, path)
-      return `已导出项目 #${projectId} 到 ${path}`
+      return `已导出项目「${project?.name ?? '未知项目'}」到 ${path}`
     },
   },
   {
@@ -1094,8 +1598,9 @@ const SPECS: ToolSpec[] = [
     handler: async (args) => {
       const projectId = needNum(args.projectId, 'projectId')
       const path = needPath(args.path)
+      const project = (await projectList()).find((item) => item.id === projectId)
       await openapiExport(projectId, path)
-      return `已导出项目 #${projectId} 的 OpenAPI 文档到 ${path}`
+      return `已导出项目「${project?.name ?? '未知项目'}」的 OpenAPI 文档到 ${path}`
     },
   },
   {
@@ -1106,21 +1611,22 @@ const SPECS: ToolSpec[] = [
     handler: async (args) => {
       const id = needNum(args.id, 'id')
       const path = needPath(args.path)
+      const report = (await reportList(200)).find((item) => item.id === id)
       await reportExport(id, path)
-      return `已导出报告 #${id} 到 ${path}`
+      return `已导出报告「${report?.planName ?? '未知报告'}」到 ${path}`
     },
   },
   {
     name: 'workspace_stats',
-    desc: '工作台总览：项目 / 请求 / 环境 / 历史 / 报告数量',
+    desc: '工作台总览：项目 / 接口 / 环境 / 记录 / 报告数量与压测成功率（已转中文标签）',
     args: '无',
-    handler: () => workspaceStats(),
+    handler: async () => workspaceDigest(await workspaceStats()),
   },
   {
     name: 'dashboard_metrics',
-    desc: '数据大屏指标：趋势、状态码、方法、耗时、Top 接口等',
+    desc: '数据大屏指标：趋势、状态码、方法、耗时、热门接口、活跃项目（已转中文标签与可读单位）',
     args: '无',
-    handler: () => dashboardMetrics(),
+    handler: async () => dashboardDigest(await dashboardMetrics()),
   },
 ]
 
@@ -1131,6 +1637,7 @@ export const toolNames = () => SPECS.map((spec) => spec.name)
 /** 工具 id → 中文名，用于界面展示 */
 export const TOOL_LABELS: Record<string, string> = {
   project_list: '读取项目列表',
+  project_request_counts: '统计各项目请求数',
   project_create: '新建项目',
   project_update: '修改项目',
   project_delete: '删除项目',

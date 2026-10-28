@@ -12,8 +12,8 @@ use tauri::State;
 
 use crate::models::{
     AiChatPayload, AiMessage, AiProvider, AiSession, AiStoredMessage, AiStreamEvent, AiToolDayStat,
-    AiToolLog, AiToolLogPage, AiToolLogStats, AiToolUsageStat, AiUsageDay, AiUsageStat,
-    AiUsageStats, HttpResult, SendRequestPayload,
+    AiToolLog, AiToolLogPage, AiToolLogStats, AiToolUsageStat, AiUsageDay, AiUsageLog, AiUsagePage,
+    AiUsageStat, AiUsageStats, HttpResult, SendRequestPayload,
 };
 use crate::prompts::XIAO_HI_SYSTEM_PROMPT;
 use crate::state::AppState;
@@ -376,6 +376,109 @@ fn extract_api_error(raw: &str) -> String {
     trimmed.chars().take(300).collect()
 }
 
+/// 常见服务商错误转成中文提示；识别不了的保留原文，避免吞掉有效信息
+fn humanize_api_error(status: u16, message: &str) -> String {
+    let lower = message.to_ascii_lowercase();
+
+    // 模型名不被支持：The supported API model names are A, B, but you passed C.
+    if let Some(pos) = lower.find("supported api model names are") {
+        let head = "supported api model names are";
+        let rest = &message[pos + head.len()..];
+        let rest_lower = rest.to_ascii_lowercase();
+        let (supported, passed) = match rest_lower.find("but you passed") {
+            Some(split) => (
+                rest[..split].trim().trim_end_matches(',').trim().to_string(),
+                rest[split + "but you passed".len()..]
+                    .trim()
+                    .trim_end_matches('.')
+                    .trim()
+                    .to_string(),
+            ),
+            None => (rest.trim().trim_end_matches('.').to_string(), String::new()),
+        };
+        let mut text = if passed.is_empty() {
+            "当前服务商不支持所选模型".to_string()
+        } else {
+            format!("当前服务商不支持模型「{passed}」")
+        };
+        if !supported.is_empty() {
+            text.push_str(&format!("。可用模型：{supported}"));
+        }
+        text.push_str("。请到「模型服务配置」里从下拉列表重新选择模型。");
+        return text;
+    }
+
+    if status == 401
+        || lower.contains("invalid api key")
+        || lower.contains("incorrect api key")
+        || lower.contains("invalid_api_key")
+        || lower.contains("unauthorized")
+    {
+        return "API Key 无效或已过期，请到「模型服务配置」重新填写密钥。".to_string();
+    }
+    if status == 402
+        || lower.contains("insufficient balance")
+        || lower.contains("insufficient_quota")
+        || lower.contains("insufficient quota")
+    {
+        return "账户余额或额度不足，请到服务商控制台充值后再试。".to_string();
+    }
+    if status == 403 {
+        return "没有访问权限：当前密钥无权调用该模型，或所在地区受限。".to_string();
+    }
+    if status == 404 {
+        return "接口地址或模型不存在，请检查 Base URL 与模型名是否正确。".to_string();
+    }
+    if status == 429 || lower.contains("rate limit") {
+        return "请求过于频繁或已超出配额，请稍后再试。".to_string();
+    }
+    if lower.contains("model") {
+        let missing = lower.contains("not exist")
+            || lower.contains("not found")
+            || lower.contains("does not exist")
+            || lower.contains("unsupported model")
+            || lower.contains("unknown model");
+        if missing {
+            return "模型不存在或已下线，请从「模型服务配置」的模型下拉列表里选择服务商在售的模型。"
+                .to_string();
+        }
+    }
+    if lower.contains("context length")
+        || lower.contains("maximum context")
+        || lower.contains("context_length_exceeded")
+        || lower.contains("too many tokens")
+    {
+        return "内容超出模型上下文长度上限，请精简问题、减少附件，或改用上下文更大的模型。".to_string();
+    }
+    if status >= 500 {
+        return format!("服务商暂时不可用（HTTP {status}），请稍后重试。");
+    }
+    if status == 400 {
+        return format!("请求参数被服务商拒绝：{message}");
+    }
+    message.to_string()
+}
+
+/// 网络层错误转中文，保留原文便于排查代理与本地服务
+fn humanize_network_error(raw: &str) -> String {
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("dns") || lower.contains("failed to lookup address") {
+        return format!("无法解析服务商域名，请检查网络或 Base URL 是否写错。（原始错误：{raw}）");
+    }
+    if lower.contains("connection refused") || lower.contains("connection reset") {
+        return format!(
+            "连接被拒绝，请确认地址与端口正确；本地模型需先启动服务。（原始错误：{raw}）"
+        );
+    }
+    if lower.contains("timed out") || lower.contains("timeout") {
+        return format!("连接超时，请检查网络、代理或服务商状态。（原始错误：{raw}）");
+    }
+    if lower.contains("certificate") || lower.contains("tls") {
+        return format!("HTTPS 证书校验失败，请检查代理或系统证书。（原始错误：{raw}）");
+    }
+    format!("连接 AI 服务失败：{raw}")
+}
+
 /// 把非流式响应解析成纯文本
 fn parse_full_text(kind: &str, raw: &str) -> Result<String, String> {
     let json: serde_json::Value = serde_json::from_str(raw).map_err(|_| extract_api_error(raw))?;
@@ -597,6 +700,7 @@ fn record_usage(
     ok: bool,
     latency_ms: i64,
     error: Option<&str>,
+    request_preview: &str,
 ) {
     let Ok(conn) = state.pool.get() else {
         return;
@@ -607,8 +711,8 @@ fn record_usage(
     );
     let _ = conn.execute(
         "INSERT INTO ai_usage_logs (provider_id, provider_name, model, prompt_tokens,
-            completion_tokens, ok, latency_ms, error, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            completion_tokens, ok, latency_ms, error, request_preview, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             provider.id,
             provider.name,
@@ -618,9 +722,41 @@ fn record_usage(
             ok as i64,
             latency_ms,
             error.map(|text| text.chars().take(500).collect::<String>()),
+            request_preview,
             now_ms(),
         ],
     );
+}
+
+fn clip_chars(text: &str, limit: usize) -> String {
+    let total = text.chars().count();
+    let mut out: String = text.chars().take(limit).collect();
+    if total > limit {
+        out.push_str("…（已截断）");
+    }
+    out
+}
+
+/// 记录这轮到底问了模型什么：默认取本轮用户消息；
+/// 若本轮是工具结果回灌，则同时带上最初的问题，避免只看得到「【工具 X 的结果】」。
+fn request_preview(messages: &[AiMessage]) -> String {
+    let users: Vec<&AiMessage> = messages.iter().filter(|item| item.role == "user").collect();
+    let Some(last) = users.last() else {
+        return String::new();
+    };
+    let last_text = last.content.trim();
+    if users.len() <= 1 {
+        return clip_chars(last_text, 2000);
+    }
+    let first_text = users[0].content.trim();
+    if first_text == last_text {
+        return clip_chars(last_text, 2000);
+    }
+    format!(
+        "首问：{}\n—— 本轮：{}",
+        clip_chars(first_text, 400),
+        clip_chars(last_text, 1500)
+    )
 }
 
 #[tauri::command]
@@ -650,6 +786,8 @@ pub async fn ai_chat(
             content: XIAO_HI_SYSTEM_PROMPT.to_string(),
         },
     );
+    // 本次调用实际「问了什么」，随用量流水一起落库
+    let preview = request_preview(&messages);
 
     let prepared = prepare(&provider, &messages, temperature, true)?;
 
@@ -676,7 +814,7 @@ pub async fn ai_chat(
     let response = match request.send().await {
         Ok(response) => response,
         Err(error) => {
-            let text = format!("连接 AI 服务失败：{error}");
+            let text = humanize_network_error(&error.to_string());
             emit(&on_event, "error", text.clone());
             record_usage(
                 state.inner(),
@@ -686,6 +824,7 @@ pub async fn ai_chat(
                 false,
                 started.elapsed().as_millis() as i64,
                 Some(&text),
+                &preview,
             );
             return Err(text);
         }
@@ -694,7 +833,11 @@ pub async fn ai_chat(
     let status = response.status();
     if !status.is_success() {
         let raw = response.text().await.unwrap_or_default();
-        let text = format!("AI 服务返回 {}：{}", status.as_u16(), extract_api_error(&raw));
+        let text = format!(
+            "AI 服务返回 {}：{}",
+            status.as_u16(),
+            humanize_api_error(status.as_u16(), &extract_api_error(&raw))
+        );
         emit(&on_event, "error", text.clone());
         record_usage(
             state.inner(),
@@ -704,6 +847,7 @@ pub async fn ai_chat(
             false,
             started.elapsed().as_millis() as i64,
             Some(&text),
+            &preview,
         );
         return Err(text);
     }
@@ -733,6 +877,7 @@ pub async fn ai_chat(
                     true,
                     started.elapsed().as_millis() as i64,
                     None,
+                    &preview,
                 );
                 Ok(())
             }
@@ -746,6 +891,7 @@ pub async fn ai_chat(
                     false,
                     started.elapsed().as_millis() as i64,
                     Some(&text),
+                    &preview,
                 );
                 Err(text)
             }
@@ -771,6 +917,7 @@ pub async fn ai_chat(
                 $ok,
                 started.elapsed().as_millis() as i64,
                 $err,
+                &preview,
             );
         }};
     }
@@ -1283,7 +1430,7 @@ pub fn ai_tool_log_stats(
              WHERE created_at >= ?1
              GROUP BY tool
              ORDER BY COUNT(*) DESC
-             LIMIT 8",
+             LIMIT 60",
         )
         .map_err(err)?;
     let tool_rows = tool_stmt
@@ -1429,7 +1576,8 @@ pub fn ai_usage_stats(
         .prepare(
             "SELECT strftime('%Y-%m-%d', created_at / 1000, 'unixepoch', 'localtime') AS day,
                     COUNT(*),
-                    COALESCE(SUM(prompt_tokens + completion_tokens), 0)
+                    COALESCE(SUM(prompt_tokens), 0),
+                    COALESCE(SUM(completion_tokens), 0)
              FROM ai_usage_logs
              WHERE created_at >= ?1
              GROUP BY day ORDER BY day",
@@ -1437,10 +1585,14 @@ pub fn ai_usage_stats(
         .map_err(err)?;
     let day_rows = day_stmt
         .query_map(params![since], |row| {
+            let prompt_tokens: i64 = row.get(2)?;
+            let completion_tokens: i64 = row.get(3)?;
             Ok(AiUsageDay {
                 day: row.get(0)?,
                 calls: row.get(1)?,
-                total_tokens: row.get(2)?,
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens + completion_tokens,
             })
         })
         .map_err(err)?;
@@ -1461,6 +1613,66 @@ pub fn ai_usage_stats(
         items,
         daily,
     })
+}
+
+/// 用量明细：每次模型调用一条，按时间倒序分页
+#[tauri::command]
+pub fn ai_usage_logs(
+    state: State<'_, AppState>,
+    days: Option<i64>,
+    page: Option<i64>,
+    page_size: Option<i64>,
+    ok: Option<bool>,
+) -> Result<AiUsagePage, String> {
+    let conn = state.pool.get().map_err(err)?;
+    let days = days.unwrap_or(30).clamp(1, USAGE_RETENTION_DAYS);
+    let since = now_ms() - days * DAY_MS;
+    let page = page.unwrap_or(1).max(1);
+    let page_size = page_size.unwrap_or(10).clamp(1, 200);
+    let offset = (page - 1) * page_size;
+    let ok_flag: Option<i64> = ok.map(|value| if value { 1 } else { 0 });
+
+    let total: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM ai_usage_logs
+             WHERE created_at >= ?1 AND (?2 IS NULL OR ok = ?2)",
+            params![since, ok_flag],
+            |row| row.get(0),
+        )
+        .map_err(err)?;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, COALESCE(provider_name, ''), COALESCE(model, ''),
+                    prompt_tokens, completion_tokens, ok, latency_ms,
+                    COALESCE(error, ''), COALESCE(request_preview, ''), created_at
+             FROM ai_usage_logs
+             WHERE created_at >= ?1 AND (?2 IS NULL OR ok = ?2)
+             ORDER BY id DESC
+             LIMIT ?3 OFFSET ?4",
+        )
+        .map_err(err)?;
+    let rows = stmt
+        .query_map(params![since, ok_flag, page_size, offset], |row| {
+            let prompt_tokens: i64 = row.get(3)?;
+            let completion_tokens: i64 = row.get(4)?;
+            Ok(AiUsageLog {
+                id: row.get(0)?,
+                provider_name: row.get(1)?,
+                model: row.get(2)?,
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens + completion_tokens,
+                ok: row.get::<_, i64>(5)? != 0,
+                latency_ms: row.get(6)?,
+                error: row.get(7)?,
+                request_preview: row.get(8)?,
+                created_at: row.get(9)?,
+            })
+        })
+        .map_err(err)?;
+    let items: Vec<AiUsageLog> = rows.filter_map(Result::ok).collect();
+    Ok(AiUsagePage { items, total })
 }
 
 /// 清空用量记录（默认只清超过 365 天的，explicit=true 时全清）

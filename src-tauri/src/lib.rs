@@ -117,6 +117,7 @@ pub fn run() {
             commands::ai::ai_tool_log_stats,
             commands::ai::ai_tool_log_clear,
             commands::ai::ai_usage_stats,
+            commands::ai::ai_usage_logs,
             commands::ai::ai_usage_clear,
             commands::oauth::oauth2_token,
             commands::cookie::cookie_list,

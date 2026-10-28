@@ -13,14 +13,18 @@ description: FbinHttp 内置 AI 助手「小HI」的开发与维护规范。接�
 |---|---|
 | `src-tauri/src/prompts/xiao_hi_system_prompt.md` | **小HI 身份、执行流程与业务规则**（唯一权威版本，改行为先改这里） |
 | `src-tauri/src/prompts/mod.rs` | `include_str!` 编译期嵌入 prompt，导出 `XIAO_HI_SYSTEM_PROMPT` |
-| `src-tauri/src/commands/ai.rs` | 服务商 CRUD 与测试、流式对话、工具执行代理、会话/消息、工具流水与统计 |
-| `src-tauri/src/models.rs` | `AiProvider`、`AiMessage`、`AiChatPayload`、`AiStreamEvent`、`AiSession`、`AiStoredMessage`、`AiToolLog` 及统计模型 |
-| `src-tauri/src/db/schema.sql` | `ai_providers`、`ai_sessions`、`ai_messages`、`ai_tool_logs` 四张表 |
-| `src/utils/aiTools.ts` | **工具注册表**：38 个工具的声明、参数解析、执行、中文名、敏感标记 |
-| `src/views/AiAssistant.vue` | 对话页：会话侧栏 + 消息气泡 + 工具卡片 + 服务配置抽屉 |
+| `src-tauri/src/commands/ai.rs` | 服务商 CRUD 与测试、流式对话、工具执行代理、会话/消息、工具流水、用量统计、报错中文化 |
+| `src-tauri/src/models.rs` | `AiProvider`、`AiMessage`、`AiChatPayload`、`AiStreamEvent`、`AiSession`、`AiStoredMessage`、`AiToolLog`、`AiUsageLog` / `AiUsagePage` / `AiUsageDay` |
+| `src-tauri/src/db/schema.sql` | `ai_providers`、`ai_sessions`、`ai_messages`、`ai_tool_logs`、`ai_usage_logs` 五张表 |
+| `src/utils/aiTools.ts` | **工具注册表**：39 个工具的声明、参数解析、执行、中文名、敏感标记 |
+| `src/utils/aiPricing.ts` | 模型价格表与费用估算：`estimateCost / fmtUsd / fmtCny / fmtUnit`，`USD_TO_CNY` |
+| `src/views/AiAssistant.vue` | 对话页：会话侧栏 + 消息气泡 + 工具卡片 + 模型服务抽屉 |
+| `src/views/AiUsage.vue` | 用量统计独立页（`/ai/usage`）：6 张指标卡 + 每日 token 柱 + 调用记录 / 模型汇总 / 工具准确率三 Tab + 右侧抽屉 |
 | `src/views/AiToolLogs.vue` | 工具调用记录页（`/ai/logs`）：指标卡、趋势柱、表格、详情抽屉 |
-| `src/App.vue` | 右下角悬浮机器人入口（`/ai` 页隐藏） |
-| `src/api/index.ts` | `aiProvider*`、`aiChat`、`aiExecute`、`aiSession*`、`aiMessage*`、`aiToolLog*` |
+| `src/views/Settings.vue` | 设置页「AI 辅助（小HI）」卡片：已上线说明 + 「打开小HI」「用量统计」 |
+| `src/views/Dashboard.vue` | 首页使用说明：第 07 步「用小HI 提效」、3 张 AI 技巧卡、3 条 AI FAQ |
+| `src/App.vue` | 右侧屏幕垂直居中的悬浮机器人入口（54px，`right: 14px` + `top: 50%`，`/ai` 页隐藏） |
+| `src/api/index.ts` | `aiProvider*`、`aiChat`、`aiExecute`、`aiSession*`、`aiMessage*`、`aiToolLog*`、`aiUsage*` |
 
 ## 三种协议
 
@@ -95,11 +99,11 @@ Rust 侧 `ai_chat(payload, on_event: Channel<AiStreamEvent>)`，逐块 `on_event
 
 改规则时的顺序：`agent_hard_rules.md`（需求） → `SCHEMAS` / `MAX_TOOL_ROUNDS` / `danger` 标记 → 前端提示文案 → 本表。
 
-### 工具清单（38）
+### 工具清单（39）
 
 | 分类 | 工具 |
 |---|---|
-| 项目 | `project_list` `project_create` `project_update` `project_delete` `project_import` `project_export` |
+| 项目 | `project_list` `project_request_counts` `project_create` `project_update` `project_delete` `project_import` `project_export` |
 | 集合 | `collection_tree` `collection_create` `collection_rename` `collection_delete` |
 | 请求 | `request_list` `request_get` `request_search` `request_options` `request_create` `request_update` `request_script_save` `request_delete` `curl_import` `send_request` `run_batch` |
 | 环境 | `env_list` `env_create` `env_var_save` `env_activate` |
@@ -145,7 +149,15 @@ Rust 侧 `ai_chat(payload, on_event: Channel<AiStreamEvent>)`，逐块 `on_event
 - **思考与执行过程默认折叠**：模型返回的 `reasoning`（OpenAI `reasoning_content` / Claude `thinking` / Gemini `thought`）与全部工具卡片收进一个 `a-collapse` 面板，标题为「思考过程 · N 个工具调用」；气泡正文只留用户的提问与最终回答
 - **附件**：输入框左侧回形针选择本地文本文件（≤60000 字符，超出截断），内容以 ```` ```fbin-file 文件名 ```` 块拼进用户消息；`contentParts` 会过滤掉该块，气泡里只显示附件胶囊，模型仍能读到全文
 - 输入框：Enter 发送、Shift/Ctrl + Enter 换行，`event.isComposing` 时不发送（中文输入法组字保护）
-- 悬浮入口：54px 机器人（纯 CSS/SVG，无图片），`z-index: 900` 低于弹窗，`/ai` 页隐藏，主内容区留 62px 底部空间
+- 悬浮入口：54px 机器人（纯 CSS/SVG，无图片），`z-index: 900` 低于弹窗，固定在**右侧屏幕垂直居中**（`right: 14px; top: 50%; margin-top: -27px`），`/ai` 页隐藏，不占用主内容区布局
+- 其他入口必须与悬浮入口说法一致：设置页「AI 辅助（小HI）」卡片（绿色「已上线」标签 + 打开小HI / 用量统计两个按钮）、首页使用说明第 07 步、3 张 AI 技巧卡与 3 条 AI FAQ；改文案时三处一起改，禁止出现「即将开放」「右下角机器人」这类过期描述
+- **只展示结果**：自动执行工具的那一轮（「我先获取…」）标 `hidden`，模板渲染 `visibleMessages`；重开会话用 `isExecutionNote()` 过滤历史，同 deepseek 的「只给答案」
+- **用量统计独立页**（`/ai/usage`，`src/views/AiUsage.vue`，工具栏「用量统计」直接路由过去）：6 张指标卡（调用次数 / 模型成功率 / 工具准确率 / 总 token / 估算费用 / 平均耗时）+ 每日 token 堆叠柱（输入/输出，>45 天按周聚合）+ Tab「调用记录 / 模型汇总 / 工具准确率」；调用记录来自 `ai_usage_logs`，一次调用一条，默认 10 条/页（10/20/50/100），完整 `YYYY-MM-DD HH:MM:SS`，整行点击弹右侧 560px 抽屉
+- **费用估算**：`src/utils/aiPricing.ts` 按模型名正则匹配厂商公开单价（USD/1M tokens），匹配不到走默认价并在 UI 标注「默认估算」；导出 `estimateCost / fmtUsd / fmtCny / fmtUnit`，汇率常量 `USD_TO_CNY`
+- `ai_tool_log_stats` 的 `LIMIT 60`：工具准确率覆盖全部常见工具；`ai_usage_logs` 支持 `ok` 参数筛选成功/失败
+- 列表类工具统一 `summarizeList()` 返回 `{ total, shown, items }`（明细限 50），模型引用 `total` 而非数条目
+- **工具输出先中文化再回灌**：`report_list` / `report_get` 由 `reportRows()` / `reportDigest()` 把 status（completed→已完成）、mode（fixed→固定并发）、bodyType（json→JSON）、errorType（TIMEOUT→请求超时）映射成中文，`requestId` / `envId` 解析成请求名 / 项目名 / 环境名，时间统一 `YYYY-MM-DD HH:MM:SS`；`history_list` 由 `historyRows()` 把 projectId 换成项目名。映射表是 `REPORT_STATUS_LABELS` / `STRESS_MODE_LABELS` / `BODY_TYPE_LABELS` / `ERROR_TYPE_LABELS`，新增枚举值时先补表
+- **其余查询类工具的取值规范**：`project_list` / `request_list` / `request_search` / `request_options` / `plan_list` 统一把 `updatedAt` 换成 `fmtTime` 本地时间；`env_list` 用中文键并给 `isSecret` 变量打码（明文密钥禁止进入模型上下文）；`workspace_stats` 走 `workspaceDigest()`、`dashboard_metrics` 走 `dashboardDigest()`，`topRequests.successRate` / `Reports.errorRate` 后端已是 **0–100**，不要再乘 100；`send_request` 的 `formatHttpResult` 用 `HTTP_STATUS_CN` 输出「200 成功」并把耗时/体积换成毫秒/KB
 - **空态自我介绍**：会话为空时显示 hero（头像 + 一段定位说明）、4 张能力卡（调接口 / 做工程 / 查数据 / 有留痕，数据来自 script 里的 `capabilities`）、敏感操作提示、以及 6 个可点击填充的 `suggestions`；改能力清单只改 `capabilities`，不用动模板
 
 ## 脚本引擎（前后置脚本）
@@ -159,14 +171,31 @@ Rust 侧 `ai_chat(payload, on_event: Channel<AiStreamEvent>)`，逐块 `on_event
 
 ## 模型用量统计（token 与准确率）
 
-每次 `ai_chat` 结束（成功或失败）都写一行 `ai_usage_logs`：`provider_id/provider_name/model` 快照、`prompt_tokens`、`completion_tokens`、`ok`、`latency_ms`、`error`。保留 365 天，写入时顺带清理过期行。
+每次 `ai_chat` 结束（成功或失败）都写一行 `ai_usage_logs`：`provider_id/provider_name/model` 快照、`prompt_tokens`、`completion_tokens`、`ok`、`latency_ms`、`error`、`request_preview`（本轮实际发给模型的用户消息；工具续跑时格式为「首问：… —— 本轮：…」，整体超过 2000 字截断）。保留 365 天，写入时顺带清理过期行。
 
 - **真实 token**：SSE 中解析 `usage`（OpenAI `usage.prompt_tokens/completion_tokens`、Anthropic `message_start.usage.input_tokens` + `message_delta.usage.output_tokens`、Gemini `usageMetadata`），非 SSE 整包也走同一解析
 - **估算兜底**：网关不回 usage 时按字符估算——中日韩字符 1 token/字，其余 4 字符 1 token（`estimate_tokens`）
 - **准确率口径**：`success_rate = ok 调用 / 总调用`；`tool_success_rate` 通过 `ai_tool_logs JOIN ai_sessions ON provider_id` 归属到模型，不额外建表
 - 命令：`ai_usage_stats(days)` 返回总量 + 按模型聚合 + 按天 token 趋势；`ai_usage_clear(all)` 默认只清过期，`all=true` 全清
-- 前端入口：小HI 头部「用量统计」，5 张指标卡（调用数 / 成功率 / 工具成功率 / 总 token / 平均耗时）+ 按模型明细表，支持 7/30/90/365 天切换
+- 前端入口：小HI 顶部「用量统计」直接路由到 `/ai/usage`（不再用弹窗）；页面为 6 张指标卡（调用次数 / 模型成功率 / 工具准确率 / 总 token / 估算费用 / 平均耗时）+ 每日 token 堆叠柱（>45 天按周聚合）+ Tab「调用记录 / 模型汇总 / 工具准确率」，默认 10 条/页（10/20/50/100），整行点击开右侧 560px 抽屉
 - `ai_provider_test` 不计入统计（连通性测试不算真实用量）
+
+## 模型目录与报错中文化
+
+模型服务抽屉（`AiAssistant.vue`）里的四处要保持一致，别只改其一：
+
+| 行为 | 实现 |
+|---|---|
+| 服务商 → 预置模型 | `presetModels`：OpenAI / DeepSeek / Kimi / 智谱 / 通义千问 / 硅基流动 / OpenRouter / Ollama 本地 / Claude / Gemini，用户从下拉选，避免手填错模型名 |
+| Base URL 识别服务商 | `hostHints` 按域名匹配（`api.openai.com`、`deepseek.com` 等），粘贴地址后自动带出服务商 |
+| 模型排序 | `naturalCompare()`：`localeCompare(..., { numeric: true })`，保证 `gpt-4o` 排在 `gpt-4` 之后 |
+| 模型名校验提示 | `modelHint`：命中预置给推荐说明，未命中提示「可能不被支持」，但仍允许保存 |
+
+报错统一在 Rust 侧转中文（`commands/ai.rs`），前端不得各自拼状态码文案：
+
+- `humanize_api_error(status, message)`：401 / 402 / 403 / 404 / 429 / 5xx、`supported API model names are ...`（列出可用模型并指向「模型服务配置」）、上下文超长、模型下线
+- `humanize_network_error(raw)`：DNS 解析失败 / 连接被拒 / 请求超时 / 证书校验失败，中文说明后附原始错误，方便排查自建网关
+- 新增厂商或遇到新报错模式，先补这两个函数，再考虑前端提示
 
 ## 常见坑
 
@@ -182,6 +211,10 @@ Rust 侧 `ai_chat(payload, on_event: Channel<AiStreamEvent>)`，逐块 `on_event
 | 模型输出 `<| DSLM | calls>` 等 XML 乱码 | 模型漏出原生工具语法；`liftNativeCalls()` 会抽出 JSON 还原成 fbin-tool 块，流式阶段在 `<\|` 处截断，prompt 里已明令禁用 |
 | 用户只看到「无法回答」 | 模型一轮吐多个 tool_call，被硬规则 2 全部拒绝后反复重试；`rejections` 达到 2 直接终止并提示，此时可手动点工具卡片运行 |
 | 进入小HI 页面卡顿 | 旧实现 `onMounted` 自动打开最近会话并整段渲染；现只预取服务商/会话列表，消息改为点击会话时加载，`parseSegments` 结果按内容缓存 |
+| 对话里满屏「执行过程 · 1 个工具调用」 | 自动执行的中间轮被标记 `hidden`，模板只渲染 `visibleMessages`；历史会话按 `isExecutionNote()` 同样过滤，只回放最终回答 |
+| 模型把请求数量说错 / 说「列表被截断」 | 列表类工具统一走 `summarizeList()`：`total` 在前、明细限 50 条，模型直接引用 total；prompt 的「数据准确性」禁止数条数 |
+| 改了 AI 页面但桌面客户端没变化 | 安装版把前端打进二进制，只更新 `dist/` 无效；要 `npm run build` 后重新 `npm run build:win` / `build:mac`，开发期用 `npm run tauri dev` |
+| 服务商报「模型不存在」但列表里有 | 多半是手填了带版本后缀的名字；让用户从 `presetModels` 下拉重选，再触发 `humanize_api_error` 的中文提示 |
 
 ## 校验
 
@@ -190,9 +223,9 @@ cargo check          # 在 src-tauri
 npm.cmd run build    # 根目录，vue-tsc + vite build
 ```
 
-两条都过再交付；改动 AI 功能后，手动回归：发一条纯聊天、发一条会触发工具的消息、打开 `/ai/logs` 翻页并点开详情。
+两条都过再交付；改动 AI 功能后，手动回归：发一条纯聊天、发一条会触发工具的消息、打开 `/ai/logs` 翻页并点开详情、打开 `/ai/usage` 切换 7/30/90/365 天并翻页。
 
 ## 样式与文案
 
-- 名称统一「小HI」，不写「AI 助手」作为产品名（导航、标题、占位符、system prompt 一致）
+- 名称统一「小HI」：导航、页面标题、占位符、system prompt 都用小HI；设置页卡片可写「AI 辅助（小HI）」，但不要再把「AI 助手」当成产品名
 - 所有面向用户的文案中文、简洁、可执行；工具失败要说清「下一步怎么改」

@@ -46,8 +46,8 @@ Windows 下 `cargo check` 若报 `hit restricted ... D:\Software\Rust\cargo\.glo
 
 ## 发版流程
 
-1. 同步版本号：`package.json`、`package-lock.json`（2 处）、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock` 的 `fbinhttp` 条目、`src-tauri/tauri.conf.json`（当前 1.0.5）
-2. 提交后打 tag：`git tag v1.0.5 && git push origin v1.0.5`
+1. 同步版本号：`package.json`、`package-lock.json`（2 处）、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock` 的 `fbinhttp` 条目、`src-tauri/tauri.conf.json`（当前 1.0.6）
+2. 提交后打 tag：`git tag v1.0.6 && git push origin v1.0.6`，同时把 `.github/workflows/release.yml` 里的 `releaseBody` 更新成本次版本说明（GitHub Release 直接用它）
 3. `.github/workflows/release.yml` 在 tag 推送时自动构建 Windows NSIS 与 macOS universal dmg，上传到 GitHub Release
 4. 应用内更新检查走 `commands/update.rs` 的 `RELEASE_API`（`https://api.github.com/repos/Wayward-GOU/FbinHttp/releases/latest`），仓库地址已改为 FbinHttp
 5. macOS 用户安装脚本 `scripts/install-macos.sh`（`REPO=Wayward-GOU/FbinHttp`）从 Release 下载 dmg，并绕过未签名校验；README 中的安装命令同源
@@ -61,3 +61,4 @@ Windows 下 `cargo check` 若报 `hit restricted ... D:\Software\Rust\cargo\.glo
 | 窗口一片空白、无报错弹层 | 前端 `setup()` 抛异常，最常见是 `App.vue` 里 `navs` 的 TDZ，用 `npm run dev` 看控制台 |
 | 托盘图标没变 | `tray.png` 是编译期嵌入，需重新编译，仅替换文件不生效 |
 | 安装包名仍是旧名 | 检查 `productName` 是否被改动，以及构建前是否重新加载了配置 |
+| 安装包/客户端界面还是旧版 | 安装版把 `dist/` 编进二进制，只跑 `npm run build` 或重启旧 exe 不会更新；必须重新 `npm run build:win` / `build:mac`（`beforeBuildCommand` 会自动再构建一次前端） |

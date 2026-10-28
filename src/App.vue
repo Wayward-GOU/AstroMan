@@ -365,7 +365,7 @@ const theme = computed(() => {
         </div>
       </aside>
 
-      <main class="main" :class="{ 'main-dock': !route.path.startsWith('/ai') }">
+      <main class="main">
         <router-view />
       </main>
 
@@ -671,11 +671,12 @@ const theme = computed(() => {
   box-shadow: 0 8px 24px rgba(15, 23, 42, 0.28);
 }
 
-/* 全局悬浮入口：小HI 小机器人，贴右下角，尽量不压内容 */
+/* 全局悬浮入口：小HI 小机器人，贴右侧屏幕垂直居中 */
 .hi-float {
   position: fixed;
   right: 14px;
-  bottom: 14px;
+  top: 50%;
+  margin-top: -27px;
   z-index: 900;
   width: 54px;
   height: 54px;
@@ -906,11 +907,6 @@ const theme = computed(() => {
   height: 100%;
   overflow: auto;
   background: var(--fm-bg);
-}
-
-/* 为右下角悬浮机器人预留空间，保证内容能滚动到按钮上方 */
-.main-dock {
-  padding-bottom: 62px;
 }
 
 /* ---------- 命令面板 ---------- */

@@ -792,7 +792,35 @@ pub struct AiUsageStat {
 pub struct AiUsageDay {
     pub day: String,
     pub calls: i64,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
     pub total_tokens: i64,
+}
+
+/// 单次模型调用记录（调一次记一条，用于分页查看）
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiUsageLog {
+    pub id: i64,
+    pub provider_name: String,
+    pub model: String,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub total_tokens: i64,
+    pub ok: bool,
+    pub latency_ms: i64,
+    pub error: String,
+    /// 这轮实际发给模型的内容（本轮用户消息，工具续跑时附带首问）
+    pub request_preview: String,
+    pub created_at: i64,
+}
+
+/// 用量明细分页结果
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiUsagePage {
+    pub items: Vec<AiUsageLog>,
+    pub total: i64,
 }
 
 /// 模型用量看板

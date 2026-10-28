@@ -1,6 +1,6 @@
 [package]
 name = "fbinhttp"
-version = "1.0.5"
+version = "1.0.6"
 description = "FbinHttp - 本地 API 调试与压测工具"
 edition = "2021"
 

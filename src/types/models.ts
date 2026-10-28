@@ -279,6 +279,160 @@ export interface DashboardMetrics {
   topProjects: ProjectPoint[]
 }
 
+/** AI 服务商：kind 决定协议（openai / anthropic / gemini） */
+export interface AiProvider {
+  id?: number | null
+  name: string
+  kind: string
+  baseUrl: string
+  model: string
+  /** 编辑时留空表示沿用已保存的 Key */
+  apiKey: string
+  temperature?: number | null
+  isDefault?: boolean
+}
+
+export interface AiMessage {
+  role: 'system' | 'user' | 'assistant'
+  content: string
+}
+
+export interface AiChatPayload {
+  providerId: number
+  messages: AiMessage[]
+  temperature?: number | null
+}
+
+/** 流式事件：delta 增量文本 / done 结束 / error 错误 */
+export interface AiStreamEvent {
+  kind: 'delta' | 'done' | 'error' | string
+  text: string
+}
+
+/** AI 历史会话 */
+export interface AiSession {
+  id: number
+  title: string
+  providerId?: number | null
+  messageCount: number
+  createdAt: number
+  updatedAt: number
+}
+
+export interface AiStoredMessage {
+  id: number
+  sessionId: number
+  role: 'user' | 'assistant' | string
+  content: string
+  reasoning?: string | null
+  createdAt: number
+}
+
+/** AI 工具调用流水 */
+export interface AiToolLog {
+  id: number
+  sessionId?: number | null
+  tool: string
+  args: string
+  ok: boolean
+  durationMs: number
+  resultPreview: string
+  createdAt: number
+}
+
+export interface AiToolLogPage {
+  items: AiToolLog[]
+  total: number
+}
+
+export interface AiToolDayStat {
+  date: string
+  total: number
+  failed: number
+}
+
+export interface AiToolUsageStat {
+  tool: string
+  total: number
+  failed: number
+  avgDurationMs: number
+}
+
+export interface AiToolLogStats {
+  total: number
+  ok: number
+  failed: number
+  avgDurationMs: number
+  last24h: number
+  days: AiToolDayStat[]
+  tools: AiToolUsageStat[]
+}
+
+/** 单个模型（服务商）的用量与准确率 */
+export interface AiUsageStat {
+  providerId: number | null
+  providerName: string
+  model: string
+  calls: number
+  okCalls: number
+  /** 成功调用占比 0~1 */
+  successRate: number
+  promptTokens: number
+  completionTokens: number
+  totalTokens: number
+  avgLatencyMs: number
+  toolCalls: number
+  toolOk: number
+  toolSuccessRate: number
+  lastUsedAt: number
+}
+
+export interface AiUsageDay {
+  day: string
+  calls: number
+  promptTokens: number
+  completionTokens: number
+  totalTokens: number
+}
+
+/** 单次模型调用记录 */
+export interface AiUsageLog {
+  id: number
+  providerName: string
+  model: string
+  promptTokens: number
+  completionTokens: number
+  totalTokens: number
+  ok: boolean
+  latencyMs: number
+  error: string
+  /** 这轮实际发给模型的内容（本轮提问；工具续跑时附带首问） */
+  requestPreview: string
+  createdAt: number
+}
+
+/** 用量明细分页 */
+export interface AiUsagePage {
+  items: AiUsageLog[]
+  total: number
+}
+
+export interface AiUsageStats {
+  days: number
+  totalCalls: number
+  okCalls: number
+  successRate: number
+  promptTokens: number
+  completionTokens: number
+  totalTokens: number
+  avgLatencyMs: number
+  toolCalls: number
+  toolOk: number
+  toolSuccessRate: number
+  items: AiUsageStat[]
+  daily: AiUsageDay[]
+}
+
 export interface RequestRun {
   id: number
   requestId: number
@@ -451,6 +605,10 @@ export interface ReportConfigSnapshot {
   bodyType?: string
   envId?: number | null
   timeoutMs?: number
+  connectTimeoutMs?: number
+  followRedirects?: boolean
+  stopErrorRate?: number | null
+  stopMinRequests?: number | null
   thinkTimeMs?: number
   rampUpSec?: number
   targetRps?: number

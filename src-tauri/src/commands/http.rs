@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use crate::commands::cookie;
 use crate::models::{FormField, HttpResult, SendRequestPayload};
 use crate::state::AppState;
-use crate::util::{err, now_ms, render};
+use crate::util::{err, now_ms, render, strip_json_comments};
 use rusqlite::{params, Connection};
 use tauri::State;
 
@@ -16,6 +16,14 @@ const MAX_HISTORY: i64 = 100_000;
 #[tauri::command]
 pub async fn send_http_request(
     state: State<'_, AppState>,
+    payload: SendRequestPayload,
+) -> Result<HttpResult, String> {
+    execute(state.inner(), payload).await
+}
+
+/// 真正发请求的实现：手动发送与 AI 执行共用，保证历史、Cookie、快照逻辑完全一致
+pub(crate) async fn execute(
+    state: &AppState,
     payload: SendRequestPayload,
 ) -> Result<HttpResult, String> {
     let vars = match payload.env_id {
@@ -198,7 +206,14 @@ pub async fn send_http_request(
                     applied_headers.push(("Content-Type".to_string(), content_type.to_string()));
                     builder = builder.header(reqwest::header::CONTENT_TYPE, content_type);
                 }
-                sent_body = render(payload.body.as_deref().unwrap_or(""), &vars);
+                let raw_body = payload.body.as_deref().unwrap_or("");
+                // JSON 允许写注释（Postman 的 raw/JSON 编辑器同样如此），发送前去掉，避免服务端解析失败
+                let source = if body_type == "json" {
+                    strip_json_comments(raw_body)
+                } else {
+                    raw_body.to_string()
+                };
+                sent_body = render(&source, &vars);
                 builder = builder.body(sent_body.clone());
             }
         }
@@ -214,14 +229,14 @@ pub async fn send_http_request(
                 }
             }
             record_history(
-                &state,
+                state,
                 &payload,
                 &url_for_history,
                 Some(result.status as i64),
                 result.duration_ms as i64,
             );
             record_run_snapshot(
-                &state,
+                state,
                 &payload,
                 &url_for_history,
                 &applied_headers,
@@ -232,7 +247,7 @@ pub async fn send_http_request(
         }
         Err(error) => {
             let duration = started.elapsed().as_millis() as i64;
-            record_history(&state, &payload, &url_for_history, None, duration);
+            record_history(state, &payload, &url_for_history, None, duration);
             let result = HttpResult {
                 status: 0,
                 status_text: String::new(),
@@ -244,7 +259,7 @@ pub async fn send_http_request(
                 error: Some(error.to_string()),
             };
             record_run_snapshot(
-                &state,
+                state,
                 &payload,
                 &url_for_history,
                 &applied_headers,

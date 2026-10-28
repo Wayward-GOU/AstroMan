@@ -85,3 +85,5 @@ npm run tauri dev
 ```
 
 只跑 `npm run dev`（纯浏览器）时 `invoke` 不存在，属于预期，不要据此判断功能坏了。
+
+前端改动只跑 `npm run build` 不会更新已安装的客户端（安装包内嵌 `dist/`），发版前必须重新执行 `npm run build:win` / `build:mac`，详见 `fbinhttp-build-release`。

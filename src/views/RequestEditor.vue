@@ -1302,6 +1302,8 @@ const responseHeaders = computed(() => {
                   v-model="form.body"
                   fill
                   :rows="14"
+                  :commentable="form.bodyType === 'json'"
+                  :language="form.bodyType === 'json' ? 'json' : 'plain'"
                   placeholder='{"name":"fink"}'
                 />
                 <div v-else class="empty-hint">该请求没有 Body</div>

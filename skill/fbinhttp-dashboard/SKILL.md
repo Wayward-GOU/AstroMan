@@ -105,6 +105,18 @@ main-grid（我的项目：左列表 + 右侧最近压测/本机状态/常用工
 - `max-width: 1180px`：`.console`、`.main-grid`、`.dash-grid` 全部单列
 - `max-width: 980px`：`.runner-band` 单列、`.example-grid` 单列
 
+### 使用说明与 AI 引导
+
+底部「使用说明 / FAQ」由 script 里的三个常量驱动，改文案只改数据、不动模板：
+
+| 常量 | 内容 | 现状 |
+|---|---|---|
+| `steps` | 八步上手：01 建项目 → 02 配环境 → 03 调接口 → 04 压测 → 05 签名加密 → 06 导入接口 → **07 用小HI 提效** → 08 数据与备份 | 每步带 `action` 文案与 `go()` 跳转，AI 步走 `router.push({ name: 'ai' })` |
+| `tips` | 12 张技巧卡：变量优先级、3 个前置脚本示例、后置断言、cURL 导入、多标签、压测参数、**3 张 AI 卡**（自然语言操作 / 写脚本与查数据 / 用量与费用）、数据备份 | AI 卡必须写「点右侧屏幕中间的机器人」，不能写右下角 |
+| `faqs` | 15 条常见问题，含「小HI 能帮我做什么」「AI 服务怎么配置、密钥是否安全」「AI 用了多少 token、花了多少钱」 | 与 `Settings.vue` 的 AI 卡片、README 的 FAQ 保持同一口径 |
+
+改 AI 入口/权限/计费口径时，同时检查：本文件的 `steps/tips/faqs`、`Settings.vue` 的 AI 卡片、`AiAssistant.vue` 的工具文案、README「已实现功能」。
+
 ### 新增一块图表
 
 1. 在 `dashboard_metrics` 里加聚合字段（能一条 SQL 出就不要加命令），补 `models.rs` 结构

@@ -2,6 +2,7 @@ mod commands;
 mod db;
 mod models;
 mod netinfo;
+mod prompts;
 mod state;
 mod util;
 
@@ -98,6 +99,26 @@ pub fn run() {
             commands::environment::env_var_save,
             commands::environment::env_script_save,
             commands::http::send_http_request,
+            commands::ai::ai_provider_list,
+            commands::ai::ai_provider_save,
+            commands::ai::ai_provider_delete,
+            commands::ai::ai_provider_test,
+            commands::ai::ai_chat,
+            commands::ai::ai_execute,
+            commands::ai::ai_session_list,
+            commands::ai::ai_session_create,
+            commands::ai::ai_session_rename,
+            commands::ai::ai_session_delete,
+            commands::ai::ai_message_list,
+            commands::ai::ai_message_add,
+            commands::ai::ai_message_clear,
+            commands::ai::ai_tool_log_add,
+            commands::ai::ai_tool_log_list,
+            commands::ai::ai_tool_log_stats,
+            commands::ai::ai_tool_log_clear,
+            commands::ai::ai_usage_stats,
+            commands::ai::ai_usage_logs,
+            commands::ai::ai_usage_clear,
             commands::oauth::oauth2_token,
             commands::cookie::cookie_list,
             commands::cookie::cookie_save,

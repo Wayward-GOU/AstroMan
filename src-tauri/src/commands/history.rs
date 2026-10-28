@@ -14,6 +14,8 @@ const MAX_QUERY_LIMIT: u32 = 20_000;
 pub fn history_list(
     state: State<'_, AppState>,
     limit: Option<u32>,
+    request_id: Option<i64>,
+    project_id: Option<i64>,
 ) -> Result<Vec<HistoryItem>, String> {
     let limit = limit.unwrap_or(100).clamp(1, MAX_QUERY_LIMIT) as i64;
 
@@ -25,11 +27,13 @@ pub fn history_list(
              FROM request_history h
              LEFT JOIN requests r ON r.id = h.request_id
              LEFT JOIN collections c ON c.id = r.collection_id
+             WHERE (?2 IS NULL OR h.request_id = ?2)
+               AND (?3 IS NULL OR c.project_id = ?3)
              ORDER BY h.id DESC LIMIT ?1",
         )
         .map_err(err)?;
     let rows = stmt
-        .query_map(params![limit], |row| {
+        .query_map(params![limit, request_id, project_id], |row| {
             Ok(HistoryItem {
                 id: row.get(0)?,
                 request_id: row.get(1)?,

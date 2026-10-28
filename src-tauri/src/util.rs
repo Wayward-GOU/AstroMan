@@ -14,6 +14,63 @@ pub fn err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
 }
 
+/// 去掉 JSON 文本里的注释，与 Postman 的 raw(JSON) 编辑器保持一致
+///
+/// 支持 `// 行注释` 与 `/* 块注释 */`，字符串内部的 `//`（例如 URL）不会被误删。
+pub fn strip_json_comments(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut index = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    while index < chars.len() {
+        let current = chars[index];
+        if in_string {
+            out.push(current);
+            if escaped {
+                escaped = false;
+            } else if current == '\\' {
+                escaped = true;
+            } else if current == '"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        if current == '"' {
+            in_string = true;
+            out.push(current);
+            index += 1;
+            continue;
+        }
+        if current == '/' && index + 1 < chars.len() {
+            match chars[index + 1] {
+                '/' => {
+                    index += 2;
+                    while index < chars.len() && chars[index] != '\n' {
+                        index += 1;
+                    }
+                    continue;
+                }
+                '*' => {
+                    index += 2;
+                    while index + 1 < chars.len() && !(chars[index] == '*' && chars[index + 1] == '/') {
+                        index += 1;
+                    }
+                    index = (index + 2).min(chars.len());
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        out.push(current);
+        index += 1;
+    }
+
+    out
+}
+
 /// 简单模板渲染：支持 {{var}} 与内置变量
 ///
 /// 内置变量支持 `{{timestamp}}` 与 Postman 风格的 `{{$timestamp}}` 两种写法。

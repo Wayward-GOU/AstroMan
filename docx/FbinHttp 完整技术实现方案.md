@@ -327,6 +327,7 @@ CREATE INDEX idx_reports_created       ON test_reports(created_at DESC);
 - URL 支持 `{{变量}}` 替换，自动拆分 Query 参数
 - Headers：表格编辑，可单条启用/禁用
 - Body 六种模式：`json` / `graphql` / `form-data`（multipart，支持文件字段）/ `x-www-form-urlencoded` / `binary`（本地文件二进制上传）/ `raw`
+- JSON Body 与 Postman 兼容：允许 `//` 行注释与 `/* */` 块注释，`Ctrl / ⌘ + /` 切换选中行注释，编辑器按注释 / 字段名 / 字符串 / 数字 / `{{变量}}` 着色；发送前由 Rust `util::strip_json_comments` 剥离注释（手动发送、AI 发送与压测同一套规则），字符串里的 `https://` 不会被误删
 - 认证：Bearer / Basic / API Key（header 或 query）/ OAuth2 Client Credentials（一键获取令牌），手写 `Authorization` 头优先
 - Cookie：按 RFC 6265 解析 Set-Cookie 入库，按域名 / 路径 / Secure 自动携带，可手动维护与清空
 - 代理与 mTLS：全局设置支持 HTTP / SOCKS5 代理与客户端证书（`*.pfx` / `*.p12`），保存后重建 HttpClient
@@ -521,10 +522,25 @@ async fn run_load(
 #### 原则
 
 - 不内置模型、不代付 Token、不做额度
-- 只支持 **OpenAI 兼容协议**（`/v1/chat/completions`），一套实现覆盖 DeepSeek、通义千问、Kimi、智谱、Ollama、OneAPI、LiteLLM 等
-- Key 用 AES-GCM 加密后存本地库，主密钥存系统钥匙串，**永不上传任何服务器**
-- AI 生成内容只填入编辑器，必须用户点「采用」才写库；不自动保存、不自动执行
-- 未配置时所有 AI 入口灰显，点击引导去设置，不影响其他功能
+- 支持三种协议：OpenAI 兼容（`/chat/completions`）、Anthropic（`/v1/messages`）、Gemini（`streamGenerateContent`），一套界面覆盖 DeepSeek、通义千问、Kimi、智谱、Claude、Gemini、Ollama 等
+- Key 用 AES-256-GCM 加密（密钥由固定种子 + Key 经 SHA-256 派生）后存本地库，列表只回显掩码，**永不上传任何服务器**
+- 采用「工具调用」而不是只把结果填进编辑器：普通工具可自动连续执行（最多 5 轮、单轮 1 个），删除 / 导出 / 压测等敏感工具必须用户二次确认
+- 未配置服务商时入口仍可见，页面引导去「模型服务」配置，不影响其他功能
+
+#### 实现现状（v1.0.6）
+
+> 本节记录落地结果，与上方早期设计不一致时以本节为准。细节见 skill `fbinhttp-ai`。
+
+| 主题 | 实现 |
+|---|---|
+| 对话 | Tauri `Channel<AiStreamEvent>` 流式回传 `delta / reasoning / done / error`，三协议共用一套 SSE 解析与 usage 提取 |
+| 系统提示词 | `src-tauri/src/prompts/xiao_hi_system_prompt.md` 由 `include_str!` 编译期嵌入，每次 `ai_chat` 强制插到 `messages[0]`，前端不可覆盖 |
+| 工具 | `src/utils/aiTools.ts` 注册 39 个工具；`SCHEMAS` 做强校验，`danger` 标记 16 个敏感工具，结果回灌前做脱敏 |
+| 会话 | `ai_sessions` / `ai_messages` 落库；正文截 8000 字、思考截 2000 字，附件只存「文件名 + 字符数」摘要，避免库膨胀 |
+| 审计 | `ai_tool_logs` 每次工具调用一条（参数 / 结果各 2000 字）；`ai_usage_logs` 每次模型调用一条（token、耗时、费用估算、本轮提问），保留 365 天 |
+| 费用 | `src/utils/aiPricing.ts` 按模型名正则匹配厂商单价（USD / 1M tokens），界面同时展示美元与人民币估算，匹配不到时标注「默认估算」 |
+| 报错 | Rust `humanize_api_error` / `humanize_network_error` 把 401/402/403/404/429/5xx、模型不支持、DNS/超时/证书问题统一转中文 |
+| 入口 | 右侧屏幕垂直居中的悬浮机器人；`/ai/usage` 用量统计页；设置页「AI 辅助（小HI）」卡片与首页使用说明第 07 步均提供入口 |
 
 #### 能力清单
 
@@ -650,11 +666,16 @@ pub async fn ai_save_provider(cfg: ProviderConfig) -> Result<i64, String> { /* A
 | `api_import` | `{ path, projectId? }` | `ImportResult` | 导入 Postman / Apifox 集合 |
 | `project_export / project_import` | `{ path }` | `()` / `Project` | 项目 JSON 迁移 |
 | `openapi_export / openapi_import` | `{ projectId?, path }` | `()` / `Project` | OpenAPI 3.0 / Swagger 2.0 |
-| `ai_list_providers` | — | `Vec<Provider>` | Provider 列表（Key 打码） |
-| `ai_save_provider` | `ProviderConfig` | `id` | 保存（加密） |
-| `ai_delete_provider` | `{ id }` | `()` | 删除 |
-| `ai_test_provider` | `{ id }` | `ProviderInfo` | 探活 |
-| `ai_chat` | `{ providerId, scene, intent, context }` | 流式事件 | AI 调用 |
+| `ai_provider_list` | — | `Vec<AiProvider>` | 服务商列表（Key 打码） |
+| `ai_provider_save` | `AiProviderInput` | `AiProvider` | 新增 / 更新（AES-256-GCM 加密） |
+| `ai_provider_delete` | `{ id }` | `()` | 删除 |
+| `ai_provider_test` | `{ id }` | `String` | 连通性探活 |
+| `ai_chat` | `{ providerId, messages, temperature? }` + `Channel` | 流式 `AiStreamEvent` | 对话（system prompt 由后端注入） |
+| `ai_execute` | `{ tool, args }` | `Value` | AI 工具执行代理（敏感工具在前端确认） |
+| `ai_session_list / create / rename / delete` | 见参数 | 会话 | 会话维护 |
+| `ai_message_list / add / clear` | 见参数 | 消息 | 消息落库与回放（正文/思考截断） |
+| `ai_tool_log_add / list / stats / clear` | 见参数 | 流水 | 工具调用审计与准确率 |
+| `ai_usage_logs / ai_usage_stats / ai_usage_clear` | `{ days, page, pageSize, ok }` 等 | 分页 / 统计 | 用量、费用与每日趋势 |
 | `backup_export` | `{ path }` | `()` | 导出数据库 |
 | `backup_restore` | `{ path }` | `()` | 恢复数据库 |
 
@@ -662,10 +683,10 @@ pub async fn ai_save_provider(cfg: ProviderConfig) -> Result<i64, String> { /* A
 
 | Event | 负载 | 用途 |
 |---|---|---|
-| `load.progress` | `Sample` | 压测每秒采样 |
-| `load.done` | `{ reportId, status }` | 压测结束 |
-| `load.error` | `{ reportId, message }` | 压测异常 |
-| `ai.chunk` | `{ delta, done }` | AI 流式输出 |
+| `stress:progress` | `StressProgress` | 压测实时指标、阶段与每秒采样 |
+| `stress:done` | `StressDone` | 压测结束（含报告 id 与状态） |
+
+AI 对话不走全局事件，改用命令入参里的 `Channel<AiStreamEvent>`，避免多个窗口/会话互相串消息。
 
 ### 5.3 IPC 类型契约
 

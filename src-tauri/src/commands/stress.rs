@@ -14,7 +14,7 @@ use crate::models::{
     StatusCount, StressConfig, StressDone, StressProgress, StressReport, StressStage,
 };
 use crate::state::{AppState, DbPool};
-use crate::util::{err, now_ms, render};
+use crate::util::{err, now_ms, render, strip_json_comments};
 
 /// 延迟直方图上限（毫秒），超出的请求计入最后一个桶
 const MAX_RT_MS: usize = 60_000;
@@ -449,7 +449,14 @@ async fn send_once(ctx: &RunCtx) -> Attempt {
             builder = builder.header(reqwest::header::CONTENT_TYPE, content_type);
             header_pairs.push(("Content-Type".to_string(), content_type.to_string()));
         }
-        let rendered = render(ctx.config.body.as_deref().unwrap_or(""), &ctx.vars);
+        let raw_body = ctx.config.body.as_deref().unwrap_or("");
+        // JSON 请求体里的注释在发送前去掉，与 Postman 行为一致
+        let source = if body_type == "json" {
+            strip_json_comments(raw_body)
+        } else {
+            raw_body.to_string()
+        };
+        let rendered = render(&source, &ctx.vars);
         builder = builder.body(rendered.clone());
         request_body = Some(rendered);
     }

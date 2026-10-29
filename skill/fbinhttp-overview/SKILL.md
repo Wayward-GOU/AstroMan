@@ -22,7 +22,8 @@ FbinHttp/
 │  ├─ styles/main.css # 设计系统：--fm-* 变量
 │  ├─ tools/          # 离线工具注册表（registry.ts）与各工具组件
 │  ├─ types/models.ts # 与 Rust models.rs 对应的 TS 类型
-│  ├─ utils/          # scriptRunner（脚本引擎）、cryptoScript、rsa、curl、reportExport、xlsx、diff、mybatis、aiTools（AI 工具注册表）、aiPricing（费用估算）、markdown
+│  ├─ utils/          # scriptRunner（脚本引擎）、cryptoScript、rsa、curl、reportExport、xlsx、diff、mybatis、markdown
+│  │                  # AI：aiTools（62 工具注册表）、aiProtocol（围栏协议）、contextBudget（token 预算）、modelMeta（窗口）、untrusted（注入隔离）、aiPricing（费用）、promptText（压缩）
 │  └─ views/          # Dashboard / Project / RequestEditor / StressTest / Runner / Reports / History / Tools / SystemMonitor / Settings / Environment / ReportDetail / AiAssistant / AiUsage / AiToolLogs
 ├─ src-tauri/
 │  ├─ src/commands/   # 每个文件一个业务域，全部 #[tauri::command]
@@ -98,5 +99,5 @@ Windows 下 `cargo check` 在受限沙箱里会命中 `D:\Software\Rust\cargo\.g
 | `fbinhttp-backend` | Rust 命令、SQLite 迁移、压测引擎规范 |
 | `fbinhttp-frontend` | 页面骨架、主题变量、脚本引擎、导出 |
 | `fbinhttp-dashboard` | 首页数据大屏口径、CSS 图表约定、Runner 介绍文案 |
-| `fbinhttp-ai` | AI 助手「小HI」：双模式（聊天 / 操作）、协议接入、流式渲染、会话、工具注册表、写操作确认、工具调用记录 |
+| `fbinhttp-ai` | AI 助手「小HI」：双模式、三协议、流式渲染、上下文预算与摘要、停止/重试/工具超时、注入隔离、62 工具与目录分层、写操作确认卡、消息操作、复盘时间线、会话管理 |
 | `fbinhttp-build-release` | 构建、打包与发布 |

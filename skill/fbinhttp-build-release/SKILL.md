@@ -13,6 +13,8 @@ description: FbinHttp 的打包、图标、托盘与发布流程。需要构建 
 | Windows 安装包 | `npm run build:win` | `FbinHttp_<版本>_x64-setup.exe`（NSIS） |
 | macOS 安装包 | `npm run build:mac` | `FbinHttp_<版本>_universal.dmg` |
 | 仅校验 Rust | `cd src-tauri && cargo check` | — |
+| 前端单测 | `npm run test` | vitest 46 条 |
+| Rust 单测 | `cd src-tauri && cargo test` | 22 条 |
 
 产物统一在 `src-tauri/target/release/bundle/` 下。
 
@@ -46,8 +48,8 @@ Windows 下 `cargo check` 若报 `hit restricted ... D:\Software\Rust\cargo\.glo
 
 ## 发版流程
 
-1. 同步版本号：`package.json`、`package-lock.json`（2 处）、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock` 的 `fbinhttp` 条目、`src-tauri/tauri.conf.json`（当前 1.0.6）
-2. 提交后打 tag：`git tag v1.0.6 && git push origin v1.0.6`，同时把 `.github/workflows/release.yml` 里的 `releaseBody` 更新成本次版本说明（GitHub Release 直接用它）
+1. 同步版本号：`package.json`、`package-lock.json`（2 处）、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock` 的 `fbinhttp` 条目、`src-tauri/tauri.conf.json`（当前 1.0.7）
+2. 提交后打 tag：`git tag v1.0.7 && git push origin v1.0.7`，同时把 `.github/workflows/release.yml` 里的 `releaseBody` 更新成本次版本说明（GitHub Release 直接用它）；版本说明追加到 `### 本次更新（x.y.z）` 段落
 3. `.github/workflows/release.yml` 在 tag 推送时自动构建 Windows NSIS 与 macOS universal dmg，上传到 GitHub Release
 4. 应用内更新检查走 `commands/update.rs` 的 `RELEASE_API`（`https://api.github.com/repos/Wayward-GOU/FbinHttp/releases/latest`），仓库地址已改为 FbinHttp
 5. macOS 用户安装脚本 `scripts/install-macos.sh`（`REPO=Wayward-GOU/FbinHttp`）从 Release 下载 dmg，并绕过未签名校验；README 中的安装命令同源

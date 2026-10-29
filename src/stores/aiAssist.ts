@@ -1,7 +1,10 @@
 import { defineStore } from 'pinia'
 import { computed, reactive, ref } from 'vue'
 import { aiChat, aiProviderList } from '@/api'
+import { buildContext, estimateTokens } from '@/utils/contextBudget'
+import { contextBudgetOf } from '@/utils/modelMeta'
 import { compactPrompt } from '@/utils/promptText'
+import { wrapUntrusted } from '@/utils/untrusted'
 import type { AiMessage, AiProvider } from '@/types/models'
 
 export interface AssistMessage {
@@ -22,7 +25,6 @@ const SYSTEM_PROMPT = `你是 FbinHttp 桌面工具内置的接口分析助手�
 4. 不要输出任何工具调用块、尖括号标记或特殊标记，也不要声称自己已经发送了请求或执行了压测。
 5. 涉及密钥、Token 时提醒放到环境变量里，不要明文回显。`
 
-const MAX_CONTEXT = 12_000
 const MAX_ROUNDS = 12
 
 export const useAiAssistStore = defineStore('aiAssist', () => {
@@ -44,8 +46,15 @@ export const useAiAssistStore = defineStore('aiAssist', () => {
   const ready = computed(() => Boolean(providerId.value))
   const canSend = computed(() => ready.value && !streaming.value)
 
-  function clip(text: string, limit = MAX_CONTEXT): string {
-    return text.length > limit ? `${text.slice(0, limit)}\n…（上下文过长已截断）` : text
+  /**
+   * 大报告头尾都保留：头部是结构，尾部通常才是最新 / 汇总的关键指标。
+   * 只截中间，避免「只截前 12k」丢掉结论。
+   */
+  function clipMiddle(text: string, limit: number): string {
+    if (text.length <= limit) return text
+    const head = Math.floor(limit * 0.6)
+    const tail = Math.max(0, limit - head)
+    return `${text.slice(0, head)}\n…（中间省略 ${text.length - limit} 字符）…\n${text.slice(-tail)}`
   }
 
   async function ensureProviders(): Promise<number | null> {
@@ -65,14 +74,27 @@ export const useAiAssistStore = defineStore('aiAssist', () => {
     return providerId.value
   }
 
+  /**
+   * 按模型窗口动态分配：页面快照最多占 70%，剩下留给追问历史。
+   * 快照同样包不可信标签（T-17），避免报告正文里藏指令。
+   */
   function payload(extra: AssistMessage[]): AiMessage[] {
-    const history: AiMessage[] = [{ role: 'system', content: SYSTEM_PROMPT }]
-    if (context) history.push({ role: 'user', content: clip(compactPrompt(context)) })
+    const budget = contextBudgetOf(currentProvider.value?.model ?? '')
+    const room = Math.max(2000, budget - estimateTokens(SYSTEM_PROMPT) - 400)
+    const head: AiMessage[] = [{ role: 'system', content: SYSTEM_PROMPT }]
+    const dialogue: AiMessage[] = []
+    let left = room
+    if (context) {
+      const snapshot = wrapUntrusted('page:snapshot', compactPrompt(context))
+      const text = clipMiddle(snapshot, Math.max(1200, Math.floor(room * 0.7)))
+      head.push({ role: 'user', content: text })
+      left = Math.max(800, room - estimateTokens(text))
+    }
     for (const item of extra.slice(-MAX_ROUNDS)) {
       if (!item.content.trim()) continue
-      history.push({ role: item.role, content: compactPrompt(item.content) })
+      dialogue.push({ role: item.role, content: compactPrompt(item.content) })
     }
-    return history
+    return [...head, ...buildContext(dialogue, left).messages]
   }
 
   async function run() {

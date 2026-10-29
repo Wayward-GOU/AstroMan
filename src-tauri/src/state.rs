@@ -1,8 +1,9 @@
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::Manager;
@@ -58,6 +59,8 @@ pub struct AppState {
     pub stress_running: Arc<AtomicBool>,
     /// 压测停止信号
     pub stress_cancel: Arc<AtomicBool>,
+    /// AI 在途请求的取消标记：requestId → 取消位
+    pub ai_cancels: Arc<parking_lot::Mutex<HashMap<String, Arc<AtomicBool>>>>,
 }
 
 impl AppState {
@@ -111,6 +114,7 @@ impl AppState {
             clients: parking_lot::RwLock::new(clients),
             stress_running: Arc::new(AtomicBool::new(false)),
             stress_cancel: Arc::new(AtomicBool::new(false)),
+            ai_cancels: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         })
     }
 
@@ -137,6 +141,28 @@ impl AppState {
         *self.clients.write() = clients;
         *self.settings.write() = next.clone();
         Ok(next)
+    }
+
+    /// 登记一个在途 AI 请求，返回它的取消标记
+    pub fn ai_register(&self, id: &str) -> Arc<AtomicBool> {
+        let flag = Arc::new(AtomicBool::new(false));
+        self.ai_cancels.lock().insert(id.to_string(), flag.clone());
+        flag
+    }
+
+    /// 请求停止：找到在途请求并置位，返回是否命中
+    pub fn ai_request_cancel(&self, id: &str) -> bool {
+        if let Some(flag) = self.ai_cancels.lock().get(id) {
+            flag.store(true, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 请求结束后释放登记，避免长期占用
+    pub fn ai_release(&self, id: &str) {
+        self.ai_cancels.lock().remove(id);
     }
 }
 

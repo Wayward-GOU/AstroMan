@@ -45,6 +45,15 @@ fn migrate(pool: &DbPool) -> Result<(), String> {
         "ALTER TABLE ai_providers ADD COLUMN kind TEXT NOT NULL DEFAULT 'openai'",
         "ALTER TABLE ai_messages ADD COLUMN reasoning TEXT",
         "ALTER TABLE ai_usage_logs ADD COLUMN request_preview TEXT",
+        "ALTER TABLE ai_providers ADD COLUMN max_tokens INTEGER DEFAULT 0",
+        "ALTER TABLE ai_providers ADD COLUMN timeout_secs INTEGER DEFAULT 300",
+        "ALTER TABLE ai_sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE ai_sessions ADD COLUMN summary TEXT",
+        "ALTER TABLE ai_sessions ADD COLUMN summary_until INTEGER DEFAULT 0",
+        "ALTER TABLE ai_messages ADD COLUMN token_count INTEGER DEFAULT 0",
+        "ALTER TABLE ai_tool_logs ADD COLUMN round INTEGER DEFAULT 0",
+        "ALTER TABLE ai_tool_logs ADD COLUMN trace_id TEXT",
+        "ALTER TABLE ai_tool_logs ADD COLUMN timeout INTEGER DEFAULT 0",
     ];
     for sql in statements {
         let _ = conn.execute(sql, []);

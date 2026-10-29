@@ -58,7 +58,7 @@ description: FbinHttp 前端开发规范（Vue 3 + Ant Design Vue + Pinia + 设�
 3. 页头右侧加 `RobotOutlined` 按钮，与现有 `PageHeader` 的 `actions` 并列
 4. 需要异步取数据再分析时，先 `await` 拿到数据再 `void aiAssist.show(...)`，失败用 `message.error`
 
-约定：页面内 AI 是**只读建议**，`stores/aiAssist.ts` 的 `SYSTEM_PROMPT` 已禁止调用工具，所以不会触发写操作；抽屉的流式渲染由 store 统一处理，页面不要自己再写一份。
+约定：页面内 AI 是**只读建议**，`stores/aiAssist.ts` 的 `SYSTEM_PROMPT` 已禁止调用工具，所以不会触发写操作；抽屉的流式渲染由 store 统一处理，页面不要自己再写一份。上下文不再固定截 12k：store 按 `contextBudgetOf(model)` 分配，页面快照最多 70%，大报告用 `clipMiddle()` 保留头尾。
 
 ## 状态管理
 

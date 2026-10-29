@@ -255,3 +255,96 @@ fn random_string(len: usize, pool: &str) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vars(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn strip_comments_keeps_urls_inside_strings() {
+        let raw = "{\n  // 行注释\n  \"url\": \"https://example.com/a//b\",\n  /* 块注释 */\n  \"n\": 1\n}";
+        let clean = strip_json_comments(raw);
+        assert!(clean.contains("https://example.com/a//b"));
+        assert!(!clean.contains("行注释"));
+        assert!(!clean.contains("块注释"));
+        assert!(serde_json::from_str::<serde_json::Value>(clean.trim()).is_ok());
+    }
+
+    #[test]
+    fn strip_comments_handles_escaped_quotes_and_unclosed_block() {
+        let raw = "{\"a\":\"say \\\"hi\\\" // 不是注释\",\"b\":1 /* 未闭合";
+        let clean = strip_json_comments(raw);
+        assert!(clean.contains("say \\\"hi\\\" // 不是注释"));
+        assert!(!clean.contains("未闭合"));
+    }
+
+    #[test]
+    fn render_replaces_custom_vars_and_keeps_unknown() {
+        let map = vars(&[("host", "api.local"), ("token", "abc")]);
+        assert_eq!(
+            render("http://{{host}}/v1?t={{token}}", &map),
+            "http://api.local/v1?t=abc"
+        );
+        assert_eq!(render("{{ missing }}", &map), "{{missing}}");
+    }
+
+    #[test]
+    fn render_supports_dollar_prefixed_builtins() {
+        let map = HashMap::new();
+        let out = render("{{$uuid}}", &map);
+        assert_eq!(out.len(), 36);
+        assert!(out.contains('-'));
+        let ts = render("{{$timestamp}}", &map);
+        assert!(ts.parse::<i64>().unwrap() > 1_600_000_000_000);
+        let simple = render("{{uuidNoDash}}", &map);
+        assert_eq!(simple.len(), 32);
+        assert!(!simple.contains('-'));
+    }
+
+    #[test]
+    fn render_custom_var_wins_over_builtin() {
+        let map = vars(&[("uuid", "fixed")]);
+        assert_eq!(render("{{uuid}}", &map), "fixed");
+    }
+
+    #[test]
+    fn render_function_vars_respect_bounds() {
+        let map = HashMap::new();
+        for _ in 0..20 {
+            let value = render("{{randomInt(5,9)}}", &map);
+            let parsed: i64 = value.parse().unwrap();
+            assert!((5..=9).contains(&parsed));
+        }
+        let hex = render("{{randomHex(8)}}", &map);
+        assert_eq!(hex.len(), 8);
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+        let digits = render("{{randomNumber(6)}}", &map);
+        assert_eq!(digits.len(), 6);
+        assert!(digits.chars().all(|c| c.is_ascii_digit()));
+        let floats = render("{{randomFloat(1,2,3)}}", &map);
+        let parsed: f64 = floats.parse().unwrap();
+        assert!((1.0..=2.0).contains(&parsed));
+        assert_eq!(floats.split('.').last().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn random_string_clamps_length_and_pool() {
+        assert_eq!(random_string(0, "hex").len(), 1);
+        assert_eq!(random_string(5000, "hex").len(), 4096);
+        let upper = random_string(16, "upper");
+        assert!(upper.chars().all(|c| c.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn random_int_handles_degenerate_range() {
+        assert_eq!(random_int(3, 3), 3);
+        assert_eq!(random_int(5, 2), 5);
+    }
+}

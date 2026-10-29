@@ -1,10 +1,10 @@
 # FbinHttp AI-Agent 开发计划安排（v1.0.7）
 
 > 文档性质：AI-Agent 能力现状盘点 + 差距分析 + v1.0.7 全量开发计划
-> 基线版本：v1.0.6（`package.json` / `package-lock.json` / `src-tauri/Cargo.toml` / `src-tauri/Cargo.lock` / `src-tauri/tauri.conf.json` 均仍为 1.0.6；分支虽已叫 `develop-master-v1.0.7`，版本号尚未修改）
-> 目标版本：v1.0.7
+> 基线版本：v1.0.6
+> 目标版本：v1.0.7（5 处版本号已升至 1.0.7，`npm run build:win` 已产出 `FbinHttp_1.0.7_x64-setup.exe`）
 > 本次范围：**核心补齐 + 安全加固 + 体验优化**（不含 MCP 接入、多模态、多 Agent 编排，这三项列入 v1.0.8+）
-> 编写日期：2026-10-28　修订：2026-10-28 第二版（逐条核对代码后修正事实错误、补齐方案缺口、重排执行顺序）
+> 编写日期：2026-10-28　修订：2026-10-29 第三版（v1.0.7 代码落地，回填 4.3 状态与第 7 节发布清单）
 > 维护要求：任务状态变化时同步更新本文档第 4.3 节；发布前核对第 7 节清单
 
 ---
@@ -353,31 +353,31 @@ flowchart LR
 
 | ID | 任务 | 差距 | 优先级 | 阶段 | 复杂度 | 主要改动 | 验收标准 | 状态 |
 |---|---|---|---|---|---|---|---|---|
-| T-23 | 对话页拆分重构 | G-22 | P0 | 零 | L | 抽 `useChatStream` / `useToolLoop` / `useChatSession`；`AiAssistant.vue` 只留布局与绑定 | 纯重构不改行为；R-01 ~ R-07 与改动前一致；单文件行数下降 ≥50%；`npm run build` 通过 | 待开发 |
-| T-18 | 自动化测试基线 | G-16 | P1 | 零 / 六 | L | 阶段零：vitest 配置 + `validateToolArgs` / `callKey` / `maskSensitive` / 伪围栏用例；阶段六：Rust `#[test]` + 注入用例 | 阶段零即可 `npm run test` 通过；发布前核心函数覆盖率 ≥60%；`cargo test` 通过 | 待开发 |
-| T-25 | 模型上下文窗口元数据 | G-01 | P0 | 一 | S | 新增 `src/utils/modelMeta.ts`：`model → contextWindow` 映射 + 未知模型回退 32k；与 `aiPricing.ts` 并列 | 常见模型窗口正确；未知模型不报错；`buildContext` 可读取；映射与回退有单测 | 待开发 |
-| T-06 | 上下文 token 预算 | G-01 | P0 | 一 | L | 新增 `src/utils/contextBudget.ts`，接入对话页与页面内 AI | 50 轮会话不超限；代码块不被破坏；预算不足时保留 system + 最近轮次 | 待开发 |
-| T-07 | 历史摘要压缩 | G-01 | P0 | 一 | L | `ai_sessions` 增 `summary` / `summary_until`；异步摘要、下一轮生效；会话页展示摘要 | 超阈值自动触发；摘要期间本轮不卡顿；摘要后继续追问不丢关键决策；连续失败 3 次暂停并提示手动压缩 | 待开发 |
-| T-01 | 停止生成 | G-02 | P0 | 二 | L | `ai.rs` 新增 `ai_chat_cancel` + 请求注册表；`api/index.ts` 增加参数；`useChatStream` 管理 requestId 与停止态 | 点击后 1 秒内停止增量；不再自动调工具；已发出的工具结果丢弃且不回灌；消息标记"已停止"；可继续追问 | 待开发 |
-| T-02 | 工具硬超时 | G-03 | P0 | 二 | M | `aiTools.ts` 增加 `withTimeout`；普通 60s、导入导出 120s、`send_request` / `run_batch` 沿入参、`stress_*` 不包 | 构造慢工具验证 60 秒返回超时 Observation；迟到的结果丢弃并记日志；界面不崩；压测类不被误杀 | 待开发 |
-| T-03 | 失败自动重试 + 手动重试 | G-04 | P0 | 二 | M | `ai.rs` 重试策略（仅首 delta 前）；`useChatStream` 的 `committed` 标记与清空重发 | 首 delta 前 429 / 5xx / 网络错误按 `Retry-After` 重试 ≤2 次；已出字后只给手动重试；重试不重复落用户消息；写工具不重试 | 待开发 |
-| T-24 | 密钥掩码 + CSP 收紧 | G-21 | P0 | 三 | M | `ai.rs` 列表改返回 `api_key_masked` / `has_key`；表单留空即不修改；`tauri.conf.json` 收紧 CSP | 列表与日志不出现明文 Key；编辑不填可保留原 Key；Markdown / 字体 / 二维码在 CSP 下正常；桌面端冒烟通过 | 待开发 |
-| T-17 | 注入隔离与覆盖确认 | G-17 | P0 | 三 | M | `wrapUntrusted` 三入口（工具结果 / 附件 / 页面快照）；系统提示词补充；导出前存在性检查 | 三类入口的恶意文本用例均不改变工具序列；覆盖已有文件必须二次确认 | 待开发 |
-| T-20 | 提示词与硬规则升级 | — | P0 | 三 | S | `agent_hard_rules.md` v1.2；`xiao_hi_system_prompt.md` 增注入 / 停止 / 摘要 / 重试规则 | 前后端规则一致；不出现"工具箱工具"空承诺；停止与重试语义写清楚 | 待开发 |
-| T-09 | 工具箱工具（第一批 12 个） | G-07 | P1 | 四 | L | `aiTools.ts` 新增 `toolbox_*` 工具，复用 `src/tools/*` | 12 个工具均可调用且结果正确；写类工具正确标记；提示词同步 | 待开发 |
-| T-10 | 业务工具补齐（7 个） | G-08 | P1 | 四 | M | `aiTools.ts` 新增 `env_delete` `env_script_save` `report_delete` `report_requests` `history_stats` `run_list` `cookie_list` | 每个工具参数强校验；写操作确认；只读工具自动执行 | 待开发 |
-| T-11 | 工具输出结构化 | G-09 | P1 | 四 | M | `aiTools.ts` 统一 `ToolResult` 信封与 `format` 约定 | 列表类输出带 `total` / `truncated`；界面卡片先摘要后详情；模型不再逐条数 | 待开发 |
-| T-12 | 工具目录分层 + `tool_search` | G-10 | P1 | 四 | L | 拆分 `TOOL_CATALOG`；新增元工具；SYSTEM_PROMPT 注入策略 | 系统提示词字符数下降 ≥30%；典型请求仍能选对工具；`tool_search` 可发现长尾工具 | 待开发 |
-| T-13 | 动态模型列表 | G-11 | P1 | 五 | M | `ai.rs` 新增 `ai_models_list`；`AiAssistant.vue` 模型下拉；拉取结果回填 `modelMeta` 窗口 | 三类协议均可拉取；失败回退内置清单；缓存 24 小时；不阻塞保存 | 待开发 |
-| T-14 | 生成参数配置 | G-12 | P1 | 五 | M | `ai_providers` 增 `max_tokens` / `timeout_secs`；三协议统一应用 | 表单可配；Anthropic 不再固定 4096；超时可配；老库迁移成功 | 待开发 |
-| T-05 | 轮次 / token / 费用预算条 | G-06 | P1 | 五 | S | `AiAssistant.vue` 顶部条，读取 T-06 预算与用量 | 实时显示"第 N/8 轮、本轮 tokens、估算费用、上下文占用"；用尽前变色提示 | 待开发 |
-| T-04 | 结构化计划确认卡 | G-05 | P1 | 五 | M | 确认弹窗改为组件：任务 / 影响对象 / 参数表 / 风险 / 预检结果 | 压测、导入导出、删除各有清晰计划；取消不执行、不重试；确认结果落日志 | 待开发 |
-| T-15 | 消息级操作 | G-13 | P1 | 五 | M | 消息工具栏：复制、重新生成、编辑重发 | 三项均可用；重新生成不重复落库用户消息；编辑重发会截断其后消息 | 待开发 |
-| T-16 | Agent 复盘时间线 | G-15 | P1 | 五 | M | `ai_tool_logs` 增 `round` / `trace_id`；新增时间线抽屉与导出 | 按轮次展示思考 / 工具 / 结果 / 耗时；可导出脱敏诊断包 | 待开发 |
-| T-08 | 会话搜索 / 置顶 / 导出 / 自动标题 | G-14 | P1 | 五 | M | `ai.rs` 会话命令扩展；`AiAssistant.vue` 列表；新增导出 | 搜索命中标题与正文；置顶排序稳定；导出 Markdown / JSON 可读；首轮后标题自动生成 | 待开发 |
-| T-19 | 页面内 AI 轻量预算 | G-18 | P2 | 六 | S | `aiAssist.ts` 用 `contextBudget` 替换固定 12k | 大报告不再只截前 12k；关键尾部信息保留 | 待开发 |
-| T-21 | 文档同步 | — | P1 | 六 | S | 本文档、`FbinHttp 完整技术实现方案.md` §4.6、`README.md` 已实现功能与路线图 | 文档描述与代码一致；工具数量准确（61 个业务工具 + `tool_search`）；不再出现"列表只回显掩码" | 待开发 |
-| T-22 | 版本号与打包 | — | P0 | 六 | S | **5 处**版本号：`package.json`、`package-lock.json`（2 处）、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock` 的 `fbinhttp` 条目、`src-tauri/tauri.conf.json`；同步更新 `.github/workflows/release.yml` 的 `releaseBody` | 5 处一致；`releaseBody` 与代码一致（当前写的 39 工具 / 5 轮已过期）；`npm run build`、`cargo check`、`npm run build:win` 通过；安装包可启动 | 待开发 |
+| T-23 | 对话页拆分重构 | G-22 | P0 | 零 | L | 抽 `useChatStream` / `useToolLoop` / `useChatSession`；`AiAssistant.vue` 只留布局与绑定 | 纯重构不改行为；R-01 ~ R-07 与改动前一致；单文件行数下降 ≥50%；`npm run build` 通过 | 进行中 |
+| T-18 | 自动化测试基线 | G-16 | P1 | 零 / 六 | L | 阶段零：vitest 配置 + `validateToolArgs` / `callKey` / `maskSensitive` / 伪围栏用例；阶段六：Rust `#[test]` + 注入用例 | 阶段零即可 `npm run test` 通过；发布前核心函数覆盖率 ≥60%；`cargo test` 通过 | 进行中 |
+| T-25 | 模型上下文窗口元数据 | G-01 | P0 | 一 | S | 新增 `src/utils/modelMeta.ts`：`model → contextWindow` 映射 + 未知模型回退 32k；与 `aiPricing.ts` 并列 | 常见模型窗口正确；未知模型不报错；`buildContext` 可读取；映射与回退有单测 | 已完成 |
+| T-06 | 上下文 token 预算 | G-01 | P0 | 一 | L | 新增 `src/utils/contextBudget.ts`，接入对话页与页面内 AI | 50 轮会话不超限；代码块不被破坏；预算不足时保留 system + 最近轮次 | 已完成 |
+| T-07 | 历史摘要压缩 | G-01 | P0 | 一 | L | `ai_sessions` 增 `summary` / `summary_until`；异步摘要、下一轮生效；会话页展示摘要 | 超阈值自动触发；摘要期间本轮不卡顿；摘要后继续追问不丢关键决策；连续失败 3 次暂停并提示手动压缩 | 已完成 |
+| T-01 | 停止生成 | G-02 | P0 | 二 | L | `ai.rs` 新增 `ai_chat_cancel` + 请求注册表；`api/index.ts` 增加参数；`useChatStream` 管理 requestId 与停止态 | 点击后 1 秒内停止增量；不再自动调工具；已发出的工具结果丢弃且不回灌；消息标记"已停止"；可继续追问 | 已完成 |
+| T-02 | 工具硬超时 | G-03 | P0 | 二 | M | `aiTools.ts` 增加 `withTimeout`；普通 60s、导入导出 120s、`send_request` / `run_batch` 沿入参、`stress_*` 不包 | 构造慢工具验证 60 秒返回超时 Observation；迟到的结果丢弃并记日志；界面不崩；压测类不被误杀 | 已完成 |
+| T-03 | 失败自动重试 + 手动重试 | G-04 | P0 | 二 | M | `ai.rs` 重试策略（仅首 delta 前）；`useChatStream` 的 `committed` 标记与清空重发 | 首 delta 前 429 / 5xx / 网络错误按 `Retry-After` 重试 ≤2 次；已出字后只给手动重试；重试不重复落用户消息；写工具不重试 | 已完成 |
+| T-24 | 密钥掩码 + CSP 收紧 | G-21 | P0 | 三 | M | `ai.rs` 列表改返回 `api_key_masked` / `has_key`；表单留空即不修改；`tauri.conf.json` 收紧 CSP | 列表与日志不出现明文 Key；编辑不填可保留原 Key；Markdown / 字体 / 二维码在 CSP 下正常；桌面端冒烟通过 | 已完成 |
+| T-17 | 注入隔离与覆盖确认 | G-17 | P0 | 三 | M | `wrapUntrusted` 三入口（工具结果 / 附件 / 页面快照）；系统提示词补充；导出前存在性检查 | 三类入口的恶意文本用例均不改变工具序列；覆盖已有文件必须二次确认 | 已完成 |
+| T-20 | 提示词与硬规则升级 | — | P0 | 三 | S | `agent_hard_rules.md` v1.2；`xiao_hi_system_prompt.md` 增注入 / 停止 / 摘要 / 重试规则 | 前后端规则一致；不出现"工具箱工具"空承诺；停止与重试语义写清楚 | 已完成 |
+| T-09 | 工具箱工具（第一批 12 个） | G-07 | P1 | 四 | L | `aiTools.ts` 新增 `toolbox_*` 工具，复用 `src/tools/*` | 12 个工具均可调用且结果正确；写类工具正确标记；提示词同步 | 已完成 |
+| T-10 | 业务工具补齐（7 个） | G-08 | P1 | 四 | M | `aiTools.ts` 新增 `env_delete` `env_script_save` `report_delete` `report_requests` `history_stats` `run_list` `cookie_list` | 每个工具参数强校验；写操作确认；只读工具自动执行 | 已完成 |
+| T-11 | 工具输出结构化 | G-09 | P1 | 四 | M | `aiTools.ts` 统一 `ToolResult` 信封与 `format` 约定 | 列表类输出带 `total` / `truncated`；界面卡片先摘要后详情；模型不再逐条数 | 已完成 |
+| T-12 | 工具目录分层 + `tool_search` | G-10 | P1 | 四 | L | 拆分 `TOOL_CATALOG`；新增元工具；SYSTEM_PROMPT 注入策略 | 系统提示词字符数下降 ≥30%；典型请求仍能选对工具；`tool_search` 可发现长尾工具 | 已完成 |
+| T-13 | 动态模型列表 | G-11 | P1 | 五 | M | `ai.rs` 新增 `ai_models_list`；`AiAssistant.vue` 模型下拉；拉取结果回填 `modelMeta` 窗口 | 三类协议均可拉取；失败回退内置清单；缓存 24 小时；不阻塞保存 | 已完成 |
+| T-14 | 生成参数配置 | G-12 | P1 | 五 | M | `ai_providers` 增 `max_tokens` / `timeout_secs`；三协议统一应用 | 表单可配；Anthropic 不再固定 4096；超时可配；老库迁移成功 | 已完成 |
+| T-05 | 轮次 / token / 费用预算条 | G-06 | P1 | 五 | S | `AiAssistant.vue` 顶部条，读取 T-06 预算与用量 | 实时显示"第 N/8 轮、本轮 tokens、估算费用、上下文占用"；用尽前变色提示 | 已完成 |
+| T-04 | 结构化计划确认卡 | G-05 | P1 | 五 | M | 确认弹窗改为组件：任务 / 影响对象 / 参数表 / 风险 / 预检结果 | 压测、导入导出、删除各有清晰计划；取消不执行、不重试；确认结果落日志 | 已完成 |
+| T-15 | 消息级操作 | G-13 | P1 | 五 | M | 消息工具栏：复制、重新生成、编辑重发 | 三项均可用；重新生成不重复落库用户消息；编辑重发会截断其后消息 | 已完成 |
+| T-16 | Agent 复盘时间线 | G-15 | P1 | 五 | M | `ai_tool_logs` 增 `round` / `trace_id`；新增时间线抽屉与导出 | 按轮次展示思考 / 工具 / 结果 / 耗时；可导出脱敏诊断包 | 已完成 |
+| T-08 | 会话搜索 / 置顶 / 导出 / 自动标题 | G-14 | P1 | 五 | M | `ai.rs` 会话命令扩展；`AiAssistant.vue` 列表；新增导出 | 搜索命中标题与正文；置顶排序稳定；导出 Markdown / JSON 可读；首轮后标题自动生成 | 已完成 |
+| T-19 | 页面内 AI 轻量预算 | G-18 | P2 | 六 | S | `aiAssist.ts` 用 `contextBudget` 替换固定 12k | 大报告不再只截前 12k；关键尾部信息保留 | 已完成 |
+| T-21 | 文档同步 | — | P1 | 六 | S | 本文档、`FbinHttp 完整技术实现方案.md` §4.6、`README.md` 已实现功能与路线图 | 文档描述与代码一致；工具数量准确（61 个业务工具 + `tool_search`）；不再出现"列表只回显掩码" | 已完成 |
+| T-22 | 版本号与打包 | — | P0 | 六 | S | **5 处**版本号：`package.json`、`package-lock.json`（2 处）、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock` 的 `fbinhttp` 条目、`src-tauri/tauri.conf.json`；同步更新 `.github/workflows/release.yml` 的 `releaseBody` | 5 处一致；`releaseBody` 与代码一致（当前写的 39 工具 / 5 轮已过期）；`npm run build`、`cargo check`、`npm run build:win` 通过；安装包可启动 | 已完成 |
 
 ### 4.4 数据结构变更
 
@@ -525,14 +525,14 @@ npm run build:win
 
 | 项 | 内容 | 状态 |
 |---|---|---|
-| 版本号 | `package.json` / `package-lock.json`（2 处）/ `src-tauri/Cargo.toml` / `src-tauri/Cargo.lock` 的 `fbinhttp` 条目 / `src-tauri/tauri.conf.json` → 1.0.7 | 待办 |
-| 发布说明源 | `.github/workflows/release.yml` 的 `releaseBody` 更新为 1.0.7 内容（当前 39 工具 / 5 轮已过期） | 待办 |
-| 提示词 | `xiao_hi_system_prompt.md` 更新 + `agent_hard_rules.md` v1.2 | 待办 |
-| 文档 | 本文档 + 技术方案 §4.6 + README「已实现功能」「路线图」；修正"列表只回显掩码" | 待办 |
-| 测试 | 5.1 自动化 + 5.2 手工回归（含 R-21 ~ R-23）全部通过 | 待办 |
-| 构建 | `npm run build` / `cargo check` / `npm run build:win` | 待办 |
-| 安装包 | Windows NSIS 安装、启动、冒烟（R-01 / R-03 / R-08 / R-11） | 待办 |
-| 升级验证 | v1.0.6 数据库直接升级，R-20 通过 | 待办 |
+| 版本号 | `package.json` / `package-lock.json`（2 处）/ `src-tauri/Cargo.toml` / `src-tauri/Cargo.lock` 的 `fbinhttp` 条目 / `src-tauri/tauri.conf.json` → 1.0.7 | 已完成 |
+| 发布说明源 | `.github/workflows/release.yml` 的 `releaseBody` 更新为 1.0.7 内容（39 工具 / 5 轮已改为 61 工具 + `tool_search` / 8 轮） | 已完成 |
+| 提示词 | `xiao_hi_system_prompt.md` 更新 + `agent_hard_rules.md` v1.2 | 已完成 |
+| 文档 | 本文档 + 技术方案 §4.6 + README「已实现功能」「路线图」；修正"列表只回显掩码" | 已完成 |
+| 测试 | 5.1 自动化 + 5.2 手工回归（含 R-21 ~ R-23）全部通过 | 自动化已通过（vitest 46 / cargo test 22）；手工回归待人工 |
+| 构建 | `npm run build` / `cargo check` / `npm run build:win` | 已完成 |
+| 安装包 | Windows NSIS 安装、启动、冒烟（R-01 / R-03 / R-08 / R-11） | 安装包已产出（FbinHttp_1.0.7_x64-setup.exe）；安装冒烟待人工 |
+| 升级验证 | v1.0.6 数据库直接升级，R-20 通过 | 待人工验证 |
 | 发布说明 | 列出：可停止、可重试、上下文摘要、工具箱 12 个、业务工具 7 个、动态模型、复盘时间线、注入防护、密钥掩码 | 待办 |
 
 ---
@@ -558,9 +558,9 @@ npm run build:win
 | [src/utils/aiTools.ts](file:///d:/Software/ProjectFiles/FbinHttp/src/utils/aiTools.ts) | 工具注册、参数校验、执行、脱敏、写操作判定 |
 | `src/utils/contextBudget.ts`（新增） | token 估算、上下文组装与预算裁剪 |
 | `src/utils/modelMeta.ts`（新增） | 模型 → 上下文窗口 / 能力映射，未知模型回退 |
-| `src/composables/useChatStream.ts`（新增） | 流式请求、停止、重试、requestId 生命周期 |
-| `src/composables/useToolLoop.ts`（新增） | 工具解析、校验、确认、执行、回灌、轮次 |
-| `src/composables/useChatSession.ts`（新增） | 会话与消息持久化、截断策略 |
+| `src/composables/useChatStream.ts`（T-23 规划，尚未拆分） | 流式请求、停止、重试、requestId 生命周期 |
+| `src/composables/useToolLoop.ts`（T-23 规划，尚未拆分） | 工具解析、校验、确认、执行、回灌、轮次 |
+| `src/composables/useChatSession.ts`（T-23 规划，尚未拆分） | 会话与消息持久化、截断策略 |
 | [src/views/AiAssistant.vue](file:///d:/Software/ProjectFiles/FbinHttp/src/views/AiAssistant.vue) | 对话页布局与交互绑定（重构后只留 UI） |
 | [src-tauri/tauri.conf.json](file:///d:/Software/ProjectFiles/FbinHttp/src-tauri/tauri.conf.json) | 版本号、窗口、打包、CSP |
 | [src/utils/aiScenarios.ts](file:///d:/Software/ProjectFiles/FbinHttp/src/utils/aiScenarios.ts) | 页面内 AI 的上下文摘要器 |
@@ -590,4 +590,4 @@ npm run build:win
 
 ---
 
-> 备注：本计划中的"已完成"均以 v1.0.6 代码为准；"待开发"按 4.2 的阶段推进，每完成一个任务即更新 4.3 节状态，并在发布前跑完第 5 节全部门禁。
+> 备注：本计划中的"已完成"均以 v1.0.7 代码为准（2026-10-29 回填）；T-23 对话页拆分与覆盖率统计仍标记为"进行中"，发布前不阻塞，列入 v1.0.8 继续。

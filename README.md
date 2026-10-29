@@ -8,7 +8,7 @@
   <img alt="Rust" src="https://img.shields.io/badge/Rust-stable-B7410E?style=flat-square" />
   <img alt="Vue" src="https://img.shields.io/badge/Vue-3.5-42B883?style=flat-square" />
   <img alt="SQLite" src="https://img.shields.io/badge/SQLite-bundled-003B57?style=flat-square" />
-  <img alt="License" src="https://img.shields.io/badge/version-1.0.0-3B7DDD?style=flat-square" />
+  <img alt="License" src="https://img.shields.io/badge/version-1.0.7-3B7DDD?style=flat-square" />
 </p>
 
 ---
@@ -40,13 +40,13 @@ macOS 首次打开若出现下面这个提示（按钮只有「完成 / 移到�
 
 ```bash
 curl -fLO https://github.com/Wayward-GOU/FbinHttp/releases/latest/download/install-macos.sh
-bash install-macos.sh v1.0.6
+bash install-macos.sh v1.0.7
 ```
 
 不带参数执行时安装最新正式版。仓库若为私有，需要先提供 Token：
 
 ```bash
-GITHUB_TOKEN=ghp_xxx bash install-macos.sh v1.0.6
+GITHUB_TOKEN=ghp_xxx bash install-macos.sh v1.0.7
 ```
 
 **方式二：手动安装**
@@ -490,7 +490,8 @@ console.log('解密结果：' + plain)
   - 网络工具（5）：IP 查询（支持本机公网 IP 与任意指定 IP 的归属地、运营商、经纬度）、IPv4 子网计算（掩码/广播/可用范围/主机数/分类）、IP 与整数互转、URL 解析（协议 / 主机 / 端口 / 路径 / 查询参数）、常用端口速查
   - 二维码（2）：二维码生成（文本/网址、WiFi、名片、电话、短信、邮件、定位七类内容，可调尺寸、留白、容错级别、前景背景色、码点与定位点样式、Logo，导出 PNG/SVG）、二维码识别（上传或拖入图片，本机解析内容并识别 WiFi、名片、邮件、链接等类型）
   - 查询手册（7）：ASCII 码表、HTTP 状态码、MIME 类型、常用请求头、Git 命令速查、Docker 命令速查、正则语法速查
-- 小HI（AI 助手，自带 API Key）：支持 OpenAI 兼容 / Anthropic Claude / Google Gemini 三种协议，内置 DeepSeek、Kimi、智谱、通义千问、硅基流动、OpenRouter、Ollama、Claude、Gemini 等预设模型；既能纯聊天、答疑、出方案，也能用自然语言建项目 / 集合 / 接口、真实发送请求并解读响应、写前后置脚本、批量运行、生成并保存压测计划、查报告与导出执行记录（共 42 个工具）。所有新建 / 修改 / 删除 / 导入导出 / 发起压测都先给出完整计划、等你确认后再弹执行框
+- 小HI（AI 助手，自带 API Key）：支持 OpenAI 兼容 / Anthropic Claude / Google Gemini 三种协议，内置 DeepSeek、Kimi、智谱、通义千问、硅基流动、OpenRouter、Ollama、Claude、Gemini 等预设模型；既能纯聊天、答疑、出方案，也能用自然语言建项目 / 集合 / 接口、真实发送请求并解读响应、写前后置脚本、批量运行、生成并保存压测计划、查报告与导出执行记录（61 个业务工具 + `tool_search` 元工具，长尾工具按需检索）。所有新建 / 修改 / 删除 / 导入导出 / 发起压测都先给出完整计划、等你确认后再弹结构化执行卡（任务 / 影响对象 / 参数 / 风险 / 预检）
+- 小HI 对话体验：可随时停止生成；首个增量前遇到 429 / 5xx / 网络错误自动重试（≤2 次），已出字则只保留手动重新生成；消息支持复制、重新生成、编辑重发；顶部预算条实时显示第 N/8 轮、本轮 token 与估算费用、上下文占用与窗口大小，接近上限时变色提醒；历史过长自动异步压缩为摘要，最近几轮原文始终保留；会话支持搜索标题与正文、置顶、导出 Markdown；工具调用可按轮次查看复盘时间线并导出脱敏诊断包；模型服务支持一键拉取服务商真实模型清单（缓存 24 小时）并标注上下文窗口
 - AI 用量统计（`/ai/usage`）：每次模型调用记一条，含服务商、模型、输入 / 输出 token、耗时、估算费用（美元 + 人民币）与本轮提问内容，支持按天趋势、按模型汇总、工具准确率三个视角，近 1 年可查，默认 10 条 / 页并支持右侧抽屉查看详情
 - AI 入口与错误提示：右侧屏幕垂直居中的机器人打开小HI（`/ai` 页面内自动隐藏），设置页「AI 辅助（小HI）」卡片可直接进入小HI 与用量统计；服务商返回的 401 / 402 / 403 / 404 / 429 / 5xx、模型下线、上下文超长等报错统一转成中文并给出处理建议
 - 系统监视（Windows / macOS）：CPU 每核心占用与频率、内存/交换区、磁盘容量与读写速率、网络接口上下行速率与累计流量、电池状态、运行时长与系统信息；GPU 利用率在 Windows 下通过 PDH 采集，其他平台自动隐藏
@@ -511,9 +512,10 @@ console.log('解密结果：' + plain)
 |---|---|---|
 | M1 | 工程骨架、请求调试、环境变量、历史 | 已完成 |
 | M2 | 本地压测引擎、实时曲线、压测报告 | 已完成 |
-| M3 | 用户自带 Key 的 AI 助手：三协议接入、42 个工具、双模式（聊天 / 操作）、写操作强制确认、流式渲染、用量与费用统计、错误中文化 | 已完成 |
+| M3 | 用户自带 Key 的 AI 助手：三协议接入、61 个业务工具 + `tool_search`、双模式（聊天 / 操作）、写操作强制确认、流式渲染、用量与费用统计、错误中文化 | 已完成 |
 | M4 | cURL 一键导入、项目导出与导入 | 已完成 |
 | M5 | Postman / Apifox 集合导入、安装包验证 | 已完成 |
+| M6 | AI Agent 深度增强（v1.0.7）：停止生成与工具硬超时、首字前自动重试、上下文预算与异步摘要、注入隔离、工具箱 12 工具与 7 个业务工具、工具目录分层与 `tool_search`、动态模型清单、预算条、结构化确认卡、消息级操作、复盘时间线、会话搜索 / 置顶 / 导出 | 已完成 |
 
 ---
 

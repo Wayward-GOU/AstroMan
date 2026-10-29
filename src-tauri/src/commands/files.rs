@@ -14,6 +14,13 @@ pub fn file_read_text(path: String) -> Result<String, String> {
     std::fs::read_to_string(path).map_err(|e| format!("读取文件失败（{path}）：{e}"))
 }
 
+/// 判断文件是否已存在：导出前用于提示覆盖（T-17）
+#[command]
+pub fn file_exists(path: String) -> bool {
+    let path = path.trim();
+    !path.is_empty() && std::path::Path::new(path).exists()
+}
+
 /// 写入文本文件（用于导出结果、保存响应体等场景）
 #[command]
 pub fn file_write_text(path: String, content: String) -> Result<(), String> {

@@ -87,7 +87,7 @@ function goChat() {
         <span class="assist-bot"><RobotOutlined /></span>
         <div class="assist-title-text">
           <span class="assist-name">{{ store.title }}</span>
-          <span class="assist-sub">小HI · 基于当前页面数据分析</span>
+          <span class="assist-sub">航仔 · 基于当前页面数据分析</span>
         </div>
         <a-select
           v-if="providerOptions.length"
@@ -147,7 +147,7 @@ function goChat() {
         </div>
       </div>
 
-      <div v-if="store.streaming" class="assist-typing">小HI 正在分析…</div>
+      <div v-if="store.streaming" class="assist-typing">航仔 正在分析…</div>
     </div>
 
     <div class="assist-footer">
@@ -163,7 +163,7 @@ function goChat() {
           <template #icon><CopyOutlined /></template>
           复制回答
         </a-button>
-        <a-button size="small" type="text" @click="goChat">在小HI 中继续</a-button>
+        <a-button size="small" type="text" @click="goChat">在航仔 中继续</a-button>
         <span class="flex-spacer" />
         <a-button
           type="primary"

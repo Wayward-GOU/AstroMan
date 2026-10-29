@@ -428,12 +428,12 @@ async function submitCurl() {
 }
 
 async function exportProject() {
-  const safeName = (store.currentProject?.name || 'fbinhttp-project').replace(/[\\/:*?"<>|]/g, '_')
+  const safeName = (store.currentProject?.name || 'astroman-project').replace(/[\\/:*?"<>|]/g, '_')
   try {
     const path = await save({
       title: '导出项目 JSON',
-      defaultPath: `${safeName}.fbinhttp.json`,
-      filters: [{ name: 'FbinHttp 项目文件', extensions: ['json'] }],
+      defaultPath: `${safeName}.astroman.json`,
+      filters: [{ name: 'AstroMan 项目文件', extensions: ['json'] }],
     })
     if (!path) return
     await api.projectExport(projectId.value, path)

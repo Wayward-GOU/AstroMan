@@ -18,7 +18,7 @@ const pinia = createPinia()
 // 兜底异常：留下可复现的日志，并把完整错误弹给用户，避免只闪一条提示或直接白屏
 let errorTipShown = false
 app.config.errorHandler = (err, _instance, info) => {
-  console.error('[FbinHttp] 界面异常', info, err)
+  console.error('[AstroMan] 界面异常', info, err)
   try {
     useErrorDialogStore(pinia).show({
       title: '界面出现异常',
@@ -37,7 +37,7 @@ app.config.errorHandler = (err, _instance, info) => {
   }
 }
 window.addEventListener('unhandledrejection', (event) => {
-  console.error('[FbinHttp] 未处理的 Promise 异常', event.reason)
+  console.error('[AstroMan] 未处理的 Promise 异常', event.reason)
 })
 
 app.use(pinia)

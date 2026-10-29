@@ -1,6 +1,6 @@
 ---
-name: fbinhttp-backend
-description: FbinHttp 的 Rust/Tauri 后端开发规范。改数据库 schema、写命令、调压测引擎、改报告结构、排查 SQLite 迁移报错时使用。触发词：后端、Rust、command、SQLite、schema、migrate、压测引擎、报告字段。
+name: astroman-backend
+description: AstroMan 的 Rust/Tauri 后端开发规范。改数据库 schema、写命令、调压测引擎、改报告结构、排查 SQLite 迁移报错时使用。触发词：后端、Rust、command、SQLite、schema、migrate、压测引擎、报告字段。
 ---
 
 # Rust 后端规范
@@ -28,7 +28,7 @@ description: FbinHttp 的 Rust/Tauri 后端开发规范。改数据库 schema、
 | `commands/settings.rs` | 代理与客户端证书设置 |
 | `commands/system.rs` / `commands/winstats.rs` | 应用信息、工作区统计、首页数据大屏聚合（`dashboard_metrics`）、Windows 进程指标 |
 | `commands/update.rs` | 版本检查与下载 |
-| `commands/ai.rs` | AI 助手「小HI」：服务商、流式对话、会话消息、工具流水（详见 `fbinhttp-ai`） |
+| `commands/ai.rs` | AI 助手「航仔」：服务商、流式对话、会话消息、工具流水（详见 `astroman-ai`） |
 | `state.rs` | AppState、连接池、reqwest 客户端（普通/忽略证书）、AI 在途请求取消表 `ai_cancels: HashMap<requestId, AtomicBool>` |
 | `models.rs` | 全部前后端数据模型 |
 | `util.rs` | `err`、`now_ms`、`render`、`strip_json_comments` 等工具 |
@@ -109,7 +109,7 @@ description: FbinHttp 的 Rust/Tauri 后端开发规范。改数据库 schema、
 - 报告倒序取 6 条后 `reverse()`，让图表按时间从左到右
 - 返回结构 `DashboardMetrics` 在 `models.rs`，前端类型在 `types/models.ts`，两边字段必须同步
 
-详细口径、前端图表约定与 Runner 首页文案见 skill `fbinhttp-dashboard`。
+详细口径、前端图表约定与 Runner 首页文案见 skill `astroman-dashboard`。
 
 ## 模型约定
 

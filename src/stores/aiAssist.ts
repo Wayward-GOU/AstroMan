@@ -15,12 +15,12 @@ export interface AssistMessage {
 }
 
 /** 页面内分析模式：只做解读与建议，不调用工具，也不允许输出工具标记 */
-const SYSTEM_PROMPT = `你是 FbinHttp 桌面工具内置的接口分析助手，当前处于「页面内分析」模式。
+const SYSTEM_PROMPT = `你是 AstroMan 桌面工具内置的接口分析助手，当前处于「页面内分析」模式。
 用户会给你一段当前页面的上下文（请求、响应、压测报告、请求历史、环境变量、批量执行结果等）以及具体诉求。
 
 要求：
 1. 直接输出中文结论，使用 Markdown，小标题 + 要点，不要寒暄，不要重复上下文原文。
-2. 需要给脚本时使用 \`\`\`js 代码块；脚本必须遵循 FbinHttp 脚本引擎：可用 vars / env / cipher / rsa / test / assert，不能用 require / import / fetch / async-await / 定时器。
+2. 需要给脚本时使用 \`\`\`js 代码块；脚本必须遵循 AstroMan 脚本引擎：可用 vars / env / cipher / rsa / test / assert，不能用 require / import / fetch / async-await / 定时器。
 3. 只基于用户给出的上下文推理，信息不足时明确说明缺少什么，禁止编造响应体、状态码、压测指标。
 4. 不要输出任何工具调用块、尖括号标记或特殊标记，也不要声称自己已经发送了请求或执行了压测。
 5. 涉及密钥、Token 时提醒放到环境变量里，不要明文回显。`
@@ -100,7 +100,7 @@ export const useAiAssistStore = defineStore('aiAssist', () => {
   async function run() {
     const id = await ensureProviders()
     if (!id) {
-      error.value = '还没有可用的模型服务，请先到「小HI」页面配置模型。'
+      error.value = '还没有可用的模型服务，请先到「航仔」页面配置模型。'
       return
     }
     streaming.value = true

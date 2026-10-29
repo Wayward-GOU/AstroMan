@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# FbinHttp macOS 一键安装脚本
+# AstroMan macOS 一键安装脚本
 #
 # 用法：
 #   bash install-macos.sh            # 安装 GitHub 上最新的正式版
@@ -12,8 +12,8 @@
 
 set -euo pipefail
 
-REPO="Wayward-GOU/FbinHttp"
-APP_NAME="FbinHttp"
+REPO="Wayward-GOU/AstroMan"
+APP_NAME="AstroMan"
 APP_BUNDLE="${APP_NAME}.app"
 INSTALL_DIR="/Applications"
 
@@ -42,9 +42,11 @@ for cmd in curl hdiutil xattr sw_vers file; do
   command -v "${cmd}" >/dev/null 2>&1 || error "缺少必需命令：${cmd}"
 done
 
-MACOS_MAJOR="$(sw_vers -productVersion | cut -d. -f1)"
-if [ "${MACOS_MAJOR}" -lt 11 ]; then
-  error "需要 macOS 11.0 或更高版本，当前为 $(sw_vers -productVersion)。"
+MACOS_VERSION="$(sw_vers -productVersion)"
+MACOS_MAJOR="$(printf '%s' "${MACOS_VERSION}" | cut -d. -f1)"
+MACOS_MAJOR_MINOR="$(printf '%s' "${MACOS_VERSION}" | cut -d. -f1-2)"
+if [ "$(printf '%s\n%s\n' "10.15" "${MACOS_MAJOR_MINOR}" | sort -V | head -1)" != "10.15" ]; then
+  error "需要 macOS 10.15 (Catalina) 或更高版本，当前为 ${MACOS_VERSION}。"
 fi
 
 # 校验安装包是否包含本机架构，避免在 Intel Mac 上装到仅 arm64 的包
@@ -122,7 +124,7 @@ DMG_URL="$(printf '%s' "${RELEASE_JSON}" \
 
 [ -n "${DMG_URL}" ] || error "该版本未提供 dmg 安装包，请到 Releases 页面检查。"
 
-TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fbinhttp.XXXXXX")"
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/astroman.XXXXXX")"
 DMG_PATH="${TMP_DIR}/${APP_NAME}.dmg"
 
 info "下载 ${TAG_NAME} ..."

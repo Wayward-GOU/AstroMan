@@ -481,7 +481,7 @@ interface HeaderPreset {
 const headerPresets: HeaderPreset[] = [
   { id: 1, group: '常用', key: 'Accept', value: 'application/json' },
   { id: 2, group: '常用', key: 'Content-Type', value: 'application/json' },
-  { id: 3, group: '常用', key: 'User-Agent', value: 'FbinHttp/1.0' },
+  { id: 3, group: '常用', key: 'User-Agent', value: 'AstroMan/1.0' },
   { id: 4, group: '常用', key: 'Cache-Control', value: 'no-cache' },
   { id: 5, group: '常用', key: 'Connection', value: 'keep-alive' },
   { id: 6, group: '认证', key: 'Authorization', value: 'Bearer {{token}}' },

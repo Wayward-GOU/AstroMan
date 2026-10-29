@@ -1,4 +1,4 @@
-# FbinHttp 自动化测试方案（v1.0.8）
+# AstroMan 自动化测试方案（v1.0.8）
 
 > 文档性质：基于现有「批量运行（测试场景）」与「压测」能力的自动化测试技术方案
 > 基线版本：v1.0.7（AI-Agent 内核补齐）
@@ -20,7 +20,7 @@
 | JS 脚本运行时 | `request / response / vars / env / console / rsa / cipher / test / assert` | [scriptRunner.ts](file:///d:/Software/ProjectFiles/FbinHttp/src/utils/scriptRunner.ts#L244-L365) |
 | 压测 | 固定并发 / 阶梯阶段、预热、思考时间、限速 targetRps、超时、SLA 目标字段 | [stress.rs](file:///d:/Software/ProjectFiles/FbinHttp/src-tauri/src/commands/stress.rs#L704-L769) |
 | 压测报告 | 请求数、成功/错误、P50~P99.9、均值、标准差、TTFB、APDEX、QPS、错误率、每秒采样、错误明细、逐请求明细 | [schema.sql](file:///d:/Software/ProjectFiles/FbinHttp/src-tauri/src/db/schema.sql#L83-L173) |
-| 报告导出 | 打包为 `fbinhttp.report` JSON | [report.rs](file:///d:/Software/ProjectFiles/FbinHttp/src-tauri/src/commands/report.rs#L145-L200) |
+| 报告导出 | 打包为 `astroman.report` JSON | [report.rs](file:///d:/Software/ProjectFiles/FbinHttp/src-tauri/src/commands/report.rs#L145-L200) |
 | 请求执行底座 | `send_http_request`：环境变量渲染、鉴权、Cookie 回写、超时、响应截断 | [http.rs](file:///d:/Software/ProjectFiles/FbinHttp/src-tauri/src/commands/http.rs#L16-L230) |
 
 ### 0.2 现在缺什么
@@ -45,7 +45,7 @@
 2. **Python 可执行**：请求前后钩子、套件 setup/teardown、独立 Python 用例，全部带超时与进程树回收；
 3. **结果可交付**：每次运行落库，产出 HTML + JSON + JUnit XML 三份报告；
 4. **可门禁**：CLI 执行 + 退出码 + CI 模板；压测 SLA 与基线回归自动判定；
-5. **AI 协同**：小HI 生成场景 / Python 脚本、解释失败原因，所有写入仍走计划确认；
+5. **AI 协同**：航仔 生成场景 / Python 脚本、解释失败原因，所有写入仍走计划确认；
 6. **工具箱记事本**（附加）：登记待办与随手记，到期系统通知提醒，可关联到接口 / 套件 / 用例（详见第 16 节）。
 
 > 不在 v1.0.8：JS 引擎下沉到 Rust、混合多接口压测、分布式压测、定时调度、Allure、录制回放、契约差异分析、笔记云同步与日历视图。以上列入 v1.0.9+。
@@ -79,7 +79,7 @@
 | 执行 | Rust tokio 多 worker + 爬坡 + 阶段调度 | — |
 | 实时 | `stress:progress` / `stress:done` 事件推送 | 无统一测试事件总线 |
 | 报告 | 汇总指标 + 每秒采样 + 错误明细 + 逐请求明细 | 无 HTML，无 JUnit，无法作为门禁 |
-| 导出 | `.fbinhttp.report` JSON | 面向本工具，CI 不可读 |
+| 导出 | `.astroman.report` JSON | 面向本工具，CI 不可读 |
 | 关系 | 与批量运行完全独立 | 无法「先功能冒烟、再压测、再校验」 |
 
 ### 1.3 可直接复用的资产
@@ -166,9 +166,9 @@ flowchart TB
     REP[报告生成器<br/>HTML/JSON/JUnit]
   end
   DB[(SQLite<br/>test_* 表)]
-  CLI[fbinhttp-cli<br/>无头执行/退出码]
+  CLI[astroman-cli<br/>无头执行/退出码]
   CI[CI 流水线]
-  AI[小HI<br/>场景/脚本生成与归因]
+  AI[航仔<br/>场景/脚本生成与归因]
 
   SUITE --> CMD
   RUNUI --> CMD
@@ -1008,10 +1008,10 @@ stateDiagram-v2
 
 ### 8.1 CLI 形态
 
-新增独立二进制 `fbinhttp-cli`（复用 Tauri Rust 库，不启动窗口）：
+新增独立二进制 `astroman-cli`（复用 Tauri Rust 库，不启动窗口）：
 
 ```bash
-fbinhttp-cli test run \
+astroman-cli test run \
   --suite order-regression \
   --project 1 \
   --env test \
@@ -1071,7 +1071,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Run API suite
         run: |
-          ./fbinhttp-cli.exe test run --suite core-smoke --env test \
+          ./astroman-cli.exe test run --suite core-smoke --env test \
             --report junit,html --out ./artifacts
       - uses: actions/upload-artifact@v4
         if: always()
@@ -1085,7 +1085,7 @@ jobs:
 stage('API 回归') {
   steps {
     bat '''
-      fbinhttp-cli.exe test run --suite core-smoke --env test ^
+      astroman-cli.exe test run --suite core-smoke --env test ^
         --report junit,html --out artifacts
     '''
   }
@@ -1159,8 +1159,8 @@ CI 机器上通常没有项目库、接口定义与本地环境变量，因此�
 **CLI 侧流程**：
 
 ```bash
-fbinhttp-cli suite import order.fbintest.json --project "订单服务" --on-conflict rename
-fbinhttp-cli run --suite "订单回归" --env-file ci.json --report-dir ./artifacts
+astroman-cli suite import order.fbintest.json --project "订单服务" --on-conflict rename
+astroman-cli run --suite "订单回归" --env-file ci.json --report-dir ./artifacts
 ```
 
 `--on-conflict` 支持 `skip | overwrite | rename`，默认 `rename`（追加时间后缀），保证 CI 重复执行不会互相覆盖。
@@ -1200,7 +1200,7 @@ fbinhttp-cli run --suite "订单回归" --env-file ci.json --report-dir ./artifa
 
 ### 9.3 提示词与硬规则增量
 
-在 `xiao_hi_system_prompt.md` 与 `agent_hard_rules.md` 增加：
+在 `hangzai_system_prompt.md` 与 `agent_hard_rules.md` 增加：
 
 1. 生成测试场景必须先列出「套件 / 用例 / 变量链 / 断言 / Python 用途」，确认后才写入；
 2. Python 脚本必须显式处理异常、限制输出、不得写入工作目录之外；
@@ -1330,7 +1330,7 @@ flowchart LR
 | T-14 | JSON 报告与 schema | D-04 | P0 | S | 固定 schemaVersion | 可被外部脚本解析 | 待开发 |
 | T-15 | JUnit XML 生成 | D-05 | P0 | M | 状态映射、failure/error/skipped | Jenkins / Actions 可直接消费 | 待开发 |
 | T-16 | 附件与产物目录 | D-04 | P1 | M | workDir、大小限制、索引 | 附件可下载；超限拦截 | 待开发 |
-| T-17 | CLI 二进制与命令 | D-05 | P0 | L | 新增 `bin/fbinhttp-cli.rs`；参数解析、无头执行 | 4 个命令可用；输出与退出码正确 | 待开发 |
+| T-17 | CLI 二进制与命令 | D-05 | P0 | L | 新增 `bin/astroman-cli.rs`；参数解析、无头执行 | 4 个命令可用；输出与退出码正确 | 待开发 |
 | T-18 | CI 模板与文档 | D-05 | P1 | S | GitHub Actions / Jenkins 示例 | 模板可直接跑通 | 待开发 |
 | T-19 | 压测用例与 SLA 判定 | D-08 | P0 | L | `kind=stress`、SLA 比较、基线对比 | 4 项 SLA 超标即 failed；基线回归生效 | 待开发 |
 | T-20 | 压测报告统一入口 | D-08/D-10 | P1 | M | 报告跳转、JUnit 映射 | 功能报告可查看压测详情 | 待开发 |
@@ -1509,7 +1509,7 @@ npm run build:win
 | 数据库 | 8 张新表（测试域 7 + `notes`）+ 索引；老库升级脚本验证 | 待办 |
 | Python | 解释器探测、内置 runtime、默认关闭授权 | 待办 |
 | 报告 | HTML / JSON / JUnit 三份产物 | 待办 |
-| CLI | `fbinhttp-cli` 四命令 + 退出码 | 待办 |
+| CLI | `astroman-cli` 四命令 + 退出码 | 待办 |
 | CI | GitHub Actions / Jenkins 模板 | 待办 |
 | 压测 | SLA 判定 + 基线回归 | 待办 |
 | AI | 12 个工具 + 记事本 4 个工具 + 提示词增量 | 待办 |
@@ -1714,7 +1714,7 @@ AI 工具参数要点：
 | [src-tauri/src/db/mod.rs](file:///d:/Software/ProjectFiles/FbinHttp/src-tauri/src/db/mod.rs) | 建表与迁移 |
 | [src-tauri/src/lib.rs](file:///d:/Software/ProjectFiles/FbinHttp/src-tauri/src/lib.rs) | 命令注册 |
 | [src/utils/aiTools.ts](file:///d:/Software/ProjectFiles/FbinHttp/src/utils/aiTools.ts) | AI 工具注册 |
-| [src-tauri/src/prompts/xiao_hi_system_prompt.md](file:///d:/Software/ProjectFiles/FbinHttp/src-tauri/src/prompts/xiao_hi_system_prompt.md) | 系统提示词 |
+| [src-tauri/src/prompts/hangzai_system_prompt.md](file:///d:/Software/ProjectFiles/FbinHttp/src-tauri/src/prompts/hangzai_system_prompt.md) | 系统提示词 |
 | [src-tauri/src/docx/agent_hard_rules.md](file:///d:/Software/ProjectFiles/FbinHttp/src-tauri/src/docx/agent_hard_rules.md) | Agent 硬规则 |
 | [src/views/Tools.vue](file:///d:/Software/ProjectFiles/FbinHttp/src/views/Tools.vue) | 工具箱页面（记事本挂载入口） |
 | [src/tools/registry.ts](file:///d:/Software/ProjectFiles/FbinHttp/src/tools/registry.ts) | 工具箱工具注册表与分类 |

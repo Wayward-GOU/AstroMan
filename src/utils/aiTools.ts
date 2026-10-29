@@ -1862,7 +1862,7 @@ const SPECS: ToolSpec[] = [
   },
   {
     name: 'project_import',
-    desc: '从 FbinHttp 项目导出文件（.fbin）导入项目（可能覆盖同名项目，需用户确认）',
+    desc: '从 AstroMan 项目导出文件（.astroman.json）导入项目（可能覆盖同名项目，需用户确认）',
     args: '{ path }',
     danger: true,
     handler: async (args) => {
@@ -1872,7 +1872,7 @@ const SPECS: ToolSpec[] = [
   },
   {
     name: 'project_export',
-    desc: '把项目导出为 .fbin 文件（会写入用户给出的路径）',
+    desc: '把项目导出为 .astroman.json 文件（会写入用户给出的路径）',
     args: '{ projectId, path }',
     danger: true,
     handler: async (args) => {

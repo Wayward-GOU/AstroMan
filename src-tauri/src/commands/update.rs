@@ -1,7 +1,7 @@
 ﻿use serde::{Deserialize, Serialize};
 
-const RELEASE_API: &str = "https://api.github.com/repos/Wayward-GOU/FbinHttp/releases/latest";
-const USER_AGENT: &str = "FbinHttp-Desktop";
+const RELEASE_API: &str = "https://api.github.com/repos/Wayward-GOU/AstroMan/releases/latest";
+const USER_AGENT: &str = "AstroMan-Desktop";
 
 #[derive(Deserialize)]
 struct GithubRelease {
@@ -68,9 +68,22 @@ fn is_newer(latest: &str, current: &str) -> bool {
 }
 
 fn pick_asset(assets: &[GithubAsset]) -> Option<&GithubAsset> {
-    let wanted: &[&str] = if cfg!(target_os = "windows") {
-        &["setup.exe", ".msi"]
-    } else if cfg!(target_os = "macos") {
+    if cfg!(target_os = "windows") {
+        // 同时存在 x64 与 x86 安装包：必须按本进程架构挑，避免 32 位系统下到 64 位包
+        let arch = std::env::consts::ARCH;
+        let arch_tag = if arch == "x86" { "x86" } else { "x64" };
+        let specific = format!("_{arch_tag}-setup.exe");
+        if let Some(hit) = assets
+            .iter()
+            .find(|asset| asset.name.to_lowercase().ends_with(&specific))
+        {
+            return Some(hit);
+        }
+        return assets
+            .iter()
+            .find(|asset| asset.name.to_lowercase().ends_with("setup.exe"));
+    }
+    let wanted: &[&str] = if cfg!(target_os = "macos") {
         &[".dmg"]
     } else {
         &[".appimage", ".deb"]
@@ -134,7 +147,7 @@ fn safe_file_name(name: &str) -> String {
     let base = name
         .rsplit(['/', '\\'])
         .next()
-        .unwrap_or("fbinhttp-update")
+        .unwrap_or("astroman-update")
         .trim();
     let cleaned: String = base
         .chars()
@@ -144,7 +157,7 @@ fn safe_file_name(name: &str) -> String {
         })
         .collect();
     if cleaned.is_empty() {
-        "fbinhttp-update".to_string()
+        "astroman-update".to_string()
     } else {
         cleaned
     }
@@ -200,7 +213,7 @@ pub async fn update_download(urls: Vec<String>, file_name: String) -> Result<Str
             continue;
         }
 
-        let dir = std::env::temp_dir().join("fbinhttp-update");
+        let dir = std::env::temp_dir().join("astroman-update");
         std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败：{e}"))?;
         let target = dir.join(safe_file_name(&file_name));
         std::fs::write(&target, &bytes).map_err(|e| format!("保存安装包失败：{e}"))?;

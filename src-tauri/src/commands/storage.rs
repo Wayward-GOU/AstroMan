@@ -61,7 +61,7 @@ fn write_config(config_file: &Path, data_dir: Option<&Path>) -> Result<(), Strin
 /// 校验目录可写：实际创建一次临时文件
 fn ensure_writable(dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|error| format!("无法创建目录：{error}"))?;
-    let probe = dir.join(".fbinhttp-write-test");
+    let probe = dir.join(".astroman-write-test");
     std::fs::write(&probe, b"ok").map_err(|error| format!("目录不可写：{error}"))?;
     let _ = std::fs::remove_file(&probe);
     Ok(())

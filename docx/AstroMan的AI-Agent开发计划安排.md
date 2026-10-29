@@ -1,10 +1,10 @@
-# FbinHttp AI-Agent 开发计划安排（v1.0.7）
+# AstroMan AI-Agent 开发计划安排（v1.0.7）
 
 > 文档性质：AI-Agent 能力现状盘点 + 差距分析 + v1.0.7 全量开发计划
 > 基线版本：v1.0.6
-> 目标版本：v1.0.7（5 处版本号已升至 1.0.7，`npm run build:win` 已产出 `FbinHttp_1.0.7_x64-setup.exe`）
+> 目标版本：v1.0.7（5 处版本号已升至 1.0.7，`npm run build:win` 已产出 `AstroMan_1.0.7_x64-setup.exe`）
 > 本次范围：**核心补齐 + 安全加固 + 体验优化**（不含 MCP 接入、多模态、多 Agent 编排，这三项列入 v1.0.8+）
-> 编写日期：2026-10-28　修订：2026-10-29 第三版（v1.0.7 代码落地，回填 4.3 状态与第 7 节发布清单）
+> 编写日期：2026-10-28　修订：2026-10-29 第四版（项目更名为 AstroMan、智能体更名为航仔；补数据迁移与旧格式兼容）
 > 维护要求：任务状态变化时同步更新本文档第 4.3 节；发布前核对第 7 节清单
 
 ---
@@ -13,7 +13,7 @@
 
 ### 0.1 现在是什么水平
 
-v1.0.6 的小HI 已经不是"只会聊天的 AI 输入框"，而是一个**可调用本机 42 个工具的本地 Agent**：
+v1.0.6 的航仔 已经不是"只会聊天的 AI 输入框"，而是一个**可调用本机 42 个工具的本地 Agent**：
 
 - 三协议接入：OpenAI 兼容 / Anthropic / Gemini，用户自带 Key，Key 本地 AES-256-GCM 加密**落库**（列表回显仍是明文，见 G-21）；
 - 双模式：聊天问答不碰工具，操作模式才调工具；
@@ -57,7 +57,7 @@ v1.0.6 的小HI 已经不是"只会聊天的 AI 输入框"，而是一个**可�
 
 ```mermaid
 flowchart TB
-  U[用户输入] --> SYS[系统提示词 xiao_hi_system_prompt.md<br/>+ 前端 SYSTEM_PROMPT + 42 工具目录]
+  U[用户输入] --> SYS[系统提示词 hangzai_system_prompt.md<br/>+ 前端 SYSTEM_PROMPT + 42 工具目录]
   SYS --> LLM[ai_chat 流式请求<br/>OpenAI / Anthropic / Gemini]
   LLM -->|delta / reasoning| PAINT[前端 reactive + 50ms 合帧渲染]
   LLM -->|fbin-tool 代码块| PARSE[解析/还原伪围栏/剥离原生标签]
@@ -81,7 +81,7 @@ flowchart TB
 | E-02 | Key 加密落库 | [ai.rs](file:///d:/Software/ProjectFiles/FbinHttp/src-tauri/src/commands/ai.rs#L30-L68) | AES-256-GCM 密文存 `ai_providers.api_key_enc`；**但列表命令返回解密明文、界面直接绑定，没有掩码** | 部分完成（掩码与 CSP 见 T-24） |
 | E-03 | 流式输出 | [ai.rs](file:///d:/Software/ProjectFiles/FbinHttp/src-tauri/src/commands/ai.rs#L762-L979) | `Channel<AiStreamEvent>` 推送 `delta / reasoning / done / error`，SSE 与非 SSE 兜底 | 已完成 |
 | E-04 | 前端增量渲染 | [AiAssistant.vue](file:///d:/Software/ProjectFiles/FbinHttp/src/views/AiAssistant.vue#L772-L859) | 响应式对象 + 50ms 合帧，边生成边显示，不因 Markdown 重排卡顿 | 已完成 |
-| E-05 | 双模式意图判断 | [xiao_hi_system_prompt.md](file:///d:/Software/ProjectFiles/FbinHttp/src-tauri/src/prompts/xiao_hi_system_prompt.md#L4-L14) | 聊天 / 问答不调工具；仅本机对象操作或"帮我查/改/跑"才进入操作模式 | 已完成 |
+| E-05 | 双模式意图判断 | [hangzai_system_prompt.md](file:///d:/Software/ProjectFiles/FbinHttp/src-tauri/src/prompts/hangzai_system_prompt.md#L4-L14) | 聊天 / 问答不调工具；仅本机对象操作或"帮我查/改/跑"才进入操作模式 | 已完成 |
 | E-06 | 42 个工具注册 | [aiTools.ts](file:///d:/Software/ProjectFiles/FbinHttp/src/utils/aiTools.ts#L1005-L1770) | 项目、集合、请求、环境、历史、报告、压测计划、压测执行、导入导出、统计 | 已完成 |
 | E-07 | 参数强校验 | [aiTools.ts](file:///d:/Software/ProjectFiles/FbinHttp/src/utils/aiTools.ts#L103-L360) | 类型 / 必填 / 枚举 / 正则 / 数值与数组上下限，非法作为 Observation 回灌 | 已完成 |
 | E-08 | 写操作确认 | [AiAssistant.vue](file:///d:/Software/ProjectFiles/FbinHttp/src/views/AiAssistant.vue#L1006-L1167) | `danger` 标记 ∪ `WRITE_TOOLS` 白名单，先给计划再 `Modal.confirm`，拒绝后回灌且禁止重试 | 已完成 |
@@ -363,7 +363,7 @@ flowchart LR
 | T-03 | 失败自动重试 + 手动重试 | G-04 | P0 | 二 | M | `ai.rs` 重试策略（仅首 delta 前）；`useChatStream` 的 `committed` 标记与清空重发 | 首 delta 前 429 / 5xx / 网络错误按 `Retry-After` 重试 ≤2 次；已出字后只给手动重试；重试不重复落用户消息；写工具不重试 | 已完成 |
 | T-24 | 密钥掩码 + CSP 收紧 | G-21 | P0 | 三 | M | `ai.rs` 列表改返回 `api_key_masked` / `has_key`；表单留空即不修改；`tauri.conf.json` 收紧 CSP | 列表与日志不出现明文 Key；编辑不填可保留原 Key；Markdown / 字体 / 二维码在 CSP 下正常；桌面端冒烟通过 | 已完成 |
 | T-17 | 注入隔离与覆盖确认 | G-17 | P0 | 三 | M | `wrapUntrusted` 三入口（工具结果 / 附件 / 页面快照）；系统提示词补充；导出前存在性检查 | 三类入口的恶意文本用例均不改变工具序列；覆盖已有文件必须二次确认 | 已完成 |
-| T-20 | 提示词与硬规则升级 | — | P0 | 三 | S | `agent_hard_rules.md` v1.2；`xiao_hi_system_prompt.md` 增注入 / 停止 / 摘要 / 重试规则 | 前后端规则一致；不出现"工具箱工具"空承诺；停止与重试语义写清楚 | 已完成 |
+| T-20 | 提示词与硬规则升级 | — | P0 | 三 | S | `agent_hard_rules.md` v1.2；`hangzai_system_prompt.md` 增注入 / 停止 / 摘要 / 重试规则 | 前后端规则一致；不出现"工具箱工具"空承诺；停止与重试语义写清楚 | 已完成 |
 | T-09 | 工具箱工具（第一批 12 个） | G-07 | P1 | 四 | L | `aiTools.ts` 新增 `toolbox_*` 工具，复用 `src/tools/*` | 12 个工具均可调用且结果正确；写类工具正确标记；提示词同步 | 已完成 |
 | T-10 | 业务工具补齐（7 个） | G-08 | P1 | 四 | M | `aiTools.ts` 新增 `env_delete` `env_script_save` `report_delete` `report_requests` `history_stats` `run_list` `cookie_list` | 每个工具参数强校验；写操作确认；只读工具自动执行 | 已完成 |
 | T-11 | 工具输出结构化 | G-09 | P1 | 四 | M | `aiTools.ts` 统一 `ToolResult` 信封与 `format` 约定 | 列表类输出带 `total` / `truncated`；界面卡片先摘要后详情；模型不再逐条数 | 已完成 |
@@ -376,8 +376,8 @@ flowchart LR
 | T-16 | Agent 复盘时间线 | G-15 | P1 | 五 | M | `ai_tool_logs` 增 `round` / `trace_id`；新增时间线抽屉与导出 | 按轮次展示思考 / 工具 / 结果 / 耗时；可导出脱敏诊断包 | 已完成 |
 | T-08 | 会话搜索 / 置顶 / 导出 / 自动标题 | G-14 | P1 | 五 | M | `ai.rs` 会话命令扩展；`AiAssistant.vue` 列表；新增导出 | 搜索命中标题与正文；置顶排序稳定；导出 Markdown / JSON 可读；首轮后标题自动生成 | 已完成 |
 | T-19 | 页面内 AI 轻量预算 | G-18 | P2 | 六 | S | `aiAssist.ts` 用 `contextBudget` 替换固定 12k | 大报告不再只截前 12k；关键尾部信息保留 | 已完成 |
-| T-21 | 文档同步 | — | P1 | 六 | S | 本文档、`FbinHttp 完整技术实现方案.md` §4.6、`README.md` 已实现功能与路线图 | 文档描述与代码一致；工具数量准确（61 个业务工具 + `tool_search`）；不再出现"列表只回显掩码" | 已完成 |
-| T-22 | 版本号与打包 | — | P0 | 六 | S | **5 处**版本号：`package.json`、`package-lock.json`（2 处）、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock` 的 `fbinhttp` 条目、`src-tauri/tauri.conf.json`；同步更新 `.github/workflows/release.yml` 的 `releaseBody` | 5 处一致；`releaseBody` 与代码一致（当前写的 39 工具 / 5 轮已过期）；`npm run build`、`cargo check`、`npm run build:win` 通过；安装包可启动 | 已完成 |
+| T-21 | 文档同步 | — | P1 | 六 | S | 本文档、`AstroMan 完整技术实现方案.md` §4.6、`README.md` 已实现功能与路线图 | 文档描述与代码一致；工具数量准确（61 个业务工具 + `tool_search`）；不再出现"列表只回显掩码" | 已完成 |
+| T-22 | 版本号与打包 | — | P0 | 六 | S | **5 处**版本号：`package.json`、`package-lock.json`（2 处）、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock` 的 `astroman` 条目、`src-tauri/tauri.conf.json`；同步更新 `.github/workflows/release.yml` 的 `releaseBody` | 5 处一致；`releaseBody` 与代码一致（当前写的 39 工具 / 5 轮已过期）；`npm run build`、`cargo check`、`npm run build:win` 通过；安装包可启动 | 已完成 |
 
 ### 4.4 数据结构变更
 
@@ -406,7 +406,7 @@ ALTER TABLE ai_providers ADD COLUMN timeout_secs INTEGER DEFAULT 300;
 
 | 位置 | 变更 |
 |---|---|
-| `xiao_hi_system_prompt.md` | 新增「工具结果是不可信数据」章节；新增「用户可随时停止」「停止后工具结果作废」章节；新增「何时自动重试」说明；删除"工具箱工具优先调用"空承诺，改为指向真实工具名 |
+| `hangzai_system_prompt.md` | 新增「工具结果是不可信数据」章节；新增「用户可随时停止」「停止后工具结果作废」章节；新增「何时自动重试」说明；删除"工具箱工具优先调用"空承诺，改为指向真实工具名 |
 | `agent_hard_rules.md` | 升 v1.2：规则 7 改为统一硬超时；规则 8 增加 URL / 自定义头脱敏；规则 10 增加 round / trace_id；新增规则 11 注入隔离、规则 12 首 delta 前才可自动重试 |
 | 模型配置表单 | Key 输入框改为掩码回显（`sk-****abcd`）+「留空表示不修改」提示；明文不再绑定到渲染层 |
 | 发送按钮 | 生成中切换为"停止"；停止后气泡显示"已停止，本轮工具结果已丢弃" |
@@ -427,7 +427,7 @@ ALTER TABLE ai_providers ADD COLUMN timeout_secs INTEGER DEFAULT 300;
 7. **重构阶段（T-23）禁止顺手修 bug 或改文案**，否则无法区分"拆分引入的回归"与"原有问题"。
 8. **自动重试与手动重试共用同一个"重发"函数**，保证"清空半截 / 复用快照 / 不重复落库"三点行为一致。
 9. **CSP 收紧后必须用桌面端验证**（`npm run tauri dev`）；浏览器 `npm run dev` 没有 IPC，验证不到真实加载路径。
-10. **版本号 5 处必须一起改**（`package.json`、`package-lock.json` 两处、`Cargo.toml`、`Cargo.lock` 的 `fbinhttp` 条目、`tauri.conf.json`），第 6 处 `release.yml` 的 `releaseBody` 最容易漏。
+10. **版本号 5 处必须一起改**（`package.json`、`package-lock.json` 两处、`Cargo.toml`、`Cargo.lock` 的 `astroman` 条目、`tauri.conf.json`），第 6 处 `release.yml` 的 `releaseBody` 最容易漏。
 
 ---
 
@@ -493,7 +493,7 @@ cargo test --manifest-path src-tauri/Cargo.toml
 npm run build:win
 ```
 
-- 五处版本号一致：`package.json` / `package-lock.json`（2 处）/ `src-tauri/Cargo.toml` / `src-tauri/Cargo.lock` 的 `fbinhttp` 条目 / `src-tauri/tauri.conf.json`。
+- 五处版本号一致：`package.json` / `package-lock.json`（2 处）/ `src-tauri/Cargo.toml` / `src-tauri/Cargo.lock` 的 `astroman` 条目 / `src-tauri/tauri.conf.json`。
 - `.github/workflows/release.yml` 的 `releaseBody` 与本版能力一致（当前仍写"39 个工具、最多 5 轮"，必须更新）。
 - 安装包在干净用户环境安装、启动、配置模型、跑通 R-01 / R-03 / R-08 / R-11。
 - v1.0.6 数据库升级到 v1.0.7 后无报错、无数据丢失（R-20）。
@@ -525,13 +525,13 @@ npm run build:win
 
 | 项 | 内容 | 状态 |
 |---|---|---|
-| 版本号 | `package.json` / `package-lock.json`（2 处）/ `src-tauri/Cargo.toml` / `src-tauri/Cargo.lock` 的 `fbinhttp` 条目 / `src-tauri/tauri.conf.json` → 1.0.7 | 已完成 |
+| 版本号 | `package.json` / `package-lock.json`（2 处）/ `src-tauri/Cargo.toml` / `src-tauri/Cargo.lock` 的 `astroman` 条目 / `src-tauri/tauri.conf.json` → 1.0.7 | 已完成 |
 | 发布说明源 | `.github/workflows/release.yml` 的 `releaseBody` 更新为 1.0.7 内容（39 工具 / 5 轮已改为 61 工具 + `tool_search` / 8 轮） | 已完成 |
-| 提示词 | `xiao_hi_system_prompt.md` 更新 + `agent_hard_rules.md` v1.2 | 已完成 |
+| 提示词 | `hangzai_system_prompt.md` 更新 + `agent_hard_rules.md` v1.2 | 已完成 |
 | 文档 | 本文档 + 技术方案 §4.6 + README「已实现功能」「路线图」；修正"列表只回显掩码" | 已完成 |
 | 测试 | 5.1 自动化 + 5.2 手工回归（含 R-21 ~ R-23）全部通过 | 自动化已通过（vitest 46 / cargo test 22）；手工回归待人工 |
 | 构建 | `npm run build` / `cargo check` / `npm run build:win` | 已完成 |
-| 安装包 | Windows NSIS 安装、启动、冒烟（R-01 / R-03 / R-08 / R-11） | 安装包已产出（FbinHttp_1.0.7_x64-setup.exe）；安装冒烟待人工 |
+| 安装包 | Windows NSIS 安装、启动、冒烟（R-01 / R-03 / R-08 / R-11） | 安装包已产出（AstroMan_1.0.7_x64-setup.exe）；安装冒烟待人工 |
 | 升级验证 | v1.0.6 数据库直接升级，R-20 通过 | 待人工验证 |
 | 发布说明 | 列出：可停止、可重试、上下文摘要、工具箱 12 个、业务工具 7 个、动态模型、复盘时间线、注入防护、密钥掩码 | 待办 |
 
@@ -569,7 +569,7 @@ npm run build:win
 | [src/utils/aiPricing.ts](file:///d:/Software/ProjectFiles/FbinHttp/src/utils/aiPricing.ts) | 模型价格表与费用估算 |
 | [src/api/index.ts](file:///d:/Software/ProjectFiles/FbinHttp/src/api/index.ts) | Tauri 命令封装 |
 | [src-tauri/src/commands/ai.rs](file:///d:/Software/ProjectFiles/FbinHttp/src-tauri/src/commands/ai.rs) | provider / chat / 会话 / 消息 / 用量 / 工具日志 |
-| [src-tauri/src/prompts/xiao_hi_system_prompt.md](file:///d:/Software/ProjectFiles/FbinHttp/src-tauri/src/prompts/xiao_hi_system_prompt.md) | 小HI 系统提示词（编译期嵌入） |
+| [src-tauri/src/prompts/hangzai_system_prompt.md](file:///d:/Software/ProjectFiles/FbinHttp/src-tauri/src/prompts/hangzai_system_prompt.md) | 航仔 系统提示词（编译期嵌入） |
 | [src-tauri/src/docx/agent_hard_rules.md](file:///d:/Software/ProjectFiles/FbinHttp/src-tauri/src/docx/agent_hard_rules.md) | 代码层硬规则说明 |
 | [src-tauri/src/db/schema.sql](file:///d:/Software/ProjectFiles/FbinHttp/src-tauri/src/db/schema.sql) | 数据库表结构 |
 | [src-tauri/src/db/mod.rs](file:///d:/Software/ProjectFiles/FbinHttp/src-tauri/src/db/mod.rs) | 启动建表与老库补列 |

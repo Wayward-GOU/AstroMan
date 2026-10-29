@@ -86,7 +86,7 @@ function flag(options: OptionState, key: string): boolean {
 
 const SAMPLE_JSON = `{
   "id": 1024,
-  "name": "FbinHttp",
+  "name": "AstroMan",
   "active": true,
   "tags": ["api", "desktop"],
   "owner": {
@@ -478,7 +478,7 @@ export const TOOLS: ToolDef[] = [
       inputLabel: '原始内容',
       outputLabel: '摘要结果',
       actionLabel: '计算摘要',
-      sample: 'FbinHttp',
+      sample: 'AstroMan',
       options: [
         {
           key: 'algorithm',
@@ -534,7 +534,7 @@ export const TOOLS: ToolDef[] = [
       inputLabel: '输入内容',
       outputLabel: '输出结果',
       actionLabel: '转换',
-      sample: 'FbinHttp 本地工具箱',
+      sample: 'AstroMan 本地工具箱',
       options: [
         {
           key: 'mode',
@@ -603,7 +603,7 @@ export const TOOLS: ToolDef[] = [
       inputLabel: '输入内容',
       outputLabel: '输出结果',
       actionLabel: '转换',
-      sample: '你好，FbinHttp',
+      sample: '你好，AstroMan',
       options: [
         {
           key: 'mode',
@@ -703,7 +703,7 @@ export const TOOLS: ToolDef[] = [
       inputLabel: '输入内容',
       outputLabel: '输出结果',
       actionLabel: '转换',
-      sample: 'FbinHttp',
+      sample: 'AstroMan',
       options: [
         {
           key: 'mode',
@@ -715,7 +715,7 @@ export const TOOLS: ToolDef[] = [
             { label: '解密', value: 'decode' },
           ],
         },
-        { key: 'key', label: '密钥', type: 'input', default: 'fbinhttp', width: 160 },
+        { key: 'key', label: '密钥', type: 'input', default: 'astroman', width: 160 },
       ],
       run: (input, options) => {
         const text = requireText(input)
@@ -743,7 +743,7 @@ export const TOOLS: ToolDef[] = [
       inputLabel: '输入内容',
       outputLabel: '输出结果',
       actionLabel: '转换',
-      sample: 'FbinHttp 本地工具集',
+      sample: 'AstroMan 本地工具集',
       options: [
         {
           key: 'mode',
@@ -807,7 +807,7 @@ export const TOOLS: ToolDef[] = [
       inputLabel: '原始内容 / Base32',
       outputLabel: '转换结果',
       actionLabel: '转换',
-      sample: 'FbinHttp',
+      sample: 'AstroMan',
       options: [
         {
           key: 'mode',
@@ -836,7 +836,7 @@ export const TOOLS: ToolDef[] = [
       inputLabel: '文本 / 十六进制',
       outputLabel: '转换结果',
       actionLabel: '转换',
-      sample: 'FbinHttp 你好',
+      sample: 'AstroMan 你好',
       options: [
         {
           key: 'mode',
@@ -968,7 +968,7 @@ export const TOOLS: ToolDef[] = [
       inputLabel: '输入文本',
       outputLabel: '统计结果',
       actionLabel: '统计',
-      sample: 'FbinHttp 是一款本地 API 调试工具。\n所有数据都保存在这台电脑上。',
+      sample: 'AstroMan 是一款本地 API 调试工具。\n所有数据都保存在这台电脑上。',
       run: (input) => {
         if (!input) throw new Error('请输入文本')
         return textStats(input)
@@ -1045,7 +1045,7 @@ export const TOOLS: ToolDef[] = [
       inputLabel: '输入文本',
       outputLabel: '输出结果',
       actionLabel: '反转',
-      sample: 'FbinHttp',
+      sample: 'AstroMan',
       options: [
         {
           key: 'mode',

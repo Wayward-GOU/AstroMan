@@ -35,7 +35,7 @@ const SCENARIOS: &[SeedCollection] = &[
                 method: "GET",
                 url: "{{base_url}}/get",
                 headers: ACCEPT_JSON,
-                params: &[("page", "1"), ("size", "10"), ("keyword", "fbinhttp")],
+                params: &[("page", "1"), ("size", "10"), ("keyword", "astroman")],
                 body_type: "none",
                 body: "",
                 pre_script: "",
@@ -49,7 +49,7 @@ const SCENARIOS: &[SeedCollection] = &[
                 params: &[],
                 body_type: "json",
                 body: r#"{
-  "name": "FbinHttp",
+  "name": "AstroMan",
   "owner": "{{username}}",
   "requestId": "{{uuid}}",
   "createdAt": "{{datetime}}"
@@ -146,10 +146,10 @@ const SCENARIOS: &[SeedCollection] = &[
                 url: "{{base_url}}/headers",
                 headers: &[
                     ("Accept", "application/json"),
-                    ("X-Client", "FbinHttp/1.0"),
+                    ("X-Client", "AstroMan/1.0"),
                     ("X-Trace-Id", "{{uuid}}"),
                     ("Accept-Language", "zh-CN"),
-                    ("User-Agent", "FbinHttp-Agent"),
+                    ("User-Agent", "AstroMan-Agent"),
                 ],
                 params: &[],
                 body_type: "none",
@@ -180,7 +180,7 @@ const SCENARIOS: &[SeedCollection] = &[
                 headers: ACCEPT_JSON,
                 params: &[],
                 body_type: "form",
-                body: "name=FbinHttp&owner={{username}}&user_id={{user_id}}",
+                body: "name=AstroMan&owner={{username}}&user_id={{user_id}}",
                 pre_script: "",
                 post_script: "",
             },
@@ -451,7 +451,7 @@ const ENV_VARS: &[(&str, &str)] = &[
     ("token", "demo-token"),
     ("api_key", "demo-api-key"),
     ("user_id", "1001"),
-    ("username", "fbinhttp"),
+    ("username", "astroman"),
 ];
 
 const ENV_SCRIPT: &str = r#"// 环境脚本：每次发送请求前执行，可为环境变量赋值

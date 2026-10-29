@@ -11,13 +11,13 @@ use tauri::Manager;
 pub type DbPool = Pool<SqliteConnectionManager>;
 
 /// 数据库文件名
-pub const DB_FILE: &str = "fbinhttp.db";
-/// 改名前的数据库文件名，仅在迁移旧数据时使用
-const LEGACY_DB_FILE: &str = "finkmeter.db";
-/// 改名前的默认数据目录名
-const LEGACY_DIR_NAME: &str = "FinkMeter";
-/// 改名前的 Tauri identifier，对应旧的配置文件目录
-const LEGACY_IDENTIFIER: &str = "com.finkmeter.app";
+pub const DB_FILE: &str = "astroman.db";
+/// 旧数据库文件名（FbinHttp 时期与更早的 FinkMeter 时期），按新→旧顺序尝试
+const LEGACY_DB_FILES: [&str; 2] = ["fbinhttp.db", "finkmeter.db"];
+/// 旧默认数据目录名，按新→旧顺序尝试
+const LEGACY_DIR_NAMES: [&str; 2] = ["FbinHttp", "FinkMeter"];
+/// 旧 Tauri identifier，对应旧的配置文件目录，按新→旧顺序尝试
+const LEGACY_IDENTIFIERS: [&str; 2] = ["com.fbinhttp.app", "com.finkmeter.app"];
 
 /// 数据目录指向文件（保存在固定的系统配置目录，不随数据目录移动）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,17 +65,21 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(app: &tauri::AppHandle) -> Result<Self, String> {
-        // 产品已更名为 FbinHttp，默认数据目录改为 FbinHttp；
-        // 若存在旧目录 FinkMeter 且新目录还没有数据库，则把数据库复制过来，老数据继续可用
+        // 产品已更名为 AstroMan，默认数据目录改为 AstroMan；
+        // 依次尝试 FbinHttp / FinkMeter 旧目录，老数据继续可用
         let base_data_dir = app.path().data_dir().map_err(crate::util::err)?;
-        let legacy_data_dir = base_data_dir.join(LEGACY_DIR_NAME);
-        let default_data_dir = base_data_dir.join("FbinHttp");
-        migrate_legacy_dir(&legacy_data_dir, &default_data_dir);
+        let default_data_dir = base_data_dir.join("AstroMan");
+        for (index, legacy_name) in LEGACY_DIR_NAMES.iter().enumerate() {
+            let legacy_dir = base_data_dir.join(legacy_name);
+            migrate_legacy_dir(&legacy_dir, &default_data_dir, LEGACY_DB_FILES[index]);
+        }
         let config_dir = app.path().app_config_dir().map_err(crate::util::err)?;
-        // identifier 已改为 com.fbinhttp.app，先把旧配置目录里的 json
+        // identifier 已改为 com.astroman.app，先把旧配置目录里的 json
         //（storage.json / settings.json / 窗口状态）复制过来，升级后配置不丢
         if let Ok(base_config_dir) = app.path().config_dir() {
-            migrate_legacy_config(&base_config_dir.join(LEGACY_IDENTIFIER), &config_dir);
+            for legacy_id in LEGACY_IDENTIFIERS {
+                migrate_legacy_config(&base_config_dir.join(legacy_id), &config_dir);
+            }
         }
         std::fs::create_dir_all(&config_dir).map_err(|e| format!("创建配置目录失败：{e}"))?;
         let config_file = config_dir.join("storage.json");
@@ -167,12 +171,12 @@ impl AppState {
 }
 
 /// 把旧版默认目录的数据库文件复制到新目录（只在目标还没有数据库时执行，不覆盖任何数据）
-fn migrate_legacy_dir(legacy_dir: &Path, target_dir: &Path) {
+fn migrate_legacy_dir(legacy_dir: &Path, target_dir: &Path, legacy_db_file: &str) {
     let target_db = target_dir.join(DB_FILE);
     if target_db.exists() {
         return;
     }
-    let legacy_db = legacy_dir.join(LEGACY_DB_FILE);
+    let legacy_db = legacy_dir.join(legacy_db_file);
     if !legacy_db.exists() {
         return;
     }
@@ -186,13 +190,13 @@ fn migrate_legacy_dir(legacy_dir: &Path, target_dir: &Path) {
     }
     // WAL / SHM 一起带上，避免丢失尚未合并的事务
     for suffix in ["-wal", "-shm"] {
-        let from = legacy_dir.join(format!("{LEGACY_DB_FILE}{suffix}"));
+        let from = legacy_dir.join(format!("{legacy_db_file}{suffix}"));
         if from.exists() {
             let _ = std::fs::copy(&from, target_dir.join(format!("{DB_FILE}{suffix}")));
         }
     }
     log::info!(
-        "已把旧数据目录 {:?} 中的数据库迁移到 {:?}，原目录保留可自行删除",
+        "已把旧数据目录 {:?} 中的 {legacy_db_file} 迁移到 {:?}，原目录保留可自行删除",
         legacy_dir,
         target_dir
     );
@@ -243,13 +247,31 @@ fn migrate_legacy_config(legacy_dir: &Path, target_dir: &Path) {
 fn open_pool(data_dir: &Path) -> Result<DbPool, String> {
     std::fs::create_dir_all(data_dir).map_err(crate::util::err)?;
     let db_path = data_dir.join(DB_FILE);
-    // 若该目录下只有旧数据库 finkmeter.db，重命名为新文件名
+    // 若该目录下只有旧数据库（fbinhttp.db / finkmeter.db），重命名为新文件名
     if !db_path.exists() {
-        let legacy = data_dir.join(LEGACY_DB_FILE);
-        if legacy.exists() {
-            log::info!("检测到旧数据库 {LEGACY_DB_FILE}，重命名为 {DB_FILE}");
-            if let Err(error) = std::fs::rename(&legacy, &db_path) {
-                log::warn!("旧数据库重命名失败：{error}");
+        for legacy_name in LEGACY_DB_FILES {
+            let legacy = data_dir.join(legacy_name);
+            if legacy.exists() {
+                log::info!("检测到旧数据库 {legacy_name}，重命名为 {DB_FILE}");
+                match std::fs::rename(&legacy, &db_path) {
+                    Ok(()) => {
+                        // WAL / SHM 跟着主库一起改名，否则最近未 checkpoint 的事务会丢
+                        for suffix in ["-wal", "-shm"] {
+                            let from = data_dir.join(format!("{legacy_name}{suffix}"));
+                            if from.exists() {
+                                let to = data_dir.join(format!("{DB_FILE}{suffix}"));
+                                if to.exists() {
+                                    let _ = std::fs::remove_file(&to);
+                                }
+                                if let Err(error) = std::fs::rename(&from, &to) {
+                                    log::warn!("旧数据库附属文件 {suffix} 改名失败：{error}");
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => log::warn!("旧数据库重命名失败：{error}"),
+                }
+                break;
             }
         }
     }
@@ -294,7 +316,7 @@ fn build_clients(settings: &AppSettings) -> Result<HttpClients, String> {
 
 fn build_client_with(settings: &AppSettings, insecure: bool) -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder()
-        .user_agent(concat!("FbinHttp/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("AstroMan/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(10))
         .pool_max_idle_per_host(32)
         .danger_accept_invalid_certs(insecure);
@@ -319,4 +341,65 @@ fn build_client_with(settings: &AppSettings, insecure: bool) -> Result<reqwest::
     }
 
     builder.build().map_err(crate::util::err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("astroman-{tag}-{}-{stamp}", std::process::id()))
+    }
+
+    #[test]
+    fn migrates_legacy_db_with_wal_and_shm() {
+        let root = temp_root("db");
+        let legacy = root.join("FbinHttp");
+        let target = root.join("AstroMan");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("fbinhttp.db"), b"main").unwrap();
+        std::fs::write(legacy.join("fbinhttp.db-wal"), b"wal").unwrap();
+        std::fs::write(legacy.join("fbinhttp.db-shm"), b"shm").unwrap();
+
+        migrate_legacy_dir(&legacy, &target, "fbinhttp.db");
+
+        assert_eq!(std::fs::read(target.join("astroman.db")).unwrap(), b"main");
+        assert_eq!(std::fs::read(target.join("astroman.db-wal")).unwrap(), b"wal");
+        assert_eq!(std::fs::read(target.join("astroman.db-shm")).unwrap(), b"shm");
+        // 目标已存在时不覆盖
+        std::fs::write(legacy.join("fbinhttp.db"), b"new").unwrap();
+        migrate_legacy_dir(&legacy, &target, "fbinhttp.db");
+        assert_eq!(std::fs::read(target.join("astroman.db")).unwrap(), b"main");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migrates_config_json_without_overwrite() {
+        let root = temp_root("cfg");
+        let legacy = root.join("com.fbinhttp.app");
+        let target = root.join("com.astroman.app");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("storage.json"), "old").unwrap();
+        std::fs::write(legacy.join("settings.json"), "old-settings").unwrap();
+        migrate_legacy_config(&legacy, &target);
+        assert_eq!(std::fs::read_to_string(target.join("storage.json")).unwrap(), "old");
+        assert_eq!(
+            std::fs::read_to_string(target.join("settings.json")).unwrap(),
+            "old-settings"
+        );
+        // 已有值不被旧配置覆盖
+        std::fs::write(legacy.join("storage.json"), "older").unwrap();
+        std::fs::write(target.join("storage.json"), "newer").unwrap();
+        migrate_legacy_config(&legacy, &target);
+        assert_eq!(
+            std::fs::read_to_string(target.join("storage.json")).unwrap(),
+            "newer"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

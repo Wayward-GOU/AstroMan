@@ -573,11 +573,11 @@ function prettyArgs(args: Record<string, unknown>): string {
 /* ---------------- 对话主流程 ---------------- */
 
 // 身份、核心执行流程与业务规则由 Rust 后端注入
-// （src-tauri/src/prompts/xiao_hi_system_prompt.md，include_str! 编译期嵌入），
+// （src-tauri/src/prompts/hangzai_system_prompt.md，include_str! 编译期嵌入），
 // 前端这里只补充「工具协议」，不得与后端规则冲突：每轮最多 1 个工具调用、最多连续 8 轮。
-const SYSTEM_PROMPT = `以下是 FbinHttp 的工具调用协议，与全局规则同时生效，冲突时以全局规则为准。
+const SYSTEM_PROMPT = `以下是 AstroMan 的工具调用协议，与全局规则同时生效，冲突时以全局规则为准。
 
-小HI 既能日常聊天、知识问答、写文案与代码，也能操作本软件。先判断意图：
+航仔 既能日常聊天、知识问答、写文案与代码，也能操作本软件。先判断意图：
 - 纯聊天、闲聊、知识问答、概念解释、写文案、解释代码 → 直接回答，不要输出任何工具块；
 - 用户要「方案 / 思路 / 模板 / 建议」（压测方案、测试策略、接口设计、排障思路、脚本写法）→ 直接给出完整方案，即使话题和本软件相关也不要为了凑方案去调工具；
 - 只有用户明确指向本机某个项目 / 接口 / 报告，或要查询/修改数据、真实发送请求、执行压测、导入导出、写接口脚本时，才使用工具。
@@ -875,7 +875,7 @@ async function regenerate(item: ChatItem) {
 
 /** 把引用内容打包进用户消息：既让模型看到，也能落库后重新解析 */
 const QUOTE_LIMIT = 400
-const quoteLabel = (role: ChatQuote['role']) => (role === 'user' ? '你' : '小HI')
+const quoteLabel = (role: ChatQuote['role']) => (role === 'user' ? '你' : '航仔')
 
 function clipQuote(text: string): string {
   const flat = text.trim()
@@ -888,7 +888,7 @@ function quotePrefix(item: ChatQuote): string {
 
 /** 从落库正文里还原引用与真正的提问内容 */
 function parseStoredQuote(content: string): { body: string; quote?: ChatQuote } {
-  const match = content.match(/^【引用(你|小HI)】\n([\s\S]*?)(?:\n\n|$)/)
+  const match = content.match(/^【引用(你|航仔|小HI)】\n([\s\S]*?)(?:\n\n|$)/)
   if (!match) return { body: content }
   return {
     body: content.slice(match[0].length),
@@ -1784,7 +1784,7 @@ async function exportDiagnostics() {
   if (!target) return
   const payload = {
     exportedAt: stamp,
-    app: 'FbinHttp',
+    app: 'AstroMan',
     session: {
       id: sessionId.value,
       title: session?.title ?? '',
@@ -1842,7 +1842,7 @@ async function exportSession() {
     const stored = await aiMessageList(sessionId.value)
     const logs = await loadToolLogs(sessionId.value).catch(() => [] as AiToolLog[])
     const lines: string[] = [
-      `# ${session?.title ?? '小HI 会话'}`,
+      `# ${session?.title ?? '航仔 会话'}`,
       '',
       `- 导出时间：${new Date().toLocaleString()}`,
       `- 模型：${activeProvider.value?.name ?? '—'} / ${activeProvider.value?.model ?? '—'}`,
@@ -1853,7 +1853,7 @@ async function exportSession() {
     ]
     for (const msg of stored) {
       if (msg.role !== 'user' && msg.role !== 'assistant') continue
-      lines.push(msg.role === 'user' ? '### 你' : '### 小HI', '', maskSensitive(msg.content.trim()), '')
+      lines.push(msg.role === 'user' ? '### 你' : '### 航仔', '', maskSensitive(msg.content.trim()), '')
     }
     if (logs.length) {
       lines.push('## 工具调用', '')
@@ -2052,7 +2052,7 @@ onMounted(async () => {
 
 <template>
   <div class="page ai-page">
-    <PageHeader title="小HI" subtitle="内置 AI 助手 · 会话留存 · 可直接调用系统功能">
+    <PageHeader title="航仔" subtitle="内置 AI 助手 · 会话留存 · 可直接调用系统功能">
       <div class="head-actions">
         <a-switch v-model:checked="autoRun" size="small" />
         <span class="switch-label">自动执行工具</span>
@@ -2146,9 +2146,9 @@ onMounted(async () => {
       <section class="chat fm-card">
         <div class="chat-head">
           <div class="hi">
-            <div class="hi-avatar">HI</div>
+            <div class="hi-avatar">航</div>
             <div class="hi-text">
-              <div class="hi-name">小HI</div>
+              <div class="hi-name">航仔</div>
               <div class="hi-meta">
                 {{ activeProvider ? `${activeProvider.name} · ${activeProvider.model}` : '尚未配置模型服务' }}
               </div>
@@ -2187,7 +2187,7 @@ onMounted(async () => {
         <div v-if="!canChat" class="chat-empty">
           <RobotOutlined class="empty-icon" />
           <h3>还没有可用的模型</h3>
-          <p>小HI 由你自己的 API 驱动，密钥经加密后只保存在本机。不配置则不提供任何 AI 能力。</p>
+          <p>航仔 由你自己的 API 驱动，密钥经加密后只保存在本机。不配置则不提供任何 AI 能力。</p>
           <a-button type="primary" @click="serviceOpen = true">去配置服务</a-button>
         </div>
 
@@ -2197,9 +2197,9 @@ onMounted(async () => {
               <div class="hint-hero">
                 <div class="hint-avatar"><RobotOutlined /></div>
                 <div class="hint-hero-text">
-                  <div class="hint-title">你好，我是小HI</div>
+                  <div class="hint-title">你好，我是航仔</div>
                   <p class="hint-sub">
-                    FbinHttp 内置的 AI 助手，由你自己配置的模型驱动，密钥只加密保存在本机。
+                    AstroMan 内置的 AI 助手，由你自己配置的模型驱动，密钥只加密保存在本机。
                     可以聊技术、答问题、写代码，也可以直接用一句话描述目标，我会自动挑工具去执行，并把结果讲清楚。
                   </p>
                 </div>
@@ -2236,15 +2236,15 @@ onMounted(async () => {
             </div>
 
             <div v-for="item in visibleMessages" :key="item.id" class="bubble" :class="item.role">
-              <div v-if="item.role === 'assistant'" class="bubble-avatar">HI</div>
+              <div v-if="item.role === 'assistant'" class="bubble-avatar">航</div>
               <div class="bubble-main">
                 <div class="bubble-meta">
-                  <span class="bubble-name">{{ item.role === 'user' ? '你' : '小HI' }}</span>
+                  <span class="bubble-name">{{ item.role === 'user' ? '你' : '航仔' }}</span>
                   <span class="bubble-time">{{ fmtTime(item.createdAt) }}</span>
                 </div>
                 <div class="bubble-body" :class="{ failed: item.failed }">
                   <div v-if="item.quote" class="bubble-quote">
-                    <div class="bubble-quote-head">引用 {{ item.quote.role === 'user' ? '你' : '小HI' }}</div>
+                    <div class="bubble-quote-head">引用 {{ item.quote.role === 'user' ? '你' : '航仔' }}</div>
                     <div class="bubble-quote-text">{{ item.quote.content }}</div>
                   </div>
                   <template v-if="item.role === 'assistant' && (item.reasoning || toolParts(item).length)">
@@ -2398,7 +2398,7 @@ onMounted(async () => {
             <div v-if="quote" class="quote-bar">
               <div class="quote-bar-head">
                 <CommentOutlined />
-                <span>引用 {{ quote.role === 'user' ? '你' : '小HI' }}</span>
+                <span>引用 {{ quote.role === 'user' ? '你' : '航仔' }}</span>
                 <button type="button" class="quote-close" title="取消引用" @click="clearQuote">×</button>
               </div>
               <div class="quote-bar-text">{{ quote.content }}</div>
@@ -2426,7 +2426,7 @@ onMounted(async () => {
                 v-model:value="input"
                 :auto-size="{ minRows: 2, maxRows: 6 }"
                 :disabled="sending"
-                placeholder="和小HI聊聊，或让它帮你操作软件…（Enter 发送，Shift + Enter 换行）"
+                placeholder="和航仔聊聊，或让它帮你操作软件…（Enter 发送，Shift + Enter 换行）"
                 @keydown.enter="onEnter"
                 @keydown.ctrl.enter.prevent="send"
               />
@@ -2782,7 +2782,7 @@ onMounted(async () => {
         </a-form-item>
         <a-form-item class="default-item">
           <a-checkbox v-model:checked="form.isDefault">设为默认服务</a-checkbox>
-          <span class="default-desc">进入小HI 时自动使用该服务，也可在顶部随时切换</span>
+          <span class="default-desc">进入航仔 时自动使用该服务，也可在顶部随时切换</span>
         </a-form-item>
       </a-form>
     </a-modal>

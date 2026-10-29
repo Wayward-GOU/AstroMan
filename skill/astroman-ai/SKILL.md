@@ -1,11 +1,11 @@
 ---
-name: fbinhttp-ai
-description: FbinHttp 内置 AI 助手「小HI」的开发与维护规范。接入新模型厂商、改流式对话与停止/重试、调上下文预算与摘要、加系统工具（AI 可调用的能力）、写操作确认卡、会话与复盘时间线、排查 AI 报错时使用。触发词：小HI、AI 助手、ai_chat、aiTools、工具调用、工具记录、会话、provider、OpenAI、Claude、Gemini、上下文预算、复盘时间线。
+name: astroman-ai
+description: AstroMan 内置 AI 助手「航仔」的开发与维护规范。接入新模型厂商、改流式对话与停止/重试、调上下文预算与摘要、加系统工具（AI 可调用的能力）、写操作确认卡、会话与复盘时间线、排查 AI 报错时使用。触发词：航仔、AI 助手、ai_chat、aiTools、工具调用、工具记录、会话、provider、OpenAI、Claude、Gemini、上下文预算、复盘时间线。
 ---
 
-# 小HI（AI 助手）
+# 航仔（AI 助手）
 
-小HI 是内置在 FbinHttp 里的接口调试助手：用户自备模型 API Key，它既能纯聊天，也能通过「工具」直接操作软件（建项目、建请求、发请求、压测、导入导出），并把每次工具调用单独落库供用户审计。
+航仔 是内置在 AstroMan 里的接口调试助手：用户自备模型 API Key，它既能纯聊天，也能通过「工具」直接操作软件（建项目、建请求、发请求、压测、导入导出），并把每次工具调用单独落库供用户审计。
 
 ## v1.0.7 主要变化（先读这张表）
 
@@ -22,8 +22,8 @@ description: FbinHttp 内置 AI 助手「小HI」的开发与维护规范。接�
 
 | 位置 | 职责 |
 |---|---|
-| `src-tauri/src/prompts/xiao_hi_system_prompt.md` | **小HI 身份、执行流程与业务规则**（唯一权威版本，改行为先改这里） |
-| `src-tauri/src/prompts/mod.rs` | `include_str!` 编译期嵌入 prompt，导出 `XIAO_HI_SYSTEM_PROMPT` |
+| `src-tauri/src/prompts/hangzai_system_prompt.md` | **航仔 身份、执行流程与业务规则**（唯一权威版本，改行为先改这里） |
+| `src-tauri/src/prompts/mod.rs` | `include_str!` 编译期嵌入 prompt，导出 `HANGZAI_SYSTEM_PROMPT` |
 | `src-tauri/src/commands/ai.rs` | 服务商 CRUD 与测试、流式对话（停止 / 重试 / 超时）、动态模型清单、会话/消息、工具流水、用量统计、报错中文化 |
 | `src-tauri/src/models.rs` | `AiProvider`（`api_key_masked` / `has_key` / `max_tokens` / `timeout_secs`）、`AiMessage`、`AiChatPayload`、`AiStreamEvent`、`AiSession`（`pinned` / `summary`）、`AiStoredMessage`、`AiToolLog`（`round` / `trace_id` / `timeout`）、`AiUsageLog` / `AiUsagePage` / `AiUsageDay` |
 | `src-tauri/src/db/schema.sql` | `ai_providers`、`ai_sessions`、`ai_messages`、`ai_tool_logs`、`ai_usage_logs` 五张表 |
@@ -42,8 +42,8 @@ description: FbinHttp 内置 AI 助手「小HI」的开发与维护规范。接�
 | `src/utils/__tests__/` | vitest：`aiProtocol` / `aiTools` / `contextBudget` / `untrusted` 四组纯函数用例（46 条） |
 | `src/views/AiUsage.vue` | 用量统计独立页（`/ai/usage`）：6 张指标卡 + 每日 token 柱 + 调用记录 / 模型汇总 / 工具准确率三 Tab + 右侧抽屉 |
 | `src/views/AiToolLogs.vue` | 工具调用记录页（`/ai/logs`）：指标卡、趋势柱、表格、详情抽屉 |
-| `src/views/Settings.vue` | 设置页「AI 辅助（小HI）」卡片：已上线说明 + 「打开小HI」「用量统计」 |
-| `src/views/Dashboard.vue` | 首页使用说明：第 07 步「用小HI 提效」、3 张 AI 技巧卡、3 条 AI FAQ |
+| `src/views/Settings.vue` | 设置页「AI 辅助（航仔）」卡片：已上线说明 + 「打开航仔」「用量统计」 |
+| `src/views/Dashboard.vue` | 首页使用说明：第 07 步「用航仔 提效」、3 张 AI 技巧卡、3 条 AI FAQ |
 | `src/App.vue` | 右侧屏幕垂直居中的悬浮机器人入口（54px，`right: 14px` + `top: 50%`，`/ai` 页隐藏）+ 挂载全局 `<AiAssistDrawer />` |
 | `src/api/index.ts` | `aiProvider*`、`aiChat`、`aiExecute`、`aiSession*`、`aiMessage*`、`aiToolLog*`、`aiUsage*` |
 
@@ -76,7 +76,7 @@ description: FbinHttp 内置 AI 助手「小HI」的开发与维护规范。接�
 
 ## 双模式人格（聊天 / 操作）
 
-小HI 不是只会操作软件的执行器，必须在两种模式间自动分流，规则同时写在两份提示词里（后端 md 是权威，前端 `SYSTEM_PROMPT` 只保留协议与判定）：
+航仔 不是只会操作软件的执行器，必须在两种模式间自动分流，规则同时写在两份提示词里（后端 md 是权威，前端 `SYSTEM_PROMPT` 只保留协议与判定）：
 
 | 用户意图 | 行为 |
 |---|---|
@@ -130,7 +130,7 @@ Rust 侧 `ai_chat(payload, on_event: Channel<AiStreamEvent>)`，逐块 `on_event
 
 - 助手消息：复制、引用、**重新生成**（`regenerate`：按 `createdAt` 调 `aiMessageDeleteFrom` 删掉该条及之后的分支，再 `ask()`；不重复落用户消息）、删除
 - 用户消息：复制、引用、**编辑重发**（`editMessage`：先删库再截断本地，内容回填输入框）、删除
-- 引用（`quoteMessage`）：内容进输入框上方引用条，发送时以 `【引用你/小HI】\n…\n\n` 前缀同时写给模型；落库后 `parseStoredQuote()` 还原成气泡里的引用卡片；只引用可见正文，附件与工具块会被剥掉
+- 引用（`quoteMessage`）：内容进输入框上方引用条，发送时以 `【引用你/航仔】\n…\n\n` 前缀同时写给模型；落库后 `parseStoredQuote()` 还原成气泡里的引用卡片；只引用可见正文，附件与工具块会被剥掉
 - 删除（`removeMessage`）：`Modal.confirm` 二次确认，按 `dbId` 调 `ai_message_delete` 只删一条；本地尚未落库的消息只删本地
 - 时间对齐：`send()` 用 `aiMessageAdd` 返回的 `createdAt / id` 回填本地消息，保证编辑重发按时间删库、删除按 id 精确命中
 - 历史消息加载时直接使用数据库 `createdAt` 与 `id`；`ai_message_delete_from` 的 `inclusive` 默认 true
@@ -176,8 +176,8 @@ Rust 侧 `ai_chat(payload, on_event: Channel<AiStreamEvent>)`，逐块 `on_event
 
 ### 系统提示词注入（后端强制）
 
-- prompt 正文只维护 `src-tauri/src/prompts/xiao_hi_system_prompt.md` 一份；`prompts/mod.rs` 用 `include_str!` 编译期嵌入，不走运行时磁盘 IO，打包后即在二进制内
-- 每次 `ai_chat` 都会把 `XIAO_HI_SYSTEM_PROMPT` **插到 messages[0]**，并剔除客户端传来的同内容副本；前端无法覆盖、删除或改写这套规则
+- prompt 正文只维护 `src-tauri/src/prompts/hangzai_system_prompt.md` 一份；`prompts/mod.rs` 用 `include_str!` 编译期嵌入，不走运行时磁盘 IO，打包后即在二进制内
+- 每次 `ai_chat` 都会把 `HANGZAI_SYSTEM_PROMPT` **插到 messages[0]**，并剔除客户端传来的同内容副本；前端无法覆盖、删除或改写这套规则
 - 前端的 `SYSTEM_PROMPT` 只保留「工具协议 + 脚本引擎」这类随代码动态生成的内容（`TOOL_CATALOG` 来自注册表），不得再写身份与业务流程，避免与后端 prompt 冲突
 - 改行为（轮次上限、确认策略、输出格式）时：先改 md，再同步前端协议文案与 `MAX_TOOL_ROUNDS`、`isDangerousTool` 等常量
 - md 里的「单轮最多 1 个工具」由 `afterReply` 只取第一个 idle 安全工具来落实；「最多 8 轮」由 `autoDepth` / `forcedFinal` 拦截
@@ -255,7 +255,7 @@ Rust 侧 `ai_chat(payload, on_event: Channel<AiStreamEvent>)`，逐块 `on_event
 
 ### 新增一个工具
 
-1. 在 `src/api/index.ts` 确认已有对应 command 包装（没有就先加，参考 `fbinhttp-add-feature`）
+1. 在 `src/api/index.ts` 确认已有对应 command 包装（没有就先加，参考 `astroman-add-feature`）
 2. 在 `src/utils/aiTools.ts` 的 `SPECS` 追加 `{ name, desc, args, handler, danger?, format? }`
    - `args` 是给模型看的签名文案，写清必填/可选
    - 参数解析统一用 `str` / `needNum` / `optionalNum` / `toItems` / `needPath`，不要直接强转
@@ -297,7 +297,7 @@ Rust 侧 `ai_chat(payload, on_event: Channel<AiStreamEvent>)`，逐块 `on_event
 - **附件**：输入框左侧回形针选择本地文本文件（≤60000 字符，超出截断），内容以 ```` ```fbin-file 文件名 ```` 块拼进用户消息；`contentParts` 会过滤掉该块，气泡里只显示附件胶囊，模型仍能读到全文
 - 输入框：Enter 发送、Shift/Ctrl + Enter 换行，`event.isComposing` 时不发送（中文输入法组字保护）
 - 悬浮入口：54px 机器人（纯 CSS/SVG，无图片），`z-index: 900` 低于弹窗，固定在**右侧屏幕垂直居中**（`right: 14px; top: 50%; margin-top: -27px`），`/ai` 页隐藏，不占用主内容区布局
-- 其他入口必须与悬浮入口说法一致：设置页「AI 辅助（小HI）」卡片（绿色「已上线」标签 + 打开小HI / 用量统计两个按钮）、首页使用说明第 07 步、3 张 AI 技巧卡与 3 条 AI FAQ；改文案时三处一起改，禁止出现「即将开放」「右下角机器人」这类过期描述
+- 其他入口必须与悬浮入口说法一致：设置页「AI 辅助（航仔）」卡片（绿色「已上线」标签 + 打开航仔 / 用量统计两个按钮）、首页使用说明第 07 步、3 张 AI 技巧卡与 3 条 AI FAQ；改文案时三处一起改，禁止出现「即将开放」「右下角机器人」这类过期描述
 - **只展示结果**：自动执行工具的那一轮（「我先获取…」）标 `hidden`，模板渲染 `visibleMessages`；重开会话用 `isExecutionNote()` 过滤历史，同 deepseek 的「只给答案」
 - **用量统计独立页**（`/ai/usage`，`src/views/AiUsage.vue`，工具栏「用量统计」直接路由过去）：6 张指标卡（调用次数 / 模型成功率 / 工具准确率 / 总 token / 估算费用 / 平均耗时）+ 每日 token 堆叠柱（输入/输出，>45 天按周聚合）+ Tab「调用记录 / 模型汇总 / 工具准确率」；调用记录来自 `ai_usage_logs`，一次调用一条，默认 10 条/页（10/20/50/100），完整 `YYYY-MM-DD HH:MM:SS`，整行点击弹右侧 560px 抽屉
 - **费用估算**：`src/utils/aiPricing.ts` 按模型名正则匹配厂商公开单价（USD/1M tokens），匹配不到走默认价并在 UI 标注「默认估算」；导出 `estimateCost / fmtUsd / fmtCny / fmtUnit`，汇率常量 `USD_TO_CNY`
@@ -324,7 +324,7 @@ Rust 侧 `ai_chat(payload, on_event: Channel<AiStreamEvent>)`，逐块 `on_event
 - **估算兜底**：网关不回 usage 时按字符估算——中日韩字符 1 token/字，其余 4 字符 1 token（`estimate_tokens`）
 - **准确率口径**：`success_rate = ok 调用 / 总调用`；`tool_success_rate` 通过 `ai_tool_logs JOIN ai_sessions ON provider_id` 归属到模型，不额外建表
 - 命令：`ai_usage_stats(days)` 返回总量 + 按模型聚合 + 按天 token 趋势；`ai_usage_clear(all)` 默认只清过期，`all=true` 全清
-- 前端入口：小HI 顶部「用量统计」直接路由到 `/ai/usage`（不再用弹窗）；页面为 6 张指标卡（调用次数 / 模型成功率 / 工具准确率 / 总 token / 估算费用 / 平均耗时）+ 每日 token 堆叠柱（>45 天按周聚合）+ Tab「调用记录 / 模型汇总 / 工具准确率」，默认 10 条/页（10/20/50/100），整行点击开右侧 560px 抽屉
+- 前端入口：航仔 顶部「用量统计」直接路由到 `/ai/usage`（不再用弹窗）；页面为 6 张指标卡（调用次数 / 模型成功率 / 工具准确率 / 总 token / 估算费用 / 平均耗时）+ 每日 token 堆叠柱（>45 天按周聚合）+ Tab「调用记录 / 模型汇总 / 工具准确率」，默认 10 条/页（10/20/50/100），整行点击开右侧 560px 抽屉
 - `ai_provider_test` 不计入统计（连通性测试不算真实用量）
 
 ## 模型目录与报错中文化
@@ -410,7 +410,7 @@ Rust 侧 `ai_chat(payload, on_event: Channel<AiStreamEvent>)`，逐块 `on_event
 | 正文里出现空 fbin-tool 块 | `parseSegmentsRaw()` 要把空块丢弃，不能当代码块渲染 |
 | 用户只看到「无法回答」 | 模型一轮吐多个 tool_call，被硬规则 2 全部拒绝后反复重试；`rejections` 达到 2 直接终止并提示，此时可手动点工具卡片运行 |
 | 回答要等全部生成完才出现 | 累积消息用了普通对象，非响应式；必须 `reactive()` + 50ms 合帧 `paint()`（对话页与 `aiAssist` 两处） |
-| 进入小HI 页面卡顿 | 旧实现 `onMounted` 自动打开最近会话并整段渲染；现只预取服务商/会话列表，消息改为点击会话时加载，`parseSegments` 结果按内容缓存 |
+| 进入航仔 页面卡顿 | 旧实现 `onMounted` 自动打开最近会话并整段渲染；现只预取服务商/会话列表，消息改为点击会话时加载，`parseSegments` 结果按内容缓存 |
 | 对话里满屏「执行过程 · 1 个工具调用」 | 自动执行的中间轮被标记 `hidden`，模板只渲染 `visibleMessages`；历史会话按 `isExecutionNote()` / `isControlMessage()` 同样过滤，只回放最终回答 |
 | 模型把请求数量说错 / 说「列表被截断」 | 列表类工具统一走 `summarizeList()`：`total` 在前、明细限 50 条，模型直接引用 total；prompt 的「数据准确性」禁止数条数 |
 | 模型直接新建了东西，没先给方案 | 提示词「写入操作必须先给方案」缺失，或工具没进 `WRITE_TOOLS`；两道都要有 |
@@ -446,5 +446,5 @@ cargo test
 
 ## 样式与文案
 
-- 名称统一「小HI」：导航、页面标题、占位符、system prompt 都用小HI；设置页卡片可写「AI 辅助（小HI）」，但不要再把「AI 助手」当成产品名
+- 名称统一「航仔」：导航、页面标题、占位符、system prompt 都用航仔；设置页卡片可写「AI 辅助（航仔）」，但不要再把「AI 助手」当成产品名
 - 所有面向用户的文案中文、简洁、可执行；工具失败要说清「下一步怎么改」

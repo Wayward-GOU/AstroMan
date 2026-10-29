@@ -513,7 +513,7 @@ ${tableHtml(
 <div class="wrap">
   <header class="report-head">
     <div>
-      <div class="brand">FbinHttp · 压测报告</div>
+      <div class="brand">AstroMan · 压测报告</div>
       <h1 class="title">${escapeHtml(report.planName)}</h1>
       <div class="sub">开始 ${fmtTime(report.startTime)} · 结束 ${fmtTime(report.endTime)} · 持续 ${fmtDuration(
         report.startTime,
@@ -614,7 +614,7 @@ ${tableHtml(['配置项', '取值'], configRows)}</div>`
     }
   </div>
 
-  <div class="foot">由 FbinHttp 生成 · ${fmtTime(Date.now())}</div>
+  <div class="foot">由 AstroMan 生成 · ${fmtTime(Date.now())}</div>
 </div>
 </body>
 </html>`

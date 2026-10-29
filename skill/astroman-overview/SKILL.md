@@ -1,11 +1,11 @@
 ---
-name: fbinhttp-overview
-description: FbinHttp 项目全景。接手本项目、需要了解目录结构、启动与构建命令、运行时行为（托盘/关闭隐藏）、数据存放位置，或确认哪些旧标识（identifier、数据目录、数据库名、crate 名）必须保留时使用。触发词：FbinHttp 项目、项目结构、怎么启动、数据存哪、改名注意事项。
+name: astroman-overview
+description: AstroMan 项目全景。接手本项目、需要了解目录结构、启动与构建命令、运行时行为（托盘/关闭隐藏）、数据存放位置，或确认哪些旧标识（identifier、数据目录、数据库名、crate 名）必须保留时使用。触发词：AstroMan 项目、项目结构、怎么启动、数据存哪、改名注意事项。
 ---
 
-# FbinHttp 项目全景
+# AstroMan 项目全景
 
-FbinHttp 是一个**完全本地运行**的 API 调试、压测与开发工具箱：无账号、无云端，项目/接口/环境变量/请求历史/压测报告全部写入本机 SQLite。
+AstroMan 是一个**完全本地运行**的 API 调试、压测与开发工具箱：无账号、无云端，项目/接口/环境变量/请求历史/压测报告全部写入本机 SQLite。
 
 - 前端：Vue 3 + TypeScript + Vite + Pinia + vue-router（hash 模式）+ Ant Design Vue 4
 - 后端：Tauri 2 + Rust，SQLite（rusqlite + r2d2 连接池）
@@ -14,7 +14,7 @@ FbinHttp 是一个**完全本地运行**的 API 调试、压测与开发工具�
 ## 目录地图
 
 ```text
-FbinHttp/
+AstroMan/
 ├─ src/
 │  ├─ api/            # invoke 封装（index.ts 为主，project.ts 等按域拆分）
 │  ├─ components/     # PageHeader / CodeArea / JsonTree / KeyValueEditor / LineChart / AppLogo
@@ -55,7 +55,7 @@ Windows 下 `cargo check` 在受限沙箱里会命中 `D:\Software\Rust\cargo\.g
 - 主窗口 label 固定为 `main`（`tauri.conf.json` 的 `app.windows[0].label`）。
 - 单实例：`tauri-plugin-single-instance` 必须是第一个注册的插件，重复启动时只唤出已有窗口，不再开第二个进程抢同一个数据库。
 - 窗口状态：`tauri-plugin-window-state` 记住尺寸、位置与最大化状态，下次启动原样恢复；改动窗口配置后若想重来，删掉配置目录下的窗口状态文件即可。
-- 系统托盘在 `lib.rs::setup_tray` 创建：左键点击 → 显示主窗口；右键菜单「显示主窗口 / 退出 FbinHttp」。
+- 系统托盘在 `lib.rs::setup_tray` 创建：左键点击 → 显示主窗口；右键菜单「显示主窗口 / 退出 AstroMan」。
 - **关闭窗口 = 隐藏到托盘**（`on_window_event` 中 `prevent_close` + `hide`），真正退出只走托盘菜单或 `app.exit(0)`。
 - macOS 点击 Dock 图标时通过 `RunEvent::Reopen` 重新显示窗口。
 - 托盘图标来自 `include_bytes!("../icons/tray.png")`，改图标必须重新生成该文件，否则编译期就嵌入旧图。
@@ -64,24 +64,24 @@ Windows 下 `cargo check` 在受限沙箱里会命中 `D:\Software\Rust\cargo\.g
 
 | 内容 | 路径 |
 |---|---|
-| 默认数据目录 | `%APPDATA%\FbinHttp`（macOS 为 `~/Library/Application Support/FbinHttp`） |
-| 数据库文件 | `数据目录\fbinhttp.db` |
+| 默认数据目录 | `%APPDATA%\AstroMan`（macOS 为 `~/Library/Application Support/AstroMan`） |
+| 数据库文件 | `数据目录\astroman.db` |
 | 自定义数据目录配置 | 系统配置目录下 `storage.json` |
 | 网络设置（代理、mTLS 证书） | 系统配置目录下 `settings.json` |
 
-启动时若发现旧版 `FinkMeter\finkmeter.db` 且新目录还没有数据库，会**自动复制**到 `FbinHttp\fbinhttp.db`（含 `-wal`/`-shm`），原目录保留；自定义目录里的旧数据库会被就地重命名为 `fbinhttp.db`。自定义目录打不开时只回退默认目录、不删除配置。
+启动时若发现旧版 `FinkMeter\finkmeter.db` 且新目录还没有数据库，会**自动复制**到 `AstroMan\astroman.db`（含 `-wal`/`-shm`），原目录保留；自定义目录里的旧数据库会被就地重命名为 `astroman.db`。自定义目录打不开时只回退默认目录、不删除配置。
 
 ## 必须保留的旧标识（不要"顺手"改名）
 
 | 标识 | 值 | 原因 |
 |---|---|---|
-| tauri `identifier` | `com.finkmeter.app` | 旧值，仅作为配置目录迁移来源；现行值 `com.fbinhttp.app` |
+| tauri `identifier` | `com.finkmeter.app` | 旧值，仅作为配置目录迁移来源；现行值 `com.astroman.app` |
 | 旧数据目录名 | `FinkMeter` | 只作为迁移来源读取，不再写入 |
-| 旧数据库文件名 | `finkmeter.db` | 只作为迁移来源，新版统一 `fbinhttp.db` |
-| 旧项目文件格式 | `finkmeter.project` | 导入时仍接受，新导出写 `fbinhttp.project` |
-| 旧主题 key | `finkmeter.theme` | 读取一次后迁移到 `fbinhttp.theme` |
+| 旧数据库文件名 | `finkmeter.db` | 只作为迁移来源，新版统一 `astroman.db` |
+| 旧项目文件格式 | `finkmeter.project` | 导入时仍接受，新导出写 `astroman.project` |
+| 旧主题 key | `finkmeter.theme` | 读取一次后迁移到 `astroman.theme` |
 
-产品名、窗口标题、安装包名、界面文案、User-Agent、Release 仓库地址均已是 **FbinHttp**。
+产品名、窗口标题、安装包名、界面文案、User-Agent、Release 仓库地址均已是 **AstroMan**。
 
 ## 约定速览
 
@@ -95,9 +95,9 @@ Windows 下 `cargo check` 在受限沙箱里会命中 `D:\Software\Rust\cargo\.g
 
 | skill | 用途 |
 |---|---|
-| `fbinhttp-add-feature` | 端到端新增功能（命令 → api → 页面 → 注册） |
-| `fbinhttp-backend` | Rust 命令、SQLite 迁移、压测引擎规范 |
-| `fbinhttp-frontend` | 页面骨架、主题变量、脚本引擎、导出 |
-| `fbinhttp-dashboard` | 首页数据大屏口径、CSS 图表约定、Runner 介绍文案 |
-| `fbinhttp-ai` | AI 助手「小HI」：双模式、三协议、流式渲染、上下文预算与摘要、停止/重试/工具超时、注入隔离、62 工具与目录分层、写操作确认卡、消息操作、复盘时间线、会话管理 |
-| `fbinhttp-build-release` | 构建、打包与发布 |
+| `astroman-add-feature` | 端到端新增功能（命令 → api → 页面 → 注册） |
+| `astroman-backend` | Rust 命令、SQLite 迁移、压测引擎规范 |
+| `astroman-frontend` | 页面骨架、主题变量、脚本引擎、导出 |
+| `astroman-dashboard` | 首页数据大屏口径、CSS 图表约定、Runner 介绍文案 |
+| `astroman-ai` | AI 助手「航仔」：双模式、三协议、流式渲染、上下文预算与摘要、停止/重试/工具超时、注入隔离、62 工具与目录分层、写操作确认卡、消息操作、复盘时间线、会话管理 |
+| `astroman-build-release` | 构建、打包与发布 |

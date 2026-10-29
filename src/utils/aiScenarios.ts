@@ -108,7 +108,7 @@ ${detailBlock(detail)}
 ${resultBlock(result)}
 
 要求：
-1. 用 FbinHttp 断言脚本语法：test('名称', () => { assert(条件, '失败说明') })；
+1. 用 AstroMan 断言脚本语法：test('名称', () => { assert(条件, '失败说明') })；
 2. 覆盖状态码、业务码、关键字段类型或非空、必要字段存在性；
 3. 只输出一个 \`\`\`js 代码块，每行加简短中文注释，最多 20 行；
 4. 响应体结构不明确的地方用条件判断兜底，不要编造字段。`
@@ -124,7 +124,7 @@ ${detailBlock(detail)}
 ${resultBlock(result)}
 
 要求：
-1. 使用 FbinHttp 脚本引擎：response.status / response.json() / response.text()、vars.set()；
+1. 使用 AstroMan 脚本引擎：response.status / response.json() / response.text()、vars.set()；
 2. 先判断响应是否成功，再提取 token、id 等关键字段，字段不存在时给出提示；
 3. 只输出一个 \`\`\`js 代码块，不超过 25 行，关键步骤写中文注释；
 4. 提醒我把密钥类变量放环境变量。`

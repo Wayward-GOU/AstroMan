@@ -1,11 +1,11 @@
 ---
-name: fbinhttp-add-feature
-description: 在 FbinHttp 中端到端新增一个功能/接口（Rust command → 前端 api → 页面）。需要加新 Tauri 命令、新数据表、新页面或改 IPC 契约时使用。触发词：新增功能、加个接口、新增命令、新页面、接后端、invoke 不生效。
+name: astroman-add-feature
+description: 在 AstroMan 中端到端新增一个功能/接口（Rust command → 前端 api → 页面）。需要加新 Tauri 命令、新数据表、新页面或改 IPC 契约时使用。触发词：新增功能、加个接口、新增命令、新页面、接后端、invoke 不生效。
 ---
 
 # 新增功能的标准路径
 
-FbinHttp 是 Tauri 桌面应用，**任何数据操作都必须走后端 command**，前端不直连数据库、不直接发 HTTP（网络请求由 Rust 的 reqwest 发出）。
+AstroMan 是 Tauri 桌面应用，**任何数据操作都必须走后端 command**，前端不直连数据库、不直接发 HTTP（网络请求由 Rust 的 reqwest 发出）。
 
 按顺序做，缺一步就会"前端调不通"。
 
@@ -74,7 +74,7 @@ export const demoDo = (projectId: number) =>
 - 新页面放 `src/views/`，用 `PageHeader` 做标题区
 - 路由加在 `src/router/index.ts`（hash 路由）
 - 侧边栏导航在 `App.vue` 的 `navs` 数组——**注意 `navs` 必须在命令面板的 `watch` 之前声明**，否则触发 TDZ：`Cannot access 'navs' before initialization`，整个页面白屏
-- 需要首页额外露出（统计卡片/图表/功能介绍）时，按 `fbinhttp-dashboard` 的区块顺序与统计口径插入，别在大屏里新开数据表
+- 需要首页额外露出（统计卡片/图表/功能介绍）时，按 `astroman-dashboard` 的区块顺序与统计口径插入，别在大屏里新开数据表
 
 ## 8. 验证
 
@@ -86,4 +86,4 @@ npm run tauri dev
 
 只跑 `npm run dev`（纯浏览器）时 `invoke` 不存在，属于预期，不要据此判断功能坏了。
 
-前端改动只跑 `npm run build` 不会更新已安装的客户端（安装包内嵌 `dist/`），发版前必须重新执行 `npm run build:win` / `build:mac`，详见 `fbinhttp-build-release`。
+前端改动只跑 `npm run build` 不会更新已安装的客户端（安装包内嵌 `dist/`），发版前必须重新执行 `npm run build:win` / `build:mac`，详见 `astroman-build-release`。

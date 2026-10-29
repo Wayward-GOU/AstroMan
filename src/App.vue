@@ -96,7 +96,7 @@ const navs = [
   { key: 'home', label: '工作台', hint: '项目与请求调试', to: '/', icon: AppstoreOutlined },
   { key: 'stress', label: '压测', hint: '选择接口发起压测', to: '/stress', icon: ThunderboltOutlined },
   { key: 'runner', label: '批量运行', hint: '集合 Runner · 数据驱动', to: '/runner', icon: PlayCircleOutlined },
-  { key: 'ai', label: '小HI', hint: 'AI 助手 · 自动建请求并分析', to: '/ai', icon: RobotOutlined },
+  { key: 'ai', label: '航仔', hint: 'AI 助手 · 自动建请求并分析', to: '/ai', icon: RobotOutlined },
   { key: 'reports', label: '压测报告', hint: '历史压测结果', to: '/reports', icon: FundProjectionScreenOutlined },
   { key: 'history', label: '请求历史', hint: '最近发送记录', to: '/history', icon: HistoryOutlined },
   { key: 'monitor', label: '系统监视', hint: 'CPU · 内存 · 磁盘 · 网络', to: '/monitor', icon: LineChartOutlined },
@@ -310,7 +310,7 @@ const theme = computed(() => {
         <div class="brand">
           <AppLogo :size="38" />
           <div class="brand-text">
-            <span class="brand-name">FbinHttp</span>
+            <span class="brand-name">AstroMan</span>
             <span class="brand-sub">API 调试 · 压测</span>
           </div>
         </div>
@@ -363,7 +363,7 @@ const theme = computed(() => {
               <div class="local-desc">数据只保存在这台电脑</div>
             </div>
           </div>
-          <div class="version">FbinHttp v1.0 · Desktop</div>
+          <div class="version">AstroMan v1.0 · Desktop</div>
         </div>
       </aside>
 
@@ -380,7 +380,7 @@ const theme = computed(() => {
           v-if="!route.path.startsWith('/ai')"
           class="hi-float"
           type="button"
-          aria-label="打开小HI"
+          aria-label="打开航仔"
           @click="go('/ai')"
         >
           <span class="hi-float-halo" />
@@ -435,7 +435,7 @@ const theme = computed(() => {
             <circle cx="15.5" cy="50" r="3.2" fill="#dbe5f1" stroke="#c9d6e5" stroke-width="1" />
             <circle cx="48.5" cy="50" r="3.2" fill="#dbe5f1" stroke="#c9d6e5" stroke-width="1" />
           </svg>
-          <span class="hi-float-tip">小HI · AI 助手</span>
+          <span class="hi-float-tip">航仔 · AI 助手</span>
           <span class="hi-float-dot" />
         </button>
       </transition>
@@ -676,7 +676,7 @@ const theme = computed(() => {
   box-shadow: 0 8px 24px rgba(15, 23, 42, 0.28);
 }
 
-/* 全局悬浮入口：小HI 小机器人，贴右侧屏幕垂直居中 */
+/* 全局悬浮入口：航仔 小机器人，贴右侧屏幕垂直居中 */
 .hi-float {
   position: fixed;
   right: 14px;

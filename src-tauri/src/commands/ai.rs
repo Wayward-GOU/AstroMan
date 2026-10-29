@@ -16,14 +16,14 @@ use crate::models::{
     AiToolLog, AiToolLogPage, AiToolLogStats, AiToolUsageStat, AiUsageDay, AiUsageLog, AiUsagePage,
     AiUsageStat, AiUsageStats, HttpResult, SendRequestPayload,
 };
-use crate::prompts::XIAO_HI_SYSTEM_PROMPT;
+use crate::prompts::HANGZAI_SYSTEM_PROMPT;
 use crate::state::AppState;
 use crate::util::{err, now_ms};
 
 /// 派生 AES-256 密钥的固定种子。
 /// 属于「本机静态混淆」级别：能防止直接打开库文件看到明文 Key，但拿到程序本身仍可解出。
 /// 不引入系统钥匙串，保证 Windows / macOS 行为一致。
-const KEY_SEED: &str = "FbinHttp::ai::provider::v1";
+const KEY_SEED: &str = "AstroMan::ai::provider::v1";
 const CIPHER_PREFIX: &str = "v1:";
 /// AI 请求整体超时，长回答（尤其推理模型）留足时间
 const AI_TIMEOUT_SECS: u64 = 300;
@@ -912,15 +912,15 @@ pub async fn ai_chat(
         id: request_id.as_deref(),
     };
 
-    // 小HI 的系统提示词由后端统一注入（编译期嵌入），客户端无法覆盖或移除；
+    // 航仔 的系统提示词由后端统一注入（编译期嵌入），客户端无法覆盖或移除；
     // 前端追加的 system 消息只承载工具协议，排在其后。
     let mut messages = payload.messages.clone();
-    messages.retain(|message| message.role != "system" || message.content.trim() != XIAO_HI_SYSTEM_PROMPT.trim());
+    messages.retain(|message| message.role != "system" || message.content.trim() != HANGZAI_SYSTEM_PROMPT.trim());
     messages.insert(
         0,
         AiMessage {
             role: "system".to_string(),
-            content: XIAO_HI_SYSTEM_PROMPT.to_string(),
+            content: HANGZAI_SYSTEM_PROMPT.to_string(),
         },
     );
     // 本次调用实际「问了什么」，随用量流水一起落库

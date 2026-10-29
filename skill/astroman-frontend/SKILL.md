@@ -1,6 +1,6 @@
 ---
-name: fbinhttp-frontend
-description: FbinHttp 前端开发规范（Vue 3 + Ant Design Vue + Pinia + 设计系统 + 脚本引擎/导出工具）。改页面、改样式主题、加组件、调脚本能力、改报告导出时使用。触发词：前端、Vue、页面、样式、主题、暗色、CSS 变量、脚本、加密、导出报告。
+name: astroman-frontend
+description: AstroMan 前端开发规范（Vue 3 + Ant Design Vue + Pinia + 设计系统 + 脚本引擎/导出工具）。改页面、改样式主题、加组件、调脚本能力、改报告导出时使用。触发词：前端、Vue、页面、样式、主题、暗色、CSS 变量、脚本、加密、导出报告。
 ---
 
 # 前端规范
@@ -41,13 +41,13 @@ description: FbinHttp 前端开发规范（Vue 3 + Ant Design Vue + Pinia + 设�
 - 两层字体、字号、行高、padding 必须完全一致；`onScroll` 同时同步 gutter 的 `scrollTop` 与高亮层的 `scrollTop / scrollLeft`
 - `highlightJson()` 顺序扫描字符串 → 行注释 / 块注释 → `{{变量}}` → 数字 → 标点；字符串优先处理，所以 `"https://a.com/x"` 里的 `//` 不会被当成注释
 - 输入法组合期间（`compositionstart` / `compositionend`）临时去掉 overlay 类，否则中文拼音与候选字不可见
-- 注释只用于编辑态：发送前由 Rust 的 `util::strip_json_comments` 剥离（见 `fbinhttp-backend`），前端不负责删注释
+- 注释只用于编辑态：发送前由 Rust 的 `util::strip_json_comments` 剥离（见 `astroman-backend`），前端不负责删注释
 
 ## 首页数据大屏
 
 `Dashboard.vue` 里的图表**不依赖图表库**：柱高/宽度用峰值归一后的百分比，堆叠用 `column-reverse`，颜色只用 `--fm-*`（成功/警告/危险），空数据必须走 `.dash-empty` 文案而不是空坐标轴。数据来自 `api.dashboardMetrics()`，页面用 `Promise.allSettled` 拉取，失败时保留空态、不阻断其他区块。
 
-新增/调整图表的完整约定见 skill `fbinhttp-dashboard`。
+新增/调整图表的完整约定见 skill `astroman-dashboard`。
 
 ## 页面内 AI 入口（AiAssist）
 

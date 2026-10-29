@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   publish:
-    name: Build ${{ matrix.platform }}
+    name: Build ${{ matrix.platform }} ${{ matrix.target }}
     runs-on: ${{ matrix.platform }}
     strategy:
       fail-fast: false
@@ -18,8 +18,13 @@ jobs:
         include:
           - platform: windows-latest
             args: '--bundles nsis'
+            target: ''
+          - platform: windows-latest
+            args: '--target i686-pc-windows-msvc --bundles nsis'
+            target: i686-pc-windows-msvc
           - platform: macos-latest
             args: '--target universal-apple-darwin --bundles dmg'
+            target: ''
 
     steps:
       - name: Checkout
@@ -38,6 +43,10 @@ jobs:
         if: matrix.platform == 'macos-latest'
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
+      - name: Add Windows 32-bit target
+        if: matrix.target == 'i686-pc-windows-msvc'
+        run: rustup target add i686-pc-windows-msvc
+
       - name: Cache Rust
         uses: swatinem/rust-cache@v2
         with:
@@ -52,36 +61,47 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: 'FbinHttp ${{ github.ref_name }}'
+          releaseName: 'AstroMan ${{ github.ref_name }}'
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
           releaseBody: |
-            FbinHttp ${{ github.ref_name }} — 纯本地运行的 API 调试、压测与开发工具箱。
+            AstroMan ${{ github.ref_name }} — 纯本地运行的 API 调试、压测与开发工具箱。
 
             ### 下载
-            - macOS 11+（Apple Silicon / Intel 通用）：`FbinHttp_*_universal.dmg` + 一键安装脚本 `install-macos.sh`
-            - Windows 10/11（x64）：`FbinHttp_*_x64-setup.exe`
+            - macOS 10.15+（Apple Silicon / Intel 通用）：`AstroMan_*_universal.dmg` + 一键安装脚本 `install-macos.sh`
+            - Windows 10/11（x64）：`AstroMan_*_x64-setup.exe`（约 5MB，缺 WebView2 时联网补齐）
+            - Windows 离线安装（断网 / 内网）：`AstroMan_*_x64-offline-setup.exe` / `AstroMan_*_x86-offline-setup.exe`（约 211MB，内置 WebView2）
+            - Windows 10（32 位 x86）：`AstroMan_*_x86-setup.exe`
+            - Windows 便携版（无需安装）：`AstroMan_*_x64-portable.zip` / `AstroMan_*_x86-portable.zip`，解压双击 `astroman.exe` 即用；安装器报错时优先用这个
 
-            > macOS 的 dmg 是通用包，已内置 Intel（`x86_64`）与 Apple Silicon（`arm64`）两个切片，**Intel Mac 无需单独下载 Intel 版**。
-            > 若出现「Apple 无法验证 FbinHttp.app 是否包含可能危害 Mac 安全或泄漏隐私的恶意软件」，这是系统对未公证应用的拦截，与芯片架构无关。
+            > 系统要求：Windows 10 1809+ / Windows 11（ARM64 可直接运行 x64 包）；macOS 10.15+。Windows 7 / 8 / 8.1 与 macOS 10.14 及更早系统无法运行。
+            > 标准安装包约 5MB，缺 WebView2 时安装过程联网补齐；断网、内网、LTSC / Server 机器请用带 offline 的安装包。
+            > macOS dmg 是通用包，已内置 Intel（`x86_64`）与 Apple Silicon（`arm64`）两个切片，**Intel Mac 无需单独下载 Intel 版**。
+            > 若出现「Apple 无法验证 AstroMan.app 是否包含可能危害 Mac 安全或泄漏隐私的恶意软件」，这是系统对未公证应用的拦截，与芯片架构无关。
+            > 若提示「AstroMan 已损坏，无法打开，你应该将它移到废纸篓」，是浏览器下载带来的隔离属性问题，不要点「移到废纸篓」，在终端执行 `sudo xattr -dr com.apple.quarantine /Applications/AstroMan.app` 后重新打开即可。
 
             ### macOS 安装（推荐一键脚本）
             脚本会自动校验本机架构、安装到「应用程序」、清除隔离属性、ad-hoc 重新签名并启动：
 
             ```bash
-            curl -fLO https://github.com/Wayward-GOU/FbinHttp/releases/download/${{ github.ref_name }}/install-macos.sh
+            curl -fLO https://github.com/Wayward-GOU/AstroMan/releases/download/${{ github.ref_name }}/install-macos.sh
             bash install-macos.sh ${{ github.ref_name }}
             ```
 
-            手动安装：把应用拖到「应用程序」后，打开「系统设置 → 隐私与安全性」，在「安全性」一栏点击「仍要打开」并输入密码（macOS 15 起右键「打开」不再能绕过该提示）；或在终端执行 `sudo xattr -dr com.apple.quarantine /Applications/FbinHttp.app`。
+            手动安装：把应用拖到「应用程序」后，打开「系统设置 → 隐私与安全性」，在「安全性」一栏点击「仍要打开」并输入密码（macOS 15 起右键「打开」不再能绕过该提示）；或在终端执行 `sudo xattr -dr com.apple.quarantine /Applications/AstroMan.app`。
 
             ### Windows 安装
-            双击安装，可选语言与安装目录，当前用户安装无需管理员权限；缺少 WebView2 时安装器会自动联网安装。
+            双击安装，可选语言与安装目录，当前用户安装无需管理员权限；标准包在缺 WebView2 时自动联网补齐，离线包无需联网。
 
             > 安装包已做 ad-hoc 签名但未做 Apple 公证，SmartScreen / Gatekeeper 首次提示属正常现象。
 
             ### 本次更新（1.0.7）
+
+            **更名与数据迁移**
+            - 项目更名为 **AstroMan**；内置 AI 助手「小HI」更名为「航仔」
+            - 旧数据自动迁移：`FbinHttp\fbinhttp.db`（及更早的 `FinkMeter\finkmeter.db`）复制到 `AstroMan\astroman.db`，自定义数据目录里的旧库自动改名；配置目录从 `com.fbinhttp.app` / `com.finkmeter.app` 迁到 `com.astroman.app`，不覆盖已有配置
+            - 旧版导出的项目文件仍可导入（兼容 `fbinhttp.project` / `finkmeter.project` 格式）
 
             **请求页与环境**
             - 请求页右侧新增「环境变量」抽屉：不离开当前接口即可切换环境、增删变量、编辑环境脚本，保存后立即生效
@@ -98,7 +118,7 @@ jobs:
             - 脚本报错可直接定位：环境 / 前置 / 后置脚本出错时给出具体行号、列号与出错行上下文代码；`test()` 断言内部报错同样带定位；脚本语法错误给出明确提示
             - 请求页脚本错误区域改为多行等宽展示，长错误可滚动查看
 
-            **小HI（AI Agent）**
+            **航仔（AI Agent）**
             - 停止生成：随时中止模型输出，停止后丢弃在途工具结果，不再自动调工具，可继续追问
             - 工具硬超时与自动重试：普通工具 60 秒、文件类 120 秒超时，迟到结果丢弃并记日志；首个增量前遇 429 / 5xx / 网络错误按 `Retry-After` 自动重试 ≤2 次，已出字只保留手动重新生成
             - 上下文预算与摘要：按模型窗口动态分配预算，顶部新增预算条（第 N/8 轮、本轮 token、估算费用、上下文占用、窗口大小），接近上限变色提醒；历史过长自动异步压缩为摘要，最近几轮原文始终保留
@@ -108,19 +128,81 @@ jobs:
             - 消息与会话：助手消息可复制 / 重新生成，用户消息可复制 / 编辑重发；会话支持标题与正文搜索、置顶、导出 Markdown、首轮自动生成标题；按轮次查看复盘时间线并导出脱敏诊断包
             - 页面内 AI 按模型窗口动态分配上下文，大报告保留头部结构与尾部关键指标，不再只截前 12k
 
+            **问题修复**
+            - 修复长回答无法中断、停止后仍继续调工具
+            - 修复工具可无限挂起、失败后没有超时反馈
+            - 修复 429 / 5xx / 网络抖动直接失败、没有恢复机会
+            - 修复长会话超出模型上下文后直接报错
+            - 修复工具结果 / 附件 / 页面快照可能被提示词注入
+            - 修复服务商列表与日志可能出现明文 Key
+            - 修复全部工具写进提示词导致的膨胀与选错工具
+            - 修复列表结果被逐条计数、把截断当成完整数据
+            - 修复消息无法复制 / 重新生成 / 编辑重发
+            - 修复工具调用链路不可复盘、会话难搜索与导出
+            - 修复模型清单写死、生成参数不可配
+            - 修复写操作确认只有纯文本、信息不完整
+            - 修复页面内 AI 固定只截前 12k、丢掉报告尾部关键指标
+            - 修复 Windows 图标白色底板、安装包缺少离线能力
+
             **界面**
             - 项目页顶部导入 / 导出入口收拢为两个下拉菜单：导入含 cURL、Postman / Apifox、OpenAPI / Swagger；导出含项目 JSON、OpenAPI 3.0；导入过程中显示 loading 并禁用重复触发
-            - AI 功能入口统一使用四角星图标：AI 体检、AI 洞察、AI 分析、AI 生成计划、AI 分析结果、AI 解读；小HI 助手保留机器人形象
+            - AI 功能入口统一使用四角星图标：AI 体检、AI 洞察、AI 分析、AI 生成计划、AI 分析结果、AI 解读；航仔 助手保留机器人形象
 
             ### 主要功能
             - 项目 / 集合 / 接口管理：cURL、Postman / Apifox、OpenAPI 导入，项目 JSON / OpenAPI 导出，接口全局搜索
             - HTTP 调试：Params / Headers / Body、环境变量与环境脚本、前置 / 后置脚本、断言测试、代码片段；JSON Body 支持注释与语法着色；请求页右侧直接管理环境，项目页记住上次打开的接口
-            - 小HI（AI 助手）：61 个业务工具 + `tool_search`，可建项目与接口、真实发送请求、写脚本、批量运行、发起压测、查历史与报告；支持停止生成、自动重试、上下文预算与摘要、结构化确认卡、复盘时间线与会话管理；附用量统计
+            - 航仔（AI 助手）：61 个业务工具 + `tool_search`，可建项目与接口、真实发送请求、写脚本、批量运行、发起压测、查历史与报告；支持停止生成、自动重试、上下文预算与摘要、结构化确认卡、复盘时间线与会话管理；附用量统计
             - 批量运行：多接口按迭代次数或 CSV 每行参数化执行，环境变量、前置 / 后置脚本与断言全部生效，单次上限 5000 个请求
             - 本地压测：固定并发与阶梯加压、RPS 限速、SLA 验收、逐请求明细与 JSON / HTML / Excel 报告导出
             - 数据大屏与请求历史：近 14 天趋势、状态码 / 方法 / 耗时分布、项目与接口 Top 5、压测 P95 走势；历史保留 10 万条
             - 脚本加密：AES / DES / 3DES 加解密、MD5 / SHA / HMAC 摘要、RSA 公钥加密，满足签名与密文入参场景
             - 系统监控、开发工具箱（9 大类 75 个工具）、自动更新、单实例与窗口状态记忆
+
+      - name: Package Windows portable zip
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $arch = if ('${{ matrix.target }}' -eq 'i686-pc-windows-msvc') { 'x86' } else { 'x64' }
+          $exe = if ('${{ matrix.target }}' -eq 'i686-pc-windows-msvc') {
+            'src-tauri/target/i686-pc-windows-msvc/release/astroman.exe'
+          } else {
+            'src-tauri/target/release/astroman.exe'
+          }
+          if (-not (Test-Path $exe)) { throw "portable exe not found: $exe" }
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          @"
+          AstroMan $version $arch 便携版
+          解压后双击 astroman.exe 即可使用，无需安装，数据仍保存在本机。
+          运行需要 Microsoft Edge WebView2 运行时；Windows 10 1809+ / Windows 11 通常已自带。
+          如果没有，请先安装系统中的 Microsoft Edge WebView2 Runtime，或改用 setup 安装包。
+          "@ | Out-File -FilePath README.txt -Encoding utf8
+          Compress-Archive -Path $exe, README.txt -DestinationPath "AstroMan_${version}_${arch}-portable.zip" -Force
+          gh release upload "${{ github.ref_name }}" "AstroMan_${version}_${arch}-portable.zip" --clobber
+
+      - name: Build Windows offline installer
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $target = '${{ matrix.target }}'
+          $arch = if ($target -eq 'i686-pc-windows-msvc') { 'x86' } else { 'x64' }
+          $outDir = if ($target -eq 'i686-pc-windows-msvc') {
+            'src-tauri/target/i686-pc-windows-msvc/release/bundle/nsis'
+          } else {
+            'src-tauri/target/release/bundle/nsis'
+          }
+          $targetArgs = if ($target -ne '') { @('--target', $target) } else { @() }
+          npx tauri build --bundles nsis --config src-tauri/tauri.offline.conf.json @targetArgs
+          if ($LASTEXITCODE -ne 0) { throw "offline build failed" }
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $setup = Get-ChildItem "$outDir/AstroMan_${version}_*-setup.exe" | Select-Object -First 1
+          if (-not $setup) { throw "offline setup not found in $outDir" }
+          $offline = "AstroMan_${version}_${arch}-offline-setup.exe"
+          Move-Item $setup.FullName $offline -Force
+          gh release upload "${{ github.ref_name }}" $offline --clobber
 
       - name: Attach macOS installer script
         if: matrix.platform == 'macos-latest'

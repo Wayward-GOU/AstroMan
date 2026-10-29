@@ -35,7 +35,7 @@ async function downloadAndInstall(info: UpdateInfo) {
     await api.openExternal(path)
     message.success(
       isMac
-        ? '安装包已下载并打开，将 FbinHttp 拖入「应用程序」即可完成升级'
+        ? '安装包已下载并打开，将 AstroMan 拖入「应用程序」即可完成升级'
         : '安装包已下载，按安装向导完成升级即可',
     )
   } catch (e) {

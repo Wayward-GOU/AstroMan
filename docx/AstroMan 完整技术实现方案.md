@@ -1,4 +1,4 @@
-# FbinHttp — 本地版 API 调试与压测工具 技术实现方案
+# AstroMan — 本地版 API 调试与压测工具 技术实现方案
 
 > 版本：v1.0（本地版 · 首个可用版本）
 > 更新时间：2026-10-23
@@ -49,7 +49,7 @@ graph TB
         HTTP[HTTP 引擎<br>reqwest]
         LOAD[压测引擎<br>tokio + 精确并发]
         AI[AI 客户端<br>OpenAI 兼容协议]
-        DB[(SQLite<br>fbinhttp.db)]
+        DB[(SQLite<br>astroman.db)]
         FS[(本地文件<br>导出报告 / CSV / 备份)]
         KEY[OS Keychain<br>API Key 加密]
     end
@@ -111,10 +111,10 @@ graph TB
 
 | 项 | Windows | macOS |
 |---|---|---|
-| 数据库 | `%APPDATA%\FbinHttp\fbinhttp.db` | `~/Library/Application Support/FbinHttp/fbinhttp.db` |
-| 导出文件 | 默认 `文档/FbinHttp/` | `~/Documents/FbinHttp/` |
-| 日志 | `%APPDATA%\FbinHttp\logs\` | `~/Library/Logs/FbinHttp/` |
-| 备份 | `%APPDATA%\FbinHttp\backup\` | 同应用目录下 `backup/` |
+| 数据库 | `%APPDATA%\AstroMan\astroman.db` | `~/Library/Application Support/AstroMan/astroman.db` |
+| 导出文件 | 默认 `文档/AstroMan/` | `~/Documents/AstroMan/` |
+| 日志 | `%APPDATA%\AstroMan\logs\` | `~/Library/Logs/AstroMan/` |
+| 备份 | `%APPDATA%\AstroMan\backup\` | 同应用目录下 `backup/` |
 
 路径统一由 Rust 侧 `app.path().app_data_dir()` 解析，前端不硬编码。
 
@@ -308,11 +308,11 @@ CREATE INDEX idx_reports_created       ON test_reports(created_at DESC);
 | `request_history` | 只留最近 100000 条 |
 | `report_samples` / `report_errors` | 超过 90 天的报告一并删除采样与错误明细 |
 | `ai_conversations` | 默认不记录；开启后只留最近 200 条 |
-| 数据库文件 | 每次启动前若 `fbinhttp.db` > 500MB，提示用户到设置页做一次清理 |
+| 数据库文件 | 每次启动前若 `astroman.db` > 500MB，提示用户到设置页做一次清理 |
 
 ### 3.4 备份与恢复
 
-- 设置页提供「导出备份」：把 `fbinhttp.db` 复制到用户选择的位置，文件名带日期
+- 设置页提供「导出备份」：把 `astroman.db` 复制到用户选择的位置，文件名带日期
 - 提供「从备份恢复」：选择 `.db` 文件 → 关闭当前连接 → 覆盖 → 重启应用
 - 暂不做自动定时备份（后续版本再加）
 
@@ -515,7 +515,7 @@ async fn run_load(
 | 导入 cURL | 粘贴 `curl ...` 自动解析成请求 |
 | 导入 Postman | 支持 Collection v2.0 / v2.1 JSON |
 | 导出 Postman | 把选中集合导出为 Collection v2.1 |
-| 导出项目 | 导出为 FbinHttp 自有 JSON（含环境变量），用于换机迁移 |
+| 导出项目 | 导出为 AstroMan 自有 JSON（含环境变量），用于换机迁移 |
 
 ### 4.6 AI 辅助（用户自带 Key）
 
@@ -529,13 +529,13 @@ async fn run_load(
 
 #### 实现现状（v1.0.7，含 2026-10-29 更新）
 
-> 本节记录落地结果，与上方早期设计不一致时以本节为准。细节见 skill `fbinhttp-ai`。
+> 本节记录落地结果，与上方早期设计不一致时以本节为准。细节见 skill `astroman-ai`。
 
 | 主题 | 实现 |
 |---|---|
 | 双模式 | 后端提示词新增「聊天 / 问答」与「操作软件」两种工作模式：闲聊、知识问答、解释代码、写文案直接回答且不调用工具；只要「方案 / 思路 / 模板」也直接输出，不为凑方案去查数据；只有明确指向本机对象或说「帮我查 / 改 / 跑」才进入操作模式 |
 | 对话 | Tauri `Channel<AiStreamEvent>` 流式回传 `delta / reasoning / done / error`，三协议共用一套 SSE 解析与 usage 提取；前端累积对象必须 `reactive()`，增量 50ms 合帧刷一次，做到边生成边渲染（对话页与页面内 AI 共用同一套） |
-| 系统提示词 | `src-tauri/src/prompts/xiao_hi_system_prompt.md` 由 `include_str!` 编译期嵌入，每次 `ai_chat` 强制插到 `messages[0]`，前端不可覆盖 |
+| 系统提示词 | `src-tauri/src/prompts/hangzai_system_prompt.md` 由 `include_str!` 编译期嵌入，每次 `ai_chat` 强制插到 `messages[0]`，前端不可覆盖 |
 | 工具 | `src/utils/aiTools.ts` 注册 62 个工具（61 个业务工具 + `tool_search` 元工具）；`SCHEMAS` 强校验，`danger` 标记 + `WRITE_TOOLS` 白名单共同决定是否需要确认，结果回灌前脱敏；核心 24 个工具带完整参数说明，长尾工具只列名字、由 `tool_search` 按中英文关键词检索 |
 | 工具生态 | 工具箱 12 个（JSON 格式化 / 生成实体 / 生成 SQL / 格式互转 / 时间戳 / Base64 与 URL 编解码 / Hash 与 HMAC / URL 解析 / 正则 / JWT / 文本差异 / UUID）与业务工具 7 个（`env_delete` `env_script_save` `report_delete` `report_requests` `history_stats` `run_list` `cookie_list`）全部接入；列表类结果统一返回 `summary / total / truncated` 信封，界面先摘要后详情，模型不再逐条计数 |
 | 请求生命周期 | 支持停止生成（`ai_chat_cancel` + 请求注册表，停止后丢弃在途工具结果）；工具硬超时（普通 60 秒、文件类 120 秒、`stress_*` 不包，迟到结果丢弃并记 `timeout`）；首个增量前遇 429 / 5xx / 网络错误按 `Retry-After` 自动重试 ≤2 次，已出字只保留手动重新生成 |
@@ -559,16 +559,16 @@ async fn run_load(
 | 模型目录 | 10 家服务商的 `presetModels` 按官方文档校准（DeepSeek 仅 `deepseek-chat` / `deepseek-reasoner`）；模型下拉改用 `a-auto-complete` 原生展开，未识别服务商时兜底全量列表，仍可手填；编辑服务商回填已保存 Key |
 | 报错 | Rust `humanize_api_error` / `humanize_network_error` 把 401/402/403/404/429/5xx、模型不支持、DNS/超时/证书问题统一转中文 |
 | 页面内 AI | `stores/aiAssist.ts` + `components/AiAssistDrawer.vue` + `utils/aiScenarios.ts`，覆盖工作台洞察、项目体检、接口分析（解释响应 / 生成断言 / 生成后置脚本 / 优化定义）、环境体检、压测计划、批量运行分析、历史诊断、报告解读 8 个入口，均为只读建议且不调工具 |
-| 入口 | 右侧屏幕垂直居中的悬浮机器人；`/ai/usage` 用量统计页；设置页「AI 辅助（小HI）」卡片与首页使用说明第 07 步均提供入口 |
+| 入口 | 右侧屏幕垂直居中的悬浮机器人；`/ai/usage` 用量统计页；设置页「AI 辅助（航仔）」卡片与首页使用说明第 07 步均提供入口 |
 
 #### 能力清单
 
 | 场景 | 入口 | 输入 | 输出 |
 |---|---|---|---|
-| 日常聊天 / 答疑 | 小HI 对话页 | "HTTP/2 和 HTTP/1.1 有什么区别" | 直接回答，不调用工具 |
-| 出方案 | 小HI 对话页 | "给我一份下单接口的压测方案" | 目标、模式、并发、时长、爬坡、SLA、观察指标与风险 |
+| 日常聊天 / 答疑 | 航仔 对话页 | "HTTP/2 和 HTTP/1.1 有什么区别" | 直接回答，不调用工具 |
+| 出方案 | 航仔 对话页 | "给我一份下单接口的压测方案" | 目标、模式、并发、时长、爬坡、SLA、观察指标与风险 |
 | 生成请求 | 新建请求 / 命令面板 | "帮我建一个登录接口，POST JSON，字段 username/password" | 方法、URL、Headers、Body（确认后落库） |
-| 生成压测计划 | 小HI / 压测页 AI 生成计划 | "按基准接口做一份压测计划" | 读接口 → 完整计划 → 确认 → `plan_save` |
+| 生成压测计划 | 航仔 / 压测页 AI 生成计划 | "按基准接口做一份压测计划" | 读接口 → 完整计划 → 确认 → `plan_save` |
 | 生成脚本 | 请求编辑器脚本 Tab | 当前请求上下文 + 需求 | JavaScript 脚本 |
 | 生成参数 | 压测参数化面板 | "生成 100 条手机号" | CSV 内容 / 变量表达式 |
 | 生成断言 | 断言 Tab | "断言 status=200 且 body.code=0" | 断言配置项 |
@@ -733,7 +733,7 @@ AI 对话不走全局事件，改用命令入参里的 `Channel<AiStreamEvent>`�
 
 ```
 ┌──────────────────────────────────────────────────────┐
-│ FbinHttp   全局搜索   环境切换▼          设置 ⚙     │
+│ AstroMan   全局搜索   环境切换▼          设置 ⚙     │
 ├──────────┬───────────────────────────────────────────┤
 │  侧边栏  │           主内容区（Tab 多标签）            │
 │ 项目     │   Workspace ── Load ── Report              │
@@ -783,11 +783,11 @@ AI 对话不走全局事件，改用命令入参里的 `Channel<AiStreamEvent>`�
 ```jsonc
 // src-tauri/tauri.conf.json（节选）
 {
-  "productName": "FbinHttp",
+  "productName": "AstroMan",
   "version": "1.0.0",
-  "identifier": "com.fbinhttp.app", // 旧值为 com.finkmeter.app，启动时自动迁移配置目录
+  "identifier": "com.astroman.app", // 旧值为 com.finkmeter.app，启动时自动迁移配置目录
   "app": {
-    "windows": [{ "title": "FbinHttp", "width": 1280, "height": 800, "minWidth": 1024, "minHeight": 680 }]
+    "windows": [{ "title": "AstroMan", "width": 1280, "height": 800, "minWidth": 1024, "minHeight": 680 }]
   },
   "bundle": {
     "active": true,
@@ -798,7 +798,7 @@ AI 对话不走全局事件，改用命令入参里的 `Channel<AiStreamEvent>`�
   },
   "plugins": {
     "dialog": { "open": true, "save": true },
-    "fs": { "scope": ["$APPDATA/FbinHttp/**", "$DOCUMENT/FbinHttp/**"] },
+    "fs": { "scope": ["$APPDATA/AstroMan/**", "$DOCUMENT/AstroMan/**"] },
     "shell": { "open": true }
   }
 }
@@ -807,7 +807,7 @@ AI 对话不走全局事件，改用命令入参里的 `Channel<AiStreamEvent>`�
 ### 7.3 首次启动
 
 1. 解析应用数据目录，不存在则创建
-2. 打开/创建 `fbinhttp.db`，执行建表与 `PRAGMA`
+2. 打开/创建 `astroman.db`，执行建表与 `PRAGMA`
 3. 若表为空，写入一个示例项目「示例请求」+ 一个「本地环境」（含 `base_url=http://localhost:8080`）
 4. 加载设置（AI Provider、主题、默认导出目录）
 5. 进入工作台
@@ -892,7 +892,7 @@ npm.cmd run tauri build
 ## 十、目录结构
 
 ```
-FbinHttp/
+AstroMan/
 ├── package.json
 ├── vite.config.ts
 ├── index.html
@@ -1022,12 +1022,12 @@ FbinHttp/
 
 ```toml
 [package]
-name = "fbinhttp"
+name = "astroman"
 version = "1.0.0"
 edition = "2021"
 
 [lib]
-name = "fbinhttp_lib"
+name = "astroman_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
@@ -1099,7 +1099,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 // src-tauri/src/ai/prompts.rs
 
 pub const SCRIPT_GEN: &str = r#"
-你是 FbinHttp 的脚本助手。只输出 JavaScript 代码，不要解释，不要用 Markdown 代码块包裹。
+你是 AstroMan 的脚本助手。只输出 JavaScript 代码，不要解释，不要用 Markdown 代码块包裹。
 
 【可用对象】
 - request.method / request.url / request.headers / request.body

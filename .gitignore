@@ -1,3 +1,118 @@
+# ============================================================
+# FbinHttp 通用 .gitignore（Java 后端 + Vue 前端 + 可选 Rust/Tauri）
+# 说明：不整体忽略 JetBrains IDEA 的 .idea 目录，团队共享配置可入库；
+#       仅排除个人本地状态文件。若想完全不忽略任何 .idea 文件，
+#       删除下方「IDEA 个人状态文件」整段即可。
+# ============================================================
+
+# ---------------- 操作系统垃圾文件 ----------------
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.Spotlight-V100
+.Trashes
+
+# ---------------- 日志与临时文件 ----------------
+*.log
+logs/
+nohup.out
+*.tmp
+*.bak
+*.orig
+*~
+.cache/
+
+# ---------------- Java / Maven ----------------
+target/
+build/
+out/
+*.class
+*.jar
+*.war
+*.ear
+*.nar
+hs_err_pid*
+replay_pid*
+.mvn/wrapper/maven-wrapper.jar
+
+# ---------------- Gradle（如未使用可整段删除） ----------------
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# ---------------- Node / 前端（Vue3 / VbenAdmin / Vite） ----------------
+node_modules/
+dist/
+dist-ssr/
+coverage/
+*.local
+.npm/
+.yarn-cache/
+.pnpm-store/
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+npm-debug.log*
+# 本地环境变量：忽略真实配置，保留示例文件
+.env
+.env.*
+!.env.example
+!.env.development.example
+
+# ---------------- Rust / Tauri（如未使用可整段删除） ----------------
+src-tauri/target/
+target/
+# Cargo.lock 建议提交（桌面二进制应用）；若是纯 Rust 库再忽略它
+# Cargo.lock
+
+# ---------------- 密钥与本地私有配置（严禁入库） ----------------
+*.pem
+*.key
+*.p12
+*.jks
+keystore/
+secrets/
+application-local.yml
+application-local.properties
+application-local.yaml
+application-dev.local.yml
+config/local.*
+.env.local
+
+# ---------------- JetBrains IDEA：保留目录，仅排除个人状态文件 ----------------
+# 不写 .idea/ 整体忽略；!.idea/ 确保目录与共享配置（modules、iml、codeStyle、运行配置模板）可提交
+!.idea/
+.idea/workspace.xml
+.idea/caches/
+.idea/shelf/
+.idea/httpRequests/
+.idea/httpRequests/
+.idea/dataSources/
+.idea/dataSources.local.xml
+.idea/sqlDataSources.xml
+.idea/usage.statistics.xml
+.idea/navEditor.xml
+.idea/dictionaries/
+.idea/tasks.xml
+# 如需把整个 .idea 都纳入版本控制，直接删除本段全部规则
+
+# ---------------- VS Code（团队不用可整段删除） ----------------
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/launch.json
+
+# ---------------- 构建与打包产物 ----------------
+*.zip
+*.tar.gz
+*.rar
+release/
+package/
+
 node_modules/
 dist/
 src-tauri/target/

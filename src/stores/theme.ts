@@ -390,8 +390,8 @@ export const themes: ThemeDefinition[] = [
   dusk,
 ]
 
-const STORAGE_KEY = 'fbinhttp.theme'
-const LEGACY_STORAGE_KEY = 'finkmeter.theme'
+const STORAGE_KEY = 'astroman.theme'
+const LEGACY_STORAGE_KEYS = ['fbinhttp.theme', 'finkmeter.theme']
 
 export function findTheme(id: string | null | undefined): ThemeDefinition {
   return themes.find((item) => item.id === id) ?? ocean
@@ -406,7 +406,9 @@ export function applyTheme(theme: ThemeDefinition) {
 
 export function loadThemeId(): ThemeId {
   try {
-    const stored = localStorage.getItem(STORAGE_KEY) ?? localStorage.getItem(LEGACY_STORAGE_KEY)
+    const stored =
+      localStorage.getItem(STORAGE_KEY) ??
+      LEGACY_STORAGE_KEYS.map((key) => localStorage.getItem(key)).find((value) => value)
     if (stored && themes.some((item) => item.id === stored)) return stored as ThemeId
   } catch {
     // localStorage 不可用时回退默认主题
@@ -417,7 +419,7 @@ export function loadThemeId(): ThemeId {
 export function saveThemeId(id: ThemeId) {
   try {
     localStorage.setItem(STORAGE_KEY, id)
-    localStorage.removeItem(LEGACY_STORAGE_KEY)
+    LEGACY_STORAGE_KEYS.forEach((key) => localStorage.removeItem(key))
   } catch {
     // 忽略存储失败
   }

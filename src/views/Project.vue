@@ -1,5 +1,5 @@
 ﻿<script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
 import { open, save } from '@tauri-apps/plugin-dialog'
@@ -12,11 +12,21 @@ import {
   ImportOutlined,
   ExportOutlined,
   SearchOutlined,
+  DownOutlined,
 } from '@ant-design/icons-vue'
+import AiSparkIcon from '@/components/AiSparkIcon.vue'
 import { useProjectStore } from '@/stores/project'
+import { useAiAssistStore } from '@/stores/aiAssist'
+import { projectAuditPrompt } from '@/utils/aiScenarios'
 import { MAX_REQUEST_TABS, useTabsStore } from '@/stores/tabs'
 import { formatDateTime } from '@/utils/datetime'
 import { buildCurl } from '@/utils/curl'
+import {
+  forgetLastRequest,
+  readLastRequest,
+  rememberLastRequest,
+  type LastRequestMemory,
+} from '@/utils/lastRequest'
 import * as api from '@/api'
 import type { CollectionNode, RequestSearchHit, RequestSummary } from '@/types/models'
 
@@ -40,6 +50,25 @@ const selectedCollection = computed(() => {
 })
 const requests = ref<RequestSummary[]>([])
 const loadingRequests = ref(false)
+const expandedKeys = ref<string[]>([])
+const tableWrap = ref<HTMLElement | null>(null)
+/** 上次打开的接口：返回项目页时自动定位到它的集合并高亮 */
+const lastRequest = ref<LastRequestMemory | null>(null)
+
+const aiAssist = useAiAssistStore()
+
+async function aiAudit() {
+  try {
+    const items = await api.requestOptions(projectId.value)
+    void aiAssist.show({
+      title: '项目结构体检',
+      prompt: projectAuditPrompt(store.currentProject?.name ?? '当前项目', store.tree, items),
+      hint: `${items.length} 个接口 · ${store.tree.length} 个顶层集合`,
+    })
+  } catch (e) {
+    message.error(String(e))
+  }
+}
 
 const keyword = ref('')
 const searchHits = ref<RequestSearchHit[]>([])
@@ -108,14 +137,59 @@ onMounted(async () => {
   try {
     await store.openProject(projectId.value)
     store.syncActiveEnvironment()
-    if (store.tree.length) {
-      selectedKeys.value = [String(store.tree[0].id)]
-      await loadRequests(store.tree[0].id)
-    }
+    await restoreSelection()
   } catch (e) {
     message.error(String(e))
   }
 })
+
+function ancestorsOf(nodes: CollectionNode[], id: number, path: number[] = []): number[] | null {
+  for (const node of nodes) {
+    if (node.id === id) return path
+    const found = ancestorsOf(node.children, id, [...path, node.id])
+    if (found) return found
+  }
+  return null
+}
+
+/** 优先恢复上次打开的接口，其次选第一个集合 */
+async function restoreSelection() {
+  if (!store.tree.length) return
+  const memory = readLastRequest(projectId.value)
+  lastRequest.value = memory
+  if (memory && findNode(store.tree, memory.collectionId)) {
+    selectedKeys.value = [String(memory.collectionId)]
+    expandedKeys.value = (ancestorsOf(store.tree, memory.collectionId) ?? []).map(String)
+    await loadRequests(memory.collectionId)
+    if (requests.value.some((item) => item.id === memory.id)) {
+      await scrollToRequest(memory.id)
+      return
+    }
+    // 接口已被删除或移出该集合，记忆作废
+    lastRequest.value = null
+    forgetLastRequest(projectId.value, memory.id)
+    return
+  }
+  if (memory) forgetLastRequest(projectId.value, memory.id)
+  const first = store.tree[0]
+  selectedKeys.value = [String(first.id)]
+  expandedKeys.value = (ancestorsOf(store.tree, first.id) ?? []).map(String)
+  await loadRequests(first.id)
+}
+
+async function scrollToRequest(id: number) {
+  await nextTick()
+  const row = tableWrap.value?.querySelector<HTMLElement>(`[data-row-key="${id}"]`)
+  row?.scrollIntoView({ block: 'nearest' })
+}
+
+function onExpand(keys: Array<string | number>) {
+  expandedKeys.value = keys.map(String)
+}
+
+function rowClassName(record: RequestSummary | RequestSearchHit) {
+  return lastRequest.value && record.id === lastRequest.value.id ? 'last-opened-row' : ''
+}
 
 async function onSelect(keys: Array<string | number>) {
   const key = keys[0]
@@ -181,8 +255,16 @@ function deleteCollection(node: CollectionNode) {
       await store.refreshTree(projectId.value)
       requests.value = []
       selectedKeys.value = []
+      if (lastRequest.value && subtreeHas(node, lastRequest.value.collectionId)) {
+        lastRequest.value = null
+        forgetLastRequest(projectId.value)
+      }
     },
   })
+}
+
+function subtreeHas(node: CollectionNode, id: number) {
+  return node.id === id || !!findNode(node.children, id)
 }
 
 async function addRequest(collection: CollectionNode) {
@@ -202,23 +284,36 @@ async function addRequest(collection: CollectionNode) {
   try {
     const saved = await api.requestSave(payload)
     await loadRequests(collection.id)
-    openRequestTab(saved.id!)
+    openRequestTab(saved.id!, {
+      collectionId: collection.id,
+      name: payload.name,
+      method: payload.method,
+    })
   } catch (e) {
     message.error(String(e))
   }
 }
 
-function openRequestTab(id: number) {
+function openRequestTab(
+  id: number,
+  meta?: { collectionId?: number; name?: string; method?: string },
+) {
   tabs.ensureProject(projectId.value)
   if (!tabs.canOpen(id)) {
     message.warning(`最多同时打开 ${MAX_REQUEST_TABS} 个接口，请先关闭部分标签`)
     return
   }
+  rememberLastRequest(projectId.value, { id, ...meta })
+  lastRequest.value = readLastRequest(projectId.value)
   router.push({ name: 'request', params: { id }, query: { projectId: projectId.value } })
 }
 
 function openRequest(row: RequestSummary | RequestSearchHit) {
-  openRequestTab(row.id)
+  openRequestTab(row.id, {
+    collectionId: row.collectionId,
+    name: row.name,
+    method: row.method,
+  })
 }
 
 async function copyRowCurl(row: RequestSummary | RequestSearchHit) {
@@ -244,6 +339,10 @@ function deleteRequest(row: RequestSummary | RequestSearchHit) {
       await api.requestDelete(row.id)
       tabs.ensureProject(projectId.value)
       tabs.close(row.id)
+      if (lastRequest.value?.id === row.id) {
+        lastRequest.value = null
+        forgetLastRequest(projectId.value, row.id)
+      }
       message.success('已删除请求')
       if (searchMode.value) await runSearch()
       else if (selectedKeys.value.length) await loadRequests(Number(selectedKeys.value[0]))
@@ -316,7 +415,11 @@ async function submitCurl() {
     }
     await loadRequests(collectionId)
     message.success('已导入请求')
-    openRequestTab(saved.id!)
+    openRequestTab(saved.id!, {
+      collectionId,
+      name: parsed.name,
+      method: parsed.method,
+    })
   } catch (e) {
     message.error(String(e))
   } finally {
@@ -325,12 +428,12 @@ async function submitCurl() {
 }
 
 async function exportProject() {
-  const safeName = (store.currentProject?.name || 'fbinhttp-project').replace(/[\\/:*?"<>|]/g, '_')
+  const safeName = (store.currentProject?.name || 'astroman-project').replace(/[\\/:*?"<>|]/g, '_')
   try {
     const path = await save({
       title: '导出项目 JSON',
-      defaultPath: `${safeName}.fbinhttp.json`,
-      filters: [{ name: 'FbinHttp 项目文件', extensions: ['json'] }],
+      defaultPath: `${safeName}.astroman.json`,
+      filters: [{ name: 'AstroMan 项目文件', extensions: ['json'] }],
     })
     if (!path) return
     await api.projectExport(projectId.value, path)
@@ -468,6 +571,18 @@ async function importApiFile() {
   }
 }
 
+function onImportMenu({ key }: { key: string | number }) {
+  if (importingApi.value) return
+  if (key === 'curl') openCurl()
+  else if (key === 'postman') void importApiFile()
+  else if (key === 'openapi') void importOpenapiFile()
+}
+
+function onExportMenu({ key }: { key: string | number }) {
+  if (key === 'project') void exportProject()
+  else if (key === 'openapi') void exportOpenapi()
+}
+
 function requestRowProps(record: RequestSummary | RequestSearchHit) {
   if (searchMode.value) {
     return { onClick: () => openRequest(record), style: 'cursor:pointer' }
@@ -536,26 +651,37 @@ const columns = computed(() =>
             {{ env.name }}
           </a-select-option>
         </a-select>
-        <a-button size="small" @click="openCurl">
-          <template #icon><ImportOutlined /></template>
-          导入 cURL
+        <a-button size="small" @click="aiAudit">
+          <template #icon><AiSparkIcon /></template>
+          AI 体检
         </a-button>
-        <a-button size="small" :loading="importingApi" @click="importApiFile">
-          <template #icon><ImportOutlined /></template>
-          导入 Postman
-        </a-button>
-        <a-button size="small" :loading="importingApi" @click="importOpenapiFile">
-          <template #icon><ImportOutlined /></template>
-          导入 OpenAPI
-        </a-button>
-        <a-button size="small" @click="exportProject">
-          <template #icon><ExportOutlined /></template>
-          导出项目 JSON
-        </a-button>
-        <a-button size="small" @click="exportOpenapi">
-          <template #icon><ExportOutlined /></template>
-          导出 OpenAPI
-        </a-button>
+        <a-dropdown :trigger="['click']" :disabled="importingApi">
+          <a-button size="small" :loading="importingApi">
+            <template #icon><ImportOutlined /></template>
+            导入
+            <DownOutlined class="caret" />
+          </a-button>
+          <template #overlay>
+            <a-menu @click="onImportMenu">
+              <a-menu-item key="curl">cURL 命令</a-menu-item>
+              <a-menu-item key="postman">Postman / Apifox</a-menu-item>
+              <a-menu-item key="openapi">OpenAPI / Swagger</a-menu-item>
+            </a-menu>
+          </template>
+        </a-dropdown>
+        <a-dropdown :trigger="['click']">
+          <a-button size="small">
+            <template #icon><ExportOutlined /></template>
+            导出
+            <DownOutlined class="caret" />
+          </a-button>
+          <template #overlay>
+            <a-menu @click="onExportMenu">
+              <a-menu-item key="project">项目 JSON</a-menu-item>
+              <a-menu-item key="openapi">OpenAPI 3.0</a-menu-item>
+            </a-menu>
+          </template>
+        </a-dropdown>
         <a-button size="small" @click="router.push(`/environment/${projectId}`)">
           <template #icon><SettingOutlined /></template>
           管理环境
@@ -578,8 +704,10 @@ const columns = computed(() =>
             v-if="treeData.length"
             :tree-data="treeData"
             :selected-keys="selectedKeys"
+            :expanded-keys="expandedKeys"
             block-node
             @select="onSelect"
+            @expand="onExpand"
           >
             <template #title="node">
               <div
@@ -642,7 +770,7 @@ const columns = computed(() =>
           </div>
         </div>
         <a-spin :spinning="loadingRequests || searching">
-          <div class="table-wrap scroll-y">
+          <div ref="tableWrap" class="table-wrap scroll-y">
           <a-table
             v-if="displayRows.length"
             :data-source="displayRows"
@@ -651,12 +779,20 @@ const columns = computed(() =>
             row-key="id"
             size="middle"
             :custom-row="requestRowProps"
+            :row-class-name="rowClassName"
           >
             <template #bodyCell="{ column, record }">
               <template v-if="column.key === 'name'">
                 <span class="req-name">
                   <FileTextOutlined class="req-icon" />
                   {{ (record as RequestSummary).name }}
+                  <span
+                    v-if="lastRequest && lastRequest.id === (record as RequestSummary).id"
+                    class="last-badge"
+                    title="上次打开的接口"
+                  >
+                    上次
+                  </span>
                 </span>
               </template>
               <template v-else-if="column.key === 'collectionName'">
@@ -836,6 +972,12 @@ const columns = computed(() =>
   align-items: center;
 }
 
+.caret {
+  margin-left: 2px;
+  font-size: 10px;
+  opacity: 0.65;
+}
+
 .curl-tip {
   padding: 10px 12px;
   border-radius: var(--fm-radius);
@@ -1011,6 +1153,30 @@ const columns = computed(() =>
   border: 1px solid var(--fm-border);
   padding: 1px 7px;
   border-radius: 999px;
+}
+
+.last-badge {
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 400;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: 999px;
+  color: var(--fm-primary);
+  background: var(--fm-primary-soft);
+  border: 1px solid var(--fm-border);
+}
+
+.table-wrap :deep(tr.last-opened-row > td) {
+  background: var(--fm-primary-soft);
+}
+
+.table-wrap :deep(tr.last-opened-row > td:first-child) {
+  box-shadow: inset 3px 0 0 var(--fm-primary);
+}
+
+.table-wrap :deep(tr.last-opened-row:hover > td) {
+  background: var(--fm-primary-soft);
 }
 
 .req-name {

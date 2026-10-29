@@ -205,6 +205,9 @@ export const planDelete = (id: number) => invoke<void>('plan_delete', { id })
 // 本地文件读写（Runner 数据文件、导出结果、保存响应体）
 export const fileReadText = (path: string) => invoke<string>('file_read_text', { path })
 
+/** 导出前判断目标文件是否已存在，用于覆盖二次确认 */
+export const fileExists = (path: string) => invoke<boolean>('file_exists', { path })
+
 export const fileWriteText = (path: string, content: string) =>
   invoke<void>('file_write_text', { path, content })
 
@@ -289,12 +292,27 @@ export const aiChat = async (
   await invoke<void>('ai_chat', { payload, onEvent: channel })
 }
 
+/** 停止在途生成：命中返回 true */
+export const aiChatCancel = (requestId: string) =>
+  invoke<boolean>('ai_chat_cancel', { requestId })
+
+/** 拉取服务商实际可用模型（前端缓存 24 小时，失败回退内置清单） */
+export const aiModelsList = (providerId: number) =>
+  invoke<string[]>('ai_models_list', { providerId })
+
 /** AI 生成的请求直接执行，与手动发送共用同一链路 */
 export const aiExecute = (payload: SendRequestPayload) =>
   invoke<HttpResult>('ai_execute', { payload })
 
 // AI 会话记录
-export const aiSessionList = () => invoke<AiSession[]>('ai_session_list')
+export const aiSessionList = (keyword?: string) =>
+  invoke<AiSession[]>('ai_session_list', { keyword: keyword ?? null })
+
+export const aiSessionPin = (id: number, pinned: boolean) =>
+  invoke<void>('ai_session_pin', { id, pinned })
+
+export const aiSessionSummarySave = (id: number, summary: string, summaryUntil: number) =>
+  invoke<void>('ai_session_summary_save', { id, summary, summaryUntil })
 
 export const aiSessionCreate = (title?: string, providerId?: number | null) =>
   invoke<AiSession>('ai_session_create', { title: title ?? null, providerId: providerId ?? null })
@@ -317,6 +335,17 @@ export const aiMessageAdd = (
 export const aiMessageClear = (sessionId: number) =>
   invoke<void>('ai_message_clear', { sessionId })
 
+/** 删除单条消息（按数据库 id）：消息级删除只移除这一条 */
+export const aiMessageDelete = (id: number) => invoke<void>('ai_message_delete', { id })
+
+/** 编辑重发：删除该消息及其后的所有消息，避免旧分支残留 */
+export const aiMessageDeleteFrom = (
+  sessionId: number,
+  createdAt: number,
+  inclusive = true,
+) =>
+  invoke<void>('ai_message_delete_from', { sessionId, createdAt, inclusive })
+
 // AI 工具调用流水
 export const aiToolLogAdd = (log: {
   sessionId?: number | null
@@ -325,6 +354,9 @@ export const aiToolLogAdd = (log: {
   ok: boolean
   durationMs: number
   resultPreview: string
+  round?: number
+  traceId?: string | null
+  timeout?: boolean
 }) =>
   invoke<void>('ai_tool_log_add', {
     sessionId: log.sessionId ?? null,
@@ -333,6 +365,9 @@ export const aiToolLogAdd = (log: {
     ok: log.ok,
     durationMs: log.durationMs,
     resultPreview: log.resultPreview,
+    round: log.round ?? 0,
+    traceId: log.traceId ?? null,
+    timeout: log.timeout ?? false,
   })
 
 export const aiToolLogList = (query: {

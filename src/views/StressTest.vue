@@ -15,9 +15,13 @@ import {
   SaveOutlined,
   DeleteOutlined,
 } from '@ant-design/icons-vue'
+import AiSparkIcon from '@/components/AiSparkIcon.vue'
 import PageHeader from '@/components/PageHeader.vue'
 import LineChart from '@/components/LineChart.vue'
 import { useProjectStore } from '@/stores/project'
+import { useAiAssistStore } from '@/stores/aiAssist'
+import { useErrorDialogStore } from '@/stores/errorDialog'
+import { stressPlanPrompt } from '@/utils/aiScenarios'
 import * as api from '@/api'
 import type {
   Environment,
@@ -68,8 +72,47 @@ const selectedChoice = computed(
 )
 
 const currentProject = computed(
-  () => projectStore.projects.find((item) => item.id === (targetProjectId.value ?? activeProjectId.value)) ?? null,
+  () =>
+    projectStore.projects.find(
+      (item) => item.id === (targetProjectId.value ?? activeProjectId.value),
+    ) ?? null,
 )
+
+const aiAssist = useAiAssistStore()
+const errorDialog = useErrorDialogStore()
+
+/** 压测出错时的上下文，方便看出是哪套配置 */
+function stressContext(stage: string) {
+  const env = environments.value.find((item) => item.id === envId.value)
+  return [
+    { label: '阶段', value: stage },
+    { label: '接口', value: request.value?.name ?? '未选择接口' },
+    {
+      label: '请求',
+      value: request.value ? `${request.value.method} ${request.value.url}` : '—',
+    },
+    { label: '环境', value: env?.name ?? '未选择' },
+    {
+      label: '配置',
+      value:
+        settings.mode === 'fixed'
+          ? `${settings.concurrent} 并发 × ${settings.durationSec}s`
+          : `${stages.value.length} 段阶梯 ${totalSeconds.value}s`,
+    },
+  ]
+}
+
+function aiPlan() {
+  if (!request.value) {
+    message.warning('先选择一个接口再做计划')
+    return
+  }
+  void aiAssist.show({
+    title: '压测计划建议',
+    prompt: stressPlanPrompt(request.value, settings, stages.value),
+    hint: `${request.value.method} ${request.value.url} · 当前 ${settings.concurrent} 并发 × ${settings.durationSec}s`,
+  })
+}
 
 async function openConfig() {
   if (running.value) {
@@ -296,7 +339,11 @@ onMounted(async () => {
         if (event.payload.reportId) {
           message.success('压测已结束，报告已生成')
         } else if (event.payload.message) {
-          message.error(event.payload.message)
+          errorDialog.show({
+            title: '压测异常结束',
+            error: event.payload.message,
+            context: stressContext('压测执行'),
+          })
         }
         nextTick(() => resultCard.value?.scrollIntoView({ behavior: 'smooth', block: 'center' }))
       }),
@@ -474,7 +521,11 @@ async function start() {
     })
   } catch (e) {
     running.value = false
-    message.error(String(e))
+    errorDialog.show({
+      title: '压测启动失败',
+      error: e,
+      context: stressContext('启动压测'),
+    })
   }
 }
 
@@ -507,6 +558,10 @@ function backToRequest() {
       title="接口压测"
       subtitle="选择项目与接口、配置压测参数，在本地发起真实并发请求"
     >
+      <a-button :disabled="!request" @click="aiPlan">
+        <template #icon><AiSparkIcon /></template>
+        AI 生成计划
+      </a-button>
       <a-button type="primary" :disabled="running" @click="openConfig">
         <template #icon><PlusOutlined /></template>
         新建压测

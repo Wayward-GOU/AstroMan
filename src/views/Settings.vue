@@ -223,7 +223,7 @@ async function manualCheck() {
 
 async function openReleasePage() {
   try {
-    await api.openExternal(updateInfo.value?.releaseUrl || 'https://github.com/Wayward-GOU/FbinHttp/releases')
+    await api.openExternal(updateInfo.value?.releaseUrl || 'https://github.com/Wayward-GOU/AstroMan/releases')
   } catch (e) {
     message.error(String(e))
   }
@@ -441,8 +441,8 @@ async function openReleasePage() {
         <div v-if="isMac" class="storage-tip">
           <SafetyCertificateOutlined />
           <span>
-            macOS 首次打开或覆盖升级后若提示「Apple 无法验证 FbinHttp.app」，是系统对未公证应用的拦截，与 Intel / Apple Silicon 架构无关：到「系统设置 → 隐私与安全性」点击「仍要打开」，或在终端执行
-            <code>sudo xattr -dr com.apple.quarantine /Applications/FbinHttp.app</code>。
+            macOS 首次打开或覆盖升级后若提示「Apple 无法验证 AstroMan.app」，是系统对未公证应用的拦截，与 Intel / Apple Silicon 架构无关：到「系统设置 → 隐私与安全性」点击「仍要打开」，或在终端执行
+            <code>sudo xattr -dr com.apple.quarantine /Applications/AstroMan.app</code>。
           </span>
         </div>
         <div class="storage-tip">
@@ -464,7 +464,7 @@ async function openReleasePage() {
         <div class="rows">
           <div class="row">
             <span class="label">版本</span>
-            <span class="value mono">FbinHttp {{ info?.version || '-' }}</span>
+            <span class="value mono">AstroMan {{ info?.version || '-' }}</span>
           </div>
           <div class="row">
             <span class="label">运行模式</span>
@@ -514,13 +514,13 @@ async function openReleasePage() {
         <div class="block-head">
           <span class="block-icon purple"><ThunderboltOutlined /></span>
           <div>
-            <div class="block-title">AI 辅助（小HI）</div>
+            <div class="block-title">AI 辅助（航仔）</div>
             <div class="block-desc">用一句话描述需求，直接操作项目、请求与压测</div>
           </div>
           <span class="soon live">已上线</span>
         </div>
         <div class="ai-hint">
-          点右侧屏幕中间的机器人即可打开小HI。先在顶部「模型服务」里配置一家服务商（DeepSeek / Kimi / 智谱 / 通义千问 / Claude / Gemini /
+          点右侧屏幕中间的机器人即可打开航仔。先在顶部「模型服务」里配置一家服务商（DeepSeek / Kimi / 智谱 / 通义千问 / Claude / Gemini /
           Ollama 等，兼容 OpenAI 协议的服务都能接），之后能建项目、写请求、发请求、生成签名脚本、查压测报告与导出记录。
           敏感操作会先弹确认；密钥仅加密保存在本机数据库，不会上传到任何服务器。
         </div>
@@ -529,7 +529,7 @@ async function openReleasePage() {
           <li>用量统计可按天查看调用次数、token 与预估费用，按模型和工具拆分明细。</li>
         </ul>
         <div class="ai-actions">
-          <a-button type="primary" @click="router.push({ name: 'ai' })">打开小HI</a-button>
+          <a-button type="primary" @click="router.push({ name: 'ai' })">打开航仔</a-button>
           <a-button @click="router.push({ name: 'ai-usage' })">用量统计</a-button>
         </div>
       </div>

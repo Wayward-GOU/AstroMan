@@ -23,14 +23,14 @@ fn show_main_window(app: &tauri::AppHandle) {
 /// 系统托盘：左键点击显示主窗口，右键菜单可显示或退出
 fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "退出 FbinHttp", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "退出 AstroMan", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &quit])?;
 
     TrayIconBuilder::with_id("main-tray")
         .icon(tauri::image::Image::from_bytes(include_bytes!(
             "../icons/tray.png"
         ))?)
-        .tooltip("FbinHttp")
+        .tooltip("AstroMan")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
@@ -66,7 +66,7 @@ pub fn run() {
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .setup(|app| {
             let state = state::AppState::new(app.handle())?;
-            log::info!("FbinHttp 数据目录: {:?}", state.data_dir);
+            log::info!("AstroMan 数据目录: {:?}", state.data_dir);
             app.manage(state);
             app.manage(commands::winstats::WinStatsState::new());
             setup_tray(app.handle())?;
@@ -104,14 +104,20 @@ pub fn run() {
             commands::ai::ai_provider_delete,
             commands::ai::ai_provider_test,
             commands::ai::ai_chat,
+            commands::ai::ai_chat_cancel,
             commands::ai::ai_execute,
+            commands::ai::ai_models_list,
             commands::ai::ai_session_list,
             commands::ai::ai_session_create,
             commands::ai::ai_session_rename,
             commands::ai::ai_session_delete,
+            commands::ai::ai_session_pin,
+            commands::ai::ai_session_summary_save,
             commands::ai::ai_message_list,
             commands::ai::ai_message_add,
             commands::ai::ai_message_clear,
+            commands::ai::ai_message_delete_from,
+            commands::ai::ai_message_delete,
             commands::ai::ai_tool_log_add,
             commands::ai::ai_tool_log_list,
             commands::ai::ai_tool_log_stats,
@@ -131,6 +137,7 @@ pub fn run() {
             commands::plan::plan_save,
             commands::plan::plan_delete,
             commands::files::file_read_text,
+            commands::files::file_exists,
             commands::files::file_write_text,
             commands::history::history_list,
             commands::history::history_stats,
@@ -166,14 +173,14 @@ pub fn run() {
             commands::storage::app_restart,
         ])
         .on_window_event(|window, event| {
-            // 关闭主窗口时隐藏到托盘，从托盘菜单「退出 FbinHttp」才会真正结束进程
+            // 关闭主窗口时隐藏到托盘，从托盘菜单「退出 AstroMan」才会真正结束进程
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();
             }
         })
         .build(tauri::generate_context!())
-        .expect("启动 FbinHttp 失败")
+        .expect("启动 AstroMan 失败")
         .run(|app_handle, event| {
             // macOS 点击 Dock 图标时把隐藏的主窗口重新显示出来
             #[cfg(target_os = "macos")]

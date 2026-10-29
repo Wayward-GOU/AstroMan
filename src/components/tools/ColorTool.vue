@@ -96,7 +96,7 @@ const fields = computed(() => {
 
       <div class="color-preview" :style="{ background: info.hex }">
         <span class="color-preview-text" :style="{ color: info.contrastWithWhite > 4.5 ? '#ffffff' : '#0f172a' }">
-          FbinHttp · {{ info.hex }}
+          AstroMan · {{ info.hex }}
         </span>
       </div>
     </template>

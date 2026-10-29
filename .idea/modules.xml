@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/FinkMeter.iml" filepath="$PROJECT_DIR$/.idea/FinkMeter.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/FbinHttp.iml" filepath="$PROJECT_DIR$/.idea/FbinHttp.iml" />
     </modules>
   </component>
 </project>

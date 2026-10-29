@@ -653,11 +653,23 @@ pub struct AiProvider {
     pub kind: String,
     pub base_url: String,
     pub model: String,
-    /// 明文只在内存与传输层出现，落库前统一加密
+    /// 明文只在内存与传输层出现，落库前统一加密；列表接口不再返回明文
     #[serde(default)]
     pub api_key: String,
+    /// 列表回显用掩码（sk-****abcd），由 Rust 侧即时计算
+    #[serde(default)]
+    pub api_key_masked: String,
+    /// 是否已配置 Key：编辑时留空表示沿用原 Key
+    #[serde(default)]
+    pub has_key: bool,
     #[serde(default)]
     pub temperature: Option<f64>,
+    /// 单次生成最大 token，0 = 按协议默认
+    #[serde(default)]
+    pub max_tokens: Option<i64>,
+    /// 单次请求超时秒数，0 = 默认 300
+    #[serde(default)]
+    pub timeout_secs: Option<i64>,
     #[serde(default)]
     pub is_default: bool,
 }
@@ -676,9 +688,12 @@ pub struct AiChatPayload {
     pub messages: Vec<AiMessage>,
     #[serde(default)]
     pub temperature: Option<f64>,
+    /// 在途请求标识：前端用同一个 id 调用 ai_chat_cancel 停止生成
+    #[serde(default)]
+    pub request_id: Option<String>,
 }
 
-/// 流式事件：delta 增量文本 / done 结束 / error 错误
+/// 流式事件：delta 增量文本 / reasoning 思考 / done 结束 / cancelled 已停止 / error 错误
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiStreamEvent {
@@ -694,6 +709,14 @@ pub struct AiSession {
     pub title: String,
     pub provider_id: Option<i64>,
     pub message_count: i64,
+    #[serde(default)]
+    pub pinned: bool,
+    /// 较早对话压缩后的结构化摘要，从下一轮开始替代原文进入上下文
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// 摘要覆盖到的消息时间（毫秒），早于它的消息不再逐条发送
+    #[serde(default)]
+    pub summary_until: i64,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -721,6 +744,15 @@ pub struct AiToolLog {
     pub ok: bool,
     pub duration_ms: i64,
     pub result_preview: String,
+    /// 第几轮工具调用（1 起），用于复盘时间线
+    #[serde(default)]
+    pub round: i64,
+    /// 同一轮任务的链路标识
+    #[serde(default)]
+    pub trace_id: Option<String>,
+    /// 前端等待超时（工具仍在后台执行）
+    #[serde(default)]
+    pub timeout: bool,
     pub created_at: i64,
 }
 

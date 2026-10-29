@@ -226,7 +226,7 @@ function toolRate(record: { total: number; failed: number }): string {
 function clearLogs() {
   Modal.confirm({
     title: '清空全部工具调用记录？',
-    content: '只删除小HI 的工具调用流水，不会影响会话消息。记录默认保留近 1 年，超出部分会自动清理。',
+    content: '只删除航仔 的工具调用流水，不会影响会话消息。记录默认保留近 1 年，超出部分会自动清理。',
     okText: '清空',
     okType: 'danger',
     cancelText: '取消',
@@ -254,10 +254,10 @@ onMounted(() => {
 
 <template>
   <div class="page logs-page">
-    <PageHeader title="工具调用记录" subtitle="小HI 每次调用系统功能都会留下一条流水，保留近 1 年">
+    <PageHeader title="工具调用记录" subtitle="航仔 每次调用系统功能都会留下一条流水，保留近 1 年">
       <a-button size="small" @click="backToAi">
         <template #icon><ArrowLeftOutlined /></template>
-        返回小HI
+        返回航仔
       </a-button>
       <a-button size="small" :loading="loading || statsLoading" @click="refresh">
         <template #icon><ReloadOutlined /></template>
@@ -351,7 +351,7 @@ onMounted(() => {
           <span v-if="bar.showLabel" class="chart-tick">{{ bar.label }}</span>
         </div>
       </div>
-      <div v-else class="panel-empty">暂无可统计的调用，和小HI 聊一句并让它执行一个系统操作试试</div>
+      <div v-else class="panel-empty">暂无可统计的调用，和航仔 聊一句并让它执行一个系统操作试试</div>
     </div>
 
     <!-- 明细 / 分工具 -->

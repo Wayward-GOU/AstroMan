@@ -214,6 +214,8 @@ CREATE TABLE IF NOT EXISTS ai_providers (
     api_key_enc   TEXT,
     extra_headers TEXT,
     temperature   REAL DEFAULT 0.3,
+    max_tokens    INTEGER DEFAULT 0,
+    timeout_secs  INTEGER DEFAULT 300,
     is_default    INTEGER DEFAULT 0,
     enabled       INTEGER DEFAULT 1,
     created_at    INTEGER NOT NULL,
@@ -234,11 +236,14 @@ CREATE TABLE IF NOT EXISTS ai_conversations (
 
 -- AI 会话（一次对话 = 一条会话，消息按 id 顺序追加）
 CREATE TABLE IF NOT EXISTS ai_sessions (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    title       TEXT NOT NULL,
-    provider_id INTEGER,
-    created_at  INTEGER NOT NULL,
-    updated_at  INTEGER NOT NULL
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    title         TEXT NOT NULL,
+    provider_id   INTEGER,
+    pinned        INTEGER NOT NULL DEFAULT 0,
+    summary       TEXT,
+    summary_until INTEGER DEFAULT 0,
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS ai_messages (
@@ -247,6 +252,7 @@ CREATE TABLE IF NOT EXISTS ai_messages (
     role       TEXT NOT NULL,
     content    TEXT NOT NULL,
     reasoning  TEXT,
+    token_count INTEGER DEFAULT 0,
     created_at INTEGER NOT NULL
 );
 
@@ -259,6 +265,9 @@ CREATE TABLE IF NOT EXISTS ai_tool_logs (
     ok            INTEGER NOT NULL DEFAULT 1,
     duration_ms   INTEGER NOT NULL DEFAULT 0,
     result_preview TEXT,
+    round         INTEGER DEFAULT 0,
+    trace_id      TEXT,
+    timeout       INTEGER DEFAULT 0,
     created_at    INTEGER NOT NULL
 );
 

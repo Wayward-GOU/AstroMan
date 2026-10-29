@@ -286,9 +286,16 @@ export interface AiProvider {
   kind: string
   baseUrl: string
   model: string
-  /** 编辑时留空表示沿用已保存的 Key */
+  /** 编辑时留空表示沿用已保存的 Key（列表接口不回传明文） */
   apiKey: string
+  /** 列表回显掩码，形如 sk-****abcd */
+  apiKeyMasked?: string
+  hasKey?: boolean
   temperature?: number | null
+  /** 单次生成最大 token，0 / 空 = 按协议默认 */
+  maxTokens?: number | null
+  /** 单次请求超时秒数，0 / 空 = 默认 300 */
+  timeoutSecs?: number | null
   isDefault?: boolean
 }
 
@@ -301,11 +308,13 @@ export interface AiChatPayload {
   providerId: number
   messages: AiMessage[]
   temperature?: number | null
+  /** 在途请求标识，配合 ai_chat_cancel 停止生成 */
+  requestId?: string | null
 }
 
-/** 流式事件：delta 增量文本 / done 结束 / error 错误 */
+/** 流式事件：delta 增量文本 / reasoning 思考 / retry 重试提示 / done 结束 / cancelled 已停止 / error 错误 */
 export interface AiStreamEvent {
-  kind: 'delta' | 'done' | 'error' | string
+  kind: 'delta' | 'reasoning' | 'retry' | 'done' | 'cancelled' | 'error' | string
   text: string
 }
 
@@ -315,6 +324,9 @@ export interface AiSession {
   title: string
   providerId?: number | null
   messageCount: number
+  pinned?: boolean
+  summary?: string | null
+  summaryUntil?: number
   createdAt: number
   updatedAt: number
 }
@@ -337,6 +349,12 @@ export interface AiToolLog {
   ok: boolean
   durationMs: number
   resultPreview: string
+  /** 第几轮工具调用（1 起） */
+  round?: number
+  /** 同一轮任务的链路标识 */
+  traceId?: string | null
+  /** 前端等待超时（后台仍在执行） */
+  timeout?: boolean
   createdAt: number
 }
 

@@ -25,9 +25,12 @@ import {
   BarChartOutlined,
   FileTextOutlined,
 } from '@ant-design/icons-vue'
+import AiSparkIcon from '@/components/AiSparkIcon.vue'
 import PageHeader from '@/components/PageHeader.vue'
 import { formatDateTime } from '@/utils/datetime'
 import { useProjectStore } from '@/stores/project'
+import { useAiAssistStore } from '@/stores/aiAssist'
+import { dashboardInsightPrompt } from '@/utils/aiScenarios'
 import * as api from '@/api'
 import type {
   DashboardMetrics,
@@ -51,6 +54,18 @@ const history = ref<HistoryItem[]>([])
 const reports = ref<StressReport[]>([])
 const stats = ref<WorkspaceStats | null>(null)
 const metrics = ref<DashboardMetrics | null>(null)
+
+const aiAssist = useAiAssistStore()
+
+function aiInsight() {
+  void aiAssist.show({
+    title: '工作台洞察',
+    prompt: dashboardInsightPrompt(stats.value, metrics.value),
+    hint: stats.value
+      ? `${stats.value.projectCount} 个项目 · ${stats.value.requestCount} 个接口 · ${stats.value.historyCount} 条历史`
+      : '数据加载中',
+  })
+}
 const storage = ref<StorageInfo | null>(null)
 const snapshot = ref<MonitorSnapshot | null>(null)
 const monitorLoading = ref(false)
@@ -423,9 +438,9 @@ const steps = computed(() => [
   },
   {
     key: '07',
-    title: '用小HI 提效',
-    desc: '在「小HI」里说一句话就能建项目、写接口、发请求、写签名脚本、查压测报告，并能导出执行记录。',
-    action: '打开小HI',
+    title: '用航仔 提效',
+    desc: '在「航仔」里说一句话就能建项目、写接口、发请求、写签名脚本、查压测报告，并能导出执行记录。',
+    action: '打开航仔',
     go: () => router.push({ name: 'ai' }),
   },
   {
@@ -480,22 +495,27 @@ const tips = [
   },
   {
     title: 'AI 助手：自然语言操作',
-    desc: '点右侧屏幕中间的机器人进入小HI。先在小HI 顶部「模型服务」里配置一家服务商（如 DeepSeek / Kimi / 智谱 / Claude），之后直接说需求即可，工具调用会先请你确认敏感操作。',
+    desc: '点右侧屏幕中间的机器人进入航仔。先在航仔 顶部「模型服务」里配置一家服务商（如 DeepSeek / Kimi / 智谱 / Claude），之后直接说需求即可。写入类操作会先给计划、等你确认后再执行。',
     code: '列出本机所有项目，并按请求数量排序\n在第一个项目里新建登录接口，发送并分析返回\n给接口写一个前置签名脚本，再发一次验证',
   },
   {
+    title: 'AI 助手：聊天与出方案',
+    desc: '航仔 也能当日常助手：解释概念、给压测方案、做错误诊断、写脚本草稿，这类问答不会去翻你的项目数据。',
+    code: 'HTTP/2 和 HTTP/1.1 有什么区别\n给我一份下单接口的压测方案，含并发与 SLA\n这个 401 报错一般怎么排查',
+  },
+  {
     title: 'AI 助手：写脚本与查数据',
-    desc: '可让 小HI 直接写前置 / 后置脚本（保存前做语法检查），也能查压测报告、按接口或项目导出执行记录为 CSV / JSON。',
+    desc: '可让 航仔 直接写前置 / 后置脚本（保存前做语法检查），也能查压测报告、按接口或项目导出执行记录为 CSV / JSON。',
     code: '给「创建订单」接口写 HMAC-SHA256 签名前置脚本\n导出某接口最近 50 条执行记录为 CSV\n最近一次压测报告的关键指标怎么样',
   },
   {
     title: 'AI 用量与费用',
-    desc: '每次模型调用都会记一条：服务商、模型、输入 / 输出 token、耗时与估算费用，近 1 年可查；小HI 顶部「用量统计」进入。',
+    desc: '每次模型调用都会记一条：服务商、模型、输入 / 输出 token、耗时与估算费用，近 1 年可查；航仔 顶部「用量统计」进入。',
     code: '',
   },
   {
     title: '数据备份与迁移',
-    desc: '项目页或卡片菜单导出 *.fbinhttp.json 交给同事；设置页可查看数据库路径并迁移数据目录。',
+    desc: '项目页或卡片菜单导出 *.astroman.json 交给同事；设置页可查看数据库路径并迁移数据目录。',
     code: '',
   },
 ]
@@ -527,7 +547,7 @@ const faqs = [
   },
   {
     q: '怎么把项目分享给同事？',
-    a: '项目页顶部或工作台项目卡片菜单里选「导出项目」，会得到 *.fbinhttp.json（含集合、接口、脚本与断言）。对方在工作台点「导入项目 → 导入项目 JSON」即可复原；重名时会自动加「（导入）」后缀，不影响原有项目。',
+    a: '项目页顶部或工作台项目卡片菜单里选「导出项目」，会得到 *.astroman.json（含集合、接口、脚本与断言）。对方在工作台点「导入项目 → 导入项目 JSON」即可复原；重名时会自动加「（导入）」后缀，不影响原有项目。',
   },
   {
     q: '变量没生效怎么排查？',
@@ -550,16 +570,16 @@ const faqs = [
     a: '压测中随时可以点「停止」，已产生的数据仍会保存成报告。建议只在测试环境压测，并提前确认目标服务的限流策略。',
   },
   {
-    q: '小HI 能帮我做什么？',
-    a: '它可以直接操作本机数据：新建项目 / 集合 / 接口、真实发送请求并解读响应、写前置与后置脚本、批量执行、启动压测、查询历史与压测报告、导出执行记录，还能查工作台与大屏统计。删除、导出、压测这类操作会先弹确认，你点了才会执行。',
+    q: '航仔 能帮我做什么？',
+    a: '两个模式：一是聊天答疑、出方案（压测方案、测试策略、脚本写法、错误诊断），只给建议不动数据；二是操作本机——新建项目 / 集合 / 接口、真实发送请求并解读响应、写前置与后置脚本、批量执行、生成压测计划、查询历史与报告、导出执行记录。凡是要新建、修改、删除、导入导出或发起压测，它都会先把完整计划列出来，你确认后才弹执行框。',
   },
   {
     q: 'AI 服务怎么配置？密钥安全吗？',
-    a: '进入小HI，点顶部「模型服务」→「添加模型服务」，选一个厂商预设（自动填好协议、Base URL 和模型下拉），再填自己的 API Key 即可。支持 OpenAI 兼容、Claude、Gemini 与本地 Ollama；密钥用 AES-256-GCM 加密后只保存在本机数据库，不会上传到任何第三方。',
+    a: '进入航仔，点顶部「模型服务」→「添加模型服务」，选一个厂商预设（自动填好协议、Base URL 和模型下拉），再填自己的 API Key 即可。支持 OpenAI 兼容、Claude、Gemini 与本地 Ollama；密钥用 AES-256-GCM 加密后只保存在本机数据库，不会上传到任何第三方。',
   },
   {
     q: 'AI 用了多少 token、花了多少钱？',
-    a: '每次模型调用都会记录服务商、模型、输入 / 输出 token、耗时与估算费用，保留近 1 年。在小HI 顶部点「用量统计」可看指标卡、每日趋势、逐条调用记录（含本轮提问）与各工具准确率，费用按厂商公开单价估算并折算人民币。',
+    a: '每次模型调用都会记录服务商、模型、输入 / 输出 token、耗时与估算费用，保留近 1 年。在航仔 顶部点「用量统计」可看指标卡、每日趋势、逐条调用记录（含本轮提问）与各工具准确率，费用按厂商公开单价估算并折算人民币。',
   },
 ]
 
@@ -662,9 +682,9 @@ function removeProject(id: number, name: string) {
 async function importProject() {
   try {
     const path = await open({
-      title: '导入 FbinHttp 项目',
+      title: '导入 AstroMan 项目',
       multiple: false,
-      filters: [{ name: 'FbinHttp 项目文件', extensions: ['json'] }],
+      filters: [{ name: 'AstroMan 项目文件', extensions: ['json'] }],
     })
     if (!path) return
     const project = await api.projectImport(path)
@@ -682,8 +702,8 @@ async function exportProjectJson(id: number, name: string) {
   try {
     const path = await save({
       title: '导出项目 JSON',
-      defaultPath: `${safeName}.fbinhttp.json`,
-      filters: [{ name: 'FbinHttp 项目文件', extensions: ['json'] }],
+      defaultPath: `${safeName}.astroman.json`,
+      filters: [{ name: 'AstroMan 项目文件', extensions: ['json'] }],
     })
     if (!path) return
     await api.projectExport(id, path)
@@ -717,7 +737,7 @@ async function importApiProject() {
 }
 
 function onImportMenu(info: { key: string | number }) {
-  if (info.key === 'fbinhttp') importProject()
+  if (info.key === 'astroman') importProject()
   else if (info.key === 'api') importApiProject()
 }
 
@@ -825,11 +845,15 @@ function statusColor(code?: number | null) {
         </a-button>
         <template #overlay>
           <a-menu @click="onImportMenu">
-            <a-menu-item key="fbinhttp">导入项目 JSON</a-menu-item>
+            <a-menu-item key="astroman">导入项目 JSON</a-menu-item>
             <a-menu-item key="api">导入 Postman / Apifox 数据</a-menu-item>
           </a-menu>
         </template>
       </a-dropdown>
+      <a-button @click="aiInsight">
+        <template #icon><AiSparkIcon /></template>
+        AI 洞察
+      </a-button>
       <a-button @click="router.push('/stress')">
         <template #icon><ThunderboltOutlined /></template>
         发起压测
@@ -871,7 +895,7 @@ function statusColor(code?: number | null) {
         </div>
         <div class="console-meta">
           <DatabaseOutlined />
-          <span>FbinHttp v{{ appVersion || '1.0.0' }}</span>
+          <span>AstroMan v{{ appVersion || '1.0.0' }}</span>
           <span class="meta-dot" />
           <a @click="goSettings">数据位置与设置</a>
         </div>
@@ -976,7 +1000,7 @@ function statusColor(code?: number | null) {
         </span>
         <h2 class="intro-title">调试、压测与工具箱，一个桌面应用全部搞定</h2>
         <p class="intro-desc">
-          FbinHttp 面向需要频繁调试 HTTP 接口的开发者：界面参考 Postman，压测参数参考 JMeter，
+          AstroMan 面向需要频繁调试 HTTP 接口的开发者：界面参考 Postman，压测参数参考 JMeter，
           日常格式化与转换工具集中在一起。不用在浏览器插件和在线站点之间来回切换，也不用把接口数据交给第三方服务。
         </p>
         <div class="intro-tags">
@@ -998,7 +1022,7 @@ function statusColor(code?: number | null) {
     <!-- 功能能力 -->
     <div class="section-head feature-head">
       <div>
-        <h2 class="section-title">FbinHttp 能做什么</h2>
+        <h2 class="section-title">AstroMan 能做什么</h2>
         <div class="section-desc">从接口调试到压力测试，再到日常开发小工具，全部离线可用</div>
       </div>
     </div>
@@ -1072,7 +1096,7 @@ function statusColor(code?: number | null) {
           <div v-else class="fm-card panel-empty">
             <div class="empty-mark">📁</div>
             <div class="empty-title">还没有项目</div>
-            <div class="empty-desc">创建一个项目开始调试，或者导入 FbinHttp 项目、Postman 集合或 Apifox 数据。</div>
+            <div class="empty-desc">创建一个项目开始调试，或者导入 AstroMan 项目、Postman 集合或 Apifox 数据。</div>
             <div class="empty-actions">
               <a-button type="primary" @click="createOpen = true">新建项目</a-button>
               <a-button @click="importProject">导入项目 JSON</a-button>

@@ -1,11 +1,11 @@
 [package]
-name = "fbinhttp"
-version = "1.0.6"
-description = "FbinHttp - 本地 API 调试与压测工具"
+name = "astroman"
+version = "1.0.7"
+description = "AstroMan - 本地 API 调试与压测工具"
 edition = "2021"
 
 [lib]
-name = "fbinhttp_lib"
+name = "astroman_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

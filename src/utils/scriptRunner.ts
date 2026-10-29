@@ -143,6 +143,61 @@ function describeError(error: unknown): string {
   return String(error)
 }
 
+/**
+ * new Function 生成的是 `function anonymous(args\n) {\n<body>\n}`，
+ * 脚本体从生成代码的第 3 行开始，因此 V8 堆栈里的行号要减 2 才是用户脚本里的行号。
+ */
+const FUNCTION_BODY_LINE_OFFSET = 2
+
+const PHASE_LABEL: Record<ScriptPhase, string> = {
+  env: '环境脚本',
+  pre: '前置脚本',
+  post: '后置脚本',
+}
+
+/** 从错误堆栈里找到用户脚本内的位置（只认 new Function 产生的 <anonymous> 帧） */
+function locateScriptFrame(error: unknown, totalLines: number): { line: number; column: number } | null {
+  if (!(error instanceof Error) || !error.stack) return null
+  const pattern = /<anonymous>:(\d+):(\d+)/g
+  let match: RegExpExecArray | null
+  while ((match = pattern.exec(error.stack))) {
+    const line = Number(match[1]) - FUNCTION_BODY_LINE_OFFSET
+    const column = Number(match[2])
+    if (line >= 1 && line <= Math.max(totalLines, 1)) return { line, column }
+  }
+  return null
+}
+
+/**
+ * 把脚本抛出的错误整理成可定位的多行文本：
+ * 第一行保持原始错误信息（弹窗摘要用），后面追加出错行号与上下文代码，方便用户直接改脚本。
+ */
+function describeScriptError(error: unknown, code: string, phase: ScriptPhase): string {
+  const message = describeError(error)
+  const label = PHASE_LABEL[phase]
+  const lines = code.split(/\r?\n/)
+  const frame = locateScriptFrame(error, lines.length)
+  if (!frame) {
+    if (error instanceof SyntaxError) {
+      return `${message}\n${label}存在语法错误，无法定位到具体行，请检查括号、引号和语句是否完整`
+    }
+    return message
+  }
+  const start = Math.max(1, frame.line - 1)
+  const end = Math.min(lines.length, frame.line + 1)
+  const gutter = String(end).length
+  const snippet: string[] = []
+  for (let n = start; n <= end; n += 1) {
+    const mark = n === frame.line ? '>' : ' '
+    snippet.push(`${mark} ${String(n).padStart(gutter, ' ')} | ${lines[n - 1]}`)
+  }
+  return [
+    message,
+    `${label}第 ${frame.line} 行第 ${frame.column} 列，请检查下列代码：`,
+    ...snippet,
+  ].join('\n')
+}
+
 function createConsole(phase: ScriptPhase, logs: ScriptLog[]): ConsoleFacade {
   const push = (level: ScriptLogLevel, args: unknown[]) => {
     const text = args.map(formatArg).join(' ')
@@ -215,7 +270,7 @@ export function runPreScript(
     return {
       request: target,
       logs,
-      error: describeError(e),
+      error: describeScriptError(e, code, phase),
       durationMs: Math.round(performance.now() - started),
     }
   }
@@ -252,7 +307,7 @@ export function runPostScript(
       ;(fn as () => void)()
       assertions.push({ name: label, passed: true })
     } catch (e) {
-      assertions.push({ name: label, passed: false, message: describeError(e) })
+      assertions.push({ name: label, passed: false, message: describeScriptError(e, code, 'post') })
     }
   }
 
@@ -303,7 +358,7 @@ export function runPostScript(
     return {
       logs,
       assertions,
-      error: describeError(e),
+      error: describeScriptError(e, code, 'post'),
       durationMs: Math.round(performance.now() - started),
     }
   }

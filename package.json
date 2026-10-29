@@ -1,14 +1,17 @@
 {
-  "name": "FbinHttp",
+  "name": "AstroMan",
   "private": true,
-  "version": "1.0.6",
+  "version": "1.0.7",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
     "build:win": "tauri build --bundles nsis",
+    "build:win:offline": "tauri build --bundles nsis --config src-tauri/tauri.offline.conf.json",
+    "build:win32": "tauri build --target i686-pc-windows-msvc --bundles nsis",
     "build:mac": "tauri build --target universal-apple-darwin --bundles dmg",
     "preview": "vite preview",
+    "test": "vitest run",
     "tauri": "tauri"
   },
   "dependencies": {
@@ -32,6 +35,7 @@
     "@vitejs/plugin-vue": "^5.2.1",
     "typescript": "^5.6.3",
     "vite": "^5.4.11",
+    "vitest": "^2.1.9",
     "vue-tsc": "^2.1.10"
   }
 }

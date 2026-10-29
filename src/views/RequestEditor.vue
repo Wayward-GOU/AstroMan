@@ -13,17 +13,31 @@ import {
   CopyOutlined,
   CodeOutlined,
   PlusOutlined,
+  DownOutlined,
+  SettingOutlined,
 } from '@ant-design/icons-vue'
+import AiSparkIcon from '@/components/AiSparkIcon.vue'
 import KeyValueEditor from '@/components/KeyValueEditor.vue'
 import CodeArea from '@/components/CodeArea.vue'
+import EnvironmentDrawer from '@/components/EnvironmentDrawer.vue'
+import { useAiAssistStore } from '@/stores/aiAssist'
+import {
+  requestAssertionPrompt,
+  requestExplainPrompt,
+  requestOptimizePrompt,
+  requestPostScriptPrompt,
+} from '@/utils/aiScenarios'
 import { useProjectStore } from '@/stores/project'
 import { MAX_REQUEST_TABS, useTabsStore } from '@/stores/tabs'
+import { useErrorDialogStore } from '@/stores/errorDialog'
 import { formatDateTime } from '@/utils/datetime'
 import { buildSnippets, type Snippet } from '@/utils/curl'
 import { diffLines, diffStats, type DiffLine } from '@/utils/diff'
+import { rememberLastRequest } from '@/utils/lastRequest'
 import * as api from '@/api'
 import type {
   CookieItem,
+  Environment,
   FormField,
   HttpRequestDetail,
   HttpResult,
@@ -50,6 +64,7 @@ const route = useRoute()
 const router = useRouter()
 const store = useProjectStore()
 const tabStore = useTabsStore()
+const errorDialog = useErrorDialogStore()
 
 const requestId = computed(() => Number(route.params.id))
 const projectId = computed(() => Number(route.query.projectId || 0))
@@ -93,6 +108,39 @@ const activeTab = ref('params')
 const responseTab = ref('body')
 const insecure = ref(false)
 const envId = ref<number | null>(null)
+const envDrawerOpen = ref(false)
+
+/* ---------- 环境变量抽屉 ---------- */
+/** 抽屉内新增 / 修改 / 删除环境后，同步项目环境列表，请求里用到的变量立即生效 */
+function onEnvsChanged(list: Environment[]) {
+  store.environments = list
+  if (envId.value && !list.some((item) => item.id === envId.value)) {
+    envId.value = list.find((item) => item.isActive)?.id ?? list[0]?.id ?? null
+  }
+}
+
+/* ---------- 页面内 AI 分析 ---------- */
+const aiAssist = useAiAssistStore()
+
+function runAi(kind: string) {
+  const detail = form.value
+  if (!detail.url?.trim()) {
+    message.warning('先填写接口 URL 再做分析')
+    return
+  }
+  const options: Record<string, { title: string; prompt: string }> = {
+    explain: { title: '接口响应分析', prompt: requestExplainPrompt(detail, result.value) },
+    assert: { title: '生成断言脚本', prompt: requestAssertionPrompt(detail, result.value) },
+    post: { title: '生成后置脚本', prompt: requestPostScriptPrompt(detail, result.value) },
+    optimize: { title: '接口定义优化', prompt: requestOptimizePrompt(detail) },
+  }
+  const picked = options[kind]
+  if (!picked) return
+  void aiAssist.show({
+    ...picked,
+    hint: `${detail.method} ${detail.url}${result.value ? ` · 最近响应 ${result.value.status}` : ' · 未发送过请求'}`,
+  })
+}
 
 /* ---------- 自动保存 ---------- */
 const autoState = ref<'saved' | 'dirty' | 'saving' | 'error'>('saved')
@@ -433,7 +481,7 @@ interface HeaderPreset {
 const headerPresets: HeaderPreset[] = [
   { id: 1, group: '常用', key: 'Accept', value: 'application/json' },
   { id: 2, group: '常用', key: 'Content-Type', value: 'application/json' },
-  { id: 3, group: '常用', key: 'User-Agent', value: 'FbinHttp/1.0' },
+  { id: 3, group: '常用', key: 'User-Agent', value: 'AstroMan/1.0' },
   { id: 4, group: '常用', key: 'Cache-Control', value: 'no-cache' },
   { id: 5, group: '常用', key: 'Connection', value: 'keep-alive' },
   { id: 6, group: '认证', key: 'Authorization', value: 'Bearer {{token}}' },
@@ -509,6 +557,13 @@ async function loadRequest(id: number) {
     if (!opened) {
       message.warning(`最多同时打开 ${MAX_REQUEST_TABS} 个接口，请先关闭部分标签`)
     }
+    // 记住本接口，返回项目页时自动定位
+    rememberLastRequest(projectId.value, {
+      id,
+      collectionId: detail.collectionId,
+      name: detail.name,
+      method: detail.method,
+    })
     await loadRuns()
   } catch (e) {
     tabStore.close(id)
@@ -679,6 +734,17 @@ function deleteRequest() {
   })
 }
 
+/** 执行出错时附上上下文，方便定位是哪一次发送、哪个环境 */
+function execContext(stage: string) {
+  const env = store.environments.find((item) => item.id === envId.value)
+  return [
+    { label: '阶段', value: stage },
+    { label: '接口', value: form.value.name || '未命名请求' },
+    { label: '请求', value: `${form.value.method} ${form.value.url || '（未填写 URL）'}` },
+    { label: '环境', value: env?.name ?? '未选择' },
+  ]
+}
+
 async function send() {
   if (!form.value.url.trim()) {
     message.warning('请填写 URL')
@@ -705,7 +771,11 @@ async function send() {
       scriptMs.value += envResult.durationMs
       scriptError.value = envResult.error ?? ''
       if (envResult.error) {
-        message.error(`环境脚本执行失败：${envResult.error}`)
+        errorDialog.show({
+          title: '环境脚本执行失败',
+          error: envResult.error,
+          context: execContext('环境脚本'),
+        })
         return
       }
       outgoing = envResult.request
@@ -718,7 +788,11 @@ async function send() {
       scriptMs.value += preResult.durationMs
       scriptError.value = preResult.error ?? ''
       if (preResult.error) {
-        message.error(`前置脚本执行失败：${preResult.error}`)
+        errorDialog.show({
+          title: '前置脚本执行失败',
+          error: preResult.error,
+          context: execContext('前置脚本'),
+        })
         return
       }
       outgoing = preResult.request
@@ -748,6 +822,15 @@ async function send() {
 
     result.value = await api.sendRequest(payload)
 
+    // 超时、DNS、TLS、连接被拒等执行期错误会放在 result.error，直接弹窗展示完整原因
+    if (result.value.error) {
+      errorDialog.show({
+        title: '请求发送失败',
+        error: result.value.error,
+        context: execContext('发送请求'),
+      })
+    }
+
     const postCode = form.value.postScript?.trim()
     if (postCode) {
       const postResult = runPostScript(postCode, outgoing, result.value, envVars)
@@ -755,11 +838,21 @@ async function send() {
       scriptAssertions.value = postResult.assertions
       scriptMs.value += postResult.durationMs
       scriptError.value = postResult.error ?? ''
-      if (postResult.error) message.error(`后置脚本执行失败：${postResult.error}`)
+      if (postResult.error) {
+        errorDialog.show({
+          title: '后置脚本执行失败',
+          error: postResult.error,
+          context: execContext('后置脚本'),
+        })
+      }
       if (postResult.assertions.length || postResult.error) responseTab.value = 'tests'
     }
   } catch (e) {
-    message.error(String(e))
+    errorDialog.show({
+      title: '请求执行失败',
+      error: e,
+      context: execContext('请求执行'),
+    })
   } finally {
     sending.value = false
     scriptVars.value = listRuntimeVars()
@@ -1015,6 +1108,21 @@ const responseHeaders = computed(() => {
             <template #icon><DeleteOutlined /></template>
             删除
           </a-button>
+          <a-dropdown :trigger="['click']" placement="bottomRight">
+            <a-button>
+              <template #icon><AiSparkIcon /></template>
+              AI 分析
+              <DownOutlined class="ai-caret" />
+            </a-button>
+            <template #overlay>
+              <a-menu @click="(info: any) => runAi(String(info.key))">
+                <a-menu-item key="explain">解释这次请求 / 响应</a-menu-item>
+                <a-menu-item key="assert">生成断言脚本</a-menu-item>
+                <a-menu-item key="post">生成后置提取脚本</a-menu-item>
+                <a-menu-item key="optimize">优化这个接口定义</a-menu-item>
+              </a-menu>
+            </template>
+          </a-dropdown>
           <a-button @click="openCookies">Cookie</a-button>
           <a-button @click="openCode">
             <template #icon><CodeOutlined /></template>
@@ -1102,6 +1210,17 @@ const responseHeaders = computed(() => {
               {{ env.name }}
             </a-select-option>
           </a-select>
+          <a-tooltip :title="projectId ? '管理环境变量（增删变量、环境脚本）' : '当前接口未关联项目，无法管理环境'">
+            <a-button
+              type="text"
+              size="small"
+              class="env-gear"
+              :disabled="!projectId"
+              @click="envDrawerOpen = true"
+            >
+              <template #icon><SettingOutlined /></template>
+            </a-button>
+          </a-tooltip>
           <a-button type="primary" class="send-btn" :loading="sending" @click="send">
             <template #icon><SendOutlined /></template>
             发送
@@ -1435,10 +1554,14 @@ const responseHeaders = computed(() => {
                   <a-alert
                     v-if="scriptError"
                     type="error"
-                    :message="`脚本执行出错：${scriptError}`"
                     show-icon
                     class="test-alert"
-                  />
+                  >
+                    <template #message>脚本执行出错</template>
+                    <template #description>
+                      <pre class="script-error-pre">{{ scriptError }}</pre>
+                    </template>
+                  </a-alert>
                   <div v-if="scriptAssertions.length" class="test-list">
                     <div
                       v-for="(item, index) in scriptAssertions"
@@ -1681,6 +1804,14 @@ const responseHeaders = computed(() => {
         <div v-else class="diff-empty">暂无可对比内容</div>
       </div>
     </a-modal>
+
+    <EnvironmentDrawer
+      v-model:open="envDrawerOpen"
+      :project-id="projectId"
+      :active-id="envId"
+      @select="envId = $event"
+      @changed="onEnvsChanged"
+    />
   </a-spin>
 </template>
 
@@ -1689,6 +1820,11 @@ const responseHeaders = computed(() => {
   height: 100%;
   display: flex;
   flex-direction: column;
+}
+
+.ai-caret {
+  font-size: 10px;
+  margin-left: 4px;
 }
 
 :deep(.ant-spin-nested-loading),
@@ -2004,6 +2140,17 @@ const responseHeaders = computed(() => {
 
 .env-select :deep(.ant-select-selector) {
   box-shadow: none !important;
+}
+
+.env-gear {
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  color: var(--fm-text-2);
+}
+
+.env-gear:hover {
+  color: var(--fm-primary);
 }
 
 .send-btn {
@@ -2433,6 +2580,17 @@ const responseHeaders = computed(() => {
   margin-bottom: 10px;
 }
 
+.script-error-pre {
+  margin: 2px 0 0;
+  max-height: 190px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: 'JetBrains Mono', 'Cascadia Code', 'SFMono-Regular', Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.6;
+}
+
 .test-list {
   display: flex;
   flex-direction: column;
@@ -2474,6 +2632,7 @@ const responseHeaders = computed(() => {
   color: var(--fm-danger);
   font-size: 10.5px;
   word-break: break-all;
+  white-space: pre-wrap;
   text-align: right;
 }
 

@@ -24,14 +24,14 @@ const type = ref<QrContentType>('text')
 
 const content = reactive<QrContent>({
   text: 'https://example.com',
-  wifiSsid: 'FbinHttp-WiFi',
-  wifiPassword: 'fbinhttp2026',
+  wifiSsid: 'AstroMan-WiFi',
+  wifiPassword: 'astroman2026',
   wifiSecurity: 'WPA',
   wifiHidden: false,
   vName: '张三',
   vPhone: '13800138000',
   vEmail: 'zhangsan@example.com',
-  vOrg: 'FbinHttp',
+  vOrg: 'AstroMan',
   vTitle: '开发工程师',
   vUrl: 'https://example.com',
   vAddress: '浙江省杭州市',

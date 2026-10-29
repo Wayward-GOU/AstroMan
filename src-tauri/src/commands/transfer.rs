@@ -8,9 +8,9 @@ use crate::state::AppState;
 use crate::util::{err, now_ms};
 
 /// 导出使用的格式标记
-const FORMAT: &str = "fbinhttp.project";
-/// 改名前的格式标记，仍需接受，保证旧导出文件可以导入
-const LEGACY_FORMAT: &str = "finkmeter.project";
+const FORMAT: &str = "astroman.project";
+/// 改名前的格式标记（FbinHttp / FinkMeter 时期），仍需接受，保证旧导出文件可以导入
+const LEGACY_FORMATS: [&str; 2] = ["fbinhttp.project", "finkmeter.project"];
 const VERSION: u32 = 1;
 
 #[derive(Serialize, Deserialize)]
@@ -343,8 +343,8 @@ pub fn project_import(state: State<'_, AppState>, path: String) -> Result<Projec
     let bundle: ExportBundle =
         serde_json::from_str(&content).map_err(|e| format!("文件格式不正确：{e}"))?;
 
-    if bundle.format != FORMAT && bundle.format != LEGACY_FORMAT {
-        return Err("这不是 FbinHttp 项目文件".to_string());
+    if bundle.format != FORMAT && !LEGACY_FORMATS.contains(&bundle.format.as_str()) {
+        return Err("这不是 AstroMan 项目文件".to_string());
     }
     if bundle.version > VERSION {
         return Err("项目文件版本高于当前应用，请升级后再导入".to_string());

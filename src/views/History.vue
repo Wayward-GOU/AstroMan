@@ -4,9 +4,12 @@ import { useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
 import type { Dayjs } from 'dayjs'
 import { ClockCircleOutlined, DeleteOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons-vue'
+import AiSparkIcon from '@/components/AiSparkIcon.vue'
 import PageHeader from '@/components/PageHeader.vue'
+import { useAiAssistStore } from '@/stores/aiAssist'
 import { useTabsStore } from '@/stores/tabs'
 import { formatDateTime } from '@/utils/datetime'
+import { historyDiagnosePrompt } from '@/utils/aiScenarios'
 import * as api from '@/api'
 import type { CleanupResult, HistoryItem, HistoryStats } from '@/types/models'
 
@@ -67,6 +70,20 @@ const summary = computed(() => {
     : 0
   return { total, failed, avg, runs: stats.value?.runsTotal ?? 0 }
 })
+
+const aiAssist = useAiAssistStore()
+
+function aiAnalyze() {
+  if (!rows.value.length) {
+    message.warning('当前没有可分析的历史记录')
+    return
+  }
+  void aiAssist.show({
+    title: '请求历史分析',
+    prompt: historyDiagnosePrompt(rows.value, stats.value),
+    hint: `当前筛选结果 ${rows.value.length} 条，失败 ${summary.value.failed} 条，平均耗时 ${summary.value.avg.toFixed(0)}ms`,
+  })
+}
 
 function fmtTime(ts: number) {
   return formatDateTime(ts)
@@ -218,6 +235,10 @@ const columns = [
       title="请求历史"
       subtitle="本机保留最近 100000 条发送记录，默认展示最新 500 条，点击可跳回原接口；支持按时间范围清理"
     >
+      <a-button :disabled="!rows.length" @click="aiAnalyze">
+        <template #icon><AiSparkIcon /></template>
+        AI 分析
+      </a-button>
       <a-button :loading="loading" @click="load">
         <template #icon><ReloadOutlined /></template>
         刷新

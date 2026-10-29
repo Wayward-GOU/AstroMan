@@ -276,7 +276,7 @@ onMounted(() => {
     <PageHeader title="用量统计" subtitle="每次模型调用各记一条，含 token 与估算费用，保留近 1 年">
       <a-button size="small" @click="backToAi">
         <template #icon><ArrowLeftOutlined /></template>
-        返回小HI
+        返回航仔
       </a-button>
       <a-button size="small" :loading="loading || statsLoading" @click="refresh">
         <template #icon><ReloadOutlined /></template>
@@ -369,7 +369,7 @@ onMounted(() => {
           <span class="chart-tick">{{ bar.showLabel ? bar.label : '' }}</span>
         </div>
       </div>
-      <div v-else class="panel-empty">还没有模型调用记录，和小HI 聊一句就会开始统计</div>
+      <div v-else class="panel-empty">还没有模型调用记录，和航仔 聊一句就会开始统计</div>
     </div>
 
     <div class="panel table-panel">

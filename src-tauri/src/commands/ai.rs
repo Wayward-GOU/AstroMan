@@ -1,3 +1,4 @@
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use aes_gcm::aead::{Aead, KeyInit};
@@ -15,14 +16,14 @@ use crate::models::{
     AiToolLog, AiToolLogPage, AiToolLogStats, AiToolUsageStat, AiUsageDay, AiUsageLog, AiUsagePage,
     AiUsageStat, AiUsageStats, HttpResult, SendRequestPayload,
 };
-use crate::prompts::XIAO_HI_SYSTEM_PROMPT;
+use crate::prompts::HANGZAI_SYSTEM_PROMPT;
 use crate::state::AppState;
 use crate::util::{err, now_ms};
 
 /// 派生 AES-256 密钥的固定种子。
 /// 属于「本机静态混淆」级别：能防止直接打开库文件看到明文 Key，但拿到程序本身仍可解出。
 /// 不引入系统钥匙串，保证 Windows / macOS 行为一致。
-const KEY_SEED: &str = "FbinHttp::ai::provider::v1";
+const KEY_SEED: &str = "AstroMan::ai::provider::v1";
 const CIPHER_PREFIX: &str = "v1:";
 /// AI 请求整体超时，长回答（尤其推理模型）留足时间
 const AI_TIMEOUT_SECS: u64 = 300;
@@ -67,22 +68,69 @@ fn decrypt_key(stored: &str) -> String {
     }
 }
 
+/// 列表回显用掩码：只留前 4 位与后 2 位，短 Key 全掩码
+fn mask_key(plain: &str) -> String {
+    if plain.is_empty() {
+        return String::new();
+    }
+    if plain.chars().count() <= 6 {
+        return "******".to_string();
+    }
+    let head: String = plain.chars().take(4).collect();
+    let tail: String = plain
+        .chars()
+        .rev()
+        .take(2)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{head}******{tail}")
+}
+
+/// 列表 / 编辑回显：绝不返回明文 Key，只给掩码与「是否已配置」
 fn row_to_provider(row: &Row) -> rusqlite::Result<AiProvider> {
     let stored: String = row.get(5)?;
+    let plain = decrypt_key(&stored);
     Ok(AiProvider {
         id: Some(row.get(0)?),
         name: row.get(1)?,
         kind: row.get(2)?,
         base_url: row.get(3)?,
         model: row.get(4)?,
-        api_key: decrypt_key(&stored),
+        api_key: String::new(),
+        api_key_masked: mask_key(&plain),
+        has_key: !plain.is_empty(),
         temperature: Some(row.get(6)?),
-        is_default: row.get::<_, i64>(7)? != 0,
+        max_tokens: Some(row.get::<_, i64>(7)?),
+        timeout_secs: Some(row.get::<_, i64>(8)?),
+        is_default: row.get::<_, i64>(9)? != 0,
+    })
+}
+
+/// 内部调用（发送请求）才解密明文，明文不出 Rust 进程
+fn row_to_provider_plain(row: &Row) -> rusqlite::Result<AiProvider> {
+    let stored: String = row.get(5)?;
+    let plain = decrypt_key(&stored);
+    Ok(AiProvider {
+        id: Some(row.get(0)?),
+        name: row.get(1)?,
+        kind: row.get(2)?,
+        base_url: row.get(3)?,
+        model: row.get(4)?,
+        api_key: plain.clone(),
+        api_key_masked: mask_key(&plain),
+        has_key: !plain.is_empty(),
+        temperature: Some(row.get(6)?),
+        max_tokens: Some(row.get::<_, i64>(7)?),
+        timeout_secs: Some(row.get::<_, i64>(8)?),
+        is_default: row.get::<_, i64>(9)? != 0,
     })
 }
 
 const PROVIDER_COLUMNS: &str = "id, name, COALESCE(kind, 'openai'), base_url, model,
                                 COALESCE(api_key_enc, ''), COALESCE(temperature, 0.3),
+                                COALESCE(max_tokens, 0), COALESCE(timeout_secs, 300),
                                 COALESCE(is_default, 0)";
 
 #[tauri::command]
@@ -120,6 +168,11 @@ pub fn ai_provider_save(
     let conn = state.pool.get().map_err(err)?;
     let now = now_ms();
     let temperature = provider.temperature.unwrap_or(0.3).clamp(0.0, 2.0);
+    let max_tokens = provider.max_tokens.unwrap_or(0).max(0);
+    let timeout_secs = match provider.timeout_secs.unwrap_or(AI_TIMEOUT_SECS as i64) {
+        0 => AI_TIMEOUT_SECS as i64,
+        value => value.clamp(10, 3600),
+    };
     let key_enc = encrypt_key(&provider.api_key)?;
 
     if provider.is_default {
@@ -134,8 +187,9 @@ pub fn ai_provider_save(
                 conn.execute(
                     "UPDATE ai_providers
                      SET name = ?1, kind = ?2, base_url = ?3, model = ?4,
-                         temperature = ?5, is_default = ?6, enabled = 1, updated_at = ?7
-                     WHERE id = ?8",
+                         temperature = ?5, is_default = ?6, max_tokens = ?7,
+                         timeout_secs = ?8, enabled = 1, updated_at = ?9
+                     WHERE id = ?10",
                     params![
                         provider.name.trim(),
                         kind,
@@ -143,6 +197,8 @@ pub fn ai_provider_save(
                         provider.model.trim(),
                         temperature,
                         provider.is_default as i64,
+                        max_tokens,
+                        timeout_secs,
                         now,
                         id
                     ],
@@ -152,8 +208,9 @@ pub fn ai_provider_save(
                 conn.execute(
                     "UPDATE ai_providers
                      SET name = ?1, kind = ?2, base_url = ?3, model = ?4, api_key_enc = ?5,
-                         temperature = ?6, is_default = ?7, enabled = 1, updated_at = ?8
-                     WHERE id = ?9",
+                         temperature = ?6, is_default = ?7, max_tokens = ?8,
+                         timeout_secs = ?9, enabled = 1, updated_at = ?10
+                     WHERE id = ?11",
                     params![
                         provider.name.trim(),
                         kind,
@@ -162,6 +219,8 @@ pub fn ai_provider_save(
                         key_enc,
                         temperature,
                         provider.is_default as i64,
+                        max_tokens,
+                        timeout_secs,
                         now,
                         id
                     ],
@@ -173,8 +232,9 @@ pub fn ai_provider_save(
         None => {
             conn.execute(
                 "INSERT INTO ai_providers
-                   (name, kind, base_url, model, api_key_enc, temperature, is_default, enabled, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?8)",
+                   (name, kind, base_url, model, api_key_enc, temperature, max_tokens,
+                    timeout_secs, is_default, enabled, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?10)",
                 params![
                     provider.name.trim(),
                     kind,
@@ -182,6 +242,8 @@ pub fn ai_provider_save(
                     provider.model.trim(),
                     key_enc,
                     temperature,
+                    max_tokens,
+                    timeout_secs,
                     provider.is_default as i64,
                     now
                 ],
@@ -191,14 +253,31 @@ pub fn ai_provider_save(
         }
     };
 
+    let plain = if provider.api_key.is_empty() {
+        // 沿用原 Key 时读回掩码，避免返回明文
+        conn.query_row(
+            "SELECT COALESCE(api_key_enc, '') FROM ai_providers WHERE id = ?1",
+            params![id],
+            |row| row.get::<_, String>(0),
+        )
+        .map(|stored| decrypt_key(&stored))
+        .unwrap_or_default()
+    } else {
+        provider.api_key.clone()
+    };
+
     Ok(AiProvider {
         id: Some(id),
         name: provider.name.trim().to_string(),
         kind,
         base_url: provider.base_url.trim().to_string(),
         model: provider.model.trim().to_string(),
-        api_key: provider.api_key,
+        api_key: String::new(),
+        api_key_masked: mask_key(&plain),
+        has_key: !plain.is_empty(),
         temperature: Some(temperature),
+        max_tokens: Some(max_tokens),
+        timeout_secs: Some(timeout_secs),
         is_default: provider.is_default,
     })
 }
@@ -217,7 +296,7 @@ fn load_provider(state: &AppState, id: i64) -> Result<AiProvider, String> {
         "SELECT {PROVIDER_COLUMNS} FROM ai_providers
          WHERE id = ?1 AND COALESCE(enabled, 1) = 1"
     );
-    conn.query_row(&sql, params![id], row_to_provider)
+    conn.query_row(&sql, params![id], row_to_provider_plain)
         .map_err(|_| "AI 服务不存在或已停用，请先配置".to_string())
 }
 
@@ -272,7 +351,7 @@ fn prepare(
                 .collect();
             let mut body = serde_json::json!({
                 "model": provider.model,
-                "max_tokens": 4096,
+                "max_tokens": provider.max_tokens.filter(|value| *value > 0).unwrap_or(4096),
                 "temperature": temperature,
                 "stream": stream,
                 "messages": chat,
@@ -309,6 +388,9 @@ fn prepare(
                 "contents": contents,
                 "generationConfig": { "temperature": temperature },
             });
+            if let Some(max) = provider.max_tokens.filter(|value| *value > 0) {
+                body["generationConfig"]["maxOutputTokens"] = serde_json::json!(max);
+            }
             if !system.is_empty() {
                 body["systemInstruction"] = serde_json::json!({
                     "parts": [{ "text": system.join("\n\n") }]
@@ -341,15 +423,20 @@ fn prepare(
                     serde_json::json!({ "role": role, "content": m.content })
                 })
                 .collect();
+            let mut body = serde_json::json!({
+                "model": provider.model,
+                "temperature": temperature,
+                "stream": stream,
+                "messages": chat,
+            });
+            // 不配置时不传，交给服务商默认值，避免部分网关拒绝未知字段
+            if let Some(max) = provider.max_tokens.filter(|value| *value > 0) {
+                body["max_tokens"] = serde_json::json!(max);
+            }
             Ok(Prepared {
                 url: format!("{base}/chat/completions"),
                 headers: vec![("Authorization".to_string(), format!("Bearer {key}"))],
-                body: serde_json::json!({
-                    "model": provider.model,
-                    "temperature": temperature,
-                    "stream": stream,
-                    "messages": chat,
-                }),
+                body,
             })
         }
     }
@@ -516,6 +603,7 @@ fn parse_full_text(kind: &str, raw: &str) -> Result<String, String> {
     Ok(text)
 }
 
+#[derive(Debug, PartialEq)]
 enum SseOutcome {
     Text(String),
     Reasoning(String),
@@ -759,6 +847,35 @@ fn request_preview(messages: &[AiMessage]) -> String {
     )
 }
 
+/// 请求结束时释放取消登记（无论成功 / 失败 / 被停止）
+struct AiCancelGuard<'a> {
+    state: &'a AppState,
+    id: Option<&'a str>,
+}
+
+impl Drop for AiCancelGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.id {
+            self.state.ai_release(id);
+        }
+    }
+}
+
+/// 停止在途生成：命中返回 true，未命中（已结束）返回 false
+#[tauri::command]
+pub fn ai_chat_cancel(state: State<'_, AppState>, request_id: String) -> bool {
+    state.ai_request_cancel(&request_id)
+}
+
+/// 429 响应里的 Retry-After（秒），解析失败退回 None
+fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|value| value.min(30))
+}
+
 #[tauri::command]
 pub async fn ai_chat(
     state: State<'_, AppState>,
@@ -774,16 +891,36 @@ pub async fn ai_chat(
         .or(provider.temperature)
         .unwrap_or(0.3)
         .clamp(0.0, 2.0);
+    let timeout_secs = provider
+        .timeout_secs
+        .unwrap_or(AI_TIMEOUT_SECS as i64)
+        .clamp(10, 3600) as u64;
 
-    // 小HI 的系统提示词由后端统一注入（编译期嵌入），客户端无法覆盖或移除；
+    // 停止生成：requestId 登记后，前端可随时调用 ai_chat_cancel 置位
+    let request_id = payload.request_id.clone();
+    let cancel = request_id
+        .as_deref()
+        .map(|id| state.ai_register(id));
+    let is_cancelled = || -> bool {
+        cancel
+            .as_ref()
+            .map(|flag| flag.load(Ordering::SeqCst))
+            .unwrap_or(false)
+    };
+    let _release = AiCancelGuard {
+        state: state.inner(),
+        id: request_id.as_deref(),
+    };
+
+    // 航仔 的系统提示词由后端统一注入（编译期嵌入），客户端无法覆盖或移除；
     // 前端追加的 system 消息只承载工具协议，排在其后。
     let mut messages = payload.messages.clone();
-    messages.retain(|message| message.role != "system" || message.content.trim() != XIAO_HI_SYSTEM_PROMPT.trim());
+    messages.retain(|message| message.role != "system" || message.content.trim() != HANGZAI_SYSTEM_PROMPT.trim());
     messages.insert(
         0,
         AiMessage {
             role: "system".to_string(),
-            content: XIAO_HI_SYSTEM_PROMPT.to_string(),
+            content: HANGZAI_SYSTEM_PROMPT.to_string(),
         },
     );
     // 本次调用实际「问了什么」，随用量流水一起落库
@@ -804,29 +941,79 @@ pub async fn ai_chat(
     let mut request = state
         .client(false)
         .post(&prepared.url)
-        .timeout(Duration::from_secs(AI_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(timeout_secs))
         .header("Content-Type", "application/json")
         .json(&prepared.body);
     for (key, value) in &prepared.headers {
         request = request.header(key, value);
     }
 
-    let response = match request.send().await {
-        Ok(response) => response,
-        Err(error) => {
-            let text = humanize_network_error(&error.to_string());
-            emit(&on_event, "error", text.clone());
-            record_usage(
-                state.inner(),
-                &provider,
-                prompt_chars,
-                0,
-                false,
-                started.elapsed().as_millis() as i64,
-                Some(&text),
-                &preview,
-            );
-            return Err(text);
+    if is_cancelled() {
+        emit(&on_event, "cancelled", "");
+        return Ok(());
+    }
+
+    // 首 delta 之前允许自动重试（429 / 5xx / 网络错误），最多 2 次；
+    // 一旦给用户吐出内容就不再静默重试，否则会出现半句话后整段重来
+    let mut attempt = 0u32;
+    let response = loop {
+        attempt += 1;
+        let attempt_request = request
+            .try_clone()
+            .ok_or_else(|| "请求体无法复用，已停止重试".to_string())?;
+        match attempt_request.send().await {
+            Ok(response) => {
+                let status = response.status();
+                let retryable = status.as_u16() == 429 || status.is_server_error();
+                if retryable && attempt <= 2 {
+                    let wait = retry_after_secs(response.headers())
+                        .unwrap_or(if attempt == 1 { 1 } else { 3 });
+                    emit(
+                        &on_event,
+                        "retry",
+                        format!(
+                            "服务{}，{wait} 秒后重试（{attempt}/2）",
+                            if status.as_u16() == 429 { "限流" } else { "繁忙" }
+                        ),
+                    );
+                    tokio::time::sleep(Duration::from_secs(wait)).await;
+                    if is_cancelled() {
+                        emit(&on_event, "cancelled", "");
+                        return Ok(());
+                    }
+                    continue;
+                }
+                break response;
+            }
+            Err(error) => {
+                if attempt <= 2 {
+                    let wait = if attempt == 1 { 1 } else { 3 };
+                    emit(
+                        &on_event,
+                        "retry",
+                        format!("网络异常，{wait} 秒后重试（{attempt}/2）"),
+                    );
+                    tokio::time::sleep(Duration::from_secs(wait)).await;
+                    if is_cancelled() {
+                        emit(&on_event, "cancelled", "");
+                        return Ok(());
+                    }
+                    continue;
+                }
+                let text = humanize_network_error(&error.to_string());
+                emit(&on_event, "error", text.clone());
+                record_usage(
+                    state.inner(),
+                    &provider,
+                    prompt_chars,
+                    0,
+                    false,
+                    started.elapsed().as_millis() as i64,
+                    Some(&text),
+                    &preview,
+                );
+                return Err(text);
+            }
         }
     };
 
@@ -862,6 +1049,10 @@ pub async fn ai_chat(
     if !is_sse {
         // 部分代理会忽略 stream 参数，直接整包返回 JSON
         let raw = response.text().await.map_err(err)?;
+        if is_cancelled() {
+            emit(&on_event, "cancelled", "");
+            return Ok(());
+        }
         let (prompt, completion) = usage_of(&provider.kind, &serde_json::from_str(&raw).unwrap_or_default())
             .unwrap_or((prompt_chars, 0));
         return match parse_full_text(&provider.kind, &raw) {
@@ -922,6 +1113,12 @@ pub async fn ai_chat(
         }};
     }
     while let Some(chunk) = stream.next().await {
+        // 用户点「停止」：立即停流并释放，后台不再继续消耗 token
+        if is_cancelled() {
+            emit(&on_event, "cancelled", "");
+            finish!(true, None);
+            return Ok(());
+        }
         let chunk = match chunk {
             Ok(chunk) => chunk,
             Err(error) => {
@@ -1016,6 +1213,83 @@ pub async fn ai_provider_test(state: State<'_, AppState>, id: i64) -> Result<Str
     }
 }
 
+/// 拉取服务商实际可用的模型列表（前端缓存 24 小时，失败回退内置清单）
+#[tauri::command]
+pub async fn ai_models_list(
+    state: State<'_, AppState>,
+    provider_id: i64,
+) -> Result<Vec<String>, String> {
+    let provider = load_provider(state.inner(), provider_id)?;
+    let base = if provider.base_url.trim().is_empty() {
+        default_base(&provider.kind).to_string()
+    } else {
+        provider
+            .base_url
+            .trim()
+            .trim_end_matches('/')
+            .to_string()
+    };
+    let key = provider.api_key.trim();
+    let client = state.client(false);
+    let (url, request) = match provider.kind.as_str() {
+        "anthropic" => (
+            format!("{base}/v1/models"),
+            client
+                .get(format!("{base}/v1/models"))
+                .header("x-api-key", key)
+                .header("anthropic-version", "2023-06-01"),
+        ),
+        "gemini" => (
+            format!("{base}/v1beta/models"),
+            client.get(format!("{base}/v1beta/models")).header("x-goog-api-key", key),
+        ),
+        _ => (
+            format!("{base}/models"),
+            client
+                .get(format!("{base}/models"))
+                .header("Authorization", format!("Bearer {key}")),
+        ),
+    };
+    let response = request
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await
+        .map_err(|error| humanize_network_error(&error.to_string()))?;
+    let status = response.status();
+    let raw = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!(
+            "拉取模型失败（{}）：{}",
+            status.as_u16(),
+            humanize_api_error(status.as_u16(), &extract_api_error(&raw))
+        ));
+    }
+    let json: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|_| format!("{url} 返回的不是合法 JSON，无法解析模型列表"))?;
+    let mut models: Vec<String> = Vec::new();
+    if provider.kind == "gemini" {
+        if let Some(list) = json["models"].as_array() {
+            for item in list {
+                if let Some(name) = item["name"].as_str() {
+                    models.push(name.trim_start_matches("models/").to_string());
+                }
+            }
+        }
+    } else if let Some(list) = json["data"].as_array() {
+        for item in list {
+            if let Some(id) = item["id"].as_str() {
+                models.push(id.to_string());
+            }
+        }
+    }
+    models.sort();
+    models.dedup();
+    if models.is_empty() {
+        return Err("服务商未返回可用模型列表".to_string());
+    }
+    Ok(models)
+}
+
 /// AI 生成的请求执行入口：与手动发送共用同一实现（历史、Cookie、快照一致）
 #[tauri::command]
 pub async fn ai_execute(
@@ -1040,31 +1314,75 @@ fn truncate_title(text: &str) -> String {
 }
 
 #[tauri::command]
-pub fn ai_session_list(state: State<'_, AppState>) -> Result<Vec<AiSession>, String> {
+pub fn ai_session_list(
+    state: State<'_, AppState>,
+    keyword: Option<String>,
+) -> Result<Vec<AiSession>, String> {
     let conn = state.pool.get().map_err(err)?;
+    let keyword = keyword.unwrap_or_default().trim().to_string();
+    let pattern = format!("%{keyword}%");
     let mut stmt = conn
         .prepare(
             "SELECT s.id, s.title, s.provider_id,
                     (SELECT COUNT(*) FROM ai_messages m WHERE m.session_id = s.id),
+                    COALESCE(s.pinned, 0), s.summary, COALESCE(s.summary_until, 0),
                     s.created_at, s.updated_at
              FROM ai_sessions s
-             ORDER BY s.updated_at DESC, s.id DESC
+             WHERE ?1 = ''
+                OR s.title LIKE ?2
+                OR EXISTS (
+                    SELECT 1 FROM ai_messages m
+                    WHERE m.session_id = s.id AND m.content LIKE ?2
+                )
+             ORDER BY COALESCE(s.pinned, 0) DESC, s.updated_at DESC, s.id DESC
              LIMIT 200",
         )
         .map_err(err)?;
     let rows = stmt
-        .query_map([], |row| {
+        .query_map(params![keyword, pattern], |row| {
             Ok(AiSession {
                 id: row.get(0)?,
                 title: row.get(1)?,
                 provider_id: row.get(2)?,
                 message_count: row.get(3)?,
-                created_at: row.get(4)?,
-                updated_at: row.get(5)?,
+                pinned: row.get::<_, i64>(4)? != 0,
+                summary: row.get(5)?,
+                summary_until: row.get(6)?,
+                created_at: row.get(7)?,
+                updated_at: row.get(8)?,
             })
         })
         .map_err(err)?;
     Ok(rows.filter_map(Result::ok).collect())
+}
+
+/// 置顶 / 取消置顶：会话多了以后按重要程度排序
+#[tauri::command]
+pub fn ai_session_pin(state: State<'_, AppState>, id: i64, pinned: bool) -> Result<(), String> {
+    let conn = state.pool.get().map_err(err)?;
+    conn.execute(
+        "UPDATE ai_sessions SET pinned = ?1 WHERE id = ?2",
+        params![pinned as i64, id],
+    )
+    .map_err(err)?;
+    Ok(())
+}
+
+/// 保存历史摘要：从下一轮开始替代 summary_until 之前的原文
+#[tauri::command]
+pub fn ai_session_summary_save(
+    state: State<'_, AppState>,
+    id: i64,
+    summary: String,
+    summary_until: i64,
+) -> Result<(), String> {
+    let conn = state.pool.get().map_err(err)?;
+    conn.execute(
+        "UPDATE ai_sessions SET summary = ?1, summary_until = ?2 WHERE id = ?3",
+        params![summary, summary_until, id],
+    )
+    .map_err(err)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -1089,6 +1407,9 @@ pub fn ai_session_create(
         title,
         provider_id,
         message_count: 0,
+        pinned: false,
+        summary: None,
+        summary_until: 0,
         created_at: now,
         updated_at: now,
     })
@@ -1208,10 +1529,11 @@ pub fn ai_message_add(
     let now = now_ms();
     let content = clip_trace(&strip_file_blocks(&content), MESSAGE_MAX_CHARS);
     let reasoning = reasoning.map(|text| clip_trace(&text, REASONING_MAX_CHARS));
+    let token_count = estimate_tokens(&content);
     conn.execute(
-        "INSERT INTO ai_messages (session_id, role, content, reasoning, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![session_id, role, content, reasoning, now],
+        "INSERT INTO ai_messages (session_id, role, content, reasoning, token_count, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![session_id, role, content, reasoning, token_count, now],
     )
     .map_err(err)?;
     let id = conn.last_insert_rowid();
@@ -1255,6 +1577,35 @@ pub fn ai_message_clear(state: State<'_, AppState>, session_id: i64) -> Result<(
     Ok(())
 }
 
+/// 编辑重发：删除指定时间起的消息（含被编辑的那条），避免重发后旧分支残留
+#[tauri::command]
+pub fn ai_message_delete_from(
+    state: State<'_, AppState>,
+    session_id: i64,
+    created_at: i64,
+    inclusive: Option<bool>,
+) -> Result<(), String> {
+    let conn = state.pool.get().map_err(err)?;
+    let compare = if inclusive.unwrap_or(true) { ">=" } else { ">" };
+    conn.execute(
+        &format!(
+            "DELETE FROM ai_messages WHERE session_id = ?1 AND created_at {compare} ?2"
+        ),
+        params![session_id, created_at],
+    )
+    .map_err(err)?;
+    Ok(())
+}
+
+/// 删除单条消息（按数据库 id）：消息级「删除」只移除这一条，不动前后对话
+#[tauri::command]
+pub fn ai_message_delete(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    let conn = state.pool.get().map_err(err)?;
+    conn.execute("DELETE FROM ai_messages WHERE id = ?1", params![id])
+        .map_err(err)?;
+    Ok(())
+}
+
 /* ---------------- 工具调用流水 ---------------- */
 
 /// 工具流水保留上限：近 1 年
@@ -1281,14 +1632,17 @@ pub fn ai_tool_log_add(
     ok: bool,
     duration_ms: i64,
     result_preview: String,
+    round: Option<i64>,
+    trace_id: Option<String>,
+    timeout: Option<bool>,
 ) -> Result<(), String> {
     let conn = state.pool.get().map_err(err)?;
     let args: String = args.chars().take(2000).collect();
     let preview: String = result_preview.chars().take(2000).collect();
     conn.execute(
         "INSERT INTO ai_tool_logs
-           (session_id, tool, args, ok, duration_ms, result_preview, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+           (session_id, tool, args, ok, duration_ms, result_preview, round, trace_id, timeout, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             session_id,
             tool,
@@ -1296,6 +1650,9 @@ pub fn ai_tool_log_add(
             ok as i64,
             duration_ms,
             preview,
+            round.unwrap_or(0),
+            trace_id,
+            timeout.unwrap_or(false) as i64,
             now_ms()
         ],
     )
@@ -1338,7 +1695,8 @@ pub fn ai_tool_log_list(
     let mut stmt = conn
         .prepare(
             "SELECT id, session_id, tool, COALESCE(args, ''), ok,
-                    duration_ms, COALESCE(result_preview, ''), created_at
+                    duration_ms, COALESCE(result_preview, ''), created_at,
+                    COALESCE(round, 0), trace_id, COALESCE(timeout, 0)
              FROM ai_tool_logs
              WHERE (?1 IS NULL OR session_id = ?1)
                AND (?2 = '' OR tool = ?2)
@@ -1361,6 +1719,9 @@ pub fn ai_tool_log_list(
                     duration_ms: row.get(5)?,
                     result_preview: row.get(6)?,
                     created_at: row.get(7)?,
+                    round: row.get(8)?,
+                    trace_id: row.get(9)?,
+                    timeout: row.get::<_, i64>(10)? != 0,
                 })
             },
         )
@@ -1696,5 +2057,158 @@ fn rate(part: i64, total: i64) -> f64 {
         0.0
     } else {
         part as f64 / total as f64
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mask_key_keeps_head_and_tail() {
+        assert_eq!(mask_key("sk-1234567890abcdef"), "sk-1******ef");
+        assert_eq!(mask_key("short"), "******");
+        assert_eq!(mask_key(""), "");
+    }
+
+    #[test]
+    fn encrypt_decrypt_roundtrip() {
+        let plain = "sk-test-不会出现在明文里的密钥";
+        let packed = encrypt_key(plain).expect("encrypt");
+        assert_ne!(packed, plain);
+        assert_eq!(decrypt_key(&packed), plain);
+        // 空串与损坏密文都不 panic
+        assert_eq!(decrypt_key(""), "");
+        // 历史明文行按原样返回，带前缀但损坏的密文返回空串
+        assert_eq!(decrypt_key("legacy-plain-key"), "legacy-plain-key");
+        assert_eq!(decrypt_key(&format!("{CIPHER_PREFIX}not-base64!!!")), "");
+    }
+
+    #[test]
+    fn humanize_api_error_maps_common_status() {
+        assert!(humanize_api_error(401, "x").contains("API Key 无效"));
+        assert!(humanize_api_error(402, "x").contains("余额"));
+        assert!(humanize_api_error(403, "x").contains("没有访问权限"));
+        assert!(humanize_api_error(404, "x").contains("接口地址或模型不存在"));
+        assert!(humanize_api_error(429, "x").contains("请求过于频繁"));
+        assert!(humanize_api_error(503, "x").contains("HTTP 503"));
+        assert!(humanize_api_error(400, "bad param").contains("bad param"));
+        // 未知状态码保留原文
+        assert_eq!(humanize_api_error(418, "teapot"), "teapot");
+    }
+
+    #[test]
+    fn humanize_api_error_supported_models() {
+        let msg = "The supported API model names are deepseek-chat, deepseek-reasoner, but you passed gpt-4.";
+        let text = humanize_api_error(400, msg);
+        assert!(text.contains("gpt-4"));
+        assert!(text.contains("deepseek-chat"));
+        assert!(text.contains("模型服务配置"));
+    }
+
+    #[test]
+    fn humanize_api_error_context_length() {
+        let text = humanize_api_error(400, "This model's maximum context length is 8192 tokens");
+        assert!(text.contains("上下文长度"));
+    }
+
+    #[test]
+    fn humanize_network_error_categories() {
+        assert!(humanize_network_error("dns error: failed to lookup address").contains("无法解析"));
+        assert!(humanize_network_error("connection refused").contains("连接被拒绝"));
+        assert!(humanize_network_error("operation timed out").contains("连接超时"));
+        assert!(humanize_network_error("certificate verify failed").contains("证书"));
+        assert!(humanize_network_error("boom").starts_with("连接 AI 服务失败"));
+    }
+
+    #[test]
+    fn truncate_title_handles_cjk_and_whitespace() {
+        assert_eq!(truncate_title("  你好   世界  "), "你好 世界");
+        assert_eq!(truncate_title(""), "新对话");
+        let long = "一".repeat(30);
+        let title = truncate_title(&long);
+        assert_eq!(title.chars().count(), 25);
+        assert!(title.ends_with('…'));
+    }
+
+    #[test]
+    fn estimate_tokens_counts_cjk_as_one() {
+        assert_eq!(estimate_tokens("你好"), 2);
+        assert_eq!(estimate_tokens("abcd"), 1);
+        // 非中文按 4 字符 1 token 向上取整
+        assert_eq!(estimate_tokens("abcde"), 2);
+    }
+
+    #[test]
+    fn clip_chars_and_trace_add_notice() {
+        assert_eq!(clip_chars("abc", 5), "abc");
+        let clipped = clip_chars("abcdef", 3);
+        assert!(clipped.starts_with("abc"));
+        assert!(clipped.contains("已截断"));
+        let trace = clip_trace("abcdef", 3);
+        assert!(trace.contains("原长度 6"));
+    }
+
+    #[test]
+    fn strip_file_blocks_replaces_body_with_summary() {
+        let text = "看附件：\n```fbin-file demo.json\n{\"a\":1}\n```\n结束";
+        let stored = strip_file_blocks(text);
+        assert!(stored.contains("【附件 demo.json · 7 字符，正文未入库】"));
+        assert!(!stored.contains("{\"a\":1}"));
+        // 不完整围栏原样返回，不做破坏性处理
+        let broken = "```fbin-file demo.json\n没有收尾";
+        assert_eq!(strip_file_blocks(broken), broken);
+    }
+
+    #[test]
+    fn parse_sse_openai_text_and_done() {
+        let line = r#"data: {"choices":[{"delta":{"content":"你好"}}]}"#;
+        assert_eq!(parse_sse("openai", line), Ok(SseOutcome::Text("你好".into())));
+        assert_eq!(parse_sse("openai", "data: [DONE]"), Ok(SseOutcome::Done));
+        assert_eq!(parse_sse("openai", "event: ping"), Ok(SseOutcome::Ignore));
+        assert_eq!(parse_sse("openai", "data: not-json"), Ok(SseOutcome::Ignore));
+        let reasoning = r#"data: {"choices":[{"delta":{"reasoning_content":"思考"}}]}"#;
+        assert_eq!(
+            parse_sse("openai", reasoning),
+            Ok(SseOutcome::Reasoning("思考".into()))
+        );
+    }
+
+    #[test]
+    fn parse_sse_anthropic_and_gemini() {
+        let anth = r#"data: {"type":"content_block_delta","delta":{"text":"hi"}}"#;
+        assert_eq!(parse_sse("anthropic", anth), Ok(SseOutcome::Text("hi".into())));
+        let thinking = r#"data: {"type":"content_block_delta","delta":{"thinking":"想"}}"#;
+        assert_eq!(
+            parse_sse("anthropic", thinking),
+            Ok(SseOutcome::Reasoning("想".into()))
+        );
+        assert_eq!(
+            parse_sse("anthropic", r#"data: {"type":"message_stop"}"#),
+            Ok(SseOutcome::Done)
+        );
+        let gemini = r#"data: {"candidates":[{"content":{"parts":[{"text":"哈"}]}}]}"#;
+        assert_eq!(parse_sse("gemini", gemini), Ok(SseOutcome::Text("哈".into())));
+        let blocked = r#"data: {"promptFeedback":{"blockReason":"SAFETY"}}"#;
+        assert!(parse_sse("gemini", blocked).is_err());
+    }
+
+    #[test]
+    fn extract_api_error_reads_message_fields() {
+        assert_eq!(extract_api_error(""), "服务无响应内容");
+        assert_eq!(
+            extract_api_error(r#"{"error":{"message":"bad"}}"#),
+            "bad"
+        );
+        assert_eq!(extract_api_error(r#"{"message":"oops"}"#), "oops");
+        assert_eq!(extract_api_error("plain text"), "plain text");
+    }
+
+    #[test]
+    fn retry_after_reads_header() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "3".parse().unwrap());
+        assert_eq!(retry_after_secs(&headers), Some(3));
+        assert_eq!(retry_after_secs(&reqwest::header::HeaderMap::new()), None);
     }
 }

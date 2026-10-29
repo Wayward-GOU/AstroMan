@@ -3,7 +3,10 @@ import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
 import { PlusOutlined, CheckCircleFilled } from '@ant-design/icons-vue'
+import AiSparkIcon from '@/components/AiSparkIcon.vue'
 import PageHeader from '@/components/PageHeader.vue'
+import { useAiAssistStore } from '@/stores/aiAssist'
+import { envAuditPrompt } from '@/utils/aiScenarios'
 import * as api from '@/api'
 import type { Environment, EnvVariable } from '@/types/models'
 
@@ -22,6 +25,20 @@ const envScript = ref('')
 const scriptSaving = ref(false)
 
 const current = computed(() => environments.value.find((e) => e.id === currentId.value) ?? null)
+
+const aiAssist = useAiAssistStore()
+
+function aiAudit() {
+  if (!current.value) {
+    message.warning('先选择一个环境')
+    return
+  }
+  void aiAssist.show({
+    title: '环境变量体检',
+    prompt: envAuditPrompt(current.value, variables.value),
+    hint: `${current.value.name} · ${variables.value.length} 个变量 · 密钥值不会发送明文`,
+  })
+}
 
 onMounted(load)
 
@@ -133,6 +150,10 @@ function removeEnv(env: Environment) {
       title="环境变量"
       subtitle="请求里的 {{变量名}} 会被替换成当前环境变量、环境脚本或内置变量的值"
     >
+      <a-button :disabled="!current" @click="aiAudit">
+        <template #icon><AiSparkIcon /></template>
+        AI 体检
+      </a-button>
       <a-button @click="router.push(`/project/${projectId}`)">返回项目</a-button>
       <a-button type="primary" @click="createOpen = true">
         <template #icon><PlusOutlined /></template>
@@ -227,7 +248,7 @@ function removeEnv(env: Environment) {
             每次发送请求前执行，可用 <span class="mono" v-pre>vars.set('key', value)</span> 赋值，请求里用
             <span class="mono" v-pre>{{key}}</span> 引用；也可读取 <span class="mono" v-pre>request</span>、
             <span class="mono" v-pre>env</span>、<span class="mono" v-pre>rsa.publicEncrypt(明文, 公钥)</span>、
-            <span class="mono" v-pre>cipher</span>（aes / des / md5 / sha256 / hmac / base64）与
+            <span class="mono" v-pre>cipher</span>（aes / des / 3des / md5 / sha1 / sha256 / hmac / base64 / hex）与
             <span class="mono" v-pre>console</span>。
           </div>
         </div>
@@ -248,7 +269,9 @@ function removeEnv(env: Environment) {
       <div class="hint-head">
         <div class="hint-title">变量与脚本说明</div>
         <div class="hint-sub">
-          变量优先级：运行时变量（脚本 <span class="mono" v-pre>vars.set</span>）&gt; 环境变量 &gt; 内置变量
+          变量优先级：运行时变量（脚本 <span class="mono" v-pre>vars.set</span>）&gt; 环境变量 &gt; 内置变量；
+          所有内置变量都支持 Postman 的 <span class="mono" v-pre>$</span> 前缀（如 <span class="mono" v-pre>{{$uuid}}</span>），
+          可用于 URL、Params、Headers、Auth 与 Body；脚本里请用 <span class="mono" v-pre>vars</span> / <span class="mono" v-pre>env</span> 读取
         </div>
       </div>
       <div class="hint-groups">
@@ -256,23 +279,23 @@ function removeEnv(env: Environment) {
           <div class="hint-group-title">时间类</div>
           <div class="hint-item">
             <span class="hint-key mono" v-pre>{{timestamp}}</span>
-            <span class="hint-desc" v-pre>毫秒时间戳，也支持 Postman 写法 {{$timestamp}}</span>
+            <span class="hint-desc" v-pre>毫秒时间戳；{{timestampMs}} 等价，也支持 Postman 写法 {{$timestamp}}</span>
           </div>
           <div class="hint-item">
             <span class="hint-key mono" v-pre>{{timestampSec}}</span>
-            <span class="hint-desc">秒级时间戳</span>
+            <span class="hint-desc">秒级时间戳，常用于签名时间戳字段</span>
           </div>
           <div class="hint-item">
             <span class="hint-key mono" v-pre>{{isoTime}}</span>
-            <span class="hint-desc">ISO 8601，如 2026-10-26T20:30:00.123+08:00</span>
+            <span class="hint-desc" v-pre>ISO 8601，如 2026-10-26T20:30:00.123+08:00；{{isoTimestamp}} 等价</span>
           </div>
           <div class="hint-item">
             <span class="hint-key mono" v-pre>{{datetime}}</span>
-            <span class="hint-desc">2026-10-26 20:30:00</span>
+            <span class="hint-desc" v-pre>2026-10-26 20:30:00；{{now}} 等价</span>
           </div>
           <div class="hint-item">
             <span class="hint-key mono" v-pre>{{date}}</span>
-            <span class="hint-desc">日期 2026-10-26</span>
+            <span class="hint-desc" v-pre>日期 2026-10-26；{{today}} 等价</span>
           </div>
           <div class="hint-item">
             <span class="hint-key mono" v-pre>{{time}}</span>
@@ -292,11 +315,11 @@ function removeEnv(env: Environment) {
           <div class="hint-group-title">随机类</div>
           <div class="hint-item">
             <span class="hint-key mono" v-pre>{{uuid}}</span>
-            <span class="hint-desc" v-pre>随机 UUID，{{uuidNoDash}} 为无短横线版本</span>
+            <span class="hint-desc" v-pre>{{guid}} 等价；{{uuidNoDash}} / {{uuidSimple}} 为无短横线版本</span>
           </div>
           <div class="hint-item">
             <span class="hint-key mono" v-pre>{{randomInt(1,100)}}</span>
-            <span class="hint-desc">区间随机整数，单参数时为 0 到该值</span>
+            <span class="hint-desc" v-pre>区间随机整数；{{randomInt(100)}} 单参数时为 0 到该值</span>
           </div>
           <div class="hint-item">
             <span class="hint-key mono" v-pre>{{randomFloat(1,10,2)}}</span>
@@ -304,7 +327,7 @@ function removeEnv(env: Environment) {
           </div>
           <div class="hint-item">
             <span class="hint-key mono" v-pre>{{randomString(8)}}</span>
-            <span class="hint-desc" v-pre>随机字母数字；{{randomString(8, hex)}} 可指定字符集</span>
+            <span class="hint-desc" v-pre>随机字母数字；字符集可选 alnum / alpha / num / hex / lower / upper，如 {{randomString(8, upper)}}</span>
           </div>
           <div class="hint-item">
             <span class="hint-key mono" v-pre>{{randomHex(16)}}</span>
@@ -312,7 +335,7 @@ function removeEnv(env: Environment) {
           </div>
           <div class="hint-item">
             <span class="hint-key mono" v-pre>{{randomNumber(6)}}</span>
-            <span class="hint-desc">指定长度纯数字串</span>
+            <span class="hint-desc">指定长度纯数字串，适合验证码、订单号</span>
           </div>
           <div class="hint-item">
             <span class="hint-key mono" v-pre>{{randomBool}}</span>
@@ -320,29 +343,111 @@ function removeEnv(env: Environment) {
           </div>
           <div class="hint-item">
             <span class="hint-key mono" v-pre>{{randomEmail}}</span>
-            <span class="hint-desc" v-pre>随机邮箱，另有 {{randomPhone}}、{{randomIPv4}}</span>
+            <span class="hint-desc" v-pre>随机邮箱；另有 {{randomPhone}}、{{randomIPv4}}</span>
           </div>
         </div>
 
         <div class="hint-group">
-          <div class="hint-group-title">自定义与脚本</div>
+          <div class="hint-group-title">变量读取与赋值</div>
+          <div class="hint-item">
+            <span class="hint-key mono" v-pre>vars.set('key', value)</span>
+            <span class="hint-desc" v-pre>写入运行时变量，请求里用 {{key}} 引用；优先级高于环境变量与内置变量</span>
+          </div>
+          <div class="hint-item">
+            <span class="hint-key mono" v-pre>vars.get / has / unset / all</span>
+            <span class="hint-desc">读取、判断、删除变量，all() 返回合并后的全部变量</span>
+          </div>
+          <div class="hint-item">
+            <span class="hint-key mono" v-pre>env.KEY</span>
+            <span class="hint-desc">只读读取当前环境变量，修改请用 vars.set</span>
+          </div>
           <div class="hint-item">
             <span class="hint-key mono" v-pre>{{base_url}}</span>
-            <span class="hint-desc">引用当前环境的变量</span>
+            <span class="hint-desc">引用当前环境变量；未定义的变量会原样保留，便于排查</span>
           </div>
           <div class="hint-item">
             <span class="hint-key mono" v-pre>{{trace_id}}</span>
-            <span class="hint-desc">引用环境脚本 vars.set 生成的运行时变量</span>
+            <span class="hint-desc" v-pre>引用环境脚本 vars.set 生成的运行时变量</span>
           </div>
           <div class="hint-item">
             <span class="hint-key mono" v-pre>{{last_title}}</span>
             <span class="hint-desc">引用后置脚本从响应中提取的值</span>
           </div>
-          <pre class="mono hint-code" v-pre>// 环境脚本示例
-vars.set('trace_id', 'trace-' + Date.now())
-vars.set('nonce', Math.random().toString(36).slice(2, 10))</pre>
-          <pre class="mono hint-code" v-pre>// 后置脚本提取响应字段
-vars.set('last_title', response.json().slideshow.title)</pre>
+        </div>
+
+        <div class="hint-group">
+          <div class="hint-group-title">脚本内置对象</div>
+          <div class="hint-item">
+            <span class="hint-key mono" v-pre>request</span>
+            <span class="hint-desc">前置 / 环境脚本可修改 method、url、headers、params、body；修改后立即用于本次请求</span>
+          </div>
+          <div class="hint-item">
+            <span class="hint-key mono" v-pre>response</span>
+            <span class="hint-desc">后置脚本读取 status、statusText、headers、body、durationMs、sizeBytes、truncated、error</span>
+          </div>
+          <div class="hint-item">
+            <span class="hint-key mono" v-pre>response.text() / json()</span>
+            <span class="hint-desc">取原始文本或解析 JSON；响应体不是合法 JSON 时会给出明确报错</span>
+          </div>
+          <div class="hint-item">
+            <span class="hint-key mono" v-pre>console.log / info / debug / warn / error</span>
+            <span class="hint-desc">输出会显示在脚本日志区，便于调试签名与变量</span>
+          </div>
+          <div class="hint-item">
+            <span class="hint-key mono" v-pre>test(name, fn) / assert(cond, msg)</span>
+            <span class="hint-desc">后置脚本断言，结果显示在「测试结果」中</span>
+          </div>
+        </div>
+
+        <div class="hint-group">
+          <div class="hint-group-title">加解密与编码</div>
+          <div class="hint-item">
+            <span class="hint-key mono" v-pre>cipher.aes.encrypt / decrypt</span>
+            <span class="hint-desc">默认 CBC + PKCS7、输出 Base64；选项 mode / iv / ivFormat / keyFormat / padding / output / input</span>
+          </div>
+          <div class="hint-item">
+            <span class="hint-key mono" v-pre>cipher.des / tripleDes</span>
+            <span class="hint-desc">DES 密钥 8 字节，3DES 密钥 24 字节，用法同 aes</span>
+          </div>
+          <div class="hint-item">
+            <span class="hint-key mono" v-pre>cipher.md5 / sha1 / sha256</span>
+            <span class="hint-desc">摘要，默认 hex，第二个参数传 base64 可切换输出</span>
+          </div>
+          <div class="hint-item">
+            <span class="hint-key mono" v-pre>cipher.hmacSha256(text, key)</span>
+            <span class="hint-desc">HMAC 签名，另有 hmacSha1，常用于接口鉴权</span>
+          </div>
+          <div class="hint-item">
+            <span class="hint-key mono" v-pre>cipher.base64 / cipher.hex</span>
+            <span class="hint-desc">encode / decode 编解码</span>
+          </div>
+          <div class="hint-item">
+            <span class="hint-key mono" v-pre>rsa.publicEncrypt(明文, 公钥)</span>
+            <span class="hint-desc">PKCS#1 v1.5 公钥加密，返回 Base64</span>
+          </div>
+        </div>
+
+        <div class="hint-group wide">
+          <div class="hint-group-title">常用配方</div>
+          <pre class="mono hint-code" v-pre>// 环境脚本：生成签名所需的 ts / nonce / sign
+const ts = String(Date.now())
+const nonce = Math.random().toString(36).slice(2, 10)
+vars.set('ts', ts)
+vars.set('nonce', nonce)
+vars.set('sign', cipher.hmacSha256(`${ts}${nonce}`, 'your-secret'))</pre>
+          <pre class="mono hint-code" v-pre>// 前置脚本：AES-CBC 加密参数，再写回请求
+const enc = cipher.aes.encrypt('13800000000', '0123456789abcdef', {
+  iv: 'abcdef0123456789',
+  output: 'base64',
+})
+vars.set('mobile', enc)</pre>
+          <pre class="mono hint-code" v-pre>// 前置脚本：RSA 加密密码（公钥放环境变量）
+vars.set('pwd', rsa.publicEncrypt('123456', env.RSA_PUBLIC_KEY))</pre>
+          <pre class="mono hint-code" v-pre>// 后置脚本：提取 token 并断言
+const data = response.json()
+vars.set('token', data.data?.token ?? '')
+test('status = 200', () => assert(response.status === 200))
+test('业务码为 0', () => assert(data.code === 0, `code=${data.code}`))</pre>
         </div>
       </div>
     </div>
@@ -639,6 +744,14 @@ vars.set('last_title', response.json().slideshow.title)</pre>
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+
+.hint-group.wide {
+  grid-column: 1 / -1;
+}
+
+.hint-group.wide .hint-code {
+  margin-top: 0;
 }
 
 .hint-group-title {

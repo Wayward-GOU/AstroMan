@@ -188,7 +188,7 @@ pub fn report_export(state: State<'_, AppState>, id: i64, path: String) -> Resul
     }
 
     let bundle = ExportBundle {
-        format: "fbinhttp.report".to_string(),
+        format: "astroman.report".to_string(),
         version: 2,
         exported_at: now_ms(),
         detail,

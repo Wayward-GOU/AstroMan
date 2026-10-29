@@ -788,7 +788,7 @@ pub async fn stress_start(
     let pool = state.pool.clone();
     // 按当前配置构建独立客户端：连接超时、重定向策略与证书开关都可配置
     let client = match reqwest::Client::builder()
-        .user_agent(concat!("FbinHttp/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("AstroMan/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_millis(
             config.connect_timeout_ms.clamp(500, 120_000),
         ))

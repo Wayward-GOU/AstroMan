@@ -7,7 +7,7 @@ const sizePx = computed(() => `${props.size}px`)
 </script>
 
 <template>
-  <img class="app-logo" src="/logo.png" :width="props.size" :height="props.size" alt="FbinHttp" :style="{ width: sizePx, height: sizePx }" />
+  <img class="app-logo" src="/logo.png" :width="props.size" :height="props.size" alt="AstroMan" :style="{ width: sizePx, height: sizePx }" />
 </template>
 
 <style scoped>

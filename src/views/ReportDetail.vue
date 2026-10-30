@@ -183,21 +183,21 @@ const config = computed(() => detail.value?.config ?? null)
 const chartLabels = computed(() => samples.value.map((s) => `${s.elapsedSec}s`))
 
 const qpsSeries = computed(() => [
-  { name: 'QPS', color: '#3d6b8f', values: samples.value.map((s) => s.qps) },
+  { name: 'QPS', color: '#4d6bfe', values: samples.value.map((s) => s.qps) },
   { name: '并发', color: '#7d8fa6', values: samples.value.map((s) => s.concurrent) },
 ])
 
 const latencySeries = computed(() => [
-  { name: '平均', color: '#3d6b8f', values: samples.value.map((s) => s.avgRt) },
+  { name: '平均', color: '#4d6bfe', values: samples.value.map((s) => s.avgRt) },
   { name: 'P50', color: '#6d8fa8', values: samples.value.map((s) => s.p50Rt) },
-  { name: 'P95', color: '#b07d33', values: samples.value.map((s) => s.p95Rt) },
-  { name: 'P99', color: '#b0524d', values: samples.value.map((s) => s.p99Rt) },
+  { name: 'P95', color: '#d97706', values: samples.value.map((s) => s.p95Rt) },
+  { name: 'P99', color: '#dc2626', values: samples.value.map((s) => s.p99Rt) },
 ])
 
 const errorSeries = computed(() => [
   {
     name: '错误率',
-    color: '#b0524d',
+    color: '#dc2626',
     values: samples.value.map((s) => {
       const total = s.successCount + s.errorCount
       return total > 0 ? (s.errorCount / total) * 100 : 0

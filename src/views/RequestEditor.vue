@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
 import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
 import { open, save as saveFile } from '@tauri-apps/plugin-dialog'
@@ -11,6 +11,8 @@ import {
   DeleteOutlined,
   CloseOutlined,
   CopyOutlined,
+  CheckOutlined,
+  EditOutlined,
   CodeOutlined,
   PlusOutlined,
   DownOutlined,
@@ -28,6 +30,7 @@ import {
   requestPostScriptPrompt,
 } from '@/utils/aiScenarios'
 import { useProjectStore } from '@/stores/project'
+import { backOr, previousEntry } from '@/stores/navHistory'
 import { MAX_REQUEST_TABS, useTabsStore } from '@/stores/tabs'
 import { useErrorDialogStore } from '@/stores/errorDialog'
 import { formatDateTime } from '@/utils/datetime'
@@ -671,7 +674,11 @@ function save(showToast = true): Promise<boolean> {
 
 async function goBack() {
   await flushSave()
-  router.push(`/project/${projectId.value}`)
+  // 优先回到真正来源页（例如从历史记录点进来就回历史记录）；
+  // 若上一页只是另一个请求标签页，则按原逻辑回项目
+  const prev = previousEntry.value
+  const fromHistory = prev && !prev.path.startsWith('/request/')
+  router.push(fromHistory ? backOr(`/project/${projectId.value}`) : `/project/${projectId.value}`)
 }
 
 async function switchTab(id: number) {
@@ -865,11 +872,35 @@ const runsOpen = ref(true)
 const runsLoading = ref(false)
 const expandedRunId = ref<number | null>(null)
 
+/* ---------- 运行历史：分页 20 条（整页共用一个滚动，不再单独限高） ---------- */
+const RUNS_PAGE_SIZE = 20
+const runsPage = ref(1)
+const runsPanelEl = ref<HTMLElement | null>(null)
+
+const runsTotalPages = computed(() => Math.max(1, Math.ceil(runs.value.length / RUNS_PAGE_SIZE)))
+
+const pagedRuns = computed(() => {
+  const start = (runsPage.value - 1) * RUNS_PAGE_SIZE
+  return runs.value.slice(start, start + RUNS_PAGE_SIZE)
+})
+
+function setRunsPage(page: number) {
+  const next = Math.min(Math.max(1, page), runsTotalPages.value)
+  if (next === runsPage.value) return
+  runsPage.value = next
+  expandedRunId.value = null
+  // 翻页后把列表顶部带回视野，避免停在上一页的滚动位置
+  nextTick(() => {
+    runsPanelEl.value?.scrollIntoView({ block: 'start', behavior: 'smooth' })
+  })
+}
+
 async function loadRuns() {
   if (!form.value.id) return
   runsLoading.value = true
   try {
     runs.value = await api.runList(form.value.id, 200)
+    runsPage.value = 1
   } catch (e) {
     message.error(String(e))
   } finally {
@@ -921,6 +952,7 @@ function clearRuns() {
       await api.runClear(id)
       runs.value = []
       expandedRunId.value = null
+      runsPage.value = 1
       message.success('已清空')
     },
   })
@@ -1050,6 +1082,67 @@ const activeSnippet = computed(
   () => snippets.value.find((item) => item.key === snippetKey.value) ?? snippets.value[0],
 )
 
+/* 生成内容默认只读；进入编辑后改动按代码类型分别留存，复制取改动后的文本 */
+const codeEditing = ref(false)
+const codeEditText = ref('')
+const codeAreaRef = ref<HTMLTextAreaElement | null>(null)
+const editedCodes = reactive<Record<string, string>>({})
+
+const activeCode = computed(
+  () => editedCodes[snippetKey.value] ?? activeSnippet.value.code,
+)
+const isCodeEdited = computed(() => editedCodes[snippetKey.value] !== undefined)
+
+function startEditCode() {
+  codeEditText.value = activeCode.value
+  codeEditing.value = true
+  nextTick(() => {
+    fitCodeArea()
+    codeAreaRef.value?.focus()
+  })
+}
+
+function fitCodeArea() {
+  const el = codeAreaRef.value
+  if (!el) return
+  const max = Math.max(260, window.innerHeight - 300)
+  el.style.height = 'auto'
+  el.style.height = `${Math.min(Math.max(el.scrollHeight + 2, 240), max)}px`
+}
+
+function finishEditCode() {
+  // 与生成内容一致时不留残余草稿，避免误报「已修改」
+  if (codeEditText.value === activeSnippet.value.code) {
+    delete editedCodes[snippetKey.value]
+  } else {
+    editedCodes[snippetKey.value] = codeEditText.value
+  }
+  codeEditing.value = false
+}
+
+function resetCode() {
+  delete editedCodes[snippetKey.value]
+  codeEditText.value = activeSnippet.value.code
+}
+
+watch(codeEditText, (text) => {
+  if (!codeEditing.value) return
+  if (text === activeSnippet.value.code) delete editedCodes[snippetKey.value]
+  else editedCodes[snippetKey.value] = text
+  nextTick(fitCodeArea)
+})
+
+/* 编辑中切换语言：先落盘当前草稿，再载入目标语言的文本 */
+watch(snippetKey, () => {
+  codeEditText.value = activeCode.value
+  if (codeEditing.value) nextTick(fitCodeArea)
+})
+
+/* 关闭抽屉时退出编辑态，下次打开仍是默认的只读视图（草稿保留） */
+watch(codeOpen, (open) => {
+  if (!open) codeEditing.value = false
+})
+
 function openCode() {
   if (!form.value.url?.trim()) {
     message.warning('请先填写请求 URL')
@@ -1060,8 +1153,12 @@ function openCode() {
 
 async function copySnippet() {
   try {
-    await navigator.clipboard.writeText(activeSnippet.value.code)
-    message.success(`已复制 ${activeSnippet.value.label} 代码`)
+    await navigator.clipboard.writeText(activeCode.value)
+    message.success(
+      isCodeEdited.value
+        ? `已复制修改后的 ${activeSnippet.value.label} 代码`
+        : `已复制 ${activeSnippet.value.label} 代码`,
+    )
   } catch {
     message.error('复制失败')
   }
@@ -1080,7 +1177,8 @@ const responseHeaders = computed(() => {
 </script>
 
 <template>
-  <a-spin :spinning="loading">
+  <div class="editor-root">
+    <a-spin :spinning="loading">
     <div class="editor-page">
       <div class="topbar">
         <div class="left">
@@ -1092,7 +1190,12 @@ const responseHeaders = computed(() => {
           <span class="crumb">
             <span class="crumb-project">{{ projectName || '项目' }}</span>
             <span class="crumb-sep">/</span>
-            <a-input v-model:value="form.name" class="name-input" placeholder="请求名称" />
+            <a-input
+              v-model:value="form.name"
+              class="name-input"
+              placeholder="请求名称"
+              :title="form.name"
+            />
           </span>
           <span class="saved-hint" :class="`is-${autoState}`">
             <template v-if="autoState === 'saving'">保存中…</template>
@@ -1226,7 +1329,7 @@ const responseHeaders = computed(() => {
             发送
           </a-button>
         </div>
-        <span class="url-tip">Enter 发送 · 支持 {{ }} 变量</span>
+        <span class="url-tip">Enter 发送 · 支持环境变量</span>
       </div>
 
       <div class="panes">
@@ -1604,7 +1707,7 @@ const responseHeaders = computed(() => {
         </div>
       </div>
 
-      <section class="runs-panel" :class="{ collapsed: !runsOpen }">
+      <section ref="runsPanelEl" class="runs-panel" :class="{ collapsed: !runsOpen }">
         <div class="runs-head">
           <button class="runs-toggle" @click="runsOpen = !runsOpen">
             <span class="run-caret" :class="{ open: runsOpen }">›</span>
@@ -1632,7 +1735,7 @@ const responseHeaders = computed(() => {
               <span>URL</span>
               <span />
             </div>
-            <template v-for="run in runs" :key="run.id">
+            <template v-for="run in pagedRuns" :key="run.id">
               <div
                 class="run-row"
                 :class="{ active: expandedRunId === run.id }"
@@ -1693,6 +1796,20 @@ const responseHeaders = computed(() => {
                 </div>
               </div>
             </template>
+
+            <div v-if="runs.length > RUNS_PAGE_SIZE" class="runs-pager">
+              <span class="runs-pager-info">
+                共 {{ runs.length }} 条 · 每页 {{ RUNS_PAGE_SIZE }} 条
+              </span>
+              <a-pagination
+                size="small"
+                :current="runsPage"
+                :page-size="RUNS_PAGE_SIZE"
+                :total="runs.length"
+                :show-size-changer="false"
+                @change="setRunsPage"
+              />
+            </div>
           </template>
         </div>
       </section>
@@ -1714,13 +1831,38 @@ const responseHeaders = computed(() => {
         </a-radio-button>
       </a-radio-group>
       <div class="code-actions">
-        <a-button size="small" type="primary" @click="copySnippet">
+        <a-button size="small" :type="codeEditing ? 'default' : 'primary'" @click="copySnippet">
           <template #icon><CopyOutlined /></template>
           复制
         </a-button>
+        <a-button v-if="!codeEditing" size="small" @click="startEditCode">
+          <template #icon><EditOutlined /></template>
+          编辑
+        </a-button>
+        <a-button v-else size="small" type="primary" @click="finishEditCode">
+          <template #icon><CheckOutlined /></template>
+          完成
+        </a-button>
+        <a-button v-if="isCodeEdited && !codeEditing" size="small" type="text" @click="resetCode">
+          恢复生成内容
+        </a-button>
+        <span
+          v-if="isCodeEdited"
+          class="code-edited-badge"
+          title="已手动修改，不再随当前请求自动更新；复制取当前文本"
+        >
+          已修改
+        </span>
         <span class="code-file mono">{{ form.name || 'request' }} · {{ activeSnippet.language }}</span>
       </div>
-      <pre class="code-block mono">{{ activeSnippet.code }}</pre>
+      <textarea
+        v-if="codeEditing"
+        ref="codeAreaRef"
+        v-model="codeEditText"
+        class="code-block code-textarea mono"
+        spellcheck="false"
+      ></textarea>
+      <pre v-else class="code-block mono">{{ activeCode }}</pre>
     </a-drawer>
 
     <a-modal
@@ -1813,11 +1955,23 @@ const responseHeaders = computed(() => {
       @changed="onEnvsChanged"
     />
   </a-spin>
+  </div>
 </template>
 
 <style scoped>
-.editor-page {
+/* 整页共用一个滚动：外层 .main 已经是 overflow:auto，
+   这里让页面至少一屏高、内容多则自然撑高，请求/响应区不再被压扁 */
+.editor-root {
   height: 100%;
+}
+
+.editor-root :deep(.ant-spin-nested-loading),
+.editor-root :deep(.ant-spin-container) {
+  height: 100%;
+}
+
+.editor-page {
+  min-height: 100%;
   display: flex;
   flex-direction: column;
 }
@@ -1825,11 +1979,6 @@ const responseHeaders = computed(() => {
 .ai-caret {
   font-size: 10px;
   margin-left: 4px;
-}
-
-:deep(.ant-spin-nested-loading),
-:deep(.ant-spin-container) {
-  height: 100%;
 }
 
 .topbar {
@@ -1847,6 +1996,16 @@ const responseHeaders = computed(() => {
   display: flex;
   align-items: center;
   gap: 10px;
+  min-width: 0;
+}
+
+.left {
+  flex: 1;
+  overflow: hidden;
+}
+
+.right {
+  flex-shrink: 0;
 }
 
 .tabs-bar {
@@ -1945,8 +2104,10 @@ const responseHeaders = computed(() => {
 
 .tab-name {
   flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .tab-close {
@@ -1994,11 +2155,13 @@ const responseHeaders = computed(() => {
 }
 
 .name-input {
-  width: 230px;
+  width: clamp(160px, 24vw, 380px);
+  min-width: 120px;
   font-weight: 600;
   border-color: transparent;
   background: transparent;
   font-size: 13px;
+  text-overflow: ellipsis;
 }
 
 .name-input:hover {
@@ -2090,29 +2253,48 @@ const responseHeaders = computed(() => {
 }
 
 .method-select {
-  width: 104px;
+  width: 96px;
   flex-shrink: 0;
   font-weight: 700;
 }
 
 .method-select :deep(.ant-select-selector) {
   box-shadow: none !important;
+  border-radius: 6px !important;
+  transition: background-color 0.14s ease;
+}
+
+/* 方法色底：让 URL 输入条左侧的方法一眼可辨（Postman / Apifox 的做法） */
+.method-select.m-GET :deep(.ant-select-selector) {
+  background: var(--fm-method-get-soft, var(--fm-success-soft));
+}
+.method-select.m-POST :deep(.ant-select-selector) {
+  background: var(--fm-method-post-soft, var(--fm-warning-soft));
+}
+.method-select.m-PUT :deep(.ant-select-selector) {
+  background: var(--fm-method-put-soft, var(--fm-primary-soft));
+}
+.method-select.m-PATCH :deep(.ant-select-selector) {
+  background: var(--fm-method-patch-soft, var(--fm-purple-soft));
+}
+.method-select.m-DELETE :deep(.ant-select-selector) {
+  background: var(--fm-method-delete-soft, var(--fm-danger-soft));
 }
 
 .method-select.m-GET :deep(.ant-select-selection-item) {
-  color: var(--fm-success);
+  color: var(--fm-method-get, var(--fm-success));
 }
 .method-select.m-POST :deep(.ant-select-selection-item) {
-  color: var(--fm-warning);
+  color: var(--fm-method-post, var(--fm-warning));
 }
 .method-select.m-PUT :deep(.ant-select-selection-item) {
-  color: var(--fm-primary);
+  color: var(--fm-method-put, var(--fm-primary));
 }
 .method-select.m-PATCH :deep(.ant-select-selection-item) {
-  color: var(--fm-purple);
+  color: var(--fm-method-patch, var(--fm-purple));
 }
 .method-select.m-DELETE :deep(.ant-select-selection-item) {
-  color: var(--fm-danger);
+  color: var(--fm-method-delete, var(--fm-danger));
 }
 
 .bar-divider {
@@ -2156,8 +2338,27 @@ const responseHeaders = computed(() => {
 .send-btn {
   height: 34px;
   flex-shrink: 0;
-  border-radius: 7px;
+  border-radius: 8px;
   font-weight: 600;
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--fm-primary) 80%, #ffffff) 0%,
+    var(--fm-primary) 100%
+  );
+  border: none;
+  box-shadow: 0 3px 10px color-mix(in srgb, var(--fm-primary) 32%, transparent);
+  transition: filter 0.16s ease, box-shadow 0.16s ease, transform 0.1s ease;
+}
+
+.send-btn:not(:disabled):hover {
+  filter: brightness(1.07);
+  box-shadow: 0 5px 16px color-mix(in srgb, var(--fm-primary) 42%, transparent);
+  transform: translateY(-1px);
+}
+
+.send-btn:not(:disabled):active {
+  transform: translateY(0);
+  filter: brightness(0.97);
 }
 
 .url-tip {
@@ -2167,7 +2368,9 @@ const responseHeaders = computed(() => {
 }
 
 .panes {
-  flex: 1;
+  flex: 1 1 auto;
+  /* 固定高度：请求 / 响应各自内部滚动，长 Body 不再把整页撑长 */
+  height: clamp(380px, 58vh, 660px);
   min-height: 0;
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
@@ -2865,25 +3068,24 @@ const responseHeaders = computed(() => {
 /* ---------- 运行历史 ---------- */
 .runs-panel {
   flex: 0 0 auto;
-  max-height: 32%;
   display: flex;
   flex-direction: column;
   background: var(--fm-surface);
-  border-top: 1px solid var(--fm-border);
-}
-
-.runs-panel.collapsed {
-  max-height: none;
 }
 
 .runs-head {
+  position: sticky;
+  top: 0;
+  z-index: 3;
   height: 34px;
+  flex-shrink: 0;
   padding: 0 14px;
   display: flex;
   align-items: center;
   gap: 12px;
   background: var(--fm-surface-alt);
   border-bottom: 1px solid var(--fm-border);
+  border-top: 1px solid var(--fm-border);
 }
 
 .runs-toggle {
@@ -2930,10 +3132,25 @@ const responseHeaders = computed(() => {
   color: var(--fm-danger);
 }
 
+/* 列表随页面滚动，不再有独立滚动条 */
 .runs-body {
   flex: 1;
-  min-height: 0;
-  overflow: auto;
+  padding-bottom: 6px;
+}
+
+.runs-pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--fm-border);
+  background: var(--fm-surface);
+}
+
+.runs-pager-info {
+  font-size: 11px;
+  color: var(--fm-muted);
 }
 
 .runs-empty {
@@ -2964,8 +3181,8 @@ const responseHeaders = computed(() => {
 
 .run-row-head {
   position: sticky;
-  top: 0;
-  z-index: 1;
+  top: 34px;
+  z-index: 2;
   background: var(--fm-surface);
   color: var(--fm-muted);
   font-size: 10px;
@@ -3095,16 +3312,15 @@ const responseHeaders = computed(() => {
   .panes {
     grid-template-columns: minmax(0, 1fr);
     grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
-    overflow: auto;
+    /* 单列时请求与响应上下叠放，各自固定一半高度、内部滚动 */
+    height: clamp(600px, 82vh, 940px);
+    min-height: 0;
+    overflow: hidden;
   }
 
   .req-pane,
   .res-pane {
-    min-height: 320px;
-  }
-
-  .runs-panel {
-    max-height: 50%;
+    min-height: 240px;
   }
 
   .run-row {
@@ -3212,13 +3428,30 @@ const responseHeaders = computed(() => {
 .code-actions {
   display: flex;
   align-items: center;
-  gap: 10px;
+  flex-wrap: wrap;
+  gap: 8px;
   margin-bottom: 10px;
 }
 
 .code-file {
+  margin-left: auto;
   font-size: 11px;
   color: var(--fm-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.code-edited-badge {
+  flex-shrink: 0;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  line-height: 16px;
+  color: var(--fm-warning, #d97706);
+  background: color-mix(in srgb, var(--fm-warning, #d97706) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--fm-warning, #d97706) 30%, transparent);
+  cursor: help;
 }
 
 .code-block {
@@ -3234,5 +3467,26 @@ const responseHeaders = computed(() => {
   color: var(--fm-text-2);
   max-height: calc(100vh - 280px);
   overflow: auto;
+}
+
+.code-textarea {
+  display: block;
+  width: 100%;
+  height: auto;
+  min-height: 240px;
+  max-height: calc(100vh - 300px);
+  resize: none;
+  outline: none;
+  tab-size: 2;
+  transition: border-color 0.16s ease, box-shadow 0.16s ease, background 0.16s ease;
+  background: var(--fm-surface);
+  border-style: dashed;
+}
+
+.code-textarea:focus {
+  border-color: var(--fm-primary);
+  border-style: solid;
+  background: var(--fm-surface);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--fm-primary) 16%, transparent);
 }
 </style>

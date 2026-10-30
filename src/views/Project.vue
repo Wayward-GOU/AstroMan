@@ -633,7 +633,7 @@ const columns = computed(() =>
           工作台
         </a-button>
         <span class="slash">/</span>
-        <span class="project-dot" :style="{ background: store.currentProject?.color || '#3d6b8f' }" />
+        <span class="project-dot" :style="{ background: store.currentProject?.color || '#4d6bfe' }" />
         <div class="project-title">
           <span class="name">{{ store.currentProject?.name || '项目' }}</span>
           <span class="desc">{{ store.currentProject?.description || '本地项目' }}</span>
@@ -785,7 +785,9 @@ const columns = computed(() =>
               <template v-if="column.key === 'name'">
                 <span class="req-name">
                   <FileTextOutlined class="req-icon" />
-                  {{ (record as RequestSummary).name }}
+                  <span class="req-label" :title="(record as RequestSummary).name">
+                    {{ (record as RequestSummary).name }}
+                  </span>
                   <span
                     v-if="lastRequest && lastRequest.id === (record as RequestSummary).id"
                     class="last-badge"
@@ -804,7 +806,9 @@ const columns = computed(() =>
                 </span>
               </template>
               <template v-else-if="column.key === 'url'">
-                <span class="mono url">{{ (record as RequestSummary).url }}</span>
+                <span class="mono url" :title="(record as RequestSummary).url">
+                  {{ (record as RequestSummary).url }}
+                </span>
               </template>
               <template v-else-if="column.key === 'updatedAt'">
                 <span class="muted">{{ fmtTime((record as RequestSummary).updatedAt) }}</span>
@@ -994,6 +998,7 @@ const columns = computed(() =>
   display: flex;
   gap: 14px;
   padding: 16px;
+  overflow-x: auto;
 }
 
 .tree-pane {
@@ -1005,8 +1010,9 @@ const columns = computed(() =>
 }
 
 .list-pane {
-  flex: 1;
-  min-width: 0;
+  flex: 1 1 480px;
+  /* 保证窄窗口下接口列表仍可用，宁可横向滚动也不压成一条缝 */
+  min-width: 400px;
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -1031,6 +1037,20 @@ const columns = computed(() =>
   flex: 1;
   min-height: 0;
   overflow: auto;
+}
+
+/* 固定表格布局：名称/URL 过长时在当前列内省略，不再挤开方法列 */
+.table-wrap :deep(.ant-table table) {
+  table-layout: fixed;
+}
+
+.table-wrap :deep(.ant-table-cell) {
+  overflow: hidden;
+}
+
+.table-wrap :deep(.ant-table-tbody > tr > td) {
+  padding-top: 10px !important;
+  padding-bottom: 10px !important;
 }
 
 .pane-head {
@@ -1115,6 +1135,14 @@ const columns = computed(() =>
   align-items: center;
   gap: 9px;
   min-width: 0;
+  overflow: hidden;
+}
+
+.list-title .pane-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .list-actions {
@@ -1147,6 +1175,8 @@ const columns = computed(() =>
 }
 
 .count {
+  flex-shrink: 0;
+  white-space: nowrap;
   font-size: 10px;
   color: var(--fm-muted);
   background: var(--fm-surface-alt);
@@ -1184,16 +1214,31 @@ const columns = computed(() =>
   align-items: center;
   gap: 7px;
   font-weight: 500;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.req-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .req-icon {
   color: #b6c0ce;
   font-size: 12px;
+  flex-shrink: 0;
 }
 
 .url {
+  display: block;
   color: var(--fm-muted);
   font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .muted {
@@ -1293,6 +1338,7 @@ const columns = computed(() =>
   .body {
     flex-direction: column;
     padding: 12px;
+    overflow-x: hidden;
   }
 
   .tree-pane {
@@ -1305,6 +1351,8 @@ const columns = computed(() =>
   }
 
   .list-pane {
+    flex: 1;
+    min-width: 0;
     min-height: 320px;
   }
 

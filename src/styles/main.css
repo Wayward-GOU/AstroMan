@@ -1,48 +1,62 @@
 /* ============ AstroMan 设计系统 ============ */
 :root {
-  --fm-primary: #3d6b8f;
-  --fm-primary-dark: #305670;
-  --fm-primary-soft: #edf3f7;
-  --fm-success: #3f7f5f;
-  --fm-success-soft: #edf5f0;
-  --fm-warning: #b07d33;
-  --fm-warning-soft: #faf4e9;
-  --fm-danger: #b0524d;
-  --fm-danger-soft: #f9efee;
-  --fm-purple: #665a80;
-  --fm-purple-soft: #f3f1f7;
+  --fm-primary: #4d6bfe;
+  --fm-primary-dark: #3b53e6;
+  --fm-primary-soft: #eef1ff;
+  --fm-success: #16a34a;
+  --fm-success-soft: #e8f8ee;
+  --fm-warning: #d97706;
+  --fm-warning-soft: #fdf3e2;
+  --fm-danger: #dc2626;
+  --fm-danger-soft: #fdeeee;
+  --fm-purple: #8b5cf6;
+  --fm-purple-soft: #f4f0fe;
 
-  --fm-bg: #f8fafc;
+  /* HTTP 方法色：参照 Postman / Apifox 的高饱和区分色，各主题保持一致 */
+  --fm-method-get: #16a34a;
+  --fm-method-get-soft: #e5f7ec;
+  --fm-method-post: #e8890c;
+  --fm-method-post-soft: #fdf1df;
+  --fm-method-put: #2563eb;
+  --fm-method-put-soft: #e8effe;
+  --fm-method-patch: #9333ea;
+  --fm-method-patch-soft: #f5edfd;
+  --fm-method-delete: #dc2626;
+  --fm-method-delete-soft: #fdecec;
+  --fm-method-other: #64748b;
+  --fm-method-other-soft: #eef1f5;
+
+  --fm-bg: #f5f6fa;
   --fm-surface: #ffffff;
-  --fm-surface-alt: #f1f5f9;
-  --fm-border: #e2e8f0;
-  --fm-border-strong: #cbd5e1;
+  --fm-surface-alt: #f2f4f9;
+  --fm-border: #e6e9f2;
+  --fm-border-strong: #ccd3e4;
 
-  --fm-text: #0f172a;
-  --fm-text-2: #334155;
-  --fm-muted: #64748b;
+  --fm-text: #151b28;
+  --fm-text-2: #3a4256;
+  --fm-muted: #6b7490;
 
   --fm-radius-sm: 6px;
   --fm-radius: 8px;
   --fm-radius-lg: 14px;
-  --fm-shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.04);
-  --fm-shadow: 0 1px 2px rgba(15, 23, 42, 0.04), 0 1px 3px rgba(15, 23, 42, 0.03);
-  --fm-shadow-lg: 0 8px 20px rgba(15, 23, 42, 0.08);
+  --fm-shadow-sm: 0 1px 2px rgba(23, 31, 56, 0.05);
+  --fm-shadow: 0 1px 2px rgba(23, 31, 56, 0.05), 0 2px 6px rgba(23, 31, 56, 0.04);
+  --fm-shadow-lg: 0 12px 28px rgba(23, 31, 56, 0.1);
 
-  --fm-sidebar: #f4f7fa;
-  --fm-sidebar-hover: #e9eff5;
-  --fm-sidebar-active: #e3ebf2;
-  --fm-sidebar-text: #64748b;
-  --fm-sidebar-icon: #7b8899;
-  --fm-sidebar-active-text: #3d6b8f;
+  --fm-sidebar: #f7f8fc;
+  --fm-sidebar-hover: #edf0f8;
+  --fm-sidebar-active: #e9edfe;
+  --fm-sidebar-text: #5f6b85;
+  --fm-sidebar-icon: #7b87a3;
+  --fm-sidebar-active-text: #4d6bfe;
 
-  --fm-code-bg: #fbfcfe;
-  --fm-gutter-bg: #f4f7fa;
-  --fm-json-key: #1f4e79;
-  --fm-json-string: #2f7d5b;
-  --fm-json-number: #b26a1f;
-  --fm-json-bool: #6a4c93;
-  --fm-json-punct: #7b8794;
+  --fm-code-bg: #fafbff;
+  --fm-gutter-bg: #f4f6fb;
+  --fm-json-key: #2563eb;
+  --fm-json-string: #16a34a;
+  --fm-json-number: #d97706;
+  --fm-json-bool: #9333ea;
+  --fm-json-punct: #8b94ad;
 }
 
 * {
@@ -183,39 +197,39 @@ body {
   border-radius: 4px;
   border: 1px solid transparent;
   font-size: 10.5px;
-  font-weight: 600;
+  font-weight: 700;
   letter-spacing: 0.2px;
 }
 
 .method-GET {
-  color: var(--fm-success);
-  background: var(--fm-success-soft);
+  color: var(--fm-method-get);
+  background: var(--fm-method-get-soft);
   border-color: transparent;
 }
 .method-POST {
-  color: var(--fm-warning);
-  background: var(--fm-warning-soft);
+  color: var(--fm-method-post);
+  background: var(--fm-method-post-soft);
   border-color: transparent;
 }
 .method-PUT {
-  color: var(--fm-primary);
-  background: var(--fm-primary-soft);
+  color: var(--fm-method-put);
+  background: var(--fm-method-put-soft);
   border-color: transparent;
 }
 .method-PATCH {
-  color: var(--fm-purple);
-  background: var(--fm-purple-soft);
+  color: var(--fm-method-patch);
+  background: var(--fm-method-patch-soft);
   border-color: transparent;
 }
 .method-DELETE {
-  color: var(--fm-danger);
-  background: var(--fm-danger-soft);
+  color: var(--fm-method-delete);
+  background: var(--fm-method-delete-soft);
   border-color: transparent;
 }
 .method-HEAD,
 .method-OPTIONS {
-  color: var(--fm-muted);
-  background: var(--fm-surface-alt);
+  color: var(--fm-method-other);
+  background: var(--fm-method-other-soft);
   border-color: transparent;
 }
 
@@ -223,19 +237,39 @@ body {
 .ant-btn {
   font-weight: 500;
   box-shadow: none;
-  transition: background-color 0.16s, border-color 0.16s, color 0.16s;
+  transition: background-color 0.16s, border-color 0.16s, color 0.16s, box-shadow 0.2s;
 }
 
-.ant-btn-primary {
-  box-shadow: none;
+/* 主按钮：轻微渐变 + 主题色光晕，更接近 Apifox / Postman 的现代按钮质感 */
+.ant-btn-primary.ant-btn-primary:not(:disabled) {
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--fm-primary) 82%, #ffffff) 0%,
+    var(--fm-primary) 100%
+  );
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--fm-primary) 30%, transparent);
 }
 
-.ant-btn-primary:not(:disabled):hover {
-  box-shadow: none;
+.ant-btn-primary.ant-btn-primary:not(:disabled):hover {
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--fm-primary) 72%, #ffffff) 0%,
+    color-mix(in srgb, var(--fm-primary) 88%, #000000) 100%
+  );
+  box-shadow: 0 4px 14px color-mix(in srgb, var(--fm-primary) 38%, transparent);
+}
+
+.ant-btn-primary.ant-btn-primary:not(:disabled):active {
+  background: var(--fm-primary-dark);
+  box-shadow: 0 1px 4px color-mix(in srgb, var(--fm-primary) 30%, transparent);
+}
+
+.ant-btn-primary:disabled {
+  background: color-mix(in srgb, var(--fm-primary) 45%, transparent);
 }
 
 .ant-btn-default:not(:disabled):hover {
-  border-color: var(--fm-border-strong);
+  border-color: var(--fm-primary);
   color: var(--fm-primary);
 }
 
@@ -249,7 +283,7 @@ body {
 .ant-input-focused,
 .ant-input-affix-wrapper-focused,
 .ant-select-focused .ant-select-selector {
-  box-shadow: 0 0 0 3px rgba(61, 107, 143, 0.12);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--fm-primary) 14%, transparent);
 }
 
 .ant-tabs-top > .ant-tabs-nav {

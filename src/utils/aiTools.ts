@@ -1526,6 +1526,12 @@ const SPECS: ToolSpec[] = [
     handler: async (args) => {
       const curl = str(args.curl).trim()
       if (!curl) throw new Error('参数 curl 不能为空')
+      // 模型复述超长命令时可能在中间插省略号，这种命令导入必然缺参数，直接拦下
+      if (/…|（已截断）|\(truncated\)|\[truncated\]/i.test(curl) || /\.\.\.\s*$/.test(curl)) {
+        throw new Error(
+          'cURL 参数看起来被截断了（含有省略号）。请把完整命令重新发一次，或改用「接口调试 → 从 cURL 导入」对话框直接粘贴原文。',
+        )
+      }
       const parsed = await curlParse(curl)
       const collectionId = optionalNum(args.collectionId)
       if (collectionId === undefined) {

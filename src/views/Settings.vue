@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch, type Component } from 'vue'
 import { useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
 import { open } from '@tauri-apps/plugin-dialog'
@@ -8,7 +8,6 @@ import {
   SafetyCertificateOutlined,
   ThunderboltOutlined,
   CopyOutlined,
-  LaptopOutlined,
   BgColorsOutlined,
   CheckOutlined,
   FolderOpenOutlined,
@@ -18,6 +17,8 @@ import {
   CloudDownloadOutlined,
   GlobalOutlined,
   KeyOutlined,
+  RobotOutlined,
+  InfoCircleOutlined,
 } from '@ant-design/icons-vue'
 import PageHeader from '@/components/PageHeader.vue'
 import * as api from '@/api'
@@ -32,6 +33,40 @@ const router = useRouter()
 /** 航仔 可调用的工具总数，随注册表自动变化 */
 const aiToolCount = toolNames().length
 
+/* ---------- 分区导航 ---------- */
+interface Section {
+  key: string
+  label: string
+  desc: string
+  icon: Component
+}
+
+const sections: Section[] = [
+  { key: 'appearance', label: '外观', desc: '主题配色与界面风格', icon: BgColorsOutlined },
+  { key: 'storage', label: '数据与存储', desc: '数据库位置、备份与隐私', icon: DatabaseOutlined },
+  { key: 'network', label: '网络与安全', desc: '代理、客户端证书、Python 授权', icon: GlobalOutlined },
+  { key: 'assistant', label: 'AI 助手', desc: '航仔与模型服务', icon: RobotOutlined },
+  { key: 'update', label: '版本更新', desc: '检查并安装新版本', icon: CloudDownloadOutlined },
+  { key: 'shortcuts', label: '快捷键与技巧', desc: '常用操作一览', icon: ThunderboltOutlined },
+  { key: 'about', label: '关于', desc: '版本信息与数据说明', icon: InfoCircleOutlined },
+]
+
+const TAB_KEY = 'astroman:settings-tab'
+
+const active = ref<string>(localStorage.getItem(TAB_KEY) || 'appearance')
+// 本地缓存的分区名可能是历史版本残留，回落到第一个分区
+if (!sections.some((item) => item.key === active.value)) active.value = 'appearance'
+const activeSection = computed(
+  () => sections.find((item) => item.key === active.value) ?? sections[0],
+)
+
+watch(active, (value) => localStorage.setItem(TAB_KEY, value))
+
+function selectSection(key: string) {
+  active.value = key
+}
+
+/* ---------- 基础信息 ---------- */
 const info = ref<AppInfo | null>(null)
 const storage = ref<StorageInfo | null>(null)
 const storageLoading = ref(false)
@@ -181,6 +216,7 @@ async function resetStorage() {
     title: '恢复默认存储位置？',
     content: '恢复后将使用应用默认数据目录，自定义目录中的文件不会被删除。需要重启应用生效。',
     okText: '恢复默认',
+    okType: 'danger',
     async onOk() {
       storageLoading.value = true
       try {
@@ -250,415 +286,936 @@ async function openReleasePage() {
 </script>
 
 <template>
-  <div class="page">
+  <div class="page settings-page">
     <PageHeader
       eyebrow="Settings"
       title="设置"
       subtitle="本地版不收集任何数据，所有内容只保存在这台电脑上"
     />
 
-    <div class="grid">
-      <div class="fm-card block theme-block">
-        <div class="block-head">
-          <span class="block-icon blue"><BgColorsOutlined /></span>
-          <div>
-            <div class="block-title">外观主题</div>
-            <div class="block-desc">选择配色方案，切换后立即生效并保存在本机</div>
-          </div>
-        </div>
-        <div class="theme-list">
-          <button
-            v-for="item in themes"
-            :key="item.id"
-            class="theme-item"
-            :class="{ active: currentThemeId === item.id }"
-            @click="setTheme(item.id)"
-          >
-            <span
-              class="theme-preview"
-              :style="{ background: item.swatches[0], borderColor: item.swatches[2] }"
-            >
-              <span class="theme-side" :style="{ background: item.swatches[1] }" />
-              <span class="theme-dot" :style="{ background: item.swatches[2] }" />
-              <span class="theme-line" :style="{ background: item.swatches[3] }" />
-            </span>
-            <span class="theme-name">{{ item.name }}</span>
-            <span class="theme-desc">{{ item.desc }}</span>
-            <CheckOutlined v-if="currentThemeId === item.id" class="theme-check" />
-          </button>
-        </div>
-      </div>
-
-      <div class="fm-card block storage-block">
-        <div class="block-head">
-          <span class="block-icon blue"><DatabaseOutlined /></span>
-          <div>
-            <div class="block-title">数据存储位置</div>
-            <div class="block-desc">自定义 SQLite 数据文件存放目录，可迁移现有数据</div>
-          </div>
-          <span class="storage-mode" :class="{ custom: storage?.isCustom }">
-            {{ storage?.isCustom ? '自定义目录' : '默认目录' }}
+    <div class="settings">
+      <!-- 左侧分类 -->
+      <aside class="set-nav">
+        <button
+          v-for="item in sections"
+          :key="item.key"
+          type="button"
+          class="nav-item"
+          :class="{ active: active === item.key }"
+          @click="selectSection(item.key)"
+        >
+          <span class="nav-ico"><component :is="item.icon" /></span>
+          <span class="nav-text">
+            <span class="nav-name">{{ item.label }}</span>
+            <span class="nav-desc">{{ item.desc }}</span>
           </span>
+        </button>
+        <div class="nav-foot">AstroMan v{{ info?.version || '-' }}</div>
+      </aside>
+
+      <!-- 右侧内容 -->
+      <section class="set-body">
+        <header class="panel-head">
+          <h2>{{ activeSection.label }}</h2>
+          <p>{{ activeSection.desc }}</p>
+        </header>
+
+        <!-- ============ 外观 ============ -->
+        <div v-if="active === 'appearance'" class="panel">
+          <div class="group">
+            <div class="group-title">主题配色</div>
+            <div class="group-desc">切换后立即生效，选择会保存在本机</div>
+            <div class="theme-list">
+              <button
+                v-for="item in themes"
+                :key="item.id"
+                type="button"
+                class="theme-item"
+                :class="{ active: currentThemeId === item.id }"
+                @click="setTheme(item.id)"
+              >
+                <span
+                  class="theme-preview"
+                  :style="{ background: item.swatches[0], borderColor: item.swatches[2] }"
+                >
+                  <span class="theme-side" :style="{ background: item.swatches[1] }" />
+                  <span class="theme-dot" :style="{ background: item.swatches[2] }" />
+                  <span class="theme-line" :style="{ background: item.swatches[3] }" />
+                </span>
+                <span class="theme-name">{{ item.name }}</span>
+                <span class="theme-desc">{{ item.desc }}</span>
+                <CheckOutlined v-if="currentThemeId === item.id" class="theme-check" />
+              </button>
+            </div>
+          </div>
+
+          <div class="group">
+            <div class="group-title">界面缩放</div>
+            <div class="row">
+              <div class="row-label">
+                <div class="row-title">调整整体缩放</div>
+                <div class="row-desc">侧边栏底部的 − / 百分比 / + 控件，或用快捷键切换</div>
+              </div>
+              <div class="row-control">
+                <kbd>{{ shortcutText('+') }}</kbd>
+                <kbd>{{ shortcutText('-') }}</kbd>
+                <kbd>{{ shortcutText('0') }}</kbd>
+              </div>
+            </div>
+          </div>
         </div>
 
-        <a-spin :spinning="storageLoading">
-          <div class="rows">
-            <div class="row">
-              <span class="label">数据目录</span>
-              <span class="value mono path">{{ storage?.dataDir || '-' }}</span>
-              <a-button type="text" size="small" class="copy" title="复制路径" @click="copy(storage?.dataDir)">
-                <template #icon><CopyOutlined /></template>
-              </a-button>
-            </div>
-            <div class="row">
-              <span class="label">数据库文件</span>
-              <span class="value mono path">{{ storage?.dbPath || '-' }}</span>
-              <a-button type="text" size="small" class="copy" title="复制路径" @click="copy(storage?.dbPath)">
-                <template #icon><CopyOutlined /></template>
-              </a-button>
-            </div>
-            <div class="row">
-              <span class="label">占用空间</span>
-              <span class="value mono">{{ storageSize }}</span>
-            </div>
-            <div class="row">
-              <span class="label">默认目录</span>
-              <span class="value mono path muted">{{ storage?.defaultDir || '-' }}</span>
-            </div>
-            <div v-if="storage?.pendingDir" class="row">
-              <span class="label">待生效</span>
-              <span class="value mono path pending">{{ storage.pendingDir }}</span>
-              <a-button type="link" size="small" class="copy" @click="restartApp">立即重启</a-button>
-            </div>
-          </div>
+        <!-- ============ 数据与存储 ============ -->
+        <div v-else-if="active === 'storage'" class="panel">
+          <a-spin :spinning="storageLoading">
+            <div class="group">
+              <div class="group-title">
+                存储位置
+                <span class="tag" :class="{ accent: storage?.isCustom }">
+                  {{ storage?.isCustom ? '自定义目录' : '默认目录' }}
+                </span>
+              </div>
+              <div class="group-desc">项目、请求、环境变量与历史记录都存在这里的 SQLite 文件中</div>
 
-          <div class="storage-actions">
-            <a-button type="primary" :loading="storageLoading" @click="changeStorage">
-              <template #icon><SwapOutlined /></template>
-              更改位置
-            </a-button>
-            <a-button :disabled="!storage?.dataDir" @click="openStorageDir(storage?.dataDir)">
-              <template #icon><FolderOpenOutlined /></template>
-              {{ openDirLabel }}
-            </a-button>
-            <a-button :disabled="!storage?.isCustom && !storage?.pendingDir" @click="resetStorage">
-              <template #icon><ReloadOutlined /></template>
-              恢复默认
-            </a-button>
-          </div>
+              <div class="row">
+                <div class="row-label">
+                  <div class="row-title">数据目录</div>
+                  <div class="row-desc mono">{{ storage?.dataDir || '-' }}</div>
+                </div>
+                <div class="row-control">
+                  <a-button size="small" @click="copy(storage?.dataDir)">
+                    <template #icon><CopyOutlined /></template>
+                    复制
+                  </a-button>
+                  <a-button size="small" :disabled="!storage?.dataDir" @click="openStorageDir(storage?.dataDir)">
+                    <template #icon><FolderOpenOutlined /></template>
+                    {{ openDirLabel }}
+                  </a-button>
+                </div>
+              </div>
 
-          <div class="storage-tip">
-            <LoginOutlined />
-            <span>
-              更改位置后需要重启应用生效；选择「迁移数据」会把当前数据库完整复制到新目录，原目录文件保留，确认数据无误后可自行删除。
-            </span>
-          </div>
-        </a-spin>
-      </div>
+              <div class="row">
+                <div class="row-label">
+                  <div class="row-title">数据库文件</div>
+                  <div class="row-desc mono">{{ storage?.dbPath || '-' }}</div>
+                </div>
+                <div class="row-control">
+                  <a-button size="small" @click="copy(storage?.dbPath)">
+                    <template #icon><CopyOutlined /></template>
+                    复制
+                  </a-button>
+                </div>
+              </div>
 
-      <div class="fm-card block network-block">
-        <div class="block-head">
-          <span class="block-icon blue"><GlobalOutlined /></span>
-          <div>
-            <div class="block-title">网络与安全</div>
-            <div class="block-desc">代理、客户端证书与 Python 授权；配置仅保存在本机</div>
-          </div>
-        </div>
-        <div class="rows">
-          <div class="row net-row">
-            <span class="label">启用代理</span>
-            <span class="value">
-              <a-switch v-model:checked="network.proxyEnabled" size="small" />
-            </span>
-          </div>
-          <div class="row net-row">
-            <span class="label">代理地址</span>
-            <span class="value">
-              <a-input
-                v-model:value="network.proxyUrl"
-                size="small"
-                :disabled="!network.proxyEnabled"
-                placeholder="http://127.0.0.1:7890 或 socks5h://127.0.0.1:1080"
-              />
-            </span>
-          </div>
-          <div class="row net-row">
-            <span class="label">客户端证书</span>
-            <span class="value cert-value">
-              <a-input
-                v-model:value="network.certPath"
-                size="small"
-                readonly
-                placeholder="未选择（仅支持 PKCS#12 的 .pfx / .p12）"
-              />
-              <a-button size="small" @click="pickCert">
-                <template #icon><KeyOutlined /></template>
-                选择
-              </a-button>
-              <a-button v-if="network.certPath" size="small" type="text" danger @click="network.certPath = ''">
-                清除
-              </a-button>
-            </span>
-          </div>
-          <div class="row net-row">
-            <span class="label">证书密码</span>
-            <span class="value">
-              <a-input-password
-                v-model:value="network.certPassword"
-                size="small"
-                :disabled="!network.certPath"
-                placeholder="PKCS#12 密码，没有可留空"
-              />
-            </span>
-          </div>
-          <div class="row net-row">
-            <span class="label">Python 脚本</span>
-            <span class="value python-value">
-              <a-switch v-model:checked="network.pythonEnabled" size="small" />
-              <span class="python-caption">
-                {{ network.pythonEnabled
-                  ? '已允许执行本地 Python 脚本'
-                  : '未开启：测试场景的 Python 钩子、Python 用例与套件包导入都会被拒绝' }}
+              <div class="row">
+                <div class="row-label">
+                  <div class="row-title">占用空间</div>
+                  <div class="row-desc">数据库与预写日志合计</div>
+                </div>
+                <div class="row-control mono">{{ storageSize }}</div>
+              </div>
+
+              <div class="row">
+                <div class="row-label">
+                  <div class="row-title">默认目录</div>
+                  <div class="row-desc mono">{{ storage?.defaultDir || '-' }}</div>
+                </div>
+              </div>
+
+              <div v-if="storage?.pendingDir" class="row">
+                <div class="row-label">
+                  <div class="row-title warn">待生效目录</div>
+                  <div class="row-desc mono">{{ storage.pendingDir }}</div>
+                </div>
+                <div class="row-control">
+                  <a-button size="small" type="primary" @click="restartApp">立即重启</a-button>
+                </div>
+              </div>
+
+              <div class="group-actions">
+                <a-button type="primary" :loading="storageLoading" @click="changeStorage">
+                  <template #icon><SwapOutlined /></template>
+                  更改位置
+                </a-button>
+              </div>
+            </div>
+
+            <div class="callout">
+              <LoginOutlined />
+              <span>
+                更改位置后需要重启应用生效；选择「迁移数据」会把当前数据库完整复制到新目录，原目录文件保留，确认数据无误后可自行删除。
               </span>
+            </div>
+
+            <div class="group danger-group">
+              <div class="group-title">恢复默认</div>
+              <div class="group-desc">切回应用默认数据目录，自定义目录里的文件不会被删除</div>
+              <div class="row">
+                <div class="row-label">
+                  <div class="row-title">恢复默认存储位置</div>
+                  <div class="row-desc">如果你从没改过目录，这里无需操作</div>
+                </div>
+                <div class="row-control">
+                  <a-button
+                    danger
+                    size="small"
+                    :disabled="!storage?.isCustom && !storage?.pendingDir"
+                    @click="resetStorage"
+                  >
+                    <template #icon><ReloadOutlined /></template>
+                    恢复默认
+                  </a-button>
+                </div>
+              </div>
+            </div>
+          </a-spin>
+        </div>
+
+        <!-- ============ 网络与安全 ============ -->
+        <div v-else-if="active === 'network'" class="panel">
+          <div class="group">
+            <div class="group-title">代理</div>
+            <div class="group-desc">支持 HTTP / HTTPS / SOCKS5，仅对本应用的请求生效</div>
+
+            <div class="row">
+              <div class="row-label">
+                <div class="row-title">启用代理</div>
+                <div class="row-desc">开启后所有请求都经由下面的地址转发</div>
+              </div>
+              <div class="row-control">
+                <a-switch v-model:checked="network.proxyEnabled" size="small" />
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="row-label">
+                <div class="row-title">代理地址</div>
+                <div class="row-desc">例：http://127.0.0.1:7890 或 socks5h://127.0.0.1:1080</div>
+              </div>
+              <div class="row-control wide">
+                <a-input
+                  v-model:value="network.proxyUrl"
+                  size="small"
+                  :disabled="!network.proxyEnabled"
+                  placeholder="http://127.0.0.1:7890"
+                />
+              </div>
+            </div>
+          </div>
+
+          <div class="group">
+            <div class="group-title">客户端证书</div>
+            <div class="group-desc">用于双向 TLS（mTLS）鉴权，仅支持 PKCS#12 的 .pfx / .p12</div>
+
+            <div class="row">
+              <div class="row-label">
+                <div class="row-title">证书文件</div>
+                <div class="row-desc">留空表示不携带客户端证书</div>
+              </div>
+              <div class="row-control wide">
+                <a-input
+                  v-model:value="network.certPath"
+                  size="small"
+                  readonly
+                  placeholder="未选择证书"
+                />
+                <a-button size="small" @click="pickCert">
+                  <template #icon><KeyOutlined /></template>
+                  选择
+                </a-button>
+                <a-button
+                  v-if="network.certPath"
+                  size="small"
+                  type="text"
+                  danger
+                  @click="network.certPath = ''"
+                >
+                  清除
+                </a-button>
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="row-label">
+                <div class="row-title">证书密码</div>
+                <div class="row-desc">PKCS#12 密码，没有可留空</div>
+              </div>
+              <div class="row-control wide">
+                <a-input-password
+                  v-model:value="network.certPassword"
+                  size="small"
+                  :disabled="!network.certPath"
+                  placeholder="证书密码"
+                />
+              </div>
+            </div>
+          </div>
+
+          <div class="group">
+            <div class="group-title">Python 脚本</div>
+            <div class="group-desc">测试场景的前后置钩子、Python 用例与套件包导入都依赖它</div>
+
+            <div class="row">
+              <div class="row-label">
+                <div class="row-title">允许执行本地脚本</div>
+                <div class="row-desc">
+                  {{
+                    network.pythonEnabled
+                      ? '已允许执行本地 Python 脚本'
+                      : '未开启：测试场景的 Python 钩子、Python 用例与套件包导入都会被拒绝'
+                  }}
+                </div>
+              </div>
+              <div class="row-control">
+                <a-switch v-model:checked="network.pythonEnabled" size="small" />
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="row-label">
+                <div class="row-title">解释器路径</div>
+                <div class="row-desc">留空自动探测（python3 / python / py -3）</div>
+              </div>
+              <div class="row-control wide">
+                <a-input
+                  v-model:value="network.pythonPath"
+                  size="small"
+                  placeholder="自动探测"
+                />
+                <a-button size="small" :loading="pythonChecking" @click="checkPython">
+                  <template #icon><ReloadOutlined /></template>
+                  探测
+                </a-button>
+              </div>
+            </div>
+
+            <div v-if="pythonCheckResult" class="probe">
+              <div :class="pythonCheckResult.available ? 'ok' : 'bad'">
+                {{ pythonCheckResult.available ? '已找到' : '未找到' }}
+                <template v-if="pythonCheckResult.info">
+                  Python {{ pythonCheckResult.info.version }}（{{ pythonCheckResult.info.display }}）
+                </template>
+              </div>
+              <div class="probe-msg">{{ pythonCheckResult.message }}</div>
+              <div v-if="network.pythonEnabled && !pythonCheckResult.enabled" class="probe-msg">
+                开关还没保存生效：点「保存并生效」后授权才会写入本机配置。
+              </div>
+              <div v-if="pythonCheckResult.tried.length" class="probe-tried mono">
+                试过：{{ pythonCheckResult.tried.join(' / ') }}
+              </div>
+            </div>
+          </div>
+
+          <div class="panel-footer">
+            <span class="footer-hint">修改后需要点这里保存才会生效</span>
+            <a-button type="primary" :loading="networkLoading" @click="saveNetwork">保存并生效</a-button>
+          </div>
+
+          <div class="callout">
+            <SafetyCertificateOutlined />
+            <span>
+              证书用于双向 TLS（mTLS）鉴权；代理支持 HTTP / HTTPS / SOCKS5。若填写有误，保存时会直接提示原因且不会覆盖当前生效配置。
+              Python 授权只影响「测试场景」里的前后置钩子、Python 用例与导入的套件包；未开启时这些脚本一律不执行，运行会给出明确原因。
             </span>
           </div>
-          <div class="row net-row">
-            <span class="label">解释器路径</span>
-            <span class="value cert-value">
-              <a-input
-                v-model:value="network.pythonPath"
-                size="small"
-                placeholder="留空自动探测（python3 / python / py -3）"
-              />
-              <a-button size="small" :loading="pythonChecking" @click="checkPython">
-                <template #icon><ReloadOutlined /></template>
-                探测
+        </div>
+
+        <!-- ============ AI 助手 ============ -->
+        <div v-else-if="active === 'assistant'" class="panel">
+          <div class="group">
+            <div class="group-title">
+              航仔
+              <span class="tag accent">已上线</span>
+            </div>
+            <div class="group-desc">用一句话描述需求，直接操作项目、请求、压测与测试场景</div>
+            <div class="hint">
+              点右侧屏幕中间的机器人即可打开航仔。先在「模型服务」里配置一家服务商（DeepSeek / Kimi /
+              智谱 / 通义千问 / Claude / Gemini / Ollama 等，兼容 OpenAI 协议的服务都能接），之后能建项目、写请求、发请求、生成签名脚本、查压测报告与导出记录。
+              敏感操作会先弹确认；密钥仅加密保存在本机数据库，不会上传到任何服务器。
+            </div>
+            <div class="row">
+              <div class="row-label">
+                <div class="row-title">可用工具</div>
+                <div class="row-desc">覆盖项目、请求、环境变量、历史记录、压测报告、测试场景与脚本</div>
+              </div>
+              <div class="row-control mono">{{ aiToolCount }} 个</div>
+            </div>
+            <div class="row">
+              <div class="row-label">
+                <div class="row-title">用量统计</div>
+                <div class="row-desc">按天查看调用次数、token 与预估费用，可按模型和工具拆分</div>
+              </div>
+              <div class="row-control">
+                <a-button size="small" @click="router.push({ name: 'ai-usage' })">查看用量</a-button>
+              </div>
+            </div>
+            <div class="group-actions">
+              <a-button type="primary" @click="router.push({ name: 'ai' })">打开航仔</a-button>
+            </div>
+          </div>
+        </div>
+
+        <!-- ============ 版本更新 ============ -->
+        <div v-else-if="active === 'update'" class="panel">
+          <div class="group">
+            <div class="group-title">
+              版本
+              <span v-if="updateInfo?.hasUpdate" class="tag accent">有新版本</span>
+            </div>
+            <div class="group-desc">从 GitHub Release 获取最新版本，下载后按安装向导升级</div>
+
+            <div class="row">
+              <div class="row-label">
+                <div class="row-title">当前版本</div>
+                <div class="row-desc">安装包不经过任何第三方服务器</div>
+              </div>
+              <div class="row-control mono">v{{ info?.version || '-' }}</div>
+            </div>
+
+            <div class="row">
+              <div class="row-label">
+                <div class="row-title">最新版本</div>
+                <div class="row-desc">点下方「检查更新」获取 GitHub 上的最新发布</div>
+              </div>
+              <div class="row-control">
+                <span class="mono">{{ updateInfo ? `v${updateInfo.latestVersion}` : '尚未检查' }}</span>
+                <span v-if="updateInfo && !updateInfo.hasUpdate" class="tag">已是最新</span>
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="row-label">
+                <div class="row-title">自动检查更新</div>
+                <div class="row-desc">启动后自动检查，有新版本时弹窗提示</div>
+              </div>
+              <div class="row-control">
+                <a-switch
+                  :checked="autoUpdate"
+                  size="small"
+                  @change="(v: unknown) => toggleAutoUpdate(Boolean(v))"
+                />
+              </div>
+            </div>
+
+            <div class="group-actions">
+              <a-button type="primary" :loading="updateLoading" @click="manualCheck">
+                <template #icon><CloudDownloadOutlined /></template>
+                检查更新
               </a-button>
+              <a-button @click="openReleasePage">打开发布页</a-button>
+            </div>
+          </div>
+
+          <div v-if="isMac" class="callout warn">
+            <SafetyCertificateOutlined />
+            <span>
+              macOS 首次打开或覆盖升级后若提示「Apple 无法验证 AstroMan.app」，是系统对未公证应用的拦截，与 Intel / Apple Silicon
+              架构无关：到「系统设置 → 隐私与安全性」点击「仍要打开」，或在终端执行
+              <code>sudo xattr -dr com.apple.quarantine /Applications/AstroMan.app</code>。
             </span>
           </div>
-          <div v-if="pythonCheckResult" class="python-check-result">
-            <div :class="pythonCheckResult.available ? 'ok' : 'bad'">
-              {{ pythonCheckResult.available ? '已找到' : '未找到' }}
-              <template v-if="pythonCheckResult.info">
-                Python {{ pythonCheckResult.info.version }}（{{ pythonCheckResult.info.display }}）
-              </template>
-            </div>
-            <div class="python-check-msg">{{ pythonCheckResult.message }}</div>
-            <div v-if="network.pythonEnabled && !pythonCheckResult.enabled" class="python-check-msg">
-              开关还没保存生效：点「保存并生效」后授权才会写入本机配置。
-            </div>
-            <div v-if="pythonCheckResult.tried.length" class="python-check-tried mono">
-              试过：{{ pythonCheckResult.tried.join(' / ') }}
-            </div>
-          </div>
-        </div>
-        <div class="storage-actions">
-          <a-button type="primary" :loading="networkLoading" @click="saveNetwork">保存并生效</a-button>
-        </div>
-        <div class="storage-tip">
-          <SafetyCertificateOutlined />
-          <span>
-            证书用于双向 TLS（mTLS）鉴权；代理支持 HTTP / HTTPS / SOCKS5。若填写有误，保存时会直接提示原因且不会覆盖当前生效配置。
-            Python 授权只影响「测试场景」里的前后置钩子、Python 用例与导入的套件包；未开启时这些脚本一律不执行，运行会给出明确原因。
-          </span>
-        </div>
-      </div>
 
-      <div class="fm-card block update-block">
-        <div class="block-head">
-          <span class="block-icon blue"><CloudDownloadOutlined /></span>
-          <div>
-            <div class="block-title">版本更新</div>
-            <div class="block-desc">从 GitHub Release 获取最新版本，下载后按安装向导升级</div>
-          </div>
-          <span v-if="updateInfo?.hasUpdate" class="update-badge">有新版本</span>
-        </div>
-        <div class="rows">
-          <div class="row">
-            <span class="label">当前版本</span>
-            <span class="value mono">v{{ info?.version || '-' }}</span>
-          </div>
-          <div class="row">
-            <span class="label">最新版本</span>
-            <span class="value mono">
-              {{ updateInfo ? `v${updateInfo.latestVersion}` : '尚未检查' }}
-              <template v-if="updateInfo && !updateInfo.hasUpdate">（已是最新）</template>
+          <div class="callout">
+            <InfoCircleOutlined />
+            <span>
+              安装包直接从 GitHub Release 下载。国内网络访问 GitHub 可能较慢，失败时请检查网络后重试。
             </span>
           </div>
-          <div class="row">
-            <span class="label">自动检查</span>
-            <span class="value">启动后自动检查更新，有新版本时弹窗提示</span>
-            <a-switch :checked="autoUpdate" size="small" @change="(v: unknown) => toggleAutoUpdate(Boolean(v))" />
-          </div>
         </div>
-        <div class="storage-actions">
-          <a-button type="primary" :loading="updateLoading" @click="manualCheck">
-            <template #icon><CloudDownloadOutlined /></template>
-            检查更新
-          </a-button>
-          <a-button @click="openReleasePage">打开发布页</a-button>
-        </div>
-        <div v-if="isMac" class="storage-tip">
-          <SafetyCertificateOutlined />
-          <span>
-            macOS 首次打开或覆盖升级后若提示「Apple 无法验证 AstroMan.app」，是系统对未公证应用的拦截，与 Intel / Apple Silicon 架构无关：到「系统设置 → 隐私与安全性」点击「仍要打开」，或在终端执行
-            <code>sudo xattr -dr com.apple.quarantine /Applications/AstroMan.app</code>。
-          </span>
-        </div>
-        <div class="storage-tip">
-          <SafetyCertificateOutlined />
-          <span>
-            安装包直接从 GitHub Release 下载，不经过任何第三方服务器。国内网络访问 GitHub 可能较慢，失败时请检查网络后重试。
-          </span>
-        </div>
-      </div>
 
-      <div class="fm-card block">
-        <div class="block-head">
-          <span class="block-icon blue"><LaptopOutlined /></span>
-          <div>
-            <div class="block-title">应用信息</div>
-            <div class="block-desc">当前版本与本地运行环境</div>
+        <!-- ============ 快捷键与技巧 ============ -->
+        <div v-else-if="active === 'shortcuts'" class="panel">
+          <div class="group">
+            <div class="group-title">快捷键</div>
+            <div class="row compact">
+              <div class="row-label"><div class="row-title">在 URL 输入框直接发送请求</div></div>
+              <div class="row-control"><kbd>Enter</kbd></div>
+            </div>
+            <div class="row compact">
+              <div class="row-label"><div class="row-title">放大界面</div></div>
+              <div class="row-control"><kbd>{{ shortcutText('+') }}</kbd></div>
+            </div>
+            <div class="row compact">
+              <div class="row-label"><div class="row-title">缩小界面</div></div>
+              <div class="row-control"><kbd>{{ shortcutText('-') }}</kbd></div>
+            </div>
+            <div class="row compact">
+              <div class="row-label"><div class="row-title">恢复 100% 缩放</div></div>
+              <div class="row-control"><kbd>{{ shortcutText('0') }}</kbd></div>
+            </div>
           </div>
-        </div>
-        <div class="rows">
-          <div class="row">
-            <span class="label">版本</span>
-            <span class="value mono">AstroMan {{ info?.version || '-' }}</span>
-          </div>
-          <div class="row">
-            <span class="label">运行模式</span>
-            <span class="value">纯本地桌面应用（Tauri）</span>
-          </div>
-          <div class="row">
-            <span class="label">运行系统</span>
-            <span class="value">{{ platformLabel }}</span>
-          </div>
-          <div class="row">
-            <span class="label">数据目录</span>
-            <span class="value mono path">{{ info?.dataDir || '-' }}</span>
-            <a-button type="text" size="small" class="copy" @click="copy(info?.dataDir)">
-              <template #icon><CopyOutlined /></template>
-            </a-button>
-          </div>
-          <div class="row">
-            <span class="label">数据库文件</span>
-            <span class="value mono path">{{ info?.dbPath || '-' }}</span>
-            <a-button type="text" size="small" class="copy" @click="copy(info?.dbPath)">
-              <template #icon><CopyOutlined /></template>
-            </a-button>
-          </div>
-        </div>
-      </div>
 
-      <div class="fm-card block">
-        <div class="block-head">
-          <span class="block-icon green"><SafetyCertificateOutlined /></span>
-          <div>
-            <div class="block-title">数据与隐私</div>
-            <div class="block-desc">所有数据都在本机，可随时备份</div>
+          <div class="group">
+            <div class="group-title">技巧</div>
+            <div class="row compact">
+              <div class="row-label">
+                <div class="row-title">引用环境变量</div>
+                <div class="row-desc">在 URL / Headers / Body 中都可使用</div>
+              </div>
+              <div class="row-control"><kbd v-pre>{{base_url}}</kbd></div>
+            </div>
+            <div class="row compact">
+              <div class="row-label">
+                <div class="row-title">生成随机整数</div>
+                <div class="row-desc">用于批量造测试数据</div>
+              </div>
+              <div class="row-control"><kbd v-pre>{{randomInt(1,100)}}</kbd></div>
+            </div>
+            <div class="row compact">
+              <div class="row-label">
+                <div class="row-title">停止压测</div>
+                <div class="row-desc">压测中可随时停止，已产生的数据仍会保存成报告</div>
+              </div>
+              <div class="row-control"><kbd>停止</kbd></div>
+            </div>
           </div>
         </div>
-        <ul class="list">
-          <li>
-            项目、集合、请求、环境变量、历史记录和压测报告全部存放在上方的 SQLite 文件中，
-            不依赖任何云端后端。
-          </li>
-          <li>不需要注册账号，没有登录态、权限体系与付费限制。</li>
-          <li>备份方式：退出应用后复制数据库文件；换电脑时放回同名路径即可。</li>
-          <li>卸载应用不会自动删除数据目录，如需彻底清理请手动删除。</li>
-        </ul>
-      </div>
 
-      <div class="fm-card block">
-        <div class="block-head">
-          <span class="block-icon purple"><ThunderboltOutlined /></span>
-          <div>
-            <div class="block-title">AI 辅助（航仔）</div>
-            <div class="block-desc">用一句话描述需求，直接操作项目、请求、压测与测试场景</div>
+        <!-- ============ 关于 ============ -->
+        <div v-else-if="active === 'about'" class="panel">
+          <div class="group">
+            <div class="group-title">应用信息</div>
+            <div class="row">
+              <div class="row-label"><div class="row-title">版本</div></div>
+              <div class="row-control mono">AstroMan {{ info?.version || '-' }}</div>
+            </div>
+            <div class="row">
+              <div class="row-label"><div class="row-title">运行模式</div></div>
+              <div class="row-control">纯本地桌面应用（Tauri）</div>
+            </div>
+            <div class="row">
+              <div class="row-label"><div class="row-title">运行系统</div></div>
+              <div class="row-control">{{ platformLabel }}</div>
+            </div>
+            <div class="row">
+              <div class="row-label">
+                <div class="row-title">数据目录</div>
+                <div class="row-desc mono">{{ info?.dataDir || '-' }}</div>
+              </div>
+              <div class="row-control">
+                <a-button size="small" @click="copy(info?.dataDir)">
+                  <template #icon><CopyOutlined /></template>
+                  复制
+                </a-button>
+              </div>
+            </div>
+            <div class="row">
+              <div class="row-label">
+                <div class="row-title">数据库文件</div>
+                <div class="row-desc mono">{{ info?.dbPath || '-' }}</div>
+              </div>
+              <div class="row-control">
+                <a-button size="small" @click="copy(info?.dbPath)">
+                  <template #icon><CopyOutlined /></template>
+                  复制
+                </a-button>
+              </div>
+            </div>
           </div>
-          <span class="soon live">已上线</span>
-        </div>
-        <div class="ai-hint">
-          点右侧屏幕中间的机器人即可打开航仔。先在顶部「模型服务」里配置一家服务商（DeepSeek / Kimi / 智谱 / 通义千问 / Claude / Gemini /
-          Ollama 等，兼容 OpenAI 协议的服务都能接），之后能建项目、写请求、发请求、生成签名脚本、查压测报告与导出记录。
-          敏感操作会先弹确认；密钥仅加密保存在本机数据库，不会上传到任何服务器。
-        </div>
-        <ul class="list">
-          <li>共 {{ aiToolCount }} 个工具，覆盖项目、请求、环境变量、历史记录、压测报告、测试场景与脚本。</li>
-          <li>用量统计可按天查看调用次数、token 与预估费用，按模型和工具拆分明细。</li>
-        </ul>
-        <div class="ai-actions">
-          <a-button type="primary" @click="router.push({ name: 'ai' })">打开航仔</a-button>
-          <a-button @click="router.push({ name: 'ai-usage' })">用量统计</a-button>
-        </div>
-      </div>
 
-      <div class="fm-card block">
-        <div class="block-head">
-          <span class="block-icon amber"><DatabaseOutlined /></span>
-          <div>
-            <div class="block-title">快捷键与技巧</div>
-            <div class="block-desc">日常使用中最常用的操作</div>
+          <div class="group">
+            <div class="group-title">数据与隐私</div>
+            <div class="group-desc">所有数据都在本机，可随时备份</div>
+            <ul class="bullet">
+              <li>
+                项目、集合、请求、环境变量、历史记录和压测报告全部存放在上方的 SQLite 文件中，不依赖任何云端后端。
+              </li>
+              <li>不需要注册账号，没有登录态、权限体系与付费限制。</li>
+              <li>备份方式：退出应用后复制数据库文件；换电脑时放回同名路径即可。</li>
+              <li>卸载应用不会自动删除数据目录，如需彻底清理请手动删除。</li>
+            </ul>
           </div>
         </div>
-        <div class="shortcuts">
-          <div class="shortcut"><span class="keys"><kbd>Enter</kbd></span><span>在 URL 输入框直接发送请求</span></div>
-          <div class="shortcut"><span class="keys"><kbd v-pre>{{base_url}}</kbd></span><span>在 URL / Headers / Body 中引用环境变量</span></div>
-          <div class="shortcut"><span class="keys"><kbd v-pre>{{randomInt(1,100)}}</kbd></span><span>生成范围内的随机整数，用于造测试数据</span></div>
-          <div class="shortcut"><span class="keys"><kbd>{{ shortcutText('+') }}</kbd></span><span>放大界面（也可使用左下角的缩放控件）</span></div>
-          <div class="shortcut"><span class="keys"><kbd>{{ shortcutText('-') }}</kbd></span><span>缩小界面</span></div>
-          <div class="shortcut"><span class="keys"><kbd>{{ shortcutText('0') }}</kbd></span><span>恢复界面缩放为 100%</span></div>
-          <div class="shortcut"><span class="keys"><kbd>停止</kbd></span><span>压测中可随时停止，数据仍会保存成报告</span></div>
-        </div>
-      </div>
+      </section>
     </div>
   </div>
 </template>
 
 <style scoped>
-/* 设置页内容较多，占满可用宽度，不沿用全局 1440px 上限 */
+/* 整页撑满可用高度，面板内部滚动，像桌面软件而不是长卡片流 */
+.settings-page {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  padding-bottom: 16px;
+}
+
 .page {
   max-width: none;
 }
 
-.grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 16px;
-  align-items: start;
-  width: 100%;
+.settings {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  gap: 0;
+  border: 1px solid var(--fm-border);
+  border-radius: var(--fm-radius-lg);
+  background: var(--fm-surface);
+  box-shadow: var(--fm-shadow);
+  overflow: hidden;
 }
 
-.block {
-  padding: 20px 22px;
+/* ---------- 左侧分类 ---------- */
+.set-nav {
+  width: 216px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 12px 10px;
+  background: var(--fm-surface-alt);
+  border-right: 1px solid var(--fm-border);
+  overflow-y: auto;
+}
+
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 9px 10px;
+  border: none;
+  border-radius: 9px;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  color: var(--fm-text-2);
+  transition: background 0.14s, color 0.14s;
+}
+
+.nav-item:hover {
+  background: var(--fm-surface);
+}
+
+.nav-item.active {
+  background: var(--fm-primary-soft);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--fm-primary) 22%, transparent);
+}
+
+.nav-ico {
+  width: 26px;
+  height: 26px;
+  flex-shrink: 0;
+  border-radius: 7px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  background: var(--fm-bg);
+  color: var(--fm-muted);
+  transition: background 0.14s, color 0.14s;
+}
+
+.nav-item.active .nav-ico {
+  background: var(--fm-primary);
+  color: #fff;
+}
+
+.nav-text {
+  display: flex;
+  flex-direction: column;
   min-width: 0;
 }
 
-/* 主题、存储、网络、更新需要整行宽度 */
-.theme-block,
-.storage-block,
-.network-block,
-.update-block {
-  grid-column: 1 / -1;
+.nav-name {
+  font-size: 12.5px;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-@media (max-width: 900px) {
-  .grid {
-    grid-template-columns: minmax(0, 1fr);
-  }
+.nav-item.active .nav-name {
+  color: var(--fm-primary);
+  font-weight: 600;
 }
 
+.nav-desc {
+  font-size: 10px;
+  color: var(--fm-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nav-foot {
+  margin-top: auto;
+  padding: 14px 10px 4px;
+  font-size: 10px;
+  color: var(--fm-muted);
+  border-top: 1px solid var(--fm-border);
+}
+
+/* ---------- 右侧内容 ---------- */
+.set-body {
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  padding: 20px 26px 28px;
+}
+
+.panel-head {
+  margin-bottom: 18px;
+}
+
+.panel-head h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.1px;
+}
+
+.panel-head p {
+  margin: 4px 0 0;
+  font-size: 11.5px;
+  color: var(--fm-muted);
+}
+
+.group {
+  margin-bottom: 22px;
+}
+
+.group-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fm-text);
+}
+
+.group-desc {
+  margin: 4px 0 10px;
+  font-size: 11px;
+  color: var(--fm-muted);
+  line-height: 1.6;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  min-height: 54px;
+  padding: 12px 2px;
+  border-bottom: 1px solid var(--fm-border);
+}
+
+.row:first-of-type {
+  border-top: 1px solid var(--fm-border);
+}
+
+.row.compact {
+  min-height: 44px;
+  padding: 8px 2px;
+}
+
+.row:last-child {
+  border-bottom: 1px solid var(--fm-border);
+}
+
+/* 最后一组操作按钮不重复画分割线 */
+.group-actions + .callout {
+  margin-top: 4px;
+}
+
+.row-label {
+  flex: 1;
+  min-width: 0;
+}
+
+.row-title {
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--fm-text);
+}
+
+.row-title.warn {
+  color: var(--fm-warning);
+}
+
+.row-desc {
+  margin-top: 3px;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--fm-muted);
+  word-break: break-all;
+}
+
+.row-control {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--fm-text-2);
+}
+
+.row-control.wide {
+  flex: 0 0 340px;
+  min-width: 220px;
+}
+
+.row-control.wide :deep(.ant-input),
+.row-control.wide :deep(.ant-input-affix-wrapper) {
+  flex: 1;
+  min-width: 0;
+}
+
+.group-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding-top: 14px;
+}
+
+.panel-footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  padding: 4px 0 14px;
+}
+
+.footer-hint {
+  font-size: 11px;
+  color: var(--fm-muted);
+}
+
+.mono {
+  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-size: 11px;
+}
+
+/* ---------- 标签 / 提示 ---------- */
+.tag {
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--fm-muted);
+  background: var(--fm-surface-alt);
+  border: 1px solid var(--fm-border);
+  padding: 1px 8px;
+  border-radius: 999px;
+  flex-shrink: 0;
+}
+
+.tag.accent {
+  color: var(--fm-primary);
+  background: var(--fm-primary-soft);
+  border-color: transparent;
+}
+
+.callout {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin-bottom: 20px;
+  padding: 11px 13px;
+  border-radius: 10px;
+  background: var(--fm-surface-alt);
+  border: 1px dashed var(--fm-border-strong);
+  font-size: 11px;
+  line-height: 1.75;
+  color: var(--fm-muted);
+}
+
+.callout.warn {
+  border-color: var(--fm-warning);
+  background: var(--fm-warning-soft);
+  color: var(--fm-text-2);
+}
+
+.callout > :first-child {
+  margin-top: 2px;
+  flex-shrink: 0;
+}
+
+.callout code {
+  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-size: 10.5px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--fm-bg);
+  word-break: break-all;
+}
+
+.hint {
+  padding: 12px 14px;
+  margin-bottom: 14px;
+  border-radius: 10px;
+  background: var(--fm-surface-alt);
+  border: 1px dashed var(--fm-border-strong);
+  font-size: 11.5px;
+  line-height: 1.85;
+  color: var(--fm-text-2);
+}
+
+.bullet {
+  margin: 8px 0 0;
+  padding-left: 18px;
+}
+
+.bullet li {
+  font-size: 11.5px;
+  line-height: 1.9;
+  color: var(--fm-text-2);
+}
+
+.probe {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 10px;
+  padding: 9px 11px;
+  border: 1px solid var(--fm-border);
+  border-radius: 8px;
+  background: var(--fm-surface-alt);
+  font-size: 11px;
+  line-height: 1.7;
+  color: var(--fm-text-2);
+}
+
+.probe .ok {
+  color: var(--fm-success);
+  font-weight: 600;
+}
+
+.probe .bad {
+  color: var(--fm-danger);
+  font-weight: 600;
+}
+
+.probe-msg {
+  color: var(--fm-muted);
+}
+
+.probe-tried {
+  font-size: 10.5px;
+  color: var(--fm-muted);
+  word-break: break-all;
+}
+
+.danger-group .group-title {
+  color: var(--fm-danger);
+}
+
+kbd {
+  display: inline-block;
+  padding: 2px 7px;
+  border-radius: 5px;
+  border: 1px solid var(--fm-border-strong);
+  border-bottom-width: 2px;
+  background: var(--fm-surface-alt);
+  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-size: 10px;
+  color: var(--fm-text-2);
+}
+
+/* ---------- 主题选择 ---------- */
 .theme-list {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(148px, 1fr));
   gap: 12px;
-}
-
-@media (max-width: 1180px) {
-  .theme-list {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
 }
 
 .theme-item {
@@ -740,295 +1297,58 @@ async function openReleasePage() {
   color: var(--fm-primary);
 }
 
-.block-head {
-  display: flex;
-  align-items: flex-start;
-  gap: 12px;
-  margin-bottom: 16px;
-}
+/* ---------- 窄窗口：导航转为横向标签 ---------- */
+@media (max-width: 900px) {
+  .settings {
+    flex-direction: column;
+  }
 
-.block-icon {
-  width: 34px;
-  height: 34px;
-  border-radius: 10px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 15px;
-  flex-shrink: 0;
-}
+  .set-nav {
+    width: 100%;
+    flex-direction: row;
+    align-items: center;
+    gap: 6px;
+    padding: 8px;
+    border-right: none;
+    border-bottom: 1px solid var(--fm-border);
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
 
-.block-icon.blue {
-  background: var(--fm-primary-soft);
-  color: var(--fm-primary);
-}
+  .nav-item {
+    width: auto;
+    flex-shrink: 0;
+    padding: 6px 10px;
+  }
 
-.block-icon.green {
-  background: var(--fm-success-soft);
-  color: var(--fm-success);
-}
+  .nav-desc,
+  .nav-foot {
+    display: none;
+  }
 
-.block-icon.purple {
-  background: var(--fm-purple-soft);
-  color: var(--fm-purple);
-}
+  .set-body {
+    padding: 16px;
+  }
 
-.block-icon.amber {
-  background: var(--fm-warning-soft);
-  color: var(--fm-warning);
-}
+  .row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
 
-.update-block {
-  grid-column: 1 / -1;
-}
+  .row-control.wide {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
 
-.update-badge {
-  margin-left: auto;
-  font-size: 10px;
-  color: var(--fm-success);
-  background: var(--fm-success-soft);
-  padding: 2px 10px;
-  border-radius: 999px;
-  flex-shrink: 0;
-}
+  .panel-footer {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
 
-.block-title {
-  font-size: 14px;
-  font-weight: 600;
-}
-
-.block-desc {
-  margin-top: 2px;
-  font-size: 11px;
-  color: var(--fm-muted);
-}
-
-.soon {
-  margin-left: auto;
-  font-size: 10px;
-  color: var(--fm-muted);
-  background: var(--fm-surface-alt);
-  border: 1px solid var(--fm-border);
-  padding: 1px 8px;
-  border-radius: 999px;
-}
-
-.soon.live {
-  color: var(--fm-success);
-  background: var(--fm-success-soft);
-  border-color: transparent;
-}
-
-.ai-actions {
-  display: flex;
-  gap: 10px;
-  margin-top: 14px;
-}
-
-.rows {
-  display: flex;
-  flex-direction: column;
-}
-
-.row {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  padding: 10px 0;
-  border-bottom: 1px dashed var(--fm-border);
-  font-size: 12px;
-}
-
-.row:last-child {
-  border-bottom: none;
-}
-
-.label {
-  width: 84px;
-  flex-shrink: 0;
-  color: var(--fm-muted);
-  font-size: 11px;
-}
-
-.net-row .value {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  align-items: center;
-}
-
-.cert-value {
-  gap: 8px;
-}
-
-.python-value {
-  gap: 8px;
-}
-
-.python-caption {
-  font-size: 10.5px;
-  line-height: 1.6;
-  color: var(--fm-muted);
-}
-
-.python-check-result {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  margin: -2px 0 4px;
-  padding: 8px 10px;
-  border: 1px solid var(--fm-border);
-  border-radius: 6px;
-  background: var(--fm-surface-alt);
-  font-size: 11px;
-  line-height: 1.6;
-  color: var(--fm-text-2);
-}
-
-.python-check-result .ok {
-  color: var(--fm-success);
-}
-
-.python-check-result .bad {
-  color: var(--fm-danger);
-}
-
-.python-check-msg {
-  color: var(--fm-muted);
-}
-
-.python-check-tried {
-  font-size: 10.5px;
-  color: var(--fm-muted);
-  word-break: break-all;
-}
-
-.value {
-  flex: 1;
-  min-width: 0;
-  word-break: break-all;
-  color: var(--fm-text-2);
-}
-
-.path {
-  font-size: 11px;
-  line-height: 1.6;
-}
-
-.copy {
-  color: var(--fm-muted);
-  flex-shrink: 0;
-}
-
-.list {
-  margin: 0;
-  padding-left: 18px;
-}
-
-.list li {
-  font-size: 12px;
-  line-height: 1.9;
-  color: var(--fm-text-2);
-}
-
-.ai-hint {
-  font-size: 12px;
-  line-height: 1.9;
-  color: var(--fm-text-2);
-  padding: 12px 14px;
-  border-radius: 10px;
-  background: var(--fm-surface-alt);
-  border: 1px dashed var(--fm-border-strong);
-  margin-bottom: 14px;
-}
-
-.shortcuts {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-.shortcut {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-size: 12px;
-  color: var(--fm-text-2);
-}
-
-.keys {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  min-width: 128px;
-  flex-shrink: 0;
-}
-
-kbd {
-  display: inline-block;
-  padding: 2px 7px;
-  border-radius: 5px;
-  border: 1px solid var(--fm-border-strong);
-  border-bottom-width: 2px;
-  background: var(--fm-surface-alt);
-  font-family: 'JetBrains Mono', Consolas, monospace;
-  font-size: 10px;
-  color: var(--fm-text-2);
-}
-
-/* ---------- 数据存储位置 ---------- */
-.storage-block {
-  grid-column: 1 / -1;
-}
-
-.storage-mode {
-  margin-left: auto;
-  font-size: 10px;
-  color: var(--fm-muted);
-  background: var(--fm-surface-alt);
-  border: 1px solid var(--fm-border);
-  padding: 2px 10px;
-  border-radius: 999px;
-  flex-shrink: 0;
-}
-
-.storage-mode.custom {
-  color: var(--fm-primary);
-  background: var(--fm-primary-soft);
-  border-color: transparent;
-}
-
-.value.muted {
-  color: var(--fm-muted);
-}
-
-.value.pending {
-  color: var(--fm-warning);
-}
-
-.storage-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-  margin-top: 14px;
-}
-
-.storage-tip {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  margin-top: 14px;
-  padding: 10px 12px;
-  border-radius: 9px;
-  background: var(--fm-surface-alt);
-  border: 1px dashed var(--fm-border-strong);
-  font-size: 11px;
-  line-height: 1.7;
-  color: var(--fm-muted);
-}
-
-.storage-tip > :first-child {
-  margin-top: 2px;
-  flex-shrink: 0;
+  .panel-footer :deep(.ant-btn) {
+    width: 100%;
+  }
 }
 </style>

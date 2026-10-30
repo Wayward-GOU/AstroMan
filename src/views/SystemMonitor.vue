@@ -44,13 +44,13 @@ let timer: number | null = null
 let errorNotified = false
 
 const COLORS = {
-  cpu: '#3d6b8f',
+  cpu: '#4d6bfe',
   mem: '#7a8fa6',
-  gpu: '#b07d33',
-  down: '#3d6b8f',
+  gpu: '#d97706',
+  down: '#4d6bfe',
   up: '#4f8a76',
-  read: '#b07d33',
-  write: '#b0524d',
+  read: '#d97706',
+  write: '#dc2626',
 }
 
 function pushHistory(list: number[], value: number) {

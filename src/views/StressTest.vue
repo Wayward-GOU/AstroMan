@@ -386,15 +386,15 @@ const samples = computed(() => progress.value?.samples ?? [])
 const qpsSeries = computed(() => [
   {
     name: 'QPS',
-    color: '#3d6b8f',
+    color: '#4d6bfe',
     values: samples.value.map((s) => s.qps),
   },
 ])
 
 const latencySeries = computed(() => [
-  { name: '平均', color: '#3d6b8f', values: samples.value.map((s) => s.avgRt) },
-  { name: 'P95', color: '#b07d33', values: samples.value.map((s) => s.p95Rt) },
-  { name: 'P99', color: '#b0524d', values: samples.value.map((s) => s.p99Rt) },
+  { name: '平均', color: '#4d6bfe', values: samples.value.map((s) => s.avgRt) },
+  { name: 'P95', color: '#d97706', values: samples.value.map((s) => s.p95Rt) },
+  { name: 'P99', color: '#dc2626', values: samples.value.map((s) => s.p99Rt) },
 ])
 
 const chartLabels = computed(() => samples.value.map((s) => `${s.elapsedSec}s`))
@@ -784,7 +784,7 @@ function backToRequest() {
             <a-progress
               :percent="running || done ? percent : 0"
               :show-info="false"
-              :stroke-color="running ? '#3d6b8f' : done ? '#3f7f5f' : '#cbd5e1'"
+              :stroke-color="running ? '#4d6bfe' : done ? '#16a34a' : '#cbd5e1'"
               size="small"
             />
             <div class="stats">

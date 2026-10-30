@@ -26,16 +26,38 @@ fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
+/// 按屏幕缩放比例挑最贴合托盘槽位的图标尺寸，避免系统缩放把图标糊掉或显小。
+/// Windows 托盘在 100% 缩放下是 16px、150% 是 24px、200% 是 32px。
+fn tray_icon_bytes(scale: f64) -> &'static [u8] {
+    if scale <= 1.1 {
+        include_bytes!("../icons/tray-16.png")
+    } else if scale <= 1.75 {
+        include_bytes!("../icons/tray.png")
+    } else {
+        include_bytes!("../icons/tray@2x.png")
+    }
+}
+
 /// 系统托盘：左键点击显示主窗口，右键菜单可显示或退出
 fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出 AstroMan", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &quit])?;
 
+    // 主窗口还没建好时退回主显示器缩放，保证始终能拿到接近托盘槽位的尺寸
+    let scale = app
+        .get_webview_window("main")
+        .and_then(|window| window.scale_factor().ok())
+        .or_else(|| {
+            app.primary_monitor()
+                .ok()
+                .flatten()
+                .map(|monitor| monitor.scale_factor())
+        })
+        .unwrap_or(1.0);
+
     TrayIconBuilder::with_id("main-tray")
-        .icon(tauri::image::Image::from_bytes(include_bytes!(
-            "../icons/tray.png"
-        ))?)
+        .icon(tauri::image::Image::from_bytes(tray_icon_bytes(scale))?)
         .tooltip("AstroMan")
         .menu(&menu)
         .show_menu_on_left_click(false)

@@ -52,22 +52,32 @@ const labelMap: Record<string, string> = {
   requestIds: '请求 ID 列表',
 }
 
-function display(value: unknown): string {
-  if (value === null || value === undefined) return '—'
+/** 预览值：短参数直接展示，长参数（如整条 cURL、大 Body）完整保留并单独滚动 */
+interface PreviewValue {
+  text: string
+  /** 超长内容：用可滚动的代码块完整展示，不做截断 */
+  long: boolean
+  /** 字符数，用于告诉用户「这里就是全文」 */
+  size: number
+}
+
+function display(value: unknown): PreviewValue {
+  if (value === null || value === undefined) return { text: '—', long: false, size: 0 }
   if (typeof value === 'string') {
     const text = value.trim()
-    if (!text) return '（空）'
-    return text.length > 400 ? `${text.slice(0, 400)}…（共 ${text.length} 字符）` : text
+    if (!text) return { text: '（空）', long: false, size: 0 }
+    const long = text.length > 400 || text.includes('\n')
+    return { text, long, size: text.length }
   }
   if (typeof value === 'object') {
     try {
-      const text = JSON.stringify(value)
-      return text.length > 400 ? `${text.slice(0, 400)}…` : text
+      const text = JSON.stringify(value, null, 2)
+      return { text, long: text.length > 400, size: text.length }
     } catch {
-      return String(value)
+      return { text: String(value), long: false, size: 0 }
     }
   }
-  return String(value)
+  return { text: String(value), long: false, size: 0 }
 }
 
 const rows = computed(() =>
@@ -147,14 +157,23 @@ const precheck = computed(() => {
     <section class="row">
       <div class="label">参数</div>
       <div class="value">
-        <table v-if="rows.length" class="params">
-          <tbody>
-            <tr v-for="row in rows" :key="row.key">
-              <th>{{ row.label }}</th>
-              <td>{{ row.value }}</td>
-            </tr>
-          </tbody>
-        </table>
+        <div v-if="rows.length" class="params">
+          <div
+            v-for="row in rows"
+            :key="row.key"
+            class="param-row"
+            :class="{ stacked: row.value.long }"
+          >
+            <div class="param-key">{{ row.label }}</div>
+            <div class="param-val">
+              <template v-if="row.value.long">
+                <div class="long-meta">{{ row.value.size }} 字符 · 全文如下（可滚动查看）</div>
+                <pre class="long-value">{{ row.value.text }}</pre>
+              </template>
+              <template v-else>{{ row.value.text }}</template>
+            </div>
+          </div>
+        </div>
         <span v-else class="muted">无额外参数</span>
       </div>
     </section>
@@ -233,7 +252,7 @@ const precheck = computed(() => {
   border: 1px solid var(--fm-border, #e6e8eb);
   border-radius: 6px;
   overflow: hidden;
-  display: table;
+  display: block;
 }
 
 .plan {
@@ -250,30 +269,61 @@ const precheck = computed(() => {
   word-break: break-all;
 }
 
-.params th,
-.params td {
+.param-row {
+  display: flex;
+  gap: 10px;
   padding: 4px 8px;
-  vertical-align: top;
-  text-align: left;
-  font-weight: 400;
   border-bottom: 1px solid var(--fm-border, #e6e8eb);
 }
 
-.params tr:last-child th,
-.params tr:last-child td {
+.param-row:last-child {
   border-bottom: none;
 }
 
-.params th {
-  width: 30%;
-  color: var(--fm-muted, #8a8f99);
-  white-space: nowrap;
+/* 长参数改成上下排布，让代码块占满整行宽度，读起来更像原文 */
+.param-row.stacked {
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 8px;
 }
 
-.params td {
+.param-key {
+  flex: 0 0 30%;
+  color: var(--fm-muted, #8a8f99);
+  white-space: nowrap;
+  font-size: 11.5px;
+}
+
+.param-val {
+  flex: 1;
+  min-width: 0;
   font-family: 'JetBrains Mono', Consolas, monospace;
   font-size: 11.5px;
   word-break: break-all;
+}
+
+/* 长参数（整条 cURL、大 Body）：完整展示，超长时在块内滚动，不做截断 */
+.long-meta {
+  margin-bottom: 3px;
+  font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
+  font-size: 10.5px;
+  color: var(--fm-muted, #8a8f99);
+}
+
+.long-value {
+  max-height: 200px;
+  overflow: auto;
+  margin: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--fm-border, #e6e8eb);
+  border-radius: 6px;
+  background: var(--fm-surface, #fff);
+  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  word-break: break-all;
+  overscroll-behavior: contain;
 }
 
 .risk,

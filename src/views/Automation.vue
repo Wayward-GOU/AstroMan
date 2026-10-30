@@ -11,6 +11,9 @@ import {
   FileTextOutlined,
   DownloadOutlined,
   UploadOutlined,
+  SearchOutlined,
+  ExperimentOutlined,
+  InboxOutlined,
 } from '@ant-design/icons-vue'
 import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog'
 import { useRouter } from 'vue-router'
@@ -164,12 +167,19 @@ function deleteSuite(item: TestSuiteSummary) {
 /* ---------- 用例 ---------- */
 const caseColumns = [
   { title: '用例', dataIndex: 'name', key: 'name', ellipsis: true },
-  { title: '类型', dataIndex: 'kind', key: 'kind', width: 90 },
-  { title: '标签', dataIndex: 'tags', key: 'tags', width: 120, ellipsis: true },
-  { title: '依赖', dataIndex: 'dependsOn', key: 'dependsOn', width: 100, ellipsis: true },
-  { title: '状态', dataIndex: 'enabled', key: 'enabled', width: 80 },
-  { title: '操作', key: 'actions', width: 120 },
+  { title: '类型', dataIndex: 'kind', key: 'kind', width: 72 },
+  { title: '标签', dataIndex: 'tags', key: 'tags', width: 96, ellipsis: true },
+  { title: '依赖', dataIndex: 'dependsOn', key: 'dependsOn', width: 76, ellipsis: true },
+  { title: '状态', dataIndex: 'enabled', key: 'enabled', width: 70 },
+  { title: '操作', key: 'actions', width: 80, align: 'right' as const },
 ]
+
+/** 用例类型短标签 */
+const kindLabel: Record<string, string> = {
+  request: 'HTTP',
+  python: 'Python',
+  stress: '压测',
+}
 const caseEditor = reactive({
   open: false,
   saving: false,
@@ -662,7 +672,7 @@ onBeforeUnmount(stopPolling)
 </script>
 
 <template>
-  <div class="automation">
+  <div class="page automation">
     <PageHeader
       eyebrow="Automation"
       title="自动化测试"
@@ -680,27 +690,68 @@ onBeforeUnmount(stopPolling)
     <div class="layout">
       <aside class="suite-pane">
         <div class="pane-head">
-          <a-input v-model:value="keyword" allow-clear placeholder="搜索套件" size="small" />
-          <a-button size="small" title="导入套件包" @click="importSuitePack"><UploadOutlined /></a-button>
-          <a-button type="primary" size="small" @click="openSuiteModal"><PlusOutlined /></a-button>
+          <div class="pane-title">
+            <ExperimentOutlined class="pane-title-icon" />
+            <span>测试套件</span>
+            <span class="pane-count">{{ suites.length }}</span>
+          </div>
+          <div class="pane-tools">
+            <a-tooltip title="导入套件包">
+              <a-button type="text" size="small" @click="importSuitePack">
+                <template #icon><UploadOutlined /></template>
+              </a-button>
+            </a-tooltip>
+            <a-tooltip title="新建套件">
+              <a-button type="primary" size="small" @click="openSuiteModal">
+                <template #icon><PlusOutlined /></template>
+              </a-button>
+            </a-tooltip>
+          </div>
         </div>
+
+        <div class="pane-search">
+          <a-input v-model:value="keyword" allow-clear placeholder="搜索套件" size="small">
+            <template #prefix><SearchOutlined /></template>
+          </a-input>
+        </div>
+
         <div class="suite-list">
-          <div
+          <button
             v-for="item in suites"
             :key="item.id"
+            type="button"
             class="suite-item"
             :class="{ active: suite?.suite.id === item.id }"
             @click="selectSuite(item.id)"
           >
-            <div class="suite-main">
-              <span class="suite-name">{{ item.name }}</span>
-              <span class="suite-meta">{{ item.caseCount }} 个用例 · {{ item.envName ?? '未指定环境' }}</span>
-            </div>
-            <a-button type="text" size="small" danger @click.stop="deleteSuite(item)">
-              <DeleteOutlined />
+            <span class="suite-dot"><ExperimentOutlined /></span>
+            <span class="suite-main">
+              <span class="suite-name" :title="item.name">{{ item.name }}</span>
+              <span class="suite-meta">
+                <span class="meta-chip">{{ item.caseCount }} 个用例</span>
+                <span class="meta-env">{{ item.envName ?? '未指定环境' }}</span>
+              </span>
+            </span>
+            <a-button
+              class="suite-del"
+              type="text"
+              size="small"
+              danger
+              title="删除套件"
+              @click.stop="deleteSuite(item)"
+            >
+              <template #icon><DeleteOutlined /></template>
+            </a-button>
+          </button>
+
+          <div v-if="!suites.length" class="pane-empty">
+            <InboxOutlined class="pane-empty-icon" />
+            <p>还没有套件</p>
+            <a-button size="small" type="primary" @click="openSuiteModal">
+              <template #icon><PlusOutlined /></template>
+              新建套件
             </a-button>
           </div>
-          <a-empty v-if="!suites.length" description="还没有套件" :image-style="{ height: '40px' }" />
         </div>
       </aside>
 
@@ -708,8 +759,13 @@ onBeforeUnmount(stopPolling)
         <template v-if="suite">
           <div class="suite-bar">
             <div class="suite-title">
-              <h2>{{ suite.suite.name }}</h2>
-              <span class="suite-sub">{{ envName }} · {{ suite.cases.length }} 个用例</span>
+              <span class="suite-badge"><ExperimentOutlined /></span>
+              <div class="suite-title-text">
+                <h2 :title="suite.suite.name">{{ suite.suite.name }}</h2>
+                <span class="suite-sub">
+                  {{ envName }} · {{ suite.cases.length }} 个用例 · {{ suite.datasets.length }} 个数据集
+                </span>
+              </div>
             </div>
             <div class="suite-actions">
               <a-button size="small" @click="exportSuitePack"><DownloadOutlined /> 导出套件</a-button>
@@ -717,16 +773,18 @@ onBeforeUnmount(stopPolling)
                 v-model:value="runEnvId"
                 allow-clear
                 placeholder="选择环境"
-                style="width: 160px"
+                style="width: 150px"
+                size="small"
                 :options="envs.map((item) => ({ label: item.name, value: item.id }))"
               />
-              <a-button type="primary" :loading="loading" @click="startRun">
-                <PlayCircleOutlined /> 运行
+              <a-button type="primary" size="small" :loading="loading" @click="startRun">
+                <template #icon><PlayCircleOutlined /></template>
+                运行
               </a-button>
             </div>
           </div>
 
-          <a-tabs v-model:activeKey="tab" size="small">
+          <a-tabs v-model:activeKey="tab" size="small" class="suite-tabs">
             <a-tab-pane key="cases" tab="用例">
               <div class="tab-tools">
                 <a-button size="small" @click="openNewCase('request')"><PlusOutlined /> HTTP 用例</a-button>
@@ -740,19 +798,35 @@ onBeforeUnmount(stopPolling)
                 size="small"
                 :pagination="false"
                 :scroll="{ y: 420 }"
+                class="suite-table"
               >
                 <template #bodyCell="{ column, record }">
-                  <template v-if="column.key === 'kind'">
-                    <a-tag :color="record.kind === 'python' ? 'purple' : record.kind === 'stress' ? 'orange' : 'blue'">
-                      {{ record.kind }}
-                    </a-tag>
+                  <template v-if="column.key === 'name'">
+                    <span class="case-name" :title="record.name">{{ record.name }}</span>
+                  </template>
+                  <template v-else-if="column.key === 'kind'">
+                    <span class="kind-chip" :class="`kind-${record.kind}`">
+                      {{ kindLabel[record.kind] ?? record.kind }}
+                    </span>
+                  </template>
+                  <template v-else-if="column.key === 'tags'">
+                    <span class="cell-muted">{{ record.tags || '—' }}</span>
+                  </template>
+                  <template v-else-if="column.key === 'dependsOn'">
+                    <span class="cell-muted">{{ record.dependsOn || '—' }}</span>
                   </template>
                   <template v-else-if="column.key === 'enabled'">
-                    <a-tag :color="record.enabled ? 'green' : 'default'">{{ record.enabled ? '启用' : '禁用' }}</a-tag>
+                    <span class="state-pill" :class="record.enabled ? 'on' : 'off'">
+                      {{ record.enabled ? '启用' : '禁用' }}
+                    </span>
                   </template>
                   <template v-else-if="column.key === 'actions'">
-                    <a-button type="link" size="small" @click="openEditCase(record)"><EditOutlined /></a-button>
-                    <a-button type="link" size="small" danger @click="deleteCase(record)"><DeleteOutlined /></a-button>
+                    <a-button type="text" size="small" title="编辑" @click="openEditCase(record)">
+                      <template #icon><EditOutlined /></template>
+                    </a-button>
+                    <a-button type="text" size="small" danger title="删除" @click="deleteCase(record)">
+                      <template #icon><DeleteOutlined /></template>
+                    </a-button>
                   </template>
                 </template>
               </a-table>
@@ -766,13 +840,19 @@ onBeforeUnmount(stopPolling)
                 size="small"
                 :loading="runsLoading"
                 :pagination="{ pageSize: 12, size: 'small' }"
+                class="suite-table"
               >
                 <template #bodyCell="{ column, record }">
                   <template v-if="column.key === 'status'">
                     <a-tag :color="statusColor[record.status]">{{ statusText[record.status] ?? record.status }}</a-tag>
                   </template>
                   <template v-else-if="column.key === 'counts'">
-                    通过 {{ record.passed }} · 失败 {{ record.failed }} · 跳过 {{ record.skipped }} · 错误 {{ record.errored }}
+                    <span class="run-counts">
+                      <span class="ok">通过 {{ record.passed }}</span>
+                      <span class="bad">失败 {{ record.failed }}</span>
+                      <span>跳过 {{ record.skipped }}</span>
+                      <span>错误 {{ record.errored }}</span>
+                    </span>
                   </template>
                   <template v-else-if="column.key === 'durationMs'">
                     {{ record.durationMs > 1000 ? `${(record.durationMs / 1000).toFixed(1)} s` : `${record.durationMs} ms` }}
@@ -796,57 +876,80 @@ onBeforeUnmount(stopPolling)
                 row-key="id"
                 size="small"
                 :pagination="false"
+                class="suite-table"
                 :columns="[
                   { title: '名称', dataIndex: 'name', key: 'name' },
                   { title: '格式', dataIndex: 'format', key: 'format', width: 80 },
                   { title: '行数', dataIndex: 'rowCount', key: 'rowCount', width: 80 },
                   { title: '内容', dataIndex: 'content', key: 'content', ellipsis: true },
-                  { title: '操作', key: 'actions', width: 120 },
+                  { title: '操作', key: 'actions', width: 96, align: 'right' as const },
                 ]"
               >
                 <template #bodyCell="{ column, record }">
-                  <template v-if="column.key === 'content'">
-                    {{ record.content ? record.content.slice(0, 80) : record.path ?? '（点击编辑查看）' }}
+                  <template v-if="column.key === 'format'">
+                    <span class="kind-chip kind-request">{{ String(record.format).toUpperCase() }}</span>
+                  </template>
+                  <template v-else-if="column.key === 'content'">
+                    <span class="cell-muted">
+                      {{ record.content ? record.content.slice(0, 80) : record.path ?? '（点击编辑查看）' }}
+                    </span>
                   </template>
                   <template v-else-if="column.key === 'actions'">
-                    <a-button type="link" size="small" @click="openEditDataset(record)"><EditOutlined /></a-button>
-                    <a-button type="link" size="small" danger @click="deleteDataset(record)"><DeleteOutlined /></a-button>
+                    <a-button type="text" size="small" title="编辑" @click="openEditDataset(record)">
+                      <template #icon><EditOutlined /></template>
+                    </a-button>
+                    <a-button type="text" size="small" danger title="删除" @click="deleteDataset(record)">
+                      <template #icon><DeleteOutlined /></template>
+                    </a-button>
                   </template>
                 </template>
               </a-table>
             </a-tab-pane>
 
             <a-tab-pane key="settings" tab="套件设置">
-              <div class="settings-grid">
-                <label>名称 <a-input v-model:value="settingsForm.name" /></label>
-                <label>
-                  默认环境
-                  <a-select
-                    v-model:value="settingsForm.envId"
-                    allow-clear
-                    :options="envs.map((item) => ({ label: item.name, value: item.id }))"
-                  />
-                </label>
-                <label>标签 <a-input v-model:value="settingsForm.tags" placeholder="smoke,order" /></label>
-                <label>解释器路径 <a-input v-model:value="settingsForm.pythonPath" placeholder="留空自动探测" /></label>
-                <label class="wide">
-                  套件配置（JSON）
-                  <a-textarea v-model:value="settingsForm.configJson" :rows="4" placeholder='{"failFast":true,"maxWorkers":1,"cookieMode":"shared"}' />
-                </label>
-                <label class="wide">
-                  setupScript（Python）
-                  <a-textarea v-model:value="settingsForm.setupScript" :rows="4" />
-                </label>
-                <label class="wide">
-                  teardownScript（Python）
-                  <a-textarea v-model:value="settingsForm.teardownScript" :rows="4" />
-                </label>
+              <div class="settings-panel">
+                <div class="settings-grid">
+                  <label>名称 <a-input v-model:value="settingsForm.name" /></label>
+                  <label>
+                    默认环境
+                    <a-select
+                      v-model:value="settingsForm.envId"
+                      allow-clear
+                      :options="envs.map((item) => ({ label: item.name, value: item.id }))"
+                    />
+                  </label>
+                  <label>标签 <a-input v-model:value="settingsForm.tags" placeholder="smoke,order" /></label>
+                  <label>解释器路径 <a-input v-model:value="settingsForm.pythonPath" placeholder="留空自动探测" /></label>
+                  <label class="wide">
+                    套件配置（JSON）
+                    <a-textarea v-model:value="settingsForm.configJson" :rows="4" placeholder='{"failFast":true,"maxWorkers":1,"cookieMode":"shared"}' />
+                  </label>
+                  <label class="wide">
+                    setupScript（Python）
+                    <a-textarea v-model:value="settingsForm.setupScript" :rows="4" />
+                  </label>
+                  <label class="wide">
+                    teardownScript（Python）
+                    <a-textarea v-model:value="settingsForm.teardownScript" :rows="4" />
+                  </label>
+                </div>
+                <div class="settings-foot">
+                  <a-button type="primary" :loading="settingsForm.saving" @click="saveSettings">保存设置</a-button>
+                </div>
               </div>
-              <a-button type="primary" :loading="settingsForm.saving" @click="saveSettings">保存设置</a-button>
             </a-tab-pane>
           </a-tabs>
         </template>
-        <a-empty v-else description="选择左侧套件，或新建一个套件开始" class="empty" />
+
+        <div v-else class="main-empty">
+          <div class="empty-illus"><ExperimentOutlined /></div>
+          <h3>还没有选择套件</h3>
+          <p>从左侧选择一个套件，或新建一个来编排 HTTP 用例、Python 脚本、数据集与断言</p>
+          <a-button type="primary" @click="openSuiteModal">
+            <template #icon><PlusOutlined /></template>
+            新建套件
+          </a-button>
+        </div>
       </main>
     </div>
 
@@ -1089,105 +1192,452 @@ onBeforeUnmount(stopPolling)
   height: 100%;
   min-height: 0;
 }
+
 .layout {
   display: flex;
   gap: 12px;
   flex: 1;
   min-height: 0;
 }
+
+/* ---------- 左侧套件列表 ---------- */
 .suite-pane {
-  width: 260px;
-  flex: 0 0 260px;
+  width: 268px;
+  flex: 0 0 268px;
   display: flex;
   flex-direction: column;
+  min-height: 0;
   background: var(--fm-surface);
   border: 1px solid var(--fm-border);
-  border-radius: 0;
-  min-height: 0;
+  border-radius: var(--fm-radius-lg);
+  box-shadow: var(--fm-shadow);
+  overflow: hidden;
 }
+
 .pane-head {
   display: flex;
+  align-items: center;
+  justify-content: space-between;
   gap: 8px;
-  padding: 8px;
-  border-bottom: 1px solid var(--fm-border);
+  padding: 12px 12px 8px;
 }
-.suite-list {
-  flex: 1;
-  overflow: auto;
-  padding: 4px;
-}
-.suite-item {
+
+.pane-title {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 8px 10px;
-  cursor: pointer;
-  border-left: 2px solid transparent;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--fm-text);
 }
+
+.pane-title-icon {
+  font-size: 13px;
+  color: var(--fm-primary);
+}
+
+.pane-count {
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--fm-muted);
+  background: var(--fm-surface-alt);
+  border: 1px solid var(--fm-border);
+  border-radius: 999px;
+  padding: 0 6px;
+  line-height: 16px;
+}
+
+.pane-tools {
+  display: flex;
+  gap: 4px;
+}
+
+.pane-search {
+  padding: 0 12px 10px;
+}
+
+.pane-search :deep(.ant-input-affix-wrapper) {
+  border-radius: 7px;
+  background: var(--fm-surface-alt);
+  border-color: transparent;
+}
+
+.pane-search :deep(.ant-input-affix-wrapper-focused) {
+  background: var(--fm-surface);
+  border-color: var(--fm-primary);
+}
+
+.suite-list {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 0 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.suite-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 8px;
+  border: none;
+  border-radius: 9px;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.14s;
+}
+
 .suite-item:hover {
   background: var(--fm-surface-alt);
 }
+
 .suite-item.active {
-  background: var(--fm-surface-alt);
-  border-left-color: var(--fm-primary);
+  background: var(--fm-primary-soft);
 }
+
+.suite-dot {
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  border-radius: 7px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  background: var(--fm-surface-alt);
+  color: var(--fm-muted);
+  transition: background 0.14s, color 0.14s;
+}
+
+.suite-item.active .suite-dot {
+  background: var(--fm-primary);
+  color: #fff;
+}
+
 .suite-main {
   flex: 1;
   min-width: 0;
   display: flex;
   flex-direction: column;
+  gap: 3px;
 }
+
 .suite-name {
-  font-weight: 600;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--fm-text);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+.suite-item.active .suite-name {
+  color: var(--fm-primary);
+  font-weight: 600;
+}
+
 .suite-meta {
-  font-size: 11px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 10.5px;
   color: var(--fm-muted);
 }
+
+.meta-chip {
+  flex-shrink: 0;
+  padding: 0 6px;
+  border-radius: 999px;
+  border: 1px solid var(--fm-border);
+  background: var(--fm-surface);
+  line-height: 15px;
+}
+
+.suite-item.active .meta-chip {
+  border-color: transparent;
+  background: var(--fm-surface);
+}
+
+.meta-env {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.suite-del {
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity 0.14s;
+}
+
+.suite-item:hover .suite-del,
+.suite-item.active .suite-del {
+  opacity: 1;
+}
+
+.pane-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 36px 10px;
+  color: var(--fm-muted);
+  font-size: 11.5px;
+}
+
+.pane-empty-icon {
+  font-size: 22px;
+  opacity: 0.55;
+}
+
+.pane-empty p {
+  margin: 0;
+}
+
+/* ---------- 右侧主区 ---------- */
 .main-pane {
   flex: 1;
   min-width: 0;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   background: var(--fm-surface);
   border: 1px solid var(--fm-border);
-  padding: 10px 12px;
-  min-height: 0;
+  border-radius: var(--fm-radius-lg);
+  box-shadow: var(--fm-shadow);
+  overflow: hidden;
 }
+
 .suite-bar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  padding-bottom: 8px;
+  gap: 14px;
+  padding: 12px 16px;
   border-bottom: 1px solid var(--fm-border);
 }
+
+.suite-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.suite-badge {
+  width: 30px;
+  height: 30px;
+  flex-shrink: 0;
+  border-radius: 9px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  background: var(--fm-primary-soft);
+  color: var(--fm-primary);
+}
+
+.suite-title-text {
+  min-width: 0;
+}
+
 .suite-title h2 {
   margin: 0;
-  font-size: 15px;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.1px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
+
 .suite-sub {
   font-size: 11px;
   color: var(--fm-muted);
 }
+
 .suite-actions {
   display: flex;
-  gap: 8px;
   align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
 }
+
+.suite-tabs {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 0 16px;
+}
+
+.suite-tabs :deep(.ant-tabs-nav) {
+  margin: 0 0 12px;
+}
+
+.suite-tabs :deep(.ant-tabs-content-holder) {
+  overflow: auto;
+  padding-bottom: 14px;
+}
+
 .tab-tools {
   display: flex;
   gap: 8px;
-  margin-bottom: 8px;
+  margin-bottom: 10px;
 }
+
+/* ---------- 表格 ---------- */
+.suite-table :deep(.ant-table) {
+  border: 1px solid var(--fm-border);
+  border-radius: 9px;
+  overflow: hidden;
+}
+
+.suite-table :deep(.ant-table-thead > tr > th) {
+  background: var(--fm-surface-alt);
+  color: var(--fm-muted);
+  font-size: 11px;
+  font-weight: 600;
+  border-bottom: 1px solid var(--fm-border);
+}
+
+.suite-table :deep(.ant-table-tbody > tr > td) {
+  font-size: 12px;
+}
+
+.case-name {
+  display: block;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cell-muted {
+  color: var(--fm-muted);
+  font-size: 11.5px;
+}
+
+.kind-chip {
+  display: inline-flex;
+  align-items: center;
+  height: 19px;
+  padding: 0 7px;
+  border-radius: 5px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+}
+
+.kind-request {
+  color: var(--fm-method-put);
+  background: var(--fm-method-put-soft);
+}
+
+.kind-python {
+  color: var(--fm-method-patch);
+  background: var(--fm-method-patch-soft);
+}
+
+.kind-stress {
+  color: var(--fm-method-post);
+  background: var(--fm-method-post-soft);
+}
+
+.state-pill {
+  display: inline-flex;
+  align-items: center;
+  height: 19px;
+  padding: 0 8px;
+  border-radius: 999px;
+  font-size: 10.5px;
+}
+
+.state-pill.on {
+  color: var(--fm-success);
+  background: var(--fm-success-soft);
+}
+
+.state-pill.off {
+  color: var(--fm-muted);
+  background: var(--fm-surface-alt);
+}
+
+.run-counts {
+  display: inline-flex;
+  gap: 10px;
+  font-size: 11.5px;
+  color: var(--fm-muted);
+}
+
+.run-counts .ok {
+  color: var(--fm-success);
+}
+
+.run-counts .bad {
+  color: var(--fm-danger);
+}
+
+/* ---------- 空白态 ---------- */
+.main-empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 40px 20px;
+  text-align: center;
+}
+
+.empty-illus {
+  width: 62px;
+  height: 62px;
+  border-radius: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 26px;
+  color: var(--fm-primary);
+  background: var(--fm-primary-soft);
+  box-shadow: 0 10px 24px rgba(77, 107, 254, 0.16);
+}
+
+.main-empty h3 {
+  margin: 6px 0 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--fm-text);
+}
+
+.main-empty p {
+  margin: 0 0 6px;
+  max-width: 340px;
+  font-size: 11.5px;
+  line-height: 1.8;
+  color: var(--fm-muted);
+}
+
+.settings-panel {
+  padding: 2px 2px 6px;
+}
+
+.settings-foot {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 4px;
+}
+
 .settings-grid,
 .editor-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 10px 14px;
+  gap: 12px 16px;
   margin-bottom: 12px;
 }
 .settings-grid label,
@@ -1310,7 +1760,22 @@ textarea.mono {
   color: var(--fm-muted);
   font-size: 11px;
 }
-.empty {
-  margin: 80px auto;
+
+@media (max-width: 1120px) {
+  .suite-pane {
+    width: 232px;
+    flex-basis: 232px;
+  }
+}
+
+@media (max-width: 900px) {
+  .layout {
+    flex-direction: column;
+  }
+
+  .suite-pane {
+    width: 100%;
+    flex: 0 0 200px;
+  }
 }
 </style>

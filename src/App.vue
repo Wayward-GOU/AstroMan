@@ -17,16 +17,28 @@ import {
   RobotOutlined,
   SearchOutlined,
   EnterOutlined,
+  MenuFoldOutlined,
+  MenuUnfoldOutlined,
+  ArrowLeftOutlined,
 } from '@ant-design/icons-vue'
 import AppLogo from '@/components/AppLogo.vue'
 import AiAssistDrawer from '@/components/AiAssistDrawer.vue'
 import ErrorDialog from '@/components/ErrorDialog.vue'
 import { currentTheme, currentThemeId, setTheme, themes } from '@/stores/theme'
+import { canGoBack, previousEntry, stepBack } from '@/stores/navHistory'
 import { isMac, shortcutText } from '@/utils/platform'
 import { checkForUpdates, isAutoUpdateEnabled } from '@/utils/updater'
 
 const route = useRoute()
 const router = useRouter()
+
+/* ---------- 全局返回 ---------- */
+const backKeyText = isMac ? '⌥ ←' : 'Alt + ←'
+
+function goBackPage() {
+  const target = stepBack()
+  if (target) router.push(target)
+}
 
 const ZOOM_KEY = 'fm-zoom'
 const ZOOM_MIN = 0.5
@@ -93,18 +105,77 @@ function onZoomHotkey(event: KeyboardEvent) {
 
 /* ---------- 侧边栏导航 ---------- */
 // 必须声明在命令面板的 computed / watch 之前，否则 watch 首次求值会触发 TDZ
-const navs = [
-  { key: 'home', label: '工作台', hint: '概览与快速入口', to: '/', icon: AppstoreOutlined },
-  { key: 'projects', label: '项目管理', hint: '项目 · 集合 · 环境', to: '/projects', icon: FolderOpenOutlined },
-  { key: 'stress', label: '压测', hint: '选择接口发起压测', to: '/stress', icon: ThunderboltOutlined },
-  { key: 'runner', label: '批量运行', hint: '集合 Runner · 数据驱动', to: '/runner', icon: PlayCircleOutlined },
-  { key: 'automation', label: '自动化测试', hint: '套件 · 断言 · Python · 报告', to: '/automation', icon: ExperimentOutlined },
-  { key: 'ai', label: '航仔', hint: 'AI 助手 · 自动建请求并分析', to: '/ai', icon: RobotOutlined },
-  { key: 'history', label: '历史记录', hint: '数据概览 · 最近发送记录', to: '/history', icon: HistoryOutlined },
-  { key: 'monitor', label: '系统监视', hint: 'CPU · 内存 · 磁盘 · 网络', to: '/monitor', icon: LineChartOutlined },
-  { key: 'tools', label: '工具箱', hint: 'JSON · 加解密 · 时间戳', to: '/tools', icon: ToolOutlined },
-  { key: 'settings', label: '设置', hint: '应用与数据', to: '/settings', icon: SettingOutlined },
+interface NavItem {
+  key: string
+  label: string
+  hint: string
+  to: string
+  icon: typeof AppstoreOutlined
+  group: string
+}
+
+const navs: NavItem[] = [
+  { key: 'home', label: '工作台', hint: '概览与快速入口', to: '/', icon: AppstoreOutlined, group: '调试' },
+  { key: 'projects', label: '项目管理', hint: '项目 · 集合 · 环境', to: '/projects', icon: FolderOpenOutlined, group: '调试' },
+  { key: 'stress', label: '压测', hint: '选择接口发起压测', to: '/stress', icon: ThunderboltOutlined, group: '测试' },
+  { key: 'runner', label: '批量运行', hint: '集合 Runner · 数据驱动', to: '/runner', icon: PlayCircleOutlined, group: '测试' },
+  { key: 'automation', label: '自动化测试', hint: '套件 · 断言 · Python · 报告', to: '/automation', icon: ExperimentOutlined, group: '测试' },
+  { key: 'ai', label: '航仔', hint: 'AI 助手 · 自动建请求并分析', to: '/ai', icon: RobotOutlined, group: '智能' },
+  { key: 'history', label: '历史记录', hint: '数据概览 · 最近发送记录', to: '/history', icon: HistoryOutlined, group: '智能' },
+  { key: 'monitor', label: '系统监视', hint: 'CPU · 内存 · 磁盘 · 网络', to: '/monitor', icon: LineChartOutlined, group: '系统' },
+  { key: 'tools', label: '工具箱', hint: 'JSON · 加解密 · 时间戳', to: '/tools', icon: ToolOutlined, group: '系统' },
+  { key: 'settings', label: '设置', hint: '应用与数据', to: '/settings', icon: SettingOutlined, group: '系统' },
 ]
+
+const navGroups = computed(() => {
+  const groups: { name: string; items: NavItem[] }[] = []
+  navs.forEach((item) => {
+    let bucket = groups.find((entry) => entry.name === item.group)
+    if (!bucket) {
+      bucket = { name: item.group, items: [] }
+      groups.push(bucket)
+    }
+    bucket.items.push(item)
+  })
+  return groups
+})
+
+/* ---------- 侧边栏折叠 ---------- */
+const SIDEBAR_KEY = 'astroman:sidebar-collapsed'
+const NARROW_BREAKPOINT = 1180
+
+const sidebarPinned = ref(false)
+try {
+  sidebarPinned.value = localStorage.getItem(SIDEBAR_KEY) === '1'
+} catch {
+  // localStorage 不可用时使用默认展开态
+}
+const windowNarrow = ref(false)
+const sidebarCollapsed = computed(() => windowNarrow.value || sidebarPinned.value)
+
+function syncSidebarWidth() {
+  windowNarrow.value = window.innerWidth < NARROW_BREAKPOINT
+}
+
+function toggleSidebar() {
+  if (windowNarrow.value) {
+    // 窄窗口下强制展开会把内容挤没，先让窗口变宽再展开
+    windowNarrow.value = false
+    sidebarPinned.value = false
+    try {
+      localStorage.setItem(SIDEBAR_KEY, '0')
+    } catch {
+      // 忽略存储失败
+    }
+    return
+  }
+  sidebarPinned.value = !sidebarPinned.value
+  try {
+    localStorage.setItem(SIDEBAR_KEY, sidebarPinned.value ? '1' : '0')
+  } catch {
+    // 忽略存储失败
+  }
+}
 
 /* ---------- 命令面板 ---------- */
 interface PaletteItem {
@@ -138,6 +209,17 @@ const paletteCommands = computed<PaletteItem[]>(() => [
     group: '页面',
     run: () => go(item.to),
   })),
+  ...(canGoBack.value
+    ? [
+        {
+          key: 'nav-back',
+          label: '返回上一页',
+          hint: previousEntry.value ? `回到 ${previousEntry.value.label}` : '回到上一次停留的页面',
+          group: '页面',
+          run: goBackPage,
+        },
+      ]
+    : []),
   {
     key: 'theme',
     label: '切换主题',
@@ -202,6 +284,14 @@ function onPaletteKeydown(event: KeyboardEvent) {
 }
 
 function onGlobalHotkey(event: KeyboardEvent) {
+  // Alt + ← 返回上一次停留的页面（桌面软件通用习惯）
+  if (event.altKey && !event.ctrlKey && !event.metaKey && event.key === 'ArrowLeft') {
+    if (canGoBack.value) {
+      event.preventDefault()
+      goBackPage()
+    }
+    return
+  }
   const modifier = isMac ? event.metaKey : event.ctrlKey
   if (!modifier || event.altKey) return
   const key = event.key.toLowerCase()
@@ -239,6 +329,8 @@ function groupPalette(items: PaletteItem[]) {
 onMounted(() => {
   const stored = Number(localStorage.getItem(ZOOM_KEY) ?? '1')
   applyZoom(Number.isFinite(stored) && stored > 0 ? stored : 1, false)
+  syncSidebarWidth()
+  window.addEventListener('resize', syncSidebarWidth)
   window.addEventListener('keydown', onZoomHotkey)
   window.addEventListener('keydown', onGlobalHotkey)
 
@@ -251,6 +343,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  window.removeEventListener('resize', syncSidebarWidth)
   window.removeEventListener('keydown', onZoomHotkey)
   window.removeEventListener('keydown', onGlobalHotkey)
   if (noticeTimer) window.clearTimeout(noticeTimer)
@@ -310,41 +403,67 @@ const theme = computed(() => {
 <template>
   <a-config-provider :theme="theme">
     <div class="shell">
-      <aside class="sider">
+      <aside class="sider" :class="{ collapsed: sidebarCollapsed }">
         <div class="brand">
-          <AppLogo :size="38" />
+          <AppLogo :size="34" />
           <div class="brand-text">
             <span class="brand-name">AstroMan</span>
             <span class="brand-sub">API 调试 · 压测</span>
           </div>
         </div>
 
-        <nav class="nav">
-          <div class="nav-label">导航</div>
-          <router-link
-            v-for="item in navs"
-            :key="item.key"
-            :to="item.to"
-            class="nav-item"
-            :class="{ active: activeKey === item.key }"
-            :title="`${item.label} · ${item.hint}`"
+        <a-tooltip
+          :title="
+            canGoBack
+              ? `返回「${previousEntry?.label ?? '上一页'}」 · ${backKeyText}`
+              : '还没有可返回的页面'
+          "
+          placement="right"
+        >
+          <button
+            class="nav-back"
+            :class="{ disabled: !canGoBack }"
+            type="button"
+            :aria-disabled="!canGoBack"
+            @click="canGoBack && goBackPage()"
           >
-            <span class="nav-icon">
-              <component :is="item.icon" />
+            <span class="nav-back-badge">
+              <ArrowLeftOutlined class="nav-back-icon" />
             </span>
-            <span class="nav-text">
-              <span class="nav-name">{{ item.label }}</span>
-              <span class="nav-hint">{{ item.hint }}</span>
+            <span class="nav-back-text">
+              <span class="nav-back-label">返回</span>
+              <span class="nav-back-target">{{ previousEntry?.label }}</span>
             </span>
-            <span class="nav-indicator" />
-          </router-link>
+          </button>
+        </a-tooltip>
+
+        <nav class="nav">
+          <div v-for="group in navGroups" :key="group.name" class="nav-section">
+            <div class="nav-label">{{ group.name }}</div>
+            <router-link
+              v-for="item in group.items"
+              :key="item.key"
+              :to="item.to"
+              class="nav-item"
+              :class="{ active: activeKey === item.key }"
+              :title="`${item.label} · ${item.hint}`"
+            >
+              <span class="nav-icon">
+                <component :is="item.icon" />
+              </span>
+              <span class="nav-text">
+                <span class="nav-name">{{ item.label }}</span>
+              </span>
+              <span class="nav-indicator" />
+            </router-link>
+          </div>
         </nav>
 
         <div class="zoom-box">
-          <a-tooltip :title="`放大 · ${shortcutText('+')}`" placement="right">
-            <button class="zoom-btn" type="button" @click="zoomIn">+</button>
+          <a-tooltip :title="`缩小 · ${shortcutText('-')}`" placement="top">
+            <button class="zoom-btn" type="button" @click="zoomOut">−</button>
           </a-tooltip>
-          <a-tooltip :title="`恢复 100% · ${shortcutText('0')}`" placement="right">
+          <a-tooltip :title="`恢复 100% · ${shortcutText('0')}`" placement="top">
             <button
               class="zoom-value"
               :class="{ active: zoom !== 1 }"
@@ -354,12 +473,19 @@ const theme = computed(() => {
               {{ Math.round(zoom * 100) }}%
             </button>
           </a-tooltip>
-          <a-tooltip :title="`缩小 · ${shortcutText('-')}`" placement="right">
-            <button class="zoom-btn" type="button" @click="zoomOut">−</button>
+          <a-tooltip :title="`放大 · ${shortcutText('+')}`" placement="top">
+            <button class="zoom-btn" type="button" @click="zoomIn">+</button>
           </a-tooltip>
         </div>
 
         <div class="sider-foot">
+          <a-tooltip title="展开侧边栏" placement="right" :disabled="!sidebarCollapsed">
+            <button class="sider-toggle" type="button" @click="toggleSidebar">
+              <MenuUnfoldOutlined v-if="sidebarCollapsed" />
+              <MenuFoldOutlined v-else />
+              <span v-if="!sidebarCollapsed" class="toggle-label">收起</span>
+            </button>
+          </a-tooltip>
           <div class="local-card">
             <SafetyCertificateOutlined class="local-icon" />
             <div>
@@ -499,58 +625,223 @@ const theme = computed(() => {
 }
 
 .sider {
-  width: 64px;
+  width: 186px;
   flex-shrink: 0;
   background: var(--fm-sidebar);
   color: var(--fm-sidebar-text);
   display: flex;
   flex-direction: column;
-  padding: 14px 8px 12px;
+  padding: 14px 10px 12px;
   border-right: 1px solid var(--fm-border);
-  transition: background 0.2s ease, border-color 0.2s ease;
+  transition: width 0.18s ease, padding 0.18s ease, background 0.2s ease, border-color 0.2s ease;
+  overflow: hidden;
+}
+
+.sider.collapsed {
+  width: 64px;
+  padding: 14px 8px 12px;
 }
 
 .brand {
   display: flex;
   align-items: center;
-  justify-content: center;
-  padding: 2px 0 16px;
+  gap: 9px;
+  padding: 2px 6px 16px;
   user-select: none;
 }
 
-.brand-text {
+.sider.collapsed .brand {
+  justify-content: center;
+  padding: 2px 0 14px;
+}
+
+.sider.collapsed .brand-text {
   display: none;
+}
+
+.brand-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
 }
 
 .brand-name {
   color: var(--fm-text);
-  font-weight: 600;
-  font-size: 14px;
+  font-weight: 700;
+  font-size: 14.5px;
   letter-spacing: 0.2px;
+  background: linear-gradient(120deg, var(--fm-text) 30%, var(--fm-primary) 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
 }
 
 .brand-sub {
   font-size: 10px;
   color: var(--fm-muted);
-  letter-spacing: 0.3px;
+  letter-spacing: 0.4px;
+  margin-top: 1px;
 }
 
 .nav {
   flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+/* ---------- 全局返回 ---------- */
+.nav-back {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: 34px;
+  margin: 0 0 14px;
+  padding: 0 10px 0 7px;
+  border: 1px solid color-mix(in srgb, var(--fm-primary) 26%, transparent);
+  border-radius: 10px;
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--fm-primary) 14%, var(--fm-surface)),
+    color-mix(in srgb, var(--fm-primary) 6%, var(--fm-surface))
+  );
+  color: var(--fm-text);
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--fm-primary) 12%, transparent);
+  transition: background 0.16s ease, border-color 0.16s ease, color 0.16s ease,
+    box-shadow 0.16s ease;
+}
+
+/* 实心主色箭头块：侧栏里唯一的实心色块，一眼能看到 */
+.nav-back-badge {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  flex: none;
+  border-radius: 7px;
+  color: #fff;
+  background: linear-gradient(135deg, var(--fm-primary), var(--fm-primary-dark));
+  box-shadow: 0 1px 3px color-mix(in srgb, var(--fm-primary) 42%, transparent);
+  transition: transform 0.16s ease, box-shadow 0.16s ease;
+}
+
+.nav-back:hover:not(.disabled) {
+  border-color: color-mix(in srgb, var(--fm-primary) 55%, transparent);
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--fm-primary) 21%, var(--fm-surface)),
+    color-mix(in srgb, var(--fm-primary) 11%, var(--fm-surface))
+  );
+  box-shadow: 0 2px 6px color-mix(in srgb, var(--fm-primary) 18%, transparent);
+}
+
+.nav-back:hover:not(.disabled) .nav-back-badge {
+  transform: translateX(-2px);
+  box-shadow: 0 2px 6px color-mix(in srgb, var(--fm-primary) 55%, transparent);
+}
+
+.nav-back:active:not(.disabled) {
+  transform: translateY(1px);
+}
+
+.nav-back:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--fm-primary) 45%, transparent);
+  outline-offset: 1px;
+}
+
+.nav-back.disabled {
+  opacity: 0.62;
+  background: transparent;
+  border-style: dashed;
+  box-shadow: none;
+  cursor: default;
+}
+
+.nav-back.disabled .nav-back-badge {
+  background: var(--fm-surface-alt);
+  color: var(--fm-muted);
+  box-shadow: none;
+}
+
+.nav-back-icon {
+  font-size: 11px;
+  flex-shrink: 0;
+}
+
+.nav-back-text {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.nav-back-label {
+  flex-shrink: 0;
+  font-weight: 600;
+  color: var(--fm-primary);
+}
+
+.nav-back-target {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--fm-muted);
+}
+
+.nav-back:hover:not(.disabled) .nav-back-target {
+  color: color-mix(in srgb, var(--fm-primary) 78%, var(--fm-muted));
+}
+
+.sider.collapsed .nav-back {
+  width: 34px;
+  height: 34px;
+  margin: 0 auto 12px;
+  padding: 0;
+  justify-content: center;
+  gap: 0;
+}
+
+.sider.collapsed .nav-back-badge {
+  width: 22px;
+  height: 22px;
+  border-radius: 8px;
+}
+
+.sider.collapsed .nav-back-text {
+  display: none;
+}
+
+.sider.collapsed .nav-back-icon {
+  font-size: 12px;
+}
+
+.nav-section {
+  margin-bottom: 10px;
 }
 
 .nav-label {
-  display: none;
+  padding: 0 8px 5px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--fm-muted);
+  opacity: 0.75;
 }
 
 .nav-item {
   position: relative;
   display: flex;
   align-items: center;
-  justify-content: center;
-  padding: 9px 0;
-  margin-bottom: 4px;
-  border-radius: 6px;
+  gap: 9px;
+  padding: 6px 8px;
+  margin-bottom: 2px;
+  border-radius: 8px;
   color: var(--fm-sidebar-text);
   text-decoration: none;
   transition: background 0.16s, color 0.16s;
@@ -569,38 +860,53 @@ const theme = computed(() => {
 .nav-item.active::before {
   content: '';
   position: absolute;
-  left: -8px;
-  top: 8px;
-  bottom: 8px;
-  width: 2px;
-  border-radius: 2px;
-  background: var(--fm-primary);
+  left: -10px;
+  top: 7px;
+  bottom: 7px;
+  width: 3px;
+  border-radius: 3px;
+  background: linear-gradient(180deg, var(--fm-primary), color-mix(in srgb, var(--fm-primary) 55%, #ffffff));
 }
 
 .nav-icon {
-  width: 32px;
-  height: 30px;
-  border-radius: 5px;
+  width: 27px;
+  height: 27px;
+  flex-shrink: 0;
+  border-radius: 6px;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 16px;
+  font-size: 14px;
+  color: var(--fm-sidebar-text);
   background: transparent;
-  color: var(--fm-sidebar-icon);
+  transition: color 0.16s ease, background 0.16s ease;
+}
+
+.nav-item:hover .nav-icon {
+  color: var(--fm-text);
 }
 
 .nav-item.active .nav-icon {
-  background: transparent;
   color: var(--fm-primary);
+  background: color-mix(in srgb, var(--fm-primary) 9%, transparent);
 }
 
 .nav-text {
-  display: none;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
 }
 
 .nav-name {
   font-size: 13px;
   font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nav-item.active .nav-name {
+  font-weight: 600;
 }
 
 .nav-hint {
@@ -616,51 +922,139 @@ const theme = computed(() => {
   display: none;
 }
 
+/* ---------- 折叠态 ---------- */
+.sider.collapsed .nav-label {
+  display: none;
+}
+
+.sider.collapsed .nav-section {
+  margin-bottom: 4px;
+}
+
+.sider.collapsed .nav-item {
+  justify-content: center;
+  gap: 0;
+  padding: 5px 0;
+  margin-bottom: 3px;
+}
+
+.sider.collapsed .nav-item.active::before {
+  left: -8px;
+}
+
+.sider.collapsed .nav-text {
+  display: none;
+}
+
+.sider.collapsed .nav-icon {
+  width: 30px;
+  height: 28px;
+  font-size: 15px;
+}
+
+/* ---------- 缩放控制：一条横向胶囊 ---------- */
 .zoom-box {
   display: flex;
-  flex-direction: column;
   align-items: center;
-  gap: 3px;
-  padding: 8px 0 6px;
+  gap: 2px;
+  margin: 2px 2px 8px;
+  padding: 3px;
+  border: 1px solid var(--fm-border);
+  border-radius: 9px;
+  background: var(--fm-surface);
 }
 
 .zoom-btn {
-  width: 34px;
-  height: 24px;
+  flex: 1;
+  height: 22px;
+  border: none;
   border-radius: 6px;
-  border: 1px solid var(--fm-border);
-  background: var(--fm-surface);
+  background: transparent;
   color: var(--fm-sidebar-text);
-  font-size: 15px;
+  font-size: 14px;
   line-height: 1;
   cursor: pointer;
-  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+  transition: color 0.15s ease, background 0.15s ease;
 }
 
 .zoom-btn:hover {
   color: var(--fm-primary);
-  border-color: var(--fm-border-strong);
+  background: var(--fm-surface-alt);
 }
 
 .zoom-btn:active {
-  transform: scale(0.96);
+  transform: scale(0.94);
 }
 
 .zoom-value {
-  width: 44px;
-  height: 20px;
+  flex: 1.5;
+  height: 22px;
   border: none;
+  border-radius: 6px;
   background: transparent;
   color: var(--fm-muted);
-  font-size: 10px;
+  font-size: 10.5px;
   font-variant-numeric: tabular-nums;
   cursor: pointer;
   padding: 0;
+  transition: color 0.15s ease, background 0.15s ease;
+}
+
+.zoom-value:hover {
+  background: var(--fm-surface-alt);
 }
 
 .zoom-value.active {
   color: var(--fm-primary);
   font-weight: 600;
+}
+
+.sider.collapsed .zoom-box {
+  justify-content: center;
+  margin: 2px 0 6px;
+  padding: 2px;
+}
+
+.sider.collapsed .zoom-box .zoom-btn {
+  display: none;
+}
+
+.sider.collapsed .zoom-value {
+  flex: 1;
+}
+
+.sider.collapsed .local-card,
+.sider.collapsed .version {
+  display: none;
+}
+
+/* ---------- 收起 / 展开按钮 ---------- */
+.sider-toggle {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--fm-sidebar-text);
+  font-size: 11.5px;
+  cursor: pointer;
+  transition: color 0.15s ease, background 0.15s ease;
+}
+
+.sider-toggle:hover {
+  background: var(--fm-sidebar-hover);
+  color: var(--fm-primary);
+}
+
+.sider.collapsed .sider-toggle {
+  justify-content: center;
+  width: 30px;
+  padding: 0;
+  margin: 0 auto;
 }
 
 .zoom-notice {
@@ -884,30 +1278,60 @@ const theme = computed(() => {
 }
 
 .sider-foot {
+  flex-shrink: 0;
   padding-top: 8px;
+  border-top: 1px solid var(--fm-border);
   display: flex;
-  justify-content: center;
+  flex-direction: column;
+  gap: 6px;
 }
 
 .local-card {
   display: flex;
   align-items: center;
-  justify-content: center;
-  padding: 8px;
-  border-radius: 6px;
+  gap: 8px;
+  padding: 9px 10px;
+  border-radius: 8px;
   background: var(--fm-surface);
   border: 1px solid var(--fm-border);
+  overflow: hidden;
+}
+
+.sider.collapsed .local-card {
+  justify-content: center;
+  padding: 8px;
+}
+
+.sider.collapsed .local-title,
+.sider.collapsed .local-desc,
+.sider.collapsed .version {
+  display: none;
 }
 
 .local-icon {
   color: var(--fm-success);
-  font-size: 14px;
+  font-size: 15px;
+  flex-shrink: 0;
 }
 
-.local-title,
-.local-desc,
+.local-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fm-text-2);
+  line-height: 1.3;
+}
+
+.local-desc {
+  font-size: 10px;
+  color: var(--fm-muted);
+  line-height: 1.3;
+}
+
 .version {
-  display: none;
+  font-size: 10px;
+  color: var(--fm-muted);
+  text-align: center;
+  letter-spacing: 0.3px;
 }
 
 .main {

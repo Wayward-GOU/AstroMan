@@ -1,4 +1,5 @@
 import { createRouter, createWebHashHistory } from 'vue-router'
+import { recordVisit } from '@/stores/navHistory'
 
 const LAST_ROUTE_KEY = 'astroman:last-route'
 // 只在上次停留页恢复一次，避免 catch-all 重定向后反复跳转
@@ -47,6 +48,8 @@ router.beforeEach((to) => {
 
 router.afterEach((to) => {
   if (!to.matched.length) return
+  // 维护「上一次停留页面」栈，供全局返回按钮使用
+  recordVisit(to)
   try {
     localStorage.setItem(LAST_ROUTE_KEY, to.fullPath)
   } catch {

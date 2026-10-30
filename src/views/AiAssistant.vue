@@ -60,6 +60,7 @@ import { buildContext, estimateMessages, estimateTokens, SUMMARY_PREFIX } from '
 import { estimateCost, fmtUsd, priceOf } from '@/utils/aiPricing'
 import { contextWindowOf, contextBudgetOf } from '@/utils/modelMeta'
 import { clipStoredPrompt, compactPrompt } from '@/utils/promptText'
+import { extractCurlCommand } from '@/utils/curl'
 import { wrapUntrusted } from '@/utils/untrusted'
 import { renderMarkdown } from '@/utils/markdown'
 import type { AiMessage, AiProvider, AiSession, AiToolLog, AiUsageLog, AiUsageStats } from '@/types/models'
@@ -1168,7 +1169,12 @@ async function afterReply(item: ChatItem) {
   ])
 }
 
-async function execTool(item: ChatItem, index: number, seg: Segment): Promise<ToolResult> {
+async function execTool(
+  item: ChatItem,
+  index: number,
+  seg: Segment,
+  argsOverride?: Record<string, unknown>,
+): Promise<ToolResult> {
   const key = runKey(item.id, index)
   let run = toolRuns[key]
   if (!run) {
@@ -1177,7 +1183,7 @@ async function execTool(item: ChatItem, index: number, seg: Segment): Promise<To
   }
   run.status = 'running'
   run.output = ''
-  const result = await executeTool(seg.tool, seg.args, sessionId.value, {
+  const result = await executeTool(seg.tool, argsOverride ?? seg.args, sessionId.value, {
     round: Math.max(1, autoDepth.value),
     traceId: traceId.value,
   })
@@ -1269,8 +1275,47 @@ function previewArgs(tool: string, args: Record<string, unknown>): string {
   return json.length > 1600 ? `${json.slice(0, 1600)}\n…（参数过长已截断）` : json
 }
 
+/** 最近一条真实用户输入（跳过工具结果回灌的伪用户消息） */
+function latestUserText(): string {
+  for (let i = messages.value.length - 1; i >= 0; i -= 1) {
+    const item = messages.value[i]
+    if (item.role !== 'user') continue
+    const text = item.content
+    if (!text.trim()) continue
+    if (text.startsWith('【工具 ') || text.startsWith('用户拒绝执行工具')) continue
+    return item.quote ? `${item.quote}\n${text}` : text
+  }
+  return ''
+}
+
+function squash(text: string) {
+  return text.replace(/\s+/g, '')
+}
+
+/**
+ * 模型复述超长工具参数（尤其是 cURL）时会被输出上限截断。
+ * 这里按「用户消息里的原文」补全：模型给的是原文前缀、或参数里出现省略号，就换成完整原文。
+ */
+function resolveToolArgs(seg: Segment): Record<string, unknown> {
+  if (seg.tool !== 'curl_import') return seg.args
+  const arg = typeof seg.args.curl === 'string' ? seg.args.curl.trim() : ''
+  const fromUser = extractCurlCommand(latestUserText())
+  if (!fromUser) return seg.args
+  const candidate = fromUser.trim()
+  if (!arg) return { ...seg.args, curl: candidate }
+  if (candidate.length <= arg.length) return seg.args
+  const truncated = /…|\.\.\.|（已截断）|已省略|\[truncated\]/i.test(arg)
+  const head = squash(arg).slice(0, 160)
+  const isPrefix = head.length >= 40 && squash(candidate).startsWith(head)
+  return truncated || isPrefix ? { ...seg.args, curl: candidate } : seg.args
+}
+
 async function runToolSegment(item: ChatItem, index: number, seg: Segment) {
   if (runState(item.id, index)?.status === 'running') return
+  // 长 cURL 经模型复述时可能被输出长度截断：优先用用户消息里的原文补全
+  const effectiveArgs = resolveToolArgs(seg)
+  // 补全后同步回工具卡，重新运行时也走完整参数（卡片详情里不再显示截断版）
+  if (effectiveArgs !== seg.args) seg.args = effectiveArgs
   if (isWriteTool(seg.tool)) {
     // 导出类工具：目标文件已存在时必须二次确认，避免静默覆盖
     const exportTools = new Set([
@@ -1291,13 +1336,13 @@ async function runToolSegment(item: ChatItem, index: number, seg: Segment) {
         width: 620,
         content: h(AiConfirmCard, {
           tool: seg.tool,
-          args: seg.args,
+          args: effectiveArgs,
           description: describeWrite(seg.tool),
           overwrite,
-          path: typeof seg.args.path === 'string' ? seg.args.path : undefined,
+          path: typeof effectiveArgs.path === 'string' ? effectiveArgs.path : undefined,
           planText:
             seg.tool === 'plan_save' || seg.tool === 'stress_start'
-              ? previewArgs(seg.tool, seg.args)
+              ? previewArgs(seg.tool, effectiveArgs)
               : undefined,
         }),
         okText: overwrite ? '覆盖写入' : '确认执行',
@@ -1312,7 +1357,7 @@ async function runToolSegment(item: ChatItem, index: number, seg: Segment) {
       void aiToolLogAdd({
         sessionId: sessionId.value,
         tool: seg.tool,
-        args: maskSensitive(JSON.stringify(seg.args)),
+        args: maskSensitive(JSON.stringify(effectiveArgs)),
         ok: false,
         durationMs: 0,
         resultPreview: '用户取消执行（未修改任何数据）',
@@ -1331,7 +1376,7 @@ async function runToolSegment(item: ChatItem, index: number, seg: Segment) {
       return
     }
   }
-  const result = await execTool(item, index, seg)
+  const result = await execTool(item, index, seg, effectiveArgs)
   if (aborted.value) return
   if (sending.value) return
   await ask([

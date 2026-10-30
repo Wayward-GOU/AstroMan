@@ -8,13 +8,17 @@ import {
   CodeOutlined,
   FontColorsOutlined,
   GlobalOutlined,
+  HistoryOutlined,
   LockOutlined,
   QrcodeOutlined,
   SearchOutlined,
+  StarFilled,
+  StarOutlined,
   ToolOutlined,
 } from '@ant-design/icons-vue'
 import ToolWorkbench from '@/components/tools/ToolWorkbench.vue'
 import { searchTools, TOOL_CATEGORIES, TOOLS, TOOL_MAP } from '@/tools/registry'
+import { useToolPrefsStore } from '@/stores/toolPrefs'
 import type { ToolCategoryId, ToolDef } from '@/tools/types'
 
 const keyword = ref('')
@@ -23,6 +27,7 @@ const activeToolId = ref<string | null>(null)
 const activeComponent = shallowRef<Component | null>(null)
 const loading = ref(false)
 
+const prefs = useToolPrefsStore()
 const route = useRoute()
 
 /** 支持从工作台等页面通过 ?tool=xxx 直接打开指定工具 */
@@ -33,6 +38,7 @@ function openFromRoute() {
   keyword.value = ''
   activeCategory.value = tool.category
   activeToolId.value = tool.id
+  prefs.markRecent(tool.id)
 }
 
 onMounted(openFromRoute)
@@ -96,6 +102,7 @@ function selectCategory(id: ToolCategoryId) {
 
 function openTool(tool: ToolDef) {
   activeToolId.value = tool.id
+  prefs.markRecent(tool.id)
 }
 
 function backToList() {
@@ -155,7 +162,19 @@ const componentKey = computed(() => activeTool.value?.id ?? '')
               <ArrowLeftOutlined /> 返回工具列表
             </a-button>
             <div class="tools-detail-title">
-              <h2>{{ activeTool.name }}</h2>
+              <h2>
+                {{ activeTool.name }}
+                <a-button
+                  type="text"
+                  size="small"
+                  class="tools-fav"
+                  @click="prefs.toggleFavorite(activeTool.id)"
+                >
+                  <StarFilled v-if="prefs.isFavorite(activeTool.id)" class="fav-on" />
+                  <StarOutlined v-else />
+                  {{ prefs.isFavorite(activeTool.id) ? '已收藏' : '收藏' }}
+                </a-button>
+              </h2>
               <p>{{ activeTool.desc }}</p>
             </div>
           </div>
@@ -171,19 +190,59 @@ const componentKey = computed(() => activeTool.value?.id ?? '')
         </template>
 
         <template v-else>
+          <div v-if="!keyword && prefs.favorites.length" class="tools-quick">
+            <span class="tools-quick-label"><StarFilled class="fav-on" /> 收藏</span>
+            <div class="tools-quick-list">
+              <button
+                v-for="tool in prefs.favorites"
+                :key="tool.id"
+                class="quick-chip"
+                @click="openTool(tool)"
+              >
+                {{ tool.name }}
+              </button>
+            </div>
+          </div>
+
+          <div v-if="!keyword && prefs.recent.length" class="tools-quick">
+            <span class="tools-quick-label"><HistoryOutlined /> 最近使用</span>
+            <div class="tools-quick-list">
+              <button
+                v-for="tool in prefs.recent"
+                :key="tool.id"
+                class="quick-chip"
+                @click="openTool(tool)"
+              >
+                {{ tool.name }}
+              </button>
+            </div>
+            <a-button type="link" size="small" class="tools-quick-clear" @click="prefs.clearRecent()">
+              清空
+            </a-button>
+          </div>
+
           <div class="tools-section-head">
             <span class="tools-section-title">{{ activeCategoryName }}</span>
             <span class="tools-section-count">{{ filtered.length }} 个工具</span>
           </div>
 
           <div v-if="filtered.length" class="tools-grid">
-            <button v-for="tool in filtered" :key="tool.id" class="tool-card" @click="openTool(tool)">
+            <div v-for="tool in filtered" :key="tool.id" class="tool-card" @click="openTool(tool)">
+              <button
+                class="tool-star"
+                :class="{ on: prefs.isFavorite(tool.id) }"
+                :title="prefs.isFavorite(tool.id) ? '取消收藏' : '收藏'"
+                @click.stop="prefs.toggleFavorite(tool.id)"
+              >
+                <StarFilled v-if="prefs.isFavorite(tool.id)" />
+                <StarOutlined v-else />
+              </button>
               <span class="tool-card-tag">
                 {{ TOOL_CATEGORIES.find((item) => item.id === tool.category)?.name }}
               </span>
               <span class="tool-card-name">{{ tool.name }}</span>
               <span class="tool-card-desc">{{ tool.desc }}</span>
-            </button>
+            </div>
           </div>
           <div v-else class="empty-hint">
             没有匹配「{{ keyword }}」的工具，换个关键字试试
@@ -316,6 +375,69 @@ const componentKey = computed(() => activeTool.value?.id ?? '')
   color: var(--fm-muted);
 }
 
+.tools-quick {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 9px 12px;
+  background: var(--fm-surface);
+  border: 1px solid var(--fm-border);
+  border-radius: var(--fm-radius);
+}
+
+.tools-quick-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding-top: 3px;
+  font-size: 12px;
+  color: var(--fm-muted);
+  white-space: nowrap;
+}
+
+.tools-quick-list {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  flex: 1;
+  min-width: 0;
+}
+
+.quick-chip {
+  padding: 3px 10px;
+  font-size: 12px;
+  color: var(--fm-text-2);
+  background: var(--fm-surface-alt);
+  border: 1px solid var(--fm-border);
+  border-radius: 999px;
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s;
+}
+
+.quick-chip:hover {
+  color: var(--fm-primary);
+  border-color: var(--fm-primary);
+}
+
+.tools-quick-clear {
+  padding: 0;
+  height: auto;
+  font-size: 12px;
+}
+
+.fav-on {
+  color: #f5a623;
+}
+
+.tools-fav {
+  margin-left: 8px;
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--fm-muted);
+}
+
 .tools-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
@@ -323,6 +445,7 @@ const componentKey = computed(() => activeTool.value?.id ?? '')
 }
 
 .tool-card {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 5px;
@@ -333,6 +456,40 @@ const componentKey = computed(() => activeTool.value?.id ?? '')
   border-radius: var(--fm-radius);
   cursor: pointer;
   transition: border-color 0.15s, box-shadow 0.15s, transform 0.15s;
+}
+
+.tool-star {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  font-size: 12px;
+  color: var(--fm-muted);
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s, color 0.15s, background 0.15s;
+}
+
+.tool-card:hover .tool-star,
+.tool-star.on {
+  opacity: 1;
+}
+
+.tool-star:hover {
+  color: #f5a623;
+  background: var(--fm-surface-alt);
+}
+
+.tool-star.on {
+  color: #f5a623;
 }
 
 .tool-card:hover {

@@ -111,6 +111,30 @@ export interface AppSettings {
   proxyUrl: string
   certPath: string
   certPassword: string
+  /** Python 解释器路径，留空自动探测 */
+  pythonPath?: string
+  /** 是否允许执行本地 Python 脚本（测试场景的钩子与 Python 用例） */
+  pythonEnabled?: boolean
+}
+
+/** Python 解释器探测结果（python_check） */
+export interface PythonCheckResult {
+  enabled: boolean
+  available: boolean
+  info?: {
+    program: string
+    launcherArgs: string[]
+    display: string
+    version: string
+    major: number
+    minor: number
+    patch: number
+  } | null
+  message: string
+  /** 自动探测时试过的候选命令 */
+  tried: string[]
+  /** 随包 astroman_runtime.py 的路径 */
+  runtimePath?: string | null
 }
 
 export interface PlanSummary {
@@ -793,6 +817,10 @@ export interface MonitorProcess {
   name: string
   cpu: number
   memory: number
+  /** 占物理内存的百分比（0–100） */
+  memoryPercent: number
+  /** 可执行文件路径，权限不足时为空 */
+  exe: string
 }
 
 /* ---------- 工具箱：IP 查询 ---------- */
@@ -813,4 +841,226 @@ export interface IpLookupInfo {
   lat?: string
   long_ip?: number
   big_area?: string
+}
+
+/* ---------- v1.0.8 自动化测试 ---------- */
+
+export interface TestSuiteSummary {
+  id: number
+  projectId: number
+  name: string
+  description?: string
+  envId?: number
+  envName?: string
+  tags?: string
+  pythonPath?: string
+  configJson?: string
+  caseCount: number
+  createdAt: number
+  updatedAt: number
+}
+
+export interface TestSuite {
+  id: number
+  projectId: number
+  name: string
+  description?: string
+  envId?: number
+  tags?: string
+  pythonPath?: string
+  configJson?: string
+  setupScript?: string
+  teardownScript?: string
+  createdAt: number
+  updatedAt: number
+}
+
+export interface TestSuitePayload {
+  id?: number
+  projectId: number
+  name: string
+  description?: string
+  envId?: number
+  tags?: string
+  pythonPath?: string
+  configJson?: string
+  setupScript?: string
+  teardownScript?: string
+}
+
+export interface TestCase {
+  id: number
+  suiteId: number
+  name: string
+  kind: string
+  requestId?: number
+  planId?: number
+  datasetId?: number
+  dependsOn?: string
+  sortOrder: number
+  enabled: boolean
+  timeoutMs: number
+  retries: number
+  retryOnFailure: boolean
+  continueOnFailure: boolean
+  tags?: string
+  variablesJson?: string
+  assertionsJson?: string
+  preScript?: string
+  postScript?: string
+  mainScript?: string
+  stressJson?: string
+  createdAt: number
+  updatedAt: number
+}
+
+export interface TestCasePayload {
+  id?: number
+  suiteId: number
+  name: string
+  kind: string
+  requestId?: number
+  planId?: number
+  datasetId?: number
+  dependsOn?: string
+  sortOrder?: number
+  enabled?: boolean
+  timeoutMs?: number
+  retries?: number
+  retryOnFailure?: boolean
+  continueOnFailure?: boolean
+  tags?: string
+  variablesJson?: string
+  assertionsJson?: string
+  preScript?: string
+  postScript?: string
+  mainScript?: string
+  stressJson?: string
+}
+
+export interface TestDataset {
+  id: number
+  suiteId: number
+  name: string
+  format: string
+  path?: string
+  content?: string
+  rowCount: number
+  sha256?: string
+  createdAt: number
+}
+
+export interface TestDatasetPayload {
+  id?: number
+  suiteId: number
+  name: string
+  format: string
+  path?: string
+  content?: string
+}
+
+export interface SuiteDetail {
+  suite: TestSuite
+  cases: TestCase[]
+  datasets: TestDataset[]
+}
+
+export interface TestRun {
+  id: number
+  suiteId: number
+  envId?: number
+  envName?: string
+  trigger: string
+  status: string
+  total: number
+  passed: number
+  failed: number
+  skipped: number
+  errored: number
+  durationMs: number
+  appVersion?: string
+  pythonVersion?: string
+  reportDir?: string
+  startedAt?: number
+  finishedAt?: number
+  createdAt: number
+}
+
+export interface RunCase {
+  id: number
+  runId: number
+  caseId?: number
+  name: string
+  kind: string
+  status: string
+  attempts: number
+  durationMs: number
+  httpDurationMs: number
+  pythonDurationMs: number
+  requestSnapshot?: string
+  responseSnapshot?: string
+  assertionsTotal: number
+  assertionsFailed: number
+  error?: string
+  logs?: string
+  pythonVersion?: string
+  scriptHash?: string
+  reportId?: number
+}
+
+export interface RunAssertion {
+  id: number
+  runCaseId: number
+  name: string
+  passed: boolean
+  message?: string
+  durationMs: number
+}
+
+export interface RunDetail {
+  run: TestRun
+  cases: RunCase[]
+  assertions: RunAssertion[]
+}
+
+export interface PreflightReport {
+  suiteId: number
+  suiteName: string
+  envId?: number
+  envName?: string
+  cookieMode: string
+  strictScripts: boolean
+  totalCases: number
+  enabledCases: number
+  errors: number
+  warnings: number
+  runnable: boolean
+  items: PreflightItem[]
+}
+
+export interface PreflightItem {
+  level: string
+  code: string
+  message: string
+  caseId?: number
+  caseName?: string
+  hint?: string
+}
+
+export interface TestArtifact {
+  id: number
+  runCaseId?: number
+  kind: string
+  name: string
+  path: string
+  relativePath?: string
+  sizeBytes: number
+  exists: boolean
+}
+
+export interface TestRunReport {
+  runId: number
+  dir: string
+  relativeDir?: string
+  files: string[]
 }

@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+    tags-ignore: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: 前端测试与构建
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run test
+      - run: npm run build
+
+  rust:
+    name: Rust 测试（Windows）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+      # tauri build 脚本需要前端产物与配置
+      - run: npm ci
+      - run: npm run build
+      # externalBin 要求 CLI 产物先存在；同时验证 CLI 能独立编译
+      - run: node scripts/prepare-cli.mjs --target x86_64-pc-windows-msvc
+      - run: cargo test --lib
+        working-directory: src-tauri
+      - run: cargo build --bin astroman-cli
+        working-directory: src-tauri

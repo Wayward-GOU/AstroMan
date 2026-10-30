@@ -146,8 +146,8 @@ describe('阶段四：工具生态', () => {
     // 长尾工具只在名字清单里出现，不再占提示词字符
     expect(TOOL_CATALOG).toContain('toolbox_json_to_entity')
     expect(TOOL_CATALOG).not.toContain('把 JSON 转成 Java')
-    // 目录整体保持精简
-    expect(TOOL_CATALOG.length).toBeLessThan(3200)
+    // 目录整体保持精简（v1.0.8 新增测试域 3 个核心工具，上限随之放宽）
+    expect(TOOL_CATALOG.length).toBeLessThan(3800)
     // 验收：注入字符数相比全量目录下降 ≥30%
     const stats = toolCatalogStats()
     expect(stats.ratio).toBeLessThanOrEqual(0.7)
@@ -167,5 +167,20 @@ describe('阶段四：工具生态', () => {
   it('新工具默认 60 秒超时', () => {
     expect(toolTimeoutOf('toolbox_hash', { text: 'a', algorithm: 'SHA256' })).toBe(60_000)
     expect(toolTimeoutOf('report_requests', { id: 1 })).toBe(60_000)
+  })
+
+  it('测试域工具：写入需确认、启动不限时、参数强校验', () => {
+    expect(isWriteTool('test_suite_create')).toBe(true)
+    expect(isWriteTool('test_case_update')).toBe(true)
+    expect(isWriteTool('test_run_start')).toBe(true)
+    expect(isWriteTool('test_run_stop')).toBe(true)
+    expect(isWriteTool('test_suite_list')).toBe(false)
+    expect(isWriteTool('test_run_get')).toBe(false)
+    expect(toolTimeoutOf('test_run_start', { suiteId: 1 })).toBeNull()
+    expect(validateToolArgs('test_suite_get', {})).toBe('缺少必填参数 id')
+    expect(validateToolArgs('test_case_create', { suiteId: 1, name: 'x', kind: 'network' })).toContain(
+      '必须是',
+    )
+    expect(validateToolArgs('test_run_get', { runId: 12 })).toBeNull()
   })
 })

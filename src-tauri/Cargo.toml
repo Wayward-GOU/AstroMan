@@ -1,8 +1,10 @@
 [package]
 name = "astroman"
-version = "1.0.7"
+version = "1.0.8"
 description = "AstroMan - 本地 API 调试与压测工具"
 edition = "2021"
+# 新增 astroman-cli 后仍让 `cargo run`（tauri dev 使用）默认启动桌面端
+default-run = "astroman"
 
 [lib]
 name = "astroman_lib"
@@ -38,6 +40,7 @@ md-5 = "0.10"
 sha1 = "0.10"
 sha2 = "0.10"
 hmac = "0.12"
+regex = "1"
 sysinfo = { version = "0.33", default-features = false, features = ["system", "disk", "network"] }
 
 [target.'cfg(windows)'.dependencies]

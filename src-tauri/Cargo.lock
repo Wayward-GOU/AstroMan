@@ -146,7 +146,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "astroman"
-version = "1.0.7"
+version = "1.0.8"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
@@ -160,6 +160,7 @@ dependencies = [
  "parking_lot",
  "r2d2",
  "r2d2_sqlite",
+ "regex",
  "reqwest 0.12.28",
  "rusqlite",
  "serde",

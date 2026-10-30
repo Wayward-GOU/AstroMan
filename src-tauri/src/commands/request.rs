@@ -44,7 +44,7 @@ fn map_detail(row: &Row<'_>) -> rusqlite::Result<HttpRequestDetail> {
     })
 }
 
-fn find_request(conn: &Connection, id: i64) -> Result<HttpRequestDetail, String> {
+pub(crate) fn find_request(conn: &Connection, id: i64) -> Result<HttpRequestDetail, String> {
     conn.query_row(
         "SELECT id, collection_id, name, method, url, headers, params,
                 body_type, body, pre_script, post_script, assertions, auth

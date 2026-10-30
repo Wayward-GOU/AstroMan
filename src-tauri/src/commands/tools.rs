@@ -7,6 +7,11 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
 use tauri::State;
 
+/// 供数据集 / 套件包等需要稳定指纹的场景复用
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    to_hex(&Sha256::digest(bytes))
+}
+
 fn to_hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {

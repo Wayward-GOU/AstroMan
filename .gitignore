@@ -119,3 +119,10 @@ src-tauri/target/
 src-tauri/gen/
 *.log
 .DS_Store
+
+# Python 运行时缓存（随包脚本执行后生成）
+__pycache__/
+*.pyc
+
+# Tauri externalBin 构建产物
+src-tauri/binaries/

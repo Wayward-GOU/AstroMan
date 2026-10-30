@@ -84,6 +84,8 @@ npm.cmd run dev
 npm.cmd run tauri build
 ```
 
+`build:*` 脚本会先执行 `node scripts/prepare-cli.mjs`，把 `astroman-cli` 编译到 `src-tauri/binaries/astroman-cli-<target-triple>`，再交给 Tauri 打包（安装包与便携版都会带 CLI）。
+
 只打 exe 安装包（NSIS，推荐）：
 
 ```powershell
@@ -105,8 +107,8 @@ npm.cmd run build:win32
 
 | 产物 | 路径 |
 |---|---|
-| **exe 安装包** | `src-tauri\target\release\bundle\nsis\AstroMan_1.0.7_x64-setup.exe` |
-| msi 安装包 | `src-tauri\target\release\bundle\msi\AstroMan_1.0.7_x64_en-US.msi` |
+| **exe 安装包** | `src-tauri\target\release\bundle\nsis\AstroMan_1.0.8_x64-setup.exe` |
+| msi 安装包 | `src-tauri\target\release\bundle\msi\AstroMan_1.0.8_x64_en-US.msi` |
 | 免安装可执行文件 | `src-tauri\target\release\astroman.exe` |
 
 安装向导内置语言与路径选择：
@@ -115,7 +117,7 @@ npm.cmd run build:win32
 - 随后在「选择安装位置」页可修改安装目录，默认 `%LOCALAPPDATA%\AstroMan`
 - 采用当前用户安装模式，全程无需管理员权限
 
-**分发方式**：把 `AstroMan_1.0.7_x64-setup.exe` 发给对方，双击安装即可使用。`astroman.exe` 只是免安装可执行文件，没有卸载入口和开始菜单快捷方式，不建议直接分发。
+**分发方式**：把 `AstroMan_1.0.8_x64-setup.exe` 发给对方，双击安装即可使用。`astroman.exe` 只是免安装可执行文件，没有卸载入口和开始菜单快捷方式，不建议直接分发。
 
 标准安装包在缺少 WebView2 时联网下载安装；目标机器完全离线时，改用 `AstroMan_*_offline-setup.exe` 离线包。
 
@@ -130,7 +132,7 @@ npm.cmd run build:win32
 | TLS 后端 | reqwest `native-tls` | 复用系统证书库，移除 rustls / ring 依赖 |
 | 安装器压缩 | NSIS `compression = "lzma"` | 安装包使用 LZMA 最高压缩 |
 
-实测体积：`astroman.exe` 约 7.4 MB，`AstroMan_1.0.7_x64-setup.exe` 约 5.2 MB（离线包约 211 MB）。
+实测体积：`astroman.exe` 约 7.4 MB，`AstroMan_1.0.8_x64-setup.exe` 约 5.2 MB（离线包约 211 MB）。
 
 > 国内网络首次打包时，下载 NSIS 工具容易超时（`timeout: global`）。可先设置镜像再执行：
 >

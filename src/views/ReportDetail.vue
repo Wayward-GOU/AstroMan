@@ -405,7 +405,7 @@ function remove() {
     async onOk() {
       await api.reportDelete(report.value!.id)
       message.success('已删除')
-      router.push('/reports')
+      router.push('/stress')
     },
   })
 }
@@ -422,7 +422,7 @@ function remove() {
         <template #icon><AiSparkIcon /></template>
         AI 解读
       </a-button>
-      <a-button @click="router.push('/reports')">
+      <a-button @click="router.push('/stress')">
         <template #icon><ArrowLeftOutlined /></template>
         返回列表
       </a-button>

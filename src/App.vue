@@ -5,7 +5,8 @@ import { theme as AntTheme } from 'ant-design-vue'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import {
   AppstoreOutlined,
-  FundProjectionScreenOutlined,
+  ExperimentOutlined,
+  FolderOpenOutlined,
   HistoryOutlined,
   SettingOutlined,
   SafetyCertificateOutlined,
@@ -93,12 +94,13 @@ function onZoomHotkey(event: KeyboardEvent) {
 /* ---------- 侧边栏导航 ---------- */
 // 必须声明在命令面板的 computed / watch 之前，否则 watch 首次求值会触发 TDZ
 const navs = [
-  { key: 'home', label: '工作台', hint: '项目与请求调试', to: '/', icon: AppstoreOutlined },
+  { key: 'home', label: '工作台', hint: '概览与快速入口', to: '/', icon: AppstoreOutlined },
+  { key: 'projects', label: '项目管理', hint: '项目 · 集合 · 环境', to: '/projects', icon: FolderOpenOutlined },
   { key: 'stress', label: '压测', hint: '选择接口发起压测', to: '/stress', icon: ThunderboltOutlined },
   { key: 'runner', label: '批量运行', hint: '集合 Runner · 数据驱动', to: '/runner', icon: PlayCircleOutlined },
+  { key: 'automation', label: '自动化测试', hint: '套件 · 断言 · Python · 报告', to: '/automation', icon: ExperimentOutlined },
   { key: 'ai', label: '航仔', hint: 'AI 助手 · 自动建请求并分析', to: '/ai', icon: RobotOutlined },
-  { key: 'reports', label: '压测报告', hint: '历史压测结果', to: '/reports', icon: FundProjectionScreenOutlined },
-  { key: 'history', label: '请求历史', hint: '最近发送记录', to: '/history', icon: HistoryOutlined },
+  { key: 'history', label: '历史记录', hint: '数据概览 · 最近发送记录', to: '/history', icon: HistoryOutlined },
   { key: 'monitor', label: '系统监视', hint: 'CPU · 内存 · 磁盘 · 网络', to: '/monitor', icon: LineChartOutlined },
   { key: 'tools', label: '工具箱', hint: 'JSON · 加解密 · 时间戳', to: '/tools', icon: ToolOutlined },
   { key: 'settings', label: '设置', hint: '应用与数据', to: '/settings', icon: SettingOutlined },
@@ -258,8 +260,10 @@ const activeKey = computed(() => {
   const path = route.path
   if (path.startsWith('/stress')) return 'stress'
   if (path.startsWith('/runner')) return 'runner'
+  if (path.startsWith('/projects')) return 'projects'
+  if (path.startsWith('/project/')) return 'projects'
+  if (path.startsWith('/automation')) return 'automation'
   if (path.startsWith('/ai')) return 'ai'
-  if (path.startsWith('/reports')) return 'reports'
   if (path.startsWith('/history')) return 'history'
   if (path.startsWith('/monitor')) return 'monitor'
   if (path.startsWith('/tools')) return 'tools'

@@ -240,6 +240,14 @@ pub fn open_external(target: String) -> Result<(), String> {
                 .args(["/C", "start", "", &target])
                 .spawn()
                 .map_err(|e| format!("打开链接失败：{e}"))?;
+        } else if std::path::Path::new(&target).is_file()
+            && !target.to_ascii_lowercase().ends_with(".exe")
+        {
+            // 报告 HTML / PDF 等普通文件交给系统默认程序
+            std::process::Command::new("cmd")
+                .args(["/C", "start", "", &target])
+                .spawn()
+                .map_err(|e| format!("打开文件失败：{e}"))?;
         } else {
             std::process::Command::new(&target)
                 .spawn()

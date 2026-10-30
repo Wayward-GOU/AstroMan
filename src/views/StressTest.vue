@@ -18,6 +18,7 @@ import {
 import AiSparkIcon from '@/components/AiSparkIcon.vue'
 import PageHeader from '@/components/PageHeader.vue'
 import LineChart from '@/components/LineChart.vue'
+import StressReportList from '@/components/StressReportList.vue'
 import { useProjectStore } from '@/stores/project'
 import { useAiAssistStore } from '@/stores/aiAssist'
 import { useErrorDialogStore } from '@/stores/errorDialog'
@@ -323,6 +324,7 @@ const progress = ref<StressProgress | null>(null)
 const done = ref<StressDone | null>(null)
 const resultCard = ref<HTMLElement | null>(null)
 const unlisteners: UnlistenFn[] = []
+const reportList = ref<{ reload: () => Promise<void> } | null>(null)
 
 onMounted(async () => {
   try {
@@ -345,6 +347,7 @@ onMounted(async () => {
             context: stressContext('压测执行'),
           })
         }
+        void reportList.value?.reload()
         nextTick(() => resultCard.value?.scrollIntoView({ behavior: 'smooth', block: 'center' }))
       }),
     )
@@ -569,10 +572,6 @@ function backToRequest() {
       <a-button @click="backToRequest">
         <template #icon><ArrowLeftOutlined /></template>
         返回请求
-      </a-button>
-      <a-button @click="router.push('/reports')">
-        <template #icon><FileTextOutlined /></template>
-        压测报告
       </a-button>
     </PageHeader>
 
@@ -874,6 +873,17 @@ function backToRequest() {
         <a-button type="primary" @click="openConfig">重新选择接口</a-button>
       </div>
     </a-spin>
+
+    <div class="reports-section">
+      <div class="reports-head">
+        <div>
+          <div class="reports-title">压测报告记录</div>
+          <div class="reports-sub">最近 200 份，点击「查看详情」查看逐请求明细</div>
+        </div>
+        <a-button size="small" @click="reportList?.reload()">刷新</a-button>
+      </div>
+      <StressReportList ref="reportList" />
+    </div>
 
     <a-modal
       v-model:open="configOpen"
@@ -1256,6 +1266,27 @@ function backToRequest() {
 </template>
 
 <style scoped>
+.reports-section {
+  margin-top: 22px;
+  padding-top: 4px;
+}
+.reports-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 6px;
+}
+.reports-title {
+  font-size: 14px;
+  font-weight: 600;
+}
+.reports-sub {
+  font-size: 11px;
+  color: var(--fm-muted);
+  margin-top: 2px;
+}
+
 .layout {
   display: grid;
   grid-template-columns: 330px minmax(0, 1fr);

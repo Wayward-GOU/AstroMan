@@ -9,9 +9,10 @@ use tauri::{AppHandle, Emitter, State};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
+use crate::commands::http::base64_encode;
 use crate::models::{
-    ErrorTypeCount, HistogramBucket, ReportError, ReportRequestRecord, ReportSample, StageSummary,
-    StatusCount, StressConfig, StressDone, StressProgress, StressReport, StressStage,
+    ErrorTypeCount, HistogramBucket, ReportError, ReportRequestRecord, ReportSample, RequestAuth,
+    StageSummary, StatusCount, StressConfig, StressDone, StressProgress, StressReport, StressStage,
 };
 use crate::state::{AppState, DbPool};
 use crate::util::{err, now_ms, render, strip_json_comments};
@@ -299,6 +300,10 @@ struct RunCtx {
     method: reqwest::Method,
     config: StressConfig,
     vars: HashMap<String, String>,
+    /// 启动时渲染好的认证配置（模板变量已替换）
+    auth: RequestAuth,
+    /// 启动时按目标 URL 预取的本机 Cookie（未启用或用户自建 Cookie 头时为空）
+    cookie: Option<String>,
     metrics: Arc<Metrics>,
     control: Arc<Control>,
     start: Instant,
@@ -334,9 +339,27 @@ fn headers_json(pairs: &[(String, String)]) -> String {
     serde_json::to_string(pairs).unwrap_or_default()
 }
 
+/// 认证配置在启动时渲染一次，避免每个请求重复解析模板
+fn render_auth(auth: &RequestAuth, vars: &HashMap<String, String>) -> RequestAuth {
+    RequestAuth {
+        kind: auth.kind.clone(),
+        token: render(&auth.token, vars),
+        username: render(&auth.username, vars),
+        password: render(&auth.password, vars),
+        key: render(&auth.key, vars),
+        value: render(&auth.value, vars),
+        add_to: auth.add_to.clone(),
+        token_url: render(&auth.token_url, vars),
+        client_id: render(&auth.client_id, vars),
+        client_secret: render(&auth.client_secret, vars),
+        scope: render(&auth.scope, vars),
+    }
+}
+
 fn build_url(
     config: &StressConfig,
     vars: &HashMap<String, String>,
+    auth: &RequestAuth,
 ) -> Result<reqwest::Url, String> {
     let mut raw = render(config.url.trim(), vars).trim().to_string();
     if raw.is_empty() {
@@ -358,6 +381,11 @@ fn build_url(
             }
             pairs.append_pair(&key, &render(&item.value, vars));
         }
+    }
+    // API Key 认证可以放在查询参数上（auth 已渲染，无需再次替换变量）
+    if auth.kind == "apikey" && auth.add_to == "query" && !auth.key.trim().is_empty() {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair(auth.key.trim(), &auth.value);
     }
     Ok(url)
 }
@@ -392,7 +420,7 @@ async fn read_snippet(mut response: reqwest::Response, limit: usize) -> (String,
 }
 
 async fn send_once(ctx: &RunCtx) -> Attempt {
-    let url = match build_url(&ctx.config, &ctx.vars) {
+    let url = match build_url(&ctx.config, &ctx.vars, &ctx.auth) {
         Ok(url) => url,
         Err(error) => {
             return Attempt {
@@ -421,6 +449,8 @@ async fn send_once(ctx: &RunCtx) -> Attempt {
 
     let mut header_pairs: Vec<(String, String)> = Vec::new();
     let mut has_content_type = false;
+    let mut has_authorization = false;
+    let mut has_cookie = false;
     for item in &ctx.config.headers {
         if !item.enabled {
             continue;
@@ -432,9 +462,45 @@ async fn send_once(ctx: &RunCtx) -> Attempt {
         if key.eq_ignore_ascii_case("content-type") {
             has_content_type = true;
         }
+        if key.eq_ignore_ascii_case("authorization") {
+            has_authorization = true;
+        }
+        if key.eq_ignore_ascii_case("cookie") {
+            has_cookie = true;
+        }
         let value = render(&item.value, &ctx.vars);
         header_pairs.push((key.clone(), value.clone()));
         builder = builder.header(key, value);
+    }
+
+    // 认证头：用户手动配置的 Authorization 优先，与手工请求保持一致
+    if !has_authorization {
+        match ctx.auth.kind.as_str() {
+            "bearer" | "oauth2" if !ctx.auth.token.trim().is_empty() => {
+                let value = format!("Bearer {}", ctx.auth.token.trim());
+                header_pairs.push(("Authorization".to_string(), value.clone()));
+                builder = builder.header(reqwest::header::AUTHORIZATION, value);
+            }
+            "basic" => {
+                let raw = format!("{}:{}", ctx.auth.username, ctx.auth.password);
+                let value = format!("Basic {}", base64_encode(raw.as_bytes()));
+                header_pairs.push(("Authorization".to_string(), value.clone()));
+                builder = builder.header(reqwest::header::AUTHORIZATION, value);
+            }
+            "apikey" if ctx.auth.add_to != "query" && !ctx.auth.key.trim().is_empty() => {
+                header_pairs.push((ctx.auth.key.clone(), ctx.auth.value.clone()));
+                builder = builder.header(ctx.auth.key.clone(), ctx.auth.value.clone());
+            }
+            _ => {}
+        }
+    }
+
+    // 自动携带本机 Cookie（启动时已按目标 URL 预取）
+    if !has_cookie {
+        if let Some(cookie) = &ctx.cookie {
+            header_pairs.push(("Cookie".to_string(), cookie.clone()));
+            builder = builder.header(reqwest::header::COOKIE, cookie.clone());
+        }
     }
 
     let body_type = ctx.config.body_type.as_str();
@@ -701,46 +767,73 @@ async fn worker(ctx: Arc<RunCtx>, index: u32, workers: u32) {
     }
 }
 
-#[tauri::command]
-pub async fn stress_start(
-    state: State<'_, AppState>,
-    app: AppHandle,
-    config: StressConfig,
-) -> Result<(), String> {
-    if state.stress_running.swap(true, Ordering::SeqCst) {
-        return Err("已有压测任务正在运行，请先停止或等待结束".to_string());
-    }
+/// 压测执行结果：命令层与套件 `kind=stress` 用例共用
+pub struct StressExecOutcome {
+    pub report_id: Option<i64>,
+    pub report: StressReport,
+    pub message: Option<String>,
+}
 
-    // 出错时把运行标记还原，避免后续无法再启动
-    let vars = match config.env_id {
-        Some(env_id) => match state.pool.get() {
-            Ok(conn) => match crate::commands::http::load_vars(&conn, env_id) {
-                Ok(vars) => vars,
-                Err(error) => {
-                    state.stress_running.store(false, Ordering::SeqCst);
-                    return Err(error);
-                }
-            },
-            Err(error) => {
-                state.stress_running.store(false, Ordering::SeqCst);
-                return Err(err(error));
-            }
-        },
+struct PreparedStress {
+    ctx: Arc<RunCtx>,
+    name: String,
+    stages: Vec<StressStage>,
+    peak: u32,
+    total_sec: u64,
+    rate: u32,
+    target_rps: f64,
+    config_snapshot: String,
+    stop_rate: Option<f64>,
+    stop_min: u32,
+    concurrent: i64,
+    errors_rx: mpsc::Receiver<ReportError>,
+    records_rx: mpsc::UnboundedReceiver<ReportRequestRecord>,
+}
+
+/// 校验配置、渲染模板、构建客户端并准备 Cookie 快照；不依赖 Tauri 事件
+fn prepare_stress(state: &AppState, config: StressConfig) -> Result<PreparedStress, String> {
+    let mut vars = match config.env_id {
+        Some(env_id) => {
+            let conn = state.pool.get().map_err(err)?;
+            crate::commands::http::load_vars(&conn, env_id)?
+        }
         None => HashMap::new(),
     };
-
-    let method = match reqwest::Method::from_bytes(config.method.trim().to_uppercase().as_bytes()) {
-        Ok(method) => method,
-        Err(_) => {
-            state.stress_running.store(false, Ordering::SeqCst);
-            return Err(format!("不支持的请求方法：{}", config.method));
+    // 运行期变量优先于环境变量
+    for (key, value) in &config.vars {
+        if !key.trim().is_empty() {
+            vars.insert(key.clone(), value.clone());
         }
-    };
-
-    if let Err(error) = build_url(&config, &vars) {
-        state.stress_running.store(false, Ordering::SeqCst);
-        return Err(error);
     }
+
+    let method = reqwest::Method::from_bytes(config.method.trim().to_uppercase().as_bytes())
+        .map_err(|_| format!("不支持的请求方法：{}", config.method))?;
+
+    let auth = config
+        .auth
+        .clone()
+        .map(|auth| render_auth(&auth, &vars))
+        .unwrap_or_default();
+
+    let prepared_url = build_url(&config, &vars, &auth)?;
+
+    // Cookie 只按目标 URL 取一次：压测过程中不写回 Cookie 库，避免高并发下的写竞争
+    let cookie_enabled = config.cookie_enabled.unwrap_or(true);
+    let user_has_cookie = config
+        .headers
+        .iter()
+        .any(|item| item.enabled && item.key.trim().eq_ignore_ascii_case("cookie"));
+    let cookie = if cookie_enabled && !user_has_cookie {
+        state
+            .pool
+            .get()
+            .ok()
+            .map(|conn| crate::commands::cookie::cookies_for_url(&conn, &prepared_url))
+            .filter(|items| !items.is_empty())
+            .map(|items| items.join("; "))
+    } else {
+        None
+    };
 
     state.stress_cancel.store(false, Ordering::SeqCst);
 
@@ -782,39 +875,25 @@ pub async fn stress_start(
     let target_rps = rate as f64;
 
     let metrics = Arc::new(Metrics::new());
-    let control = Arc::new(Control::new(if stages.is_empty() { peak } else { stages[0].concurrent }, rate));
+    let control = Arc::new(Control::new(
+        if stages.is_empty() { peak } else { stages[0].concurrent },
+        rate,
+    ));
     let cancel = state.stress_cancel.clone();
-    let running = state.stress_running.clone();
-    let pool = state.pool.clone();
-    // 按当前配置构建独立客户端：连接超时、重定向策略与证书开关都可配置
-    let client = match reqwest::Client::builder()
-        .user_agent(concat!("AstroMan/", env!("CARGO_PKG_VERSION")))
-        .connect_timeout(Duration::from_millis(
-            config.connect_timeout_ms.clamp(500, 120_000),
-        ))
-        .pool_max_idle_per_host(32)
-        .danger_accept_invalid_certs(config.insecure)
-        .redirect(if config.follow_redirects {
-            reqwest::redirect::Policy::limited(10)
-        } else {
-            reqwest::redirect::Policy::none()
-        })
-        .build()
-    {
-        Ok(client) => client,
-        Err(error) => {
-            state.stress_running.store(false, Ordering::SeqCst);
-            return Err(err(error));
-        }
-    };
+    // 按当前配置构建客户端：连接超时、重定向策略可单独覆盖，代理与客户端证书沿用应用设置
+    let client = state.client_with_options(
+        config.insecure,
+        config.connect_timeout_ms,
+        config.follow_redirects,
+    )?;
     let stop_rate = config.stop_error_rate.filter(|value| *value > 0.0);
     let stop_min = config.stop_min_requests.unwrap_or(100).max(1);
     let start = Instant::now();
     let deadline = start + Duration::from_secs(total_sec);
     let concurrent = peak as i64;
 
-    let (errors_tx, mut errors_rx) = mpsc::channel::<ReportError>(1024);
-    let (records_tx, mut records_rx) = mpsc::unbounded_channel::<ReportRequestRecord>();
+    let (errors_tx, errors_rx) = mpsc::channel::<ReportError>(1024);
+    let (records_tx, records_rx) = mpsc::unbounded_channel::<ReportRequestRecord>();
 
     let config_snapshot = json!({
         "mode": if stages.is_empty() { "fixed" } else { "stages" },
@@ -824,6 +903,11 @@ pub async fn stress_start(
         "params": config.params.iter().filter(|p| p.enabled && !p.key.trim().is_empty()).count(),
         "bodyType": config.body_type.clone(),
         "envId": config.env_id,
+        // 只记录认证方式与开关，绝不写入密钥值
+        "authKind": if auth.kind.trim().is_empty() { "none" } else { auth.kind.as_str() },
+        "apiKeyIn": auth.add_to.clone(),
+        "cookieEnabled": cookie_enabled,
+        "runtimeVars": config.vars.len(),
         "timeoutMs": config.timeout_ms,
         "connectTimeoutMs": config.connect_timeout_ms,
         "followRedirects": config.follow_redirects,
@@ -835,92 +919,145 @@ pub async fn stress_start(
         "stages": stages,
         "sla": config.sla,
     });
-    let cfg_text = config_snapshot.to_string();
+    let config_snapshot = config_snapshot.to_string();
 
     let ctx = Arc::new(RunCtx {
         client,
         method,
         config,
         vars,
-        metrics: metrics.clone(),
-        control: control.clone(),
+        auth,
+        cookie,
+        metrics,
+        control,
         start,
         deadline,
-        cancel: cancel.clone(),
+        cancel,
         errors: errors_tx,
         records: records_tx,
     });
 
-    tauri::async_runtime::spawn(async move {
-        let mut tasks = JoinSet::new();
-        for index in 0..peak {
-            tasks.spawn(worker(ctx.clone(), index, peak));
+    Ok(PreparedStress {
+        ctx,
+        name,
+        stages,
+        peak,
+        total_sec,
+        rate,
+        target_rps,
+        config_snapshot,
+        stop_rate,
+        stop_min,
+        concurrent,
+        errors_rx,
+        records_rx,
+    })
+}
+
+/// 执行压测并落库；进度通过回调交给调用方（桌面端转 Tauri 事件）
+async fn drive_stress(
+    prepared: PreparedStress,
+    pool: DbPool,
+    progress: Option<&(dyn Fn(StressProgress) + Send + Sync)>,
+    watch: Option<&Arc<AtomicBool>>,
+) -> StressExecOutcome {
+    let PreparedStress {
+        ctx,
+        name,
+        stages,
+        peak,
+        total_sec,
+        rate,
+        target_rps,
+        config_snapshot,
+        stop_rate,
+        stop_min,
+        concurrent,
+        mut errors_rx,
+        mut records_rx,
+    } = prepared;
+    let start = ctx.start;
+    let deadline = ctx.deadline;
+    let cancel = ctx.cancel.clone();
+    let metrics = ctx.metrics.clone();
+    let control = ctx.control.clone();
+
+    let mut tasks = JoinSet::new();
+    for index in 0..peak {
+        tasks.spawn(worker(ctx.clone(), index, peak));
+    }
+
+    let mut samples: Vec<ReportSample> = Vec::new();
+    let mut errors: Vec<ReportError> = Vec::new();
+    let mut requests: Vec<ReportRequestRecord> = Vec::new();
+    let mut prev_total = 0u64;
+    let mut prev_success = 0u64;
+    let mut prev_errors = 0u64;
+    let mut prev_bytes = 0u64;
+    let mut left_sec = total_sec;
+    let mut auto_stop: Option<String> = None;
+
+    let mut ticker = tokio::time::interval(Duration::from_millis(1000));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        ticker.tick().await;
+        // 套件运行被停止时同步结束压测，最迟 1 秒内生效
+        if let Some(flag) = watch {
+            if flag.load(Ordering::SeqCst) {
+                cancel.store(true, Ordering::SeqCst);
+            }
+        }
+        left_sec = left_sec.saturating_sub(1);
+
+        while let Ok(item) = errors_rx.try_recv() {
+            if errors.len() < MAX_ERRORS {
+                errors.push(item);
+            }
+        }
+        while let Ok(item) = records_rx.try_recv() {
+            if requests.len() < MAX_REQUEST_RECORDS {
+                requests.push(item);
+            }
         }
 
-        let mut samples: Vec<ReportSample> = Vec::new();
-        let mut errors: Vec<ReportError> = Vec::new();
-        let mut requests: Vec<ReportRequestRecord> = Vec::new();
-        let mut prev_total = 0u64;
-        let mut prev_success = 0u64;
-        let mut prev_errors = 0u64;
-        let mut prev_bytes = 0u64;
-        let mut left_sec = total_sec;
-        let mut auto_stop: Option<String> = None;
+        let elapsed = start.elapsed().as_secs();
+        let total = metrics.count();
+        let success = metrics.success.load(Ordering::Relaxed);
+        let failure = metrics.errors.load(Ordering::Relaxed);
+        let bytes = metrics.bytes.load(Ordering::Relaxed);
 
-        let mut ticker = tokio::time::interval(Duration::from_millis(1000));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // 阶梯加压：按时间切换生效并发
+        let (active, stage_index) = stage_at(&stages, elapsed, peak);
+        control.active.store(active, Ordering::Relaxed);
+        control.stage.store(stage_index, Ordering::Relaxed);
+        // 限速：每秒补满令牌
+        if rate > 0 {
+            control.tokens.store(rate as u64, Ordering::Relaxed);
+        }
 
-        loop {
-            ticker.tick().await;
-            left_sec = left_sec.saturating_sub(1);
+        if elapsed > 0 {
+            samples.push(ReportSample {
+                elapsed_sec: elapsed,
+                concurrent: metrics.concurrent.load(Ordering::Relaxed),
+                qps: total.saturating_sub(prev_total) as f64,
+                avg_rt: metrics.avg(),
+                p50_rt: metrics.percentile(0.5),
+                p95_rt: metrics.percentile(0.95),
+                p99_rt: metrics.percentile(0.99),
+                ttfb_avg: metrics.ttfb_avg(),
+                bytes: bytes.saturating_sub(prev_bytes),
+                success_count: success.saturating_sub(prev_success),
+                error_count: failure.saturating_sub(prev_errors),
+            });
+            prev_total = total;
+            prev_success = success;
+            prev_errors = failure;
+            prev_bytes = bytes;
+        }
 
-            while let Ok(item) = errors_rx.try_recv() {
-                if errors.len() < MAX_ERRORS {
-                    errors.push(item);
-                }
-            }
-            while let Ok(item) = records_rx.try_recv() {
-                if requests.len() < MAX_REQUEST_RECORDS {
-                    requests.push(item);
-                }
-            }
-
-            let elapsed = start.elapsed().as_secs();
-            let total = metrics.count();
-            let success = metrics.success.load(Ordering::Relaxed);
-            let failure = metrics.errors.load(Ordering::Relaxed);
-            let bytes = metrics.bytes.load(Ordering::Relaxed);
-
-            // 阶梯加压：按时间切换生效并发
-            let (active, stage_index) = stage_at(&stages, elapsed, peak);
-            control.active.store(active, Ordering::Relaxed);
-            control.stage.store(stage_index, Ordering::Relaxed);
-            // 限速：每秒补满令牌
-            if rate > 0 {
-                control.tokens.store(rate as u64, Ordering::Relaxed);
-            }
-
-            if elapsed > 0 {
-                samples.push(ReportSample {
-                    elapsed_sec: elapsed,
-                    concurrent: metrics.concurrent.load(Ordering::Relaxed),
-                    qps: total.saturating_sub(prev_total) as f64,
-                    avg_rt: metrics.avg(),
-                    p50_rt: metrics.percentile(0.5),
-                    p95_rt: metrics.percentile(0.95),
-                    p99_rt: metrics.percentile(0.99),
-                    ttfb_avg: metrics.ttfb_avg(),
-                    bytes: bytes.saturating_sub(prev_bytes),
-                    success_count: success.saturating_sub(prev_success),
-                    error_count: failure.saturating_sub(prev_errors),
-                });
-                prev_total = total;
-                prev_success = success;
-                prev_errors = failure;
-                prev_bytes = bytes;
-            }
-
-            let progress = StressProgress {
+        if let Some(sink) = progress {
+            sink(StressProgress {
                 name: name.clone(),
                 running: true,
                 elapsed_sec: elapsed,
@@ -940,147 +1077,204 @@ pub async fn stress_start(
                 active_concurrent: active,
                 status_codes: metrics.status_codes(),
                 samples: samples.clone(),
-            };
-            let _ = app.emit("stress:progress", &progress);
+            });
+        }
 
-            // 自动停止判定：错误率达到阈值且请求数足够时提前结束
-            if auto_stop.is_none() {
-                if let Some(limit) = stop_rate {
-                    if total >= stop_min as u64 && total > 0 {
-                        let error_rate = failure as f64 / total as f64 * 100.0;
-                        if error_rate > limit {
-                            auto_stop = Some(format!(
-                                "错误率 {:.1}% 超过阈值 {:.1}%，已自动停止",
-                                error_rate, limit
-                            ));
-                            cancel.store(true, Ordering::SeqCst);
-                        }
+        // 自动停止判定：错误率达到阈值且请求数足够时提前结束
+        if auto_stop.is_none() {
+            if let Some(limit) = stop_rate {
+                if total >= stop_min as u64 && total > 0 {
+                    let error_rate = failure as f64 / total as f64 * 100.0;
+                    if error_rate > limit {
+                        auto_stop = Some(format!(
+                            "错误率 {:.1}% 超过阈值 {:.1}%，已自动停止",
+                            error_rate, limit
+                        ));
+                        cancel.store(true, Ordering::SeqCst);
                     }
                 }
             }
-
-            let stopped = cancel.load(Ordering::SeqCst);
-            if stopped || Instant::now() >= deadline || left_sec == 0 {
-                break;
-            }
         }
 
-        // 等待在途请求结束，最多等 5 秒
-        let wait_all = async {
-            while tasks.join_next().await.is_some() {}
-        };
-        if tokio::time::timeout(Duration::from_secs(5), wait_all)
-            .await
-            .is_err()
-        {
-            tasks.abort_all();
+        let stopped = cancel.load(Ordering::SeqCst);
+        if stopped || Instant::now() >= deadline || left_sec == 0 {
+            break;
         }
+    }
 
-        while let Ok(item) = errors_rx.try_recv() {
-            if errors.len() < MAX_ERRORS {
-                errors.push(item);
-            }
-        }
-        while let Ok(item) = records_rx.try_recv() {
-            if requests.len() < MAX_REQUEST_RECORDS {
-                requests.push(item);
-            }
-        }
+    // 等待在途请求结束，最多等 5 秒
+    let wait_all = async {
+        while tasks.join_next().await.is_some() {}
+    };
+    if tokio::time::timeout(Duration::from_secs(5), wait_all)
+        .await
+        .is_err()
+    {
+        tasks.abort_all();
+    }
 
-        let elapsed_sec = start.elapsed().as_secs();
-        let elapsed = start.elapsed().as_secs_f64().max(0.001);
-        let total = metrics.count();
-        let success = metrics.success.load(Ordering::Relaxed);
-        let failure = metrics.errors.load(Ordering::Relaxed);
-        let status = if cancel.load(Ordering::SeqCst) {
-            "stopped"
+    while let Ok(item) = errors_rx.try_recv() {
+        if errors.len() < MAX_ERRORS {
+            errors.push(item);
+        }
+    }
+    while let Ok(item) = records_rx.try_recv() {
+        if requests.len() < MAX_REQUEST_RECORDS {
+            requests.push(item);
+        }
+    }
+
+    let elapsed = start.elapsed().as_secs_f64().max(0.001);
+    let total = metrics.count();
+    let success = metrics.success.load(Ordering::Relaxed);
+    let failure = metrics.errors.load(Ordering::Relaxed);
+    let status = if cancel.load(Ordering::SeqCst) {
+        "stopped"
+    } else {
+        "completed"
+    };
+    let end_time = now_ms();
+    let start_time = end_time - (elapsed * 1000.0) as i64;
+    let max_qps = samples.iter().map(|s| s.qps).fold(0.0, f64::max);
+
+    let histogram = metrics.histogram();
+    let status_codes = metrics.status_codes();
+    let stage_summaries = summarize_stages(&stages, &samples);
+    let error_types = metrics.error_types();
+
+    let report = StressReport {
+        id: 0,
+        plan_name: name,
+        request_id: ctx.config.request_id,
+        total_requests: total as i64,
+        success_count: success as i64,
+        error_count: failure as i64,
+        avg_rt: metrics.avg(),
+        min_rt: metrics.min(),
+        max_rt: metrics.max(),
+        p50_rt: metrics.percentile(0.5),
+        p75_rt: metrics.percentile(0.75),
+        p90_rt: metrics.percentile(0.9),
+        p95_rt: metrics.percentile(0.95),
+        p99_rt: metrics.percentile(0.99),
+        p999_rt: metrics.percentile(0.999),
+        stddev_rt: metrics.stddev(),
+        ttfb_avg: metrics.ttfb_avg(),
+        ttfb_p95: metrics.ttfb_percentile(0.95),
+        apdex: metrics.apdex(),
+        bytes_total: metrics.bytes.load(Ordering::Relaxed) as i64,
+        max_qps,
+        avg_qps: if elapsed > 0.0 {
+            total as f64 / elapsed
         } else {
-            "completed"
-        };
-        let end_time = now_ms();
-        let start_time = end_time - (elapsed * 1000.0) as i64;
-        let max_qps = samples.iter().map(|s| s.qps).fold(0.0, f64::max);
+            0.0
+        },
+        target_rps,
+        error_rate: if total > 0 {
+            failure as f64 / total as f64 * 100.0
+        } else {
+            0.0
+        },
+        concurrency: concurrent,
+        status: status.to_string(),
+        start_time: Some(start_time),
+        end_time: Some(end_time),
+        created_at: end_time,
+    };
 
-        let histogram = metrics.histogram();
-        let status_codes = metrics.status_codes();
-        let stage_summaries = summarize_stages(&stages, &samples);
-        let error_types = metrics.error_types();
+    let payload = ReportPayload {
+        report: &report,
+        samples: &samples,
+        errors: &errors,
+        requests: &requests,
+        stages: &stage_summaries,
+        status_codes: &status_codes,
+        histogram: &histogram,
+        error_types: &error_types,
+        config: &config_snapshot,
+    };
+    let (report_id, message) = match save_report(&pool, payload) {
+        Ok(id) => (Some(id), None),
+        Err(error) => (None, Some(format!("报告保存失败：{error}"))),
+    };
+    let message = message.or(auto_stop);
 
-        let report = StressReport {
-            id: 0,
-            plan_name: name.clone(),
-            request_id: ctx.config.request_id,
-            total_requests: total as i64,
-            success_count: success as i64,
-            error_count: failure as i64,
-            avg_rt: metrics.avg(),
-            min_rt: metrics.min(),
-            max_rt: metrics.max(),
-            p50_rt: metrics.percentile(0.5),
-            p75_rt: metrics.percentile(0.75),
-            p90_rt: metrics.percentile(0.9),
-            p95_rt: metrics.percentile(0.95),
-            p99_rt: metrics.percentile(0.99),
-            p999_rt: metrics.percentile(0.999),
-            stddev_rt: metrics.stddev(),
-            ttfb_avg: metrics.ttfb_avg(),
-            ttfb_p95: metrics.ttfb_percentile(0.95),
-            apdex: metrics.apdex(),
-            bytes_total: metrics.bytes.load(Ordering::Relaxed) as i64,
-            max_qps,
-            avg_qps: if elapsed > 0.0 {
-                total as f64 / elapsed
-            } else {
-                0.0
-            },
-            target_rps,
-            error_rate: if total > 0 {
-                failure as f64 / total as f64 * 100.0
-            } else {
-                0.0
-            },
-            concurrency: concurrent,
-            status: status.to_string(),
-            start_time: Some(start_time),
-            end_time: Some(end_time),
-            created_at: end_time,
-        };
+    StressExecOutcome {
+        report_id,
+        report,
+        message,
+    }
+}
 
-        let payload = ReportPayload {
-            report: &report,
-            samples: &samples,
-            errors: &errors,
-            requests: &requests,
-            stages: &stage_summaries,
-            status_codes: &status_codes,
-            histogram: &histogram,
-            error_types: &error_types,
-            config: &cfg_text,
+#[tauri::command]
+pub async fn stress_start(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    config: StressConfig,
+) -> Result<(), String> {
+    if state.stress_running.swap(true, Ordering::SeqCst) {
+        return Err("已有压测任务正在运行，请先停止或等待结束".to_string());
+    }
+    let prepared = match prepare_stress(state.inner(), config) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            state.stress_running.store(false, Ordering::SeqCst);
+            return Err(error);
+        }
+    };
+    let pool = state.pool.clone();
+    let running = state.stress_running.clone();
+    tauri::async_runtime::spawn(async move {
+        let progress_app = app.clone();
+        let sink = move |progress: StressProgress| {
+            let _ = progress_app.emit("stress:progress", &progress);
         };
-        let (report_id, message) = match save_report(&pool, payload) {
-            Ok(id) => (Some(id), None),
-            Err(error) => (None, Some(format!("报告保存失败：{error}"))),
-        };
-        let message = message.or(auto_stop);
-
+        let outcome = drive_stress(prepared, pool, Some(&sink), None).await;
         running.store(false, Ordering::SeqCst);
-
+        let elapsed_sec = outcome
+            .report
+            .end_time
+            .unwrap_or(0)
+            .saturating_sub(outcome.report.start_time.unwrap_or(0)) as u64
+            / 1000;
         let _ = app.emit(
             "stress:done",
             &StressDone {
-                report_id,
-                name,
-                status: status.to_string(),
-                total,
-                success,
-                errors: failure,
+                report_id: outcome.report_id,
+                name: outcome.report.plan_name.clone(),
+                status: outcome.report.status.clone(),
+                total: outcome.report.total_requests.max(0) as u64,
+                success: outcome.report.success_count.max(0) as u64,
+                errors: outcome.report.error_count.max(0) as u64,
                 elapsed_sec,
-                message,
+                message: outcome.message,
             },
         );
     });
 
     Ok(())
+}
+
+/// 套件内执行压测用例：与手工压测互斥，结束（含出错）后释放标记
+pub async fn run_stress_case(
+    state: &AppState,
+    config: StressConfig,
+    watch: Option<&Arc<AtomicBool>>,
+) -> Result<StressExecOutcome, String> {
+    if state.stress_running.swap(true, Ordering::SeqCst) {
+        return Err("已有压测任务正在运行（手工压测或另一个套件），请先停止或等待结束".to_string());
+    }
+    let prepared = match prepare_stress(state, config) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            state.stress_running.store(false, Ordering::SeqCst);
+            return Err(error);
+        }
+    };
+    let pool = state.pool.clone();
+    let outcome = drive_stress(prepared, pool, None, watch).await;
+    state.stress_running.store(false, Ordering::SeqCst);
+    Ok(outcome)
 }
 
 /// 按阶段把每秒采样归并成阶段性汇总

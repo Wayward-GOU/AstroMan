@@ -460,6 +460,137 @@ vars.set('request_time', new Date().toISOString())
 vars.set('client_version', '1.0.2')
 vars.set('run_id', 'run-' + Date.now())"#;
 
+/* ---------------- 示例测试套件 ---------------- */
+
+const SAMPLE_SUITE: &str = "示例回归（httpbin）";
+const SAMPLE_SUITE_CONFIG: &str = r#"{"failFast":false,"maxWorkers":1,"retries":0,"parallelRows":false,"cookieMode":"shared","strictScripts":false,"suiteTimeoutSec":120,"teardownFailureFatal":true,"vars":{}}"#;
+
+struct SeedCase {
+    request_name: &'static str,
+    name: &'static str,
+    assertions: &'static str,
+    tags: &'static str,
+}
+
+const SAMPLE_CASES: &[SeedCase] = &[
+    SeedCase {
+        request_name: "GET 查询参数",
+        name: "查询参数回显",
+        assertions: r#"[{"type":"status","op":"eq","value":200,"name":"状态码 200"},{"type":"jsonPath","path":"$.args.keyword","op":"eq","value":"astroman","name":"keyword 回显"}]"#,
+        tags: "smoke,demo",
+    },
+    SeedCase {
+        request_name: "POST 创建 JSON",
+        name: "创建 JSON 并回显",
+        assertions: r#"[{"type":"status","op":"eq","value":200,"name":"状态码 200"},{"type":"jsonPath","path":"$.json.name","op":"eq","value":"AstroMan","name":"name 回显"},{"type":"durationMs","op":"lte","value":10000,"name":"10 秒内返回"}]"#,
+        tags: "smoke,demo",
+    },
+    SeedCase {
+        request_name: "Bearer Token 认证",
+        name: "Bearer 认证通过",
+        assertions: r#"[{"type":"status","op":"eq","value":200,"name":"状态码 200"},{"type":"jsonPath","path":"$.authenticated","op":"eq","value":true,"name":"认证成功"}]"#,
+        tags: "auth,demo",
+    },
+];
+
+/// 给示例项目补一个可直接运行的回归套件（幂等，老库升级也会补）
+pub fn ensure_sample_suite(conn: &Connection) -> Result<(), String> {
+    let project_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM projects WHERE name = ?1 ORDER BY id ASC LIMIT 1",
+            params![SAMPLE_PROJECT],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some(project_id) = project_id else {
+        return Ok(());
+    };
+
+    // 示例项目里已经有套件（无论是内置的还是用户自建），都不再追加，避免删了又回来
+    let exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM test_suites WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if exists > 0 {
+        return Ok(());
+    }
+
+    let env_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM environments WHERE project_id = ?1 AND name = ?2
+             ORDER BY is_active DESC, id ASC LIMIT 1",
+            params![project_id, ENV_NAME],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+
+    // 只挂到仍然存在的示例接口上；接口都被删掉时不再生成空套件
+    let mut matched: Vec<(&SeedCase, i64)> = Vec::new();
+    for case in SAMPLE_CASES {
+        let request_id: Option<i64> = conn
+            .query_row(
+                "SELECT r.id FROM requests r
+                 JOIN collections c ON c.id = r.collection_id
+                 WHERE c.project_id = ?1 AND r.name = ?2
+                 ORDER BY r.id LIMIT 1",
+                params![project_id, case.request_name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if let Some(request_id) = request_id {
+            matched.push((case, request_id));
+        }
+    }
+    if matched.is_empty() {
+        return Ok(());
+    }
+
+    let now = now_ms();
+    conn.execute(
+        "INSERT INTO test_suites
+            (project_id, name, description, env_id, tags, config_json, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, 'demo', ?5, ?6, ?6)",
+        params![
+            project_id,
+            SAMPLE_SUITE,
+            "内置示例：对 httpbin 的查询参数、JSON 回显与 Bearer 认证做断言，可直接运行",
+            env_id,
+            SAMPLE_SUITE_CONFIG,
+            now
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    let suite_id = conn.last_insert_rowid();
+
+    for (index, (case, request_id)) in matched.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO test_cases
+                (suite_id, name, kind, request_id, sort_order, enabled, timeout_ms, tags,
+                 assertions_json, created_at, updated_at)
+             VALUES (?1, ?2, 'request', ?3, ?4, 1, 30000, ?5, ?6, ?7, ?7)",
+            params![
+                suite_id,
+                case.name,
+                request_id,
+                index as i64,
+                case.tags,
+                case.assertions,
+                now
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
+
+
 /// 首次建库时写入示例项目
 pub fn seed(conn: &Connection) -> Result<(), String> {
     let project_id = ensure_project(conn)?;

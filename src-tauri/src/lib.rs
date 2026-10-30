@@ -1,9 +1,15 @@
 mod commands;
+pub mod cli;
 mod db;
 mod models;
 mod netinfo;
 mod prompts;
+mod python_exec;
+mod report_builder;
 mod state;
+mod test_assert;
+mod test_dataset;
+mod test_runner;
 mod util;
 
 use tauri::{
@@ -136,6 +142,31 @@ pub fn run() {
             commands::plan::plan_get,
             commands::plan::plan_save,
             commands::plan::plan_delete,
+            commands::test_suite::test_suite_list,
+            commands::test_suite::test_suite_get,
+            commands::test_suite::test_suite_save,
+            commands::test_suite::test_suite_delete,
+            commands::test_pack::test_suite_export,
+            commands::test_pack::test_suite_import,
+            commands::test_suite::test_dataset_list,
+            commands::test_suite::test_dataset_get,
+            commands::test_suite::test_dataset_save,
+            commands::test_suite::test_dataset_delete,
+            commands::test_case::test_case_list,
+            commands::test_case::test_case_get,
+            commands::test_case::test_case_save,
+            commands::test_case::test_case_delete,
+            commands::test_case::test_case_reorder,
+            commands::test_preflight::test_preflight,
+            commands::python::python_check,
+            commands::test_run::test_run_start,
+            commands::test_run::test_run_stop,
+            commands::test_run::test_run_get,
+            commands::test_run::test_run_list,
+            commands::test_run::test_run_current,
+            commands::test_report::test_report_generate,
+            commands::test_report::test_artifact_list,
+            commands::test_report::test_artifact_export,
             commands::files::file_read_text,
             commands::files::file_exists,
             commands::files::file_write_text,
@@ -166,6 +197,7 @@ pub fn run() {
             commands::tools::ip_lookup,
             commands::winstats::winstats_snapshot,
             commands::winstats::winstats_processes,
+            commands::winstats::winstats_process_kill,
             commands::storage::storage_info,
             commands::storage::storage_set,
             commands::storage::storage_reset,

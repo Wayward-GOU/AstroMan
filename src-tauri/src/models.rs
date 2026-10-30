@@ -161,6 +161,9 @@ pub struct SendRequestPayload {
     /// 是否自动携带本机 Cookie，默认开启
     #[serde(default)]
     pub cookie_enabled: Option<bool>,
+    /// 执行来源：manual（默认）/ batch / suite / cli
+    #[serde(default)]
+    pub origin: Option<String>,
 }
 
 /// multipart/form-data 的表单字段
@@ -240,6 +243,8 @@ pub struct HistoryItem {
     pub url: String,
     pub status_code: Option<i64>,
     pub duration_ms: Option<i64>,
+    /// 执行来源：manual / batch / suite / cli
+    pub origin: String,
     pub created_at: i64,
 }
 
@@ -279,6 +284,8 @@ pub struct RequestRun {
     pub duration_ms: i64,
     pub size_bytes: i64,
     pub error: Option<String>,
+    /// 执行来源：manual / batch / suite / cli
+    pub origin: String,
     pub created_at: i64,
 }
 
@@ -429,6 +436,15 @@ pub struct StressConfig {
     pub body: Option<String>,
     #[serde(default)]
     pub env_id: Option<i64>,
+    /// 运行期变量：优先级高于环境变量，不落库
+    #[serde(default)]
+    pub vars: HashMap<String, String>,
+    /// 认证配置，与手工请求一致（Bearer / Basic / API Key）
+    #[serde(default)]
+    pub auth: Option<RequestAuth>,
+    /// 是否自动携带本机 Cookie，默认开启
+    #[serde(default)]
+    pub cookie_enabled: Option<bool>,
     #[serde(default)]
     pub insecure: bool,
     #[serde(default = "default_timeout")]
@@ -872,4 +888,322 @@ pub struct AiUsageStats {
     pub tool_success_rate: f64,
     pub items: Vec<AiUsageStat>,
     pub daily: Vec<AiUsageDay>,
+}
+
+// ---------- v1.0.8 自动化测试场景 ----------
+
+fn default_case_kind() -> String {
+    "request".to_string()
+}
+
+fn default_case_timeout() -> i64 {
+    30_000
+}
+
+fn default_dataset_format() -> String {
+    "csv".to_string()
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestSuite {
+    pub id: i64,
+    pub project_id: i64,
+    pub name: String,
+    pub description: Option<String>,
+    pub env_id: Option<i64>,
+    pub tags: Option<String>,
+    pub python_path: Option<String>,
+    pub config_json: Option<String>,
+    pub setup_script: Option<String>,
+    pub teardown_script: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuiteSummary {
+    pub id: i64,
+    pub project_id: i64,
+    pub name: String,
+    pub description: Option<String>,
+    pub env_id: Option<i64>,
+    pub env_name: Option<String>,
+    pub tags: Option<String>,
+    pub python_path: Option<String>,
+    pub config_json: Option<String>,
+    pub case_count: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestCase {
+    pub id: i64,
+    pub suite_id: i64,
+    pub name: String,
+    pub kind: String,
+    pub request_id: Option<i64>,
+    pub plan_id: Option<i64>,
+    pub dataset_id: Option<i64>,
+    pub depends_on: Option<String>,
+    pub sort_order: i64,
+    pub enabled: bool,
+    pub timeout_ms: i64,
+    pub retries: i64,
+    pub retry_on_failure: bool,
+    pub continue_on_failure: bool,
+    pub tags: Option<String>,
+    pub variables_json: Option<String>,
+    pub assertions_json: Option<String>,
+    pub pre_script: Option<String>,
+    pub post_script: Option<String>,
+    pub main_script: Option<String>,
+    pub stress_json: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestDataset {
+    pub id: i64,
+    pub suite_id: i64,
+    pub name: String,
+    pub format: String,
+    pub path: Option<String>,
+    /// 列表接口不返回内容，按 id 单独取
+    pub content: Option<String>,
+    pub row_count: i64,
+    pub sha256: Option<String>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuiteDetail {
+    pub suite: TestSuite,
+    pub cases: Vec<TestCase>,
+    pub datasets: Vec<TestDataset>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestSuitePayload {
+    #[serde(default)]
+    pub id: Option<i64>,
+    pub project_id: i64,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub env_id: Option<i64>,
+    #[serde(default)]
+    pub tags: Option<String>,
+    #[serde(default)]
+    pub python_path: Option<String>,
+    #[serde(default)]
+    pub config_json: Option<String>,
+    #[serde(default)]
+    pub setup_script: Option<String>,
+    #[serde(default)]
+    pub teardown_script: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestCasePayload {
+    #[serde(default)]
+    pub id: Option<i64>,
+    pub suite_id: i64,
+    pub name: String,
+    #[serde(default = "default_case_kind")]
+    pub kind: String,
+    #[serde(default)]
+    pub request_id: Option<i64>,
+    #[serde(default)]
+    pub plan_id: Option<i64>,
+    #[serde(default)]
+    pub dataset_id: Option<i64>,
+    #[serde(default)]
+    pub depends_on: Option<String>,
+    #[serde(default)]
+    pub sort_order: i64,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_case_timeout")]
+    pub timeout_ms: i64,
+    #[serde(default)]
+    pub retries: i64,
+    #[serde(default)]
+    pub retry_on_failure: bool,
+    #[serde(default)]
+    pub continue_on_failure: bool,
+    #[serde(default)]
+    pub tags: Option<String>,
+    #[serde(default)]
+    pub variables_json: Option<String>,
+    #[serde(default)]
+    pub assertions_json: Option<String>,
+    #[serde(default)]
+    pub pre_script: Option<String>,
+    #[serde(default)]
+    pub post_script: Option<String>,
+    #[serde(default)]
+    pub main_script: Option<String>,
+    #[serde(default)]
+    pub stress_json: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestDatasetPayload {
+    #[serde(default)]
+    pub id: Option<i64>,
+    pub suite_id: i64,
+    pub name: String,
+    #[serde(default = "default_dataset_format")]
+    pub format: String,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub content: Option<String>,
+}
+
+// ---------- v1.0.8 套件运行 ----------
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestRun {
+    pub id: i64,
+    pub suite_id: i64,
+    pub env_id: Option<i64>,
+    pub env_name: Option<String>,
+    pub trigger: String,
+    pub status: String,
+    pub total: i64,
+    pub passed: i64,
+    pub failed: i64,
+    pub skipped: i64,
+    pub errored: i64,
+    pub duration_ms: i64,
+    pub config_json: Option<String>,
+    pub summary_json: Option<String>,
+    pub app_version: Option<String>,
+    pub python_version: Option<String>,
+    pub report_dir: Option<String>,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestRunCase {
+    pub id: i64,
+    pub run_id: i64,
+    pub case_id: Option<i64>,
+    pub name: String,
+    pub kind: String,
+    pub status: String,
+    pub attempts: i64,
+    pub duration_ms: i64,
+    pub http_duration_ms: i64,
+    pub python_duration_ms: i64,
+    pub request_snapshot: Option<String>,
+    pub response_snapshot: Option<String>,
+    pub assertions_total: i64,
+    pub assertions_failed: i64,
+    pub error: Option<String>,
+    pub logs: Option<String>,
+    pub python_version: Option<String>,
+    pub script_hash: Option<String>,
+    pub report_id: Option<i64>,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestRunAssertion {
+    pub id: i64,
+    pub run_case_id: i64,
+    pub name: String,
+    pub passed: bool,
+    pub message: Option<String>,
+    pub duration_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunDetail {
+    pub run: TestRun,
+    pub cases: Vec<TestRunCase>,
+    pub assertions: Vec<TestRunAssertion>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunSummary {
+    pub id: i64,
+    pub suite_id: i64,
+    pub suite_name: Option<String>,
+    pub env_name: Option<String>,
+    pub trigger: String,
+    pub status: String,
+    pub total: i64,
+    pub passed: i64,
+    pub failed: i64,
+    pub skipped: i64,
+    pub errored: i64,
+    pub duration_ms: i64,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
+    pub created_at: i64,
+}
+
+/// 启动运行时允许覆盖的配置（CLI / AI / UI 共用）
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RunOverrides {
+    pub vars: Option<HashMap<String, String>>,
+    pub fail_fast: Option<bool>,
+    pub env_id: Option<i64>,
+    /// 仅本次运行生效的额外密钥（套件包 / --env-file 注入）
+    pub secrets: Option<HashMap<String, String>>,
+}
+
+/// 预检单条结果
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreflightItem {
+    /// error（阻止运行）/ warning（可运行但需注意）
+    pub level: String,
+    /// 机器可读的检查项编码，如 MISSING_VARIABLE / JS_HOOK_SKIPPED
+    pub code: String,
+    pub message: String,
+    pub case_id: Option<i64>,
+    pub case_name: Option<String>,
+    pub hint: Option<String>,
+}
+
+/// 套件运行前预检报告
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreflightReport {
+    pub suite_id: i64,
+    pub suite_name: String,
+    pub env_id: Option<i64>,
+    pub env_name: Option<String>,
+    pub cookie_mode: String,
+    pub strict_scripts: bool,
+    pub total_cases: i64,
+    pub enabled_cases: i64,
+    pub errors: i64,
+    pub warnings: i64,
+    /// 无 error 时可直接运行；strictScripts 会把跳过项升级为 error
+    pub runnable: bool,
+    pub items: Vec<PreflightItem>,
 }

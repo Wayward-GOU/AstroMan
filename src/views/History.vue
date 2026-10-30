@@ -6,6 +6,7 @@ import type { Dayjs } from 'dayjs'
 import { ClockCircleOutlined, DeleteOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons-vue'
 import AiSparkIcon from '@/components/AiSparkIcon.vue'
 import PageHeader from '@/components/PageHeader.vue'
+import DashboardMetrics from '@/components/DashboardMetrics.vue'
 import { useAiAssistStore } from '@/stores/aiAssist'
 import { useTabsStore } from '@/stores/tabs'
 import { formatDateTime } from '@/utils/datetime'
@@ -79,7 +80,7 @@ function aiAnalyze() {
     return
   }
   void aiAssist.show({
-    title: '请求历史分析',
+    title: '历史记录分析',
     prompt: historyDiagnosePrompt(rows.value, stats.value),
     hint: `当前筛选结果 ${rows.value.length} 条，失败 ${summary.value.failed} 条，平均耗时 ${summary.value.avg.toFixed(0)}ms`,
   })
@@ -139,7 +140,7 @@ const previewText = computed(() => {
   if (previewLoading.value) return '正在统计…'
   if (!preview.value) return ''
   const parts: string[] = []
-  if (cleanupScope.value.includes('history')) parts.push(`请求历史 ${preview.value.history} 条`)
+  if (cleanupScope.value.includes('history')) parts.push(`历史记录 ${preview.value.history} 条`)
   if (cleanupScope.value.includes('runs')) parts.push(`接口运行记录 ${preview.value.runs} 条`)
   if (!parts.length) return '请至少选择一项清理内容'
   return `将删除 ${parts.join('、')}`
@@ -193,7 +194,7 @@ async function runCleanup() {
       vacuum: cleanupVacuum.value,
     })
     const parts: string[] = []
-    if (cleanupScope.value.includes('history')) parts.push(`请求历史 ${result.history} 条`)
+    if (cleanupScope.value.includes('history')) parts.push(`历史记录 ${result.history} 条`)
     if (cleanupScope.value.includes('runs')) parts.push(`接口运行记录 ${result.runs} 条`)
     message.success(`已清理 ${parts.join('、')}`)
     cleanupOpen.value = false
@@ -232,8 +233,8 @@ const columns = [
   <div class="page">
     <PageHeader
       eyebrow="History"
-      title="请求历史"
-      subtitle="本机保留最近 100000 条发送记录，默认展示最新 500 条，点击可跳回原接口；支持按时间范围清理"
+      title="历史记录"
+      subtitle="请求概览与最近 100000 条发送记录，默认展示最新 500 条，点击可跳回原接口；支持按时间范围清理"
     >
       <a-button :disabled="!rows.length" @click="aiAnalyze">
         <template #icon><AiSparkIcon /></template>
@@ -251,7 +252,7 @@ const columns = [
 
     <div class="summary">
       <div class="summary-item">
-        <span class="summary-label">请求历史总数</span>
+        <span class="summary-label">历史记录总数</span>
         <span class="summary-value mono">{{ summary.total }}</span>
       </div>
       <div class="summary-divider" />
@@ -275,6 +276,8 @@ const columns = [
         <span class="summary-value mono date">{{ fmtDay(stats?.oldestAt) }}</span>
       </div>
     </div>
+
+    <DashboardMetrics />
 
     <div class="toolbar">
       <a-input v-model:value="keyword" allow-clear placeholder="搜索接口名称、URL、方法或状态码" class="search">
@@ -356,7 +359,7 @@ const columns = [
       @ok="runCleanup"
     >
       <div class="cleanup-tip">
-        只清理本机保存的请求历史与接口运行记录，项目、集合、接口、环境变量与压测报告不受影响。
+        只清理本机保存的历史记录与接口运行记录，项目、集合、接口、环境变量与压测报告不受影响。
       </div>
 
       <div class="cleanup-field">
@@ -382,7 +385,7 @@ const columns = [
       <div class="cleanup-field">
         <div class="cleanup-label">清理内容</div>
         <a-checkbox-group v-model:value="cleanupScope">
-          <a-checkbox value="history">请求历史</a-checkbox>
+          <a-checkbox value="history">历史记录</a-checkbox>
           <a-checkbox value="runs">接口运行记录</a-checkbox>
         </a-checkbox-group>
       </div>

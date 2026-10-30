@@ -26,6 +26,7 @@ import type {
   MonitorSnapshot,
   PlanSummary,
   Project,
+  PythonCheckResult,
   ReportDetail,
   ReportRequestsPage,
   RequestRun,
@@ -33,6 +34,18 @@ import type {
   RequestSummary,
   SendRequestPayload,
   StorageInfo,
+  PreflightReport,
+  TestArtifact,
+  TestCase,
+  TestCasePayload,
+  TestDataset,
+  TestDatasetPayload,
+  TestRun,
+  TestRunReport,
+  TestSuite,
+  TestSuitePayload,
+  TestSuiteSummary,
+  RunDetail,
   StressConfig,
   StressReport,
   TestPlan,
@@ -172,11 +185,15 @@ export const cookieDelete = (id: number) => invoke<void>('cookie_delete', { id }
 export const cookieClear = (domain?: string) =>
   invoke<number>('cookie_clear', { domain: domain ?? null })
 
-// 全局网络与安全设置（代理 / 客户端证书）
+// 全局网络与安全设置（代理 / 客户端证书 / Python 授权）
 export const settingsGet = () => invoke<AppSettings>('settings_get')
 
 export const settingsSet = (settings: AppSettings) =>
   invoke<AppSettings>('settings_set', { settings })
+
+/** 探测 Python 解释器；path 为空时按设置项与默认候选自动探测 */
+export const pythonCheck = (path?: string) =>
+  invoke<PythonCheckResult>('python_check', { path: path?.trim() || null })
 
 // 压测计划
 export const planList = (projectId: number) => invoke<PlanSummary[]>('plan_list', { projectId })
@@ -405,8 +422,12 @@ export const aiUsageClear = (all = false) => invoke<number>('ai_usage_clear', { 
 // 系统监视
 export const winstatsSnapshot = () => invoke<MonitorSnapshot>('winstats_snapshot')
 
-export const winstatsProcesses = (limit = 12, byMemory = false) =>
+/** limit 为 0 时返回全部进程 */
+export const winstatsProcesses = (limit = 0, byMemory = false) =>
   invoke<MonitorProcess[]>('winstats_processes', { limit, byMemory })
+
+export const winstatsProcessKill = (pid: number, name?: string) =>
+  invoke<void>('winstats_process_kill', { pid, name })
 
 // 数据存储位置
 export const storageInfo = () => invoke<StorageInfo>('storage_info')
@@ -419,3 +440,94 @@ export const storageReset = () => invoke<StorageInfo>('storage_reset')
 export const storageOpen = (path: string) => invoke<void>('storage_open', { path })
 
 export const appRestart = () => invoke<void>('app_restart')
+
+/* ---------- v1.0.8 自动化测试 ---------- */
+
+export const testSuiteList = (projectId?: number, keyword?: string, tag?: string) =>
+  invoke<TestSuiteSummary[]>('test_suite_list', {
+    projectId: projectId ?? null,
+    keyword: keyword ?? null,
+    tag: tag ?? null,
+  })
+
+export const testSuiteGet = (id: number) =>
+  invoke<{ suite: TestSuite; cases: TestCase[]; datasets: TestDataset[] }>('test_suite_get', {
+    id,
+  })
+
+export const testSuiteSave = (payload: TestSuitePayload) =>
+  invoke<number>('test_suite_save', { payload })
+
+export const testSuiteDelete = (id: number) => invoke<void>('test_suite_delete', { id })
+
+/** 导出套件包（*.astromantest.json） */
+export const testSuiteExport = (suiteId: number, path: string) =>
+  invoke<string>('test_suite_export', { suiteId, path })
+
+/** 导入套件包；onConflict：skip / overwrite / rename */
+export const testSuiteImport = (path: string, projectId?: number, onConflict = 'rename') =>
+  invoke<number>('test_suite_import', {
+    path,
+    projectId: projectId ?? null,
+    onConflict,
+  })
+
+export const testCaseList = (suiteId: number) =>
+  invoke<TestCase[]>('test_case_list', { suiteId })
+
+export const testCaseGet = (id: number) => invoke<TestCase>('test_case_get', { id })
+
+export const testCaseSave = (payload: TestCasePayload) =>
+  invoke<number>('test_case_save', { payload })
+
+export const testCaseDelete = (id: number) => invoke<void>('test_case_delete', { id })
+
+export const testCaseReorder = (suiteId: number, ids: number[]) =>
+  invoke<void>('test_case_reorder', { suiteId, ids })
+
+export const testDatasetList = (suiteId: number) =>
+  invoke<TestDataset[]>('test_dataset_list', { suiteId })
+
+export const testDatasetGet = (id: number) => invoke<TestDataset>('test_dataset_get', { id })
+
+export const testDatasetSave = (payload: TestDatasetPayload) =>
+  invoke<number>('test_dataset_save', { payload })
+
+export const testDatasetDelete = (id: number) => invoke<void>('test_dataset_delete', { id })
+
+export const testPreflight = (suiteId: number, envId?: number) =>
+  invoke<PreflightReport>('test_preflight', { suiteId, envId: envId ?? null })
+
+export const testRunStart = (
+  suiteId: number,
+  envId?: number,
+  overrides?: { failFast?: boolean; vars?: Record<string, string>; secrets?: Record<string, string> },
+  trigger: 'ui' | 'ai' | 'cli' = 'ui',
+) => invoke<number>('test_run_start', { suiteId, envId: envId ?? null, overrides, trigger })
+
+export const testRunStop = (runId: number) => invoke<void>('test_run_stop', { runId })
+
+export const testRunGet = (runId: number) => invoke<RunDetail>('test_run_get', { runId })
+
+export const testRunList = (suiteId?: number, page = 1, size = 20) =>
+  invoke<TestRun[]>('test_run_list', { suiteId: suiteId ?? null, page, size })
+
+export const testRunCurrent = (suiteId?: number) =>
+  invoke<RunDetail | null>('test_run_current', { suiteId: suiteId ?? null })
+
+export const testReportGenerate = (
+  runId: number,
+  formats?: string[],
+  outDir?: string,
+) =>
+  invoke<TestRunReport>('test_report_generate', {
+    runId,
+    formats: formats ?? null,
+    outDir: outDir ?? null,
+  })
+
+export const testArtifactList = (runId: number) =>
+  invoke<TestArtifact[]>('test_artifact_list', { runId })
+
+export const testArtifactExport = (artifactId: number, path: string) =>
+  invoke<void>('test_artifact_export', { artifactId, path })

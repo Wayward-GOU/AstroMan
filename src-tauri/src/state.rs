@@ -35,6 +35,10 @@ pub struct AppSettings {
     /// 客户端证书（PKCS#12 格式，.pfx / .p12）
     pub cert_path: String,
     pub cert_password: String,
+    /// Python 解释器路径，空表示自动探测
+    pub python_path: String,
+    /// 是否允许执行本地 Python 脚本（首次使用需显式授权）
+    pub python_enabled: bool,
 }
 
 struct HttpClients {
@@ -61,6 +65,8 @@ pub struct AppState {
     pub stress_cancel: Arc<AtomicBool>,
     /// AI 在途请求的取消标记：requestId → 取消位
     pub ai_cancels: Arc<parking_lot::Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    /// 套件运行的取消标记：runId → 取消位（按运行隔离，不用全局单例）
+    pub test_cancels: Arc<parking_lot::Mutex<HashMap<i64, Arc<AtomicBool>>>>,
 }
 
 impl AppState {
@@ -101,6 +107,11 @@ impl AppState {
             _ => (default_data_dir.clone(), open_pool(&default_data_dir)?, false),
         };
 
+        // 清理上次崩溃残留的无主报告 / 工作目录（文档 7.6）
+        if let Ok(conn) = pool.get() {
+            crate::report_builder::cleanup_orphans(&conn, &data_dir);
+        }
+
         let db_path = data_dir.join(DB_FILE);
         let settings_file = config_dir.join("settings.json");
         let settings = read_settings(&settings_file);
@@ -119,6 +130,42 @@ impl AppState {
             stress_running: Arc::new(AtomicBool::new(false)),
             stress_cancel: Arc::new(AtomicBool::new(false)),
             ai_cancels: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            test_cancels: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        })
+    }
+
+    /// 无窗口初始化：CLI 与测试用，数据目录 / 配置目录由调用方给出
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn headless(data_dir: std::path::PathBuf, config_dir: std::path::PathBuf) -> Result<Self, String> {
+        let db_path = data_dir.join(DB_FILE);
+        Self::headless_at(data_dir, config_dir, db_path)
+    }
+
+    /// 无窗口初始化并指定数据库文件路径（CLI `--db`）
+    pub fn headless_at(
+        data_dir: std::path::PathBuf,
+        config_dir: std::path::PathBuf,
+        db_path: std::path::PathBuf,
+    ) -> Result<Self, String> {
+        std::fs::create_dir_all(&config_dir).map_err(|e| format!("创建配置目录失败：{e}"))?;
+        let pool = open_pool_path(&db_path)?;
+        let settings_file = config_dir.join("settings.json");
+        let settings = read_settings(&settings_file);
+        let clients = build_clients(&settings)?;
+        Ok(Self {
+            pool,
+            db_path,
+            default_data_dir: data_dir.clone(),
+            data_dir,
+            config_file: config_dir.join("storage.json"),
+            is_custom: false,
+            settings_file,
+            settings: parking_lot::RwLock::new(settings),
+            clients: parking_lot::RwLock::new(clients),
+            stress_running: Arc::new(AtomicBool::new(false)),
+            stress_cancel: Arc::new(AtomicBool::new(false)),
+            ai_cancels: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            test_cancels: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         })
     }
 
@@ -134,6 +181,21 @@ impl AppState {
 
     pub fn settings(&self) -> AppSettings {
         self.settings.read().clone()
+    }
+
+    /// 构建带自定义连接参数的客户端（压测等场景），代理与证书配置沿用应用设置
+    pub fn client_with_options(
+        &self,
+        insecure: bool,
+        connect_timeout_ms: u64,
+        follow_redirects: bool,
+    ) -> Result<reqwest::Client, String> {
+        build_client_custom(
+            &self.settings.read(),
+            insecure,
+            connect_timeout_ms,
+            follow_redirects,
+        )
     }
 
     /// 应用新的网络设置：先重建客户端，成功后再落盘，避免配置与运行态不一致
@@ -167,6 +229,28 @@ impl AppState {
     /// 请求结束后释放登记，避免长期占用
     pub fn ai_release(&self, id: &str) {
         self.ai_cancels.lock().remove(id);
+    }
+
+    /// 登记一次套件运行的取消标记
+    pub fn test_register(&self, run_id: i64) -> Arc<AtomicBool> {
+        let flag = Arc::new(AtomicBool::new(false));
+        self.test_cancels.lock().insert(run_id, flag.clone());
+        flag
+    }
+
+    /// 请求停止某次套件运行，返回是否命中
+    pub fn test_cancel_run(&self, run_id: i64) -> bool {
+        match self.test_cancels.lock().get(&run_id) {
+            Some(flag) => {
+                flag.store(true, Ordering::SeqCst);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn test_release(&self, run_id: i64) {
+        self.test_cancels.lock().remove(&run_id);
     }
 }
 
@@ -290,6 +374,26 @@ fn open_pool(data_dir: &Path) -> Result<DbPool, String> {
     Ok(pool)
 }
 
+/// 直接按数据库文件路径建池（CLI `--db` 可能与数据目录内的默认文件名不同）
+fn open_pool_path(db_path: &Path) -> Result<DbPool, String> {
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent).map_err(crate::util::err)?;
+    }
+    let manager = SqliteConnectionManager::file(db_path).with_init(|conn| {
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA foreign_keys = ON;
+             PRAGMA busy_timeout = 5000;",
+        )
+    });
+    let pool = Pool::builder()
+        .max_size(8)
+        .build(manager)
+        .map_err(crate::util::err)?;
+    crate::db::init(&pool)?;
+    Ok(pool)
+}
+
 /// 读取已保存的自定义数据目录
 pub fn read_storage_config(config_file: &Path) -> Option<PathBuf> {
     let text = std::fs::read_to_string(config_file).ok()?;
@@ -315,11 +419,31 @@ fn build_clients(settings: &AppSettings) -> Result<HttpClients, String> {
 }
 
 fn build_client_with(settings: &AppSettings, insecure: bool) -> Result<reqwest::Client, String> {
+    build_client_custom(settings, insecure, 10_000, true)
+}
+
+/// 按自定义连接参数构建客户端
+///
+/// 压测等场景需要单独覆盖连接超时与重定向策略，但仍沿用应用的代理与客户端
+/// 证书配置，保证与手工请求走同一条网络链路。
+fn build_client_custom(
+    settings: &AppSettings,
+    insecure: bool,
+    connect_timeout_ms: u64,
+    follow_redirects: bool,
+) -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder()
         .user_agent(concat!("AstroMan/", env!("CARGO_PKG_VERSION")))
-        .connect_timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_millis(
+            connect_timeout_ms.clamp(500, 120_000),
+        ))
         .pool_max_idle_per_host(32)
-        .danger_accept_invalid_certs(insecure);
+        .danger_accept_invalid_certs(insecure)
+        .redirect(if follow_redirects {
+            reqwest::redirect::Policy::limited(10)
+        } else {
+            reqwest::redirect::Policy::none()
+        });
 
     if settings.proxy_enabled {
         let proxy_url = settings.proxy_url.trim();

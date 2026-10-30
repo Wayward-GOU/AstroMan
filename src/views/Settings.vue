@@ -24,9 +24,13 @@ import * as api from '@/api'
 import { themes, currentThemeId, setTheme } from '@/stores/theme'
 import { isMac, openDirLabel, platformLabel, shortcutText } from '@/utils/platform'
 import { checkForUpdates, isAutoUpdateEnabled, setAutoUpdateEnabled } from '@/utils/updater'
-import type { AppInfo, AppSettings, StorageInfo, UpdateInfo } from '@/types/models'
+import { toolNames } from '@/utils/aiTools'
+import type { AppInfo, AppSettings, PythonCheckResult, StorageInfo, UpdateInfo } from '@/types/models'
 
 const router = useRouter()
+
+/** 航仔 可调用的工具总数，随注册表自动变化 */
+const aiToolCount = toolNames().length
 
 const info = ref<AppInfo | null>(null)
 const storage = ref<StorageInfo | null>(null)
@@ -37,8 +41,23 @@ const network = reactive<AppSettings>({
   proxyUrl: '',
   certPath: '',
   certPassword: '',
+  pythonPath: '',
+  pythonEnabled: false,
 })
 const networkLoading = ref(false)
+const pythonChecking = ref(false)
+const pythonCheckResult = ref<PythonCheckResult | null>(null)
+
+async function checkPython() {
+  pythonChecking.value = true
+  try {
+    pythonCheckResult.value = await api.pythonCheck(network.pythonPath)
+  } catch (e) {
+    message.error(String(e))
+  } finally {
+    pythonChecking.value = false
+  }
+}
 
 onMounted(async () => {
   try {
@@ -60,7 +79,7 @@ async function saveNetwork() {
   try {
     const saved = await api.settingsSet({ ...network })
     Object.assign(network, saved)
-    message.success('网络设置已保存并立即生效')
+    message.success('设置已保存并立即生效')
   } catch (e) {
     message.error(String(e))
   } finally {
@@ -342,7 +361,7 @@ async function openReleasePage() {
           <span class="block-icon blue"><GlobalOutlined /></span>
           <div>
             <div class="block-title">网络与安全</div>
-            <div class="block-desc">代理与客户端证书对全部请求生效，配置仅保存在本机</div>
+            <div class="block-desc">代理、客户端证书与 Python 授权；配置仅保存在本机</div>
           </div>
         </div>
         <div class="rows">
@@ -392,6 +411,46 @@ async function openReleasePage() {
               />
             </span>
           </div>
+          <div class="row net-row">
+            <span class="label">Python 脚本</span>
+            <span class="value python-value">
+              <a-switch v-model:checked="network.pythonEnabled" size="small" />
+              <span class="python-caption">
+                {{ network.pythonEnabled
+                  ? '已允许执行本地 Python 脚本'
+                  : '未开启：测试场景的 Python 钩子、Python 用例与套件包导入都会被拒绝' }}
+              </span>
+            </span>
+          </div>
+          <div class="row net-row">
+            <span class="label">解释器路径</span>
+            <span class="value cert-value">
+              <a-input
+                v-model:value="network.pythonPath"
+                size="small"
+                placeholder="留空自动探测（python3 / python / py -3）"
+              />
+              <a-button size="small" :loading="pythonChecking" @click="checkPython">
+                <template #icon><ReloadOutlined /></template>
+                探测
+              </a-button>
+            </span>
+          </div>
+          <div v-if="pythonCheckResult" class="python-check-result">
+            <div :class="pythonCheckResult.available ? 'ok' : 'bad'">
+              {{ pythonCheckResult.available ? '已找到' : '未找到' }}
+              <template v-if="pythonCheckResult.info">
+                Python {{ pythonCheckResult.info.version }}（{{ pythonCheckResult.info.display }}）
+              </template>
+            </div>
+            <div class="python-check-msg">{{ pythonCheckResult.message }}</div>
+            <div v-if="network.pythonEnabled && !pythonCheckResult.enabled" class="python-check-msg">
+              开关还没保存生效：点「保存并生效」后授权才会写入本机配置。
+            </div>
+            <div v-if="pythonCheckResult.tried.length" class="python-check-tried mono">
+              试过：{{ pythonCheckResult.tried.join(' / ') }}
+            </div>
+          </div>
         </div>
         <div class="storage-actions">
           <a-button type="primary" :loading="networkLoading" @click="saveNetwork">保存并生效</a-button>
@@ -400,6 +459,7 @@ async function openReleasePage() {
           <SafetyCertificateOutlined />
           <span>
             证书用于双向 TLS（mTLS）鉴权；代理支持 HTTP / HTTPS / SOCKS5。若填写有误，保存时会直接提示原因且不会覆盖当前生效配置。
+            Python 授权只影响「测试场景」里的前后置钩子、Python 用例与导入的套件包；未开启时这些脚本一律不执行，运行会给出明确原因。
           </span>
         </div>
       </div>
@@ -515,7 +575,7 @@ async function openReleasePage() {
           <span class="block-icon purple"><ThunderboltOutlined /></span>
           <div>
             <div class="block-title">AI 辅助（航仔）</div>
-            <div class="block-desc">用一句话描述需求，直接操作项目、请求与压测</div>
+            <div class="block-desc">用一句话描述需求，直接操作项目、请求、压测与测试场景</div>
           </div>
           <span class="soon live">已上线</span>
         </div>
@@ -525,7 +585,7 @@ async function openReleasePage() {
           敏感操作会先弹确认；密钥仅加密保存在本机数据库，不会上传到任何服务器。
         </div>
         <ul class="list">
-          <li>共 39 个工具，覆盖项目、请求、环境变量、历史记录、压测报告与脚本。</li>
+          <li>共 {{ aiToolCount }} 个工具，覆盖项目、请求、环境变量、历史记录、压测报告、测试场景与脚本。</li>
           <li>用量统计可按天查看调用次数、token 与预估费用，按模型和工具拆分明细。</li>
         </ul>
         <div class="ai-actions">
@@ -799,6 +859,48 @@ async function openReleasePage() {
 
 .cert-value {
   gap: 8px;
+}
+
+.python-value {
+  gap: 8px;
+}
+
+.python-caption {
+  font-size: 10.5px;
+  line-height: 1.6;
+  color: var(--fm-muted);
+}
+
+.python-check-result {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: -2px 0 4px;
+  padding: 8px 10px;
+  border: 1px solid var(--fm-border);
+  border-radius: 6px;
+  background: var(--fm-surface-alt);
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--fm-text-2);
+}
+
+.python-check-result .ok {
+  color: var(--fm-success);
+}
+
+.python-check-result .bad {
+  color: var(--fm-danger);
+}
+
+.python-check-msg {
+  color: var(--fm-muted);
+}
+
+.python-check-tried {
+  font-size: 10.5px;
+  color: var(--fm-muted);
+  word-break: break-all;
 }
 
 .value {

@@ -16,24 +16,29 @@ pub fn history_list(
     limit: Option<u32>,
     request_id: Option<i64>,
     project_id: Option<i64>,
+    origin: Option<String>,
 ) -> Result<Vec<HistoryItem>, String> {
     let limit = limit.unwrap_or(100).clamp(1, MAX_QUERY_LIMIT) as i64;
+    let origin = origin
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
 
     let conn = state.pool.get().map_err(err)?;
     let mut stmt = conn
         .prepare(
             "SELECT h.id, h.request_id, c.project_id, h.request_name, h.method, h.url,
-                    h.status_code, h.duration_ms, h.created_at
+                    h.status_code, h.duration_ms, h.origin, h.created_at
              FROM request_history h
              LEFT JOIN requests r ON r.id = h.request_id
              LEFT JOIN collections c ON c.id = r.collection_id
              WHERE (?2 IS NULL OR h.request_id = ?2)
                AND (?3 IS NULL OR c.project_id = ?3)
+               AND (?4 IS NULL OR h.origin = ?4)
              ORDER BY h.id DESC LIMIT ?1",
         )
         .map_err(err)?;
     let rows = stmt
-        .query_map(params![limit, request_id, project_id], |row| {
+        .query_map(params![limit, request_id, project_id, origin], |row| {
             Ok(HistoryItem {
                 id: row.get(0)?,
                 request_id: row.get(1)?,
@@ -43,7 +48,8 @@ pub fn history_list(
                 url: row.get(5).unwrap_or_default(),
                 status_code: row.get(6)?,
                 duration_ms: row.get(7)?,
-                created_at: row.get(8)?,
+                origin: row.get(8).unwrap_or_default(),
+                created_at: row.get(9)?,
             })
         })
         .map_err(err)?;

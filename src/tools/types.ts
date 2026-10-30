@@ -48,6 +48,8 @@ export interface ToolDef {
   category: ToolCategoryId
   desc: string
   keywords?: string[]
+  /** 搜索别名：中英缩写、俗称，命中即可搜到 */
+  aliases?: string[]
   component?: () => Promise<{ default: Component }>
   props?: Record<string, unknown>
   simple?: SimpleTool

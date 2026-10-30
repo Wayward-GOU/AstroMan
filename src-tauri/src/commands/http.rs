@@ -13,18 +13,66 @@ const MAX_BODY: usize = 5 * 1024 * 1024;
 /// 请求历史最多保留最近 10 万条
 const MAX_HISTORY: i64 = 100_000;
 
+/// 落库策略：套件 / CLI 运行默认不写单接口历史与快照，避免冲掉手工调试记录
+#[derive(Debug, Clone)]
+pub struct RecordOptions {
+    pub origin: String,
+    pub history: bool,
+    pub run_snapshot: bool,
+}
+
+impl RecordOptions {
+    pub fn manual() -> Self {
+        Self {
+            origin: "manual".to_string(),
+            history: true,
+            run_snapshot: true,
+        }
+    }
+
+    /// 套件运行：默认不写历史与快照，避免冲掉手工调试记录
+    pub fn suite(origin: &str) -> Self {
+        Self {
+            origin: origin.to_string(),
+            history: false,
+            run_snapshot: false,
+        }
+    }
+
+    pub fn from_payload(payload: &SendRequestPayload) -> Self {
+        let mut options = Self::manual();
+        if let Some(origin) = payload.origin.as_deref().map(str::trim) {
+            if !origin.is_empty() {
+                options.origin = origin.to_string();
+            }
+        }
+        options
+    }
+}
+
 #[tauri::command]
 pub async fn send_http_request(
     state: State<'_, AppState>,
     payload: SendRequestPayload,
 ) -> Result<HttpResult, String> {
-    execute(state.inner(), payload).await
+    let options = RecordOptions::from_payload(&payload);
+    execute_with(state.inner(), payload, options, None).await
 }
 
-/// 真正发请求的实现：手动发送与 AI 执行共用，保证历史、Cookie、快照逻辑完全一致
+/// 真正发请求的实现：手动发送、批量运行、套件与 AI 执行共用，Cookie / 鉴权行为一致
 pub(crate) async fn execute(
     state: &AppState,
     payload: SendRequestPayload,
+) -> Result<HttpResult, String> {
+    execute_with(state, payload, RecordOptions::manual(), None).await
+}
+
+/// `cookie_jar` 为空时读写本机 Cookie 库；套件 isolated 模式传入运行级内存罐
+pub(crate) async fn execute_with(
+    state: &AppState,
+    payload: SendRequestPayload,
+    record: RecordOptions,
+    cookie_jar: Option<&cookie::CookieJar>,
 ) -> Result<HttpResult, String> {
     let vars = match payload.env_id {
         Some(env_id) => {
@@ -134,15 +182,19 @@ pub(crate) async fn execute(
         }
     }
 
-    // 自动携带本机 Cookie
+    // 自动携带 Cookie：isolated 模式只读运行级内存罐，不回写本机库
     if payload.cookie_enabled.unwrap_or(true) && !has_cookie {
-        if let Ok(conn) = state.pool.get() {
-            let cookies = cookie::cookies_for_url(&conn, &parsed);
-            if !cookies.is_empty() {
-                let value = cookies.join("; ");
-                applied_headers.push(("Cookie".to_string(), value.clone()));
-                builder = builder.header(reqwest::header::COOKIE, value);
-            }
+        let cookies = match cookie_jar {
+            Some(jar) => jar.cookies_for_url(&parsed),
+            None => match state.pool.get() {
+                Ok(conn) => cookie::cookies_for_url(&conn, &parsed),
+                Err(_) => Vec::new(),
+            },
+        };
+        if !cookies.is_empty() {
+            let value = cookies.join("; ");
+            applied_headers.push(("Cookie".to_string(), value.clone()));
+            builder = builder.header(reqwest::header::COOKIE, value);
         }
     }
 
@@ -224,30 +276,43 @@ pub(crate) async fn execute(
         Ok(response) => {
             let (result, set_cookies) = read_response(response, started).await;
             if payload.cookie_enabled.unwrap_or(true) && !set_cookies.is_empty() {
-                if let Ok(conn) = state.pool.get() {
-                    cookie::store_response_cookies(&conn, &parsed, &set_cookies);
+                match cookie_jar {
+                    Some(jar) => jar.store_response_cookies(&parsed, &set_cookies),
+                    None => {
+                        if let Ok(conn) = state.pool.get() {
+                            cookie::store_response_cookies(&conn, &parsed, &set_cookies);
+                        }
+                    }
                 }
             }
-            record_history(
-                state,
-                &payload,
-                &url_for_history,
-                Some(result.status as i64),
-                result.duration_ms as i64,
-            );
-            record_run_snapshot(
-                state,
-                &payload,
-                &url_for_history,
-                &applied_headers,
-                &sent_body,
-                &result,
-            );
+            if record.history {
+                record_history(
+                    state,
+                    &payload,
+                    &url_for_history,
+                    Some(result.status as i64),
+                    result.duration_ms as i64,
+                    &record.origin,
+                );
+            }
+            if record.run_snapshot {
+                record_run_snapshot(
+                    state,
+                    &payload,
+                    &url_for_history,
+                    &applied_headers,
+                    &sent_body,
+                    &result,
+                    &record.origin,
+                );
+            }
             Ok(result)
         }
         Err(error) => {
             let duration = started.elapsed().as_millis() as i64;
-            record_history(state, &payload, &url_for_history, None, duration);
+            if record.history {
+                record_history(state, &payload, &url_for_history, None, duration, &record.origin);
+            }
             let result = HttpResult {
                 status: 0,
                 status_text: String::new(),
@@ -258,14 +323,17 @@ pub(crate) async fn execute(
                 truncated: false,
                 error: Some(error.to_string()),
             };
-            record_run_snapshot(
-                state,
-                &payload,
-                &url_for_history,
-                &applied_headers,
-                &sent_body,
-                &result,
-            );
+            if record.run_snapshot {
+                record_run_snapshot(
+                    state,
+                    &payload,
+                    &url_for_history,
+                    &applied_headers,
+                    &sent_body,
+                    &result,
+                    &record.origin,
+                );
+            }
             Ok(result)
         }
     }
@@ -279,6 +347,7 @@ fn record_run_snapshot(
     headers: &[(String, String)],
     body: &str,
     result: &HttpResult,
+    origin: &str,
 ) {
     let Some(request_id) = payload.request_id else {
         return;
@@ -291,6 +360,7 @@ fn record_run_snapshot(
         headers,
         body,
         result,
+        origin,
     );
 }
 
@@ -351,7 +421,7 @@ async fn read_response(response: reqwest::Response, started: Instant) -> (HttpRe
 }
 
 /// 标准 Base64 编码（Basic 认证使用）
-fn base64_encode(input: &[u8]) -> String {
+pub(crate) fn base64_encode(input: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
     for chunk in input.chunks(3) {
@@ -376,9 +446,17 @@ fn base64_encode(input: &[u8]) -> String {
 }
 
 pub(crate) fn load_vars(conn: &Connection, env_id: i64) -> Result<HashMap<String, String>, String> {
+    Ok(load_vars_with_secrets(conn, env_id)?.0)
+}
+
+/// 同时返回变量与需要脱敏的密钥名（`is_secret = 1`）
+pub(crate) fn load_vars_with_secrets(
+    conn: &Connection,
+    env_id: i64,
+) -> Result<(HashMap<String, String>, std::collections::HashSet<String>), String> {
     let mut stmt = conn
         .prepare(
-            "SELECT \"key\", value FROM env_variables
+            "SELECT \"key\", value, is_secret FROM env_variables
              WHERE env_id = ?1 ORDER BY sort_order ASC, id ASC",
         )
         .map_err(err)?;
@@ -387,18 +465,24 @@ pub(crate) fn load_vars(conn: &Connection, env_id: i64) -> Result<HashMap<String
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                row.get::<_, i64>(2).unwrap_or(0),
             ))
         })
         .map_err(err)?;
 
     let mut vars = HashMap::new();
+    let mut secrets = std::collections::HashSet::new();
     for item in rows {
-        let (key, value) = item.map_err(err)?;
-        if !key.is_empty() {
-            vars.insert(key, value);
+        let (key, value, is_secret) = item.map_err(err)?;
+        if key.is_empty() {
+            continue;
         }
+        if is_secret != 0 {
+            secrets.insert(key.clone());
+        }
+        vars.insert(key, value);
     }
-    Ok(vars)
+    Ok((vars, secrets))
 }
 
 fn record_history(
@@ -407,6 +491,7 @@ fn record_history(
     url: &str,
     status: Option<i64>,
     duration_ms: i64,
+    origin: &str,
 ) {
     let Ok(conn) = state.pool.get() else {
         return;
@@ -420,8 +505,8 @@ fn record_history(
 
     let _ = conn.execute(
         "INSERT INTO request_history
-            (request_id, request_name, method, url, status_code, duration_ms, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            (request_id, request_name, method, url, status_code, duration_ms, created_at, origin)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             payload.request_id,
             name,
@@ -429,7 +514,8 @@ fn record_history(
             url,
             status,
             duration_ms,
-            now_ms()
+            now_ms(),
+            origin
         ],
     );
 

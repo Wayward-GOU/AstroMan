@@ -19,12 +19,15 @@ jobs:
           - platform: windows-latest
             args: '--bundles nsis'
             target: ''
+            cli: x86_64-pc-windows-msvc
           - platform: windows-latest
             args: '--target i686-pc-windows-msvc --bundles nsis'
             target: i686-pc-windows-msvc
+            cli: i686-pc-windows-msvc
           - platform: macos-latest
             args: '--target universal-apple-darwin --bundles dmg'
             target: ''
+            cli: universal-apple-darwin
 
     steps:
       - name: Checkout
@@ -54,6 +57,10 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      # Tauri externalBin 要求 binaries/astroman-cli-<triple> 先存在
+      - name: Prepare CLI binary
+        run: node scripts/prepare-cli.mjs --target ${{ matrix.cli }}
 
       - name: Build and upload to release
         uses: tauri-apps/tauri-action@v0
@@ -171,14 +178,18 @@ jobs:
             'src-tauri/target/release/astroman.exe'
           }
           if (-not (Test-Path $exe)) { throw "portable exe not found: $exe" }
+          $cli = "src-tauri/binaries/astroman-cli-${{ matrix.cli }}.exe"
+          if (-not (Test-Path $cli)) { throw "portable cli not found: $cli" }
+          Copy-Item $cli 'astroman-cli.exe' -Force
           $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
           @"
           AstroMan $version $arch 便携版
           解压后双击 astroman.exe 即可使用，无需安装，数据仍保存在本机。
+          命令行：astroman-cli.exe test run --suite <套件> --out ./artifacts
           运行需要 Microsoft Edge WebView2 运行时；Windows 10 1809+ / Windows 11 通常已自带。
           如果没有，请先安装系统中的 Microsoft Edge WebView2 Runtime，或改用 setup 安装包。
           "@ | Out-File -FilePath README.txt -Encoding utf8
-          Compress-Archive -Path $exe, README.txt -DestinationPath "AstroMan_${version}_${arch}-portable.zip" -Force
+          Compress-Archive -Path $exe, 'astroman-cli.exe', README.txt, 'src-tauri/resources' -DestinationPath "AstroMan_${version}_${arch}-portable.zip" -Force
           gh release upload "${{ github.ref_name }}" "AstroMan_${version}_${arch}-portable.zip" --clobber
 
       - name: Build Windows offline installer

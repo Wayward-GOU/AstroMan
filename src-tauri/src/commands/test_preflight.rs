@@ -59,7 +59,10 @@ pub fn run_preflight_with(
     let mut builder = ReportBuilder::new(config.strict_scripts);
 
     let cookie_mode = {
-        let raw = config.cookie_mode.clone().unwrap_or_else(|| "shared".into());
+        let raw = config
+            .cookie_mode
+            .clone()
+            .unwrap_or_else(|| "shared".into());
         let normalized = raw.trim().to_ascii_lowercase();
         if !matches!(normalized.as_str(), "" | "shared" | "isolated") {
             builder.warning(
@@ -99,12 +102,7 @@ pub fn run_preflight_with(
                 env_name = Some(name);
                 env_script = script.unwrap_or_default();
             }
-            None => builder.error(
-                "ENV_NOT_FOUND",
-                None,
-                format!("环境 #{id} 不存在"),
-                None,
-            ),
+            None => builder.error("ENV_NOT_FOUND", None, format!("环境 #{id} 不存在"), None),
         }
     }
     // CLI `--env-file` 注入的密钥同样视为已提供
@@ -130,8 +128,11 @@ pub fn run_preflight_with(
     }
 
     // Python 钩子：授权开关、解释器与版本（文档 4.6）
-    let script_present =
-        |text: &Option<String>| text.as_deref().map(str::trim).is_some_and(|value| !value.is_empty());
+    let script_present = |text: &Option<String>| {
+        text.as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+    };
     let needs_python = enabled.iter().any(|case| {
         script_present(&case.main_script)
             || script_present(&case.pre_script)
@@ -270,13 +271,7 @@ impl ReportBuilder {
         }
     }
 
-    fn error(
-        &mut self,
-        code: &str,
-        case: Option<&TestCase>,
-        message: String,
-        hint: Option<&str>,
-    ) {
+    fn error(&mut self, code: &str, case: Option<&TestCase>, message: String, hint: Option<&str>) {
         self.errors += 1;
         self.items.push(PreflightItem {
             level: "error".to_string(),
@@ -312,6 +307,8 @@ impl ReportBuilder {
         });
     }
 
+    // 收尾需要把这一轮收集到的上下文一起写回，拆结构体只会增加转发层
+    #[allow(clippy::too_many_arguments)]
     fn finish(
         self,
         suite_id: i64,
@@ -423,10 +420,7 @@ fn check_dependencies(builder: &mut ReportBuilder, cases: &[&TestCase]) {
                         .unwrap_or_else(|| format!("#{id}"))
                 })
                 .chain(std::iter::once(
-                    cycle
-                        .first()
-                        .map(|id| format!("#{id}"))
-                        .unwrap_or_default(),
+                    cycle.first().map(|id| format!("#{id}")).unwrap_or_default(),
                 ))
                 .collect();
             builder.error(
@@ -665,7 +659,11 @@ fn check_missing_variables(
 }
 
 fn dataset_columns(dataset: &TestDataset, data_dir: &Path) -> Vec<String> {
-    let table = match dataset.content.as_deref().filter(|text| !text.trim().is_empty()) {
+    let table = match dataset
+        .content
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+    {
         Some(content) => crate::test_dataset::parse(&dataset.format, content).ok(),
         None => dataset
             .path
@@ -718,12 +716,15 @@ mod tests {
 
     #[test]
     fn detects_dependency_cycle() {
-        let cases = vec![case(1, "a", Some("2")), case(2, "b", Some("1"))];
+        let cases = [case(1, "a", Some("2")), case(2, "b", Some("1"))];
         let refs: Vec<&TestCase> = cases.iter().collect();
         let mut builder = ReportBuilder::new(false);
         check_dependencies(&mut builder, &refs);
         assert_eq!(builder.errors, 1);
-        assert!(builder.items.iter().any(|item| item.code == "DEPENDENCY_CYCLE"));
+        assert!(builder
+            .items
+            .iter()
+            .any(|item| item.code == "DEPENDENCY_CYCLE"));
     }
 
     #[test]
@@ -731,28 +732,31 @@ mod tests {
         let case = case(1, "a", None);
         let mut available = HashSet::new();
         available.insert("host".to_string());
-        let texts = vec![
-            "http://{{host}}/{{missing}}?t={{$timestamp}}&k={{secret:TOKEN}}".to_string(),
-        ];
+        let texts =
+            vec!["http://{{host}}/{{missing}}?t={{$timestamp}}&k={{secret:TOKEN}}".to_string()];
         let mut builder = ReportBuilder::new(false);
         check_missing_variables(&mut builder, &case, &texts, &available, &HashSet::new());
         assert_eq!(builder.errors, 2);
-        assert!(builder.items.iter().any(|item| item.code == "MISSING_VARIABLE"));
-        assert!(builder.items.iter().any(|item| item.code == "MISSING_SECRET"));
+        assert!(builder
+            .items
+            .iter()
+            .any(|item| item.code == "MISSING_VARIABLE"));
+        assert!(builder
+            .items
+            .iter()
+            .any(|item| item.code == "MISSING_SECRET"));
     }
 
     #[test]
     fn strict_mode_upgrades_skipped_scripts_to_error() {
         let mut builder = ReportBuilder::new(true);
-        builder.warning(
-            "JS_HOOK_SKIPPED",
-            None,
-            "skip".to_string(),
-            None,
-            true,
-        );
+        builder.warning("JS_HOOK_SKIPPED", None, "skip".to_string(), None, true);
         assert_eq!(builder.errors, 1);
         assert_eq!(builder.warnings, 0);
-        assert!(!builder.finish(1, "s".into(), None, None, "shared".into(), 1, 1).runnable);
+        assert!(
+            !builder
+                .finish(1, "s".into(), None, None, "shared".into(), 1, 1)
+                .runnable
+        );
     }
 }

@@ -29,10 +29,16 @@ struct CliError {
 
 impl CliError {
     fn config(message: impl Into<String>) -> Self {
-        Self { code: EXIT_CONFIG, message: message.into() }
+        Self {
+            code: EXIT_CONFIG,
+            message: message.into(),
+        }
     }
     fn db(message: impl Into<String>) -> Self {
-        Self { code: EXIT_DB, message: message.into() }
+        Self {
+            code: EXIT_DB,
+            message: message.into(),
+        }
     }
 }
 
@@ -98,7 +104,10 @@ impl Args {
     }
 
     fn value(&self, name: &str) -> Option<&str> {
-        self.values.get(name).and_then(|items| items.last()).map(String::as_str)
+        self.values
+            .get(name)
+            .and_then(|items| items.last())
+            .map(String::as_str)
     }
 
     fn has(&self, name: &str) -> bool {
@@ -201,10 +210,7 @@ fn platform_dirs() -> (PathBuf, PathBuf) {
         let roaming = std::env::var_os("APPDATA")
             .map(PathBuf::from)
             .unwrap_or_else(|| home_dir().join("AppData/Roaming"));
-        (
-            roaming.join("AstroMan"),
-            roaming.join("com.astroman.app"),
-        )
+        (roaming.join("AstroMan"), roaming.join("com.astroman.app"))
     } else if cfg!(target_os = "macos") {
         let base = home_dir().join("Library/Application Support");
         (base.join("AstroMan"), base.join("com.astroman.app"))
@@ -299,18 +305,22 @@ fn resolve_project(conn: &Connection, spec: Option<&str>) -> CliResult<Option<i6
     };
     if let Ok(id) = spec.parse::<i64>() {
         let exists: bool = conn
-            .query_row("SELECT COUNT(*) FROM projects WHERE id = ?1", params![id], |row| {
-                Ok(row.get::<_, i64>(0)? > 0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM projects WHERE id = ?1",
+                params![id],
+                |row| Ok(row.get::<_, i64>(0)? > 0),
+            )
             .unwrap_or(false);
         if exists {
             return Ok(Some(id));
         }
     }
     let id: Option<i64> = conn
-        .query_row("SELECT id FROM projects WHERE name = ?1 ORDER BY id LIMIT 1", params![spec], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT id FROM projects WHERE name = ?1 ORDER BY id LIMIT 1",
+            params![spec],
+            |row| row.get(0),
+        )
         .optional()
         .map_err(|error| CliError::config(crate::util::err(error)))?;
     match id {
@@ -361,11 +371,7 @@ fn resolve_suite(conn: &Connection, spec: &str, project: Option<i64>) -> CliResu
     }
 }
 
-fn resolve_env(
-    conn: &Connection,
-    project_id: i64,
-    spec: Option<&str>,
-) -> CliResult<Option<i64>> {
+fn resolve_env(conn: &Connection, project_id: i64, spec: Option<&str>) -> CliResult<Option<i64>> {
     let Some(spec) = spec.map(str::trim).filter(|item| !item.is_empty()) else {
         return Ok(None);
     };
@@ -411,7 +417,11 @@ fn guard_prod(conn: &Connection, env_id: Option<i64>, allow: bool) -> CliResult<
         return Ok(());
     };
     let name: Option<String> = conn
-        .query_row("SELECT name FROM environments WHERE id = ?1", params![env_id], |row| row.get(0))
+        .query_row(
+            "SELECT name FROM environments WHERE id = ?1",
+            params![env_id],
+            |row| row.get(0),
+        )
         .optional()
         .map_err(|error| CliError::config(crate::util::err(error)))?;
     let Some(name) = name else { return Ok(()) };
@@ -502,22 +512,34 @@ fn cmd_test_run(args: &Args) -> CliResult<i32> {
     let env = Env::open(args)?;
     let state = env.state;
     let suite_id = {
-        let conn = state.pool.get().map_err(|error| CliError::db(crate::util::err(error)))?;
+        let conn = state
+            .pool
+            .get()
+            .map_err(|error| CliError::db(crate::util::err(error)))?;
         let project = resolve_project(&conn, args.value("project"))?;
         resolve_suite(&conn, spec, project)?
     };
     let suite = {
-        let conn = state.pool.get().map_err(|error| CliError::db(crate::util::err(error)))?;
-        crate::commands::test_suite::find_suite(&conn, suite_id)
-            .map_err(CliError::config)?
+        let conn = state
+            .pool
+            .get()
+            .map_err(|error| CliError::db(crate::util::err(error)))?;
+        crate::commands::test_suite::find_suite(&conn, suite_id).map_err(CliError::config)?
     };
     let (env_id, env_name) = {
-        let conn = state.pool.get().map_err(|error| CliError::db(crate::util::err(error)))?;
+        let conn = state
+            .pool
+            .get()
+            .map_err(|error| CliError::db(crate::util::err(error)))?;
         let env_id = resolve_env(&conn, suite.project_id, args.value("env"))?.or(suite.env_id);
         guard_prod(&conn, env_id, args.has("allow-prod"))?;
         let name: Option<String> = match env_id {
             Some(id) => conn
-                .query_row("SELECT name FROM environments WHERE id = ?1", params![id], |row| row.get(0))
+                .query_row(
+                    "SELECT name FROM environments WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
                 .optional()
                 .map_err(|error| CliError::config(crate::util::err(error)))?,
             None => None,
@@ -564,7 +586,10 @@ fn cmd_test_run(args: &Args) -> CliResult<i32> {
             if path.is_file() {
                 Ok(path)
             } else {
-                Err(CliError::config(format!("--data 文件不存在：{}", path.display())))
+                Err(CliError::config(format!(
+                    "--data 文件不存在：{}",
+                    path.display()
+                )))
             }
         })
         .transpose()?;
@@ -605,11 +630,7 @@ fn cmd_test_run(args: &Args) -> CliResult<i32> {
         }
     };
     let summary = match tauri::async_runtime::block_on(test_runner::run_suite(
-        &state,
-        suite_id,
-        run_id,
-        options,
-        &sink,
+        &state, suite_id, run_id, options, &sink,
     )) {
         Ok(summary) => summary,
         Err(error) => {
@@ -631,7 +652,10 @@ fn cmd_test_run(args: &Args) -> CliResult<i32> {
             } else {
                 EXIT_RUN_ERROR
             };
-            return Err(CliError { code, message: format!("运行失败：{error}") });
+            return Err(CliError {
+                code,
+                message: format!("运行失败：{error}"),
+            });
         }
     };
 
@@ -670,7 +694,10 @@ fn cmd_test_run(args: &Args) -> CliResult<i32> {
             "durationMs": summary.duration_ms,
             "reportDir": report_dir.as_deref().map(|dir| dir.replace('\\', "/")),
         });
-        println!("{}", serde_json::to_string_pretty(&payload).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        );
     } else {
         print_summary(&summary);
     }
@@ -708,14 +735,17 @@ fn print_summary(summary: &RunSummary) {
 fn cmd_test_list(args: &Args) -> CliResult<i32> {
     let env = Env::open(args)?;
     let state = env.state;
-    let conn = state.pool.get().map_err(|error| CliError::db(crate::util::err(error)))?;
+    let conn = state
+        .pool
+        .get()
+        .map_err(|error| CliError::db(crate::util::err(error)))?;
     let machine = args.has("json");
     let project = resolve_project(&conn, args.value("project"))?;
 
     if let Some(spec) = args.value("suite") {
         let suite_id = resolve_suite(&conn, spec, project)?;
-        let suite = crate::commands::test_suite::find_suite(&conn, suite_id)
-            .map_err(CliError::config)?;
+        let suite =
+            crate::commands::test_suite::find_suite(&conn, suite_id).map_err(CliError::config)?;
         let cases = load_cases(&conn, suite_id).map_err(CliError::config)?;
         if machine {
             let rows: Vec<Value> = cases
@@ -743,7 +773,12 @@ fn cmd_test_list(args: &Args) -> CliResult<i32> {
                 .unwrap_or_default()
             );
         } else {
-            println!("套件 #{} {}（{} 个用例）", suite.id, suite.name, cases.len());
+            println!(
+                "套件 #{} {}（{} 个用例）",
+                suite.id,
+                suite.name,
+                cases.len()
+            );
             for case in cases {
                 println!(
                     "  #{} [{}] {}{}{}",
@@ -772,7 +807,13 @@ fn cmd_test_list(args: &Args) -> CliResult<i32> {
         )
         .map_err(|error| CliError::config(crate::util::err(error)))?
         .query_map(params![project], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
         })
         .map_err(|error| CliError::config(crate::util::err(error)))?
         .collect::<rusqlite::Result<Vec<_>>>()
@@ -790,7 +831,10 @@ fn cmd_test_list(args: &Args) -> CliResult<i32> {
                 })
             })
             .collect();
-        println!("{}", serde_json::to_string_pretty(&json!({ "suites": items })).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "suites": items })).unwrap_or_default()
+        );
     } else if rows.is_empty() {
         println!("没有匹配的套件");
     } else {
@@ -811,16 +855,25 @@ fn cmd_test_validate(args: &Args) -> CliResult<i32> {
     let env = Env::open(args)?;
     let state = env.state;
     let (suite_id, project_id) = {
-        let conn = state.pool.get().map_err(|error| CliError::db(crate::util::err(error)))?;
+        let conn = state
+            .pool
+            .get()
+            .map_err(|error| CliError::db(crate::util::err(error)))?;
         let project = resolve_project(&conn, args.value("project"))?;
         let suite_id = resolve_suite(&conn, spec, project)?;
-        let suite = crate::commands::test_suite::find_suite(&conn, suite_id)
-            .map_err(CliError::config)?;
+        let suite =
+            crate::commands::test_suite::find_suite(&conn, suite_id).map_err(CliError::config)?;
         (suite_id, suite.project_id)
     };
     let (env_id, _) = {
-        let conn = state.pool.get().map_err(|error| CliError::db(crate::util::err(error)))?;
-        (resolve_env(&conn, project_id, args.value("env"))?, None::<String>)
+        let conn = state
+            .pool
+            .get()
+            .map_err(|error| CliError::db(crate::util::err(error)))?;
+        (
+            resolve_env(&conn, project_id, args.value("env"))?,
+            None::<String>,
+        )
     };
     let env_file = load_env_file(args.value("env-file"))?;
     let report = config(test_preflight::run_preflight_with(
@@ -857,7 +910,11 @@ fn cmd_test_validate(args: &Args) -> CliResult<i32> {
             report.suite_id,
             report.suite_name,
             report.env_name.as_deref().unwrap_or("无"),
-            if report.runnable { "可以运行" } else { "不可运行" },
+            if report.runnable {
+                "可以运行"
+            } else {
+                "不可运行"
+            },
             report.errors,
             report.warnings
         );
@@ -873,7 +930,11 @@ fn cmd_test_validate(args: &Args) -> CliResult<i32> {
             );
         }
     }
-    Ok(if report.runnable { EXIT_OK } else { EXIT_CONFIG })
+    Ok(if report.runnable {
+        EXIT_OK
+    } else {
+        EXIT_CONFIG
+    })
 }
 
 fn cmd_report_export(args: &Args) -> CliResult<i32> {
@@ -915,7 +976,11 @@ fn cmd_python_check(args: &Args) -> CliResult<i32> {
     } else {
         println!(
             "授权：{}\n可用：{}\n{}",
-            if check.enabled { "已允许执行 Python" } else { "未授权（设置 → 网络与安全 → Python 脚本）" },
+            if check.enabled {
+                "已允许执行 Python"
+            } else {
+                "未授权（设置 → 网络与安全 → Python 脚本）"
+            },
             if check.available { "是" } else { "否" },
             check.message
         );
@@ -927,7 +992,11 @@ fn cmd_python_check(args: &Args) -> CliResult<i32> {
         }
     }
     // 未授权或不可用时按配置错误退出，便于 CI 提前拦截
-    Ok(if check.info.is_some() { EXIT_OK } else { EXIT_CONFIG })
+    Ok(if check.info.is_some() {
+        EXIT_OK
+    } else {
+        EXIT_CONFIG
+    })
 }
 
 /// 套件包导入（文档 8.6 的最小实现：suite + cases + datasets）
@@ -937,7 +1006,9 @@ fn cmd_suite_import(args: &Args) -> CliResult<i32> {
         .get(2)
         .cloned()
         .or_else(|| args.value("file").map(str::to_string))
-        .ok_or_else(|| CliError::config("缺少套件包路径：astroman-cli suite import <pack.astromantest.json>"))?;
+        .ok_or_else(|| {
+            CliError::config("缺少套件包路径：astroman-cli suite import <pack.astromantest.json>")
+        })?;
     let env = Env::open(args)?;
     let state = env.state;
     let text = std::fs::read_to_string(&path)
@@ -956,7 +1027,9 @@ fn cmd_suite_import(args: &Args) -> CliResult<i32> {
         .ok_or_else(|| CliError::config("套件包缺少 suite.name"))?;
     let on_conflict = args.value("on-conflict").unwrap_or("rename");
     if !matches!(on_conflict, "skip" | "overwrite" | "rename") {
-        return Err(CliError::config("--on-conflict 仅支持 skip / overwrite / rename"));
+        return Err(CliError::config(
+            "--on-conflict 仅支持 skip / overwrite / rename",
+        ));
     }
 
     // 套件包带 Python 脚本等同于引入任意代码：未授权时直接拒绝导入（文档 8.6）
@@ -968,7 +1041,9 @@ fn cmd_suite_import(args: &Args) -> CliResult<i32> {
     }
     if let Some(cases) = pack.get("cases").and_then(Value::as_array) {
         for (index, item) in cases.iter().enumerate() {
-            let Some(map) = item.as_object() else { continue };
+            let Some(map) = item.as_object() else {
+                continue;
+            };
             let name = text_field(map, "name").unwrap_or_else(|| format!("#{}", index + 1));
             for key in ["preScript", "postScript", "mainScript"] {
                 if text_field(map, key).is_some_and(|text| !text.trim().is_empty()) {
@@ -992,7 +1067,10 @@ fn cmd_suite_import(args: &Args) -> CliResult<i32> {
         );
     }
 
-    let conn = state.pool.get().map_err(|error| CliError::db(crate::util::err(error)))?;
+    let conn = state
+        .pool
+        .get()
+        .map_err(|error| CliError::db(crate::util::err(error)))?;
     let project_id = match resolve_project(&conn, args.value("project")) {
         Ok(Some(id)) => id,
         Ok(None) => ensure_project(&conn, "导入套件")?,
@@ -1029,9 +1107,11 @@ fn cmd_suite_import(args: &Args) -> CliResult<i32> {
 fn ensure_project(conn: &Connection, name: &str) -> CliResult<i64> {
     let name = name.trim();
     let existing: Option<i64> = conn
-        .query_row("SELECT id FROM projects WHERE name = ?1 ORDER BY id LIMIT 1", params![name], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT id FROM projects WHERE name = ?1 ORDER BY id LIMIT 1",
+            params![name],
+            |row| row.get(0),
+        )
         .optional()
         .map_err(|error| CliError::config(crate::util::err(error)))?;
     if let Some(id) = existing {
@@ -1076,16 +1156,13 @@ fn insert_pack(
     pack: &Value,
 ) -> CliResult<i64> {
     let now = crate::util::now_ms();
-    let tags = suite
-        .get("tags")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join(",")
-        });
+    let tags = suite.get("tags").and_then(Value::as_array).map(|items| {
+        items
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(",")
+    });
     let config = suite
         .get("config")
         .map(|value| value.to_string())
@@ -1111,8 +1188,12 @@ fn insert_pack(
     let mut dataset_ids: HashMap<String, i64> = HashMap::new();
     if let Some(items) = pack.get("datasets").and_then(Value::as_array) {
         for item in items {
-            let Some(map) = item.as_object() else { continue };
-            let Some(dataset_name) = text_field(map, "name") else { continue };
+            let Some(map) = item.as_object() else {
+                continue;
+            };
+            let Some(dataset_name) = text_field(map, "name") else {
+                continue;
+            };
             let format = text_field(map, "format").unwrap_or_else(|| "json".into());
             let content = map
                 .get("inline")
@@ -1150,11 +1231,16 @@ fn insert_pack(
     let mut order: i64 = 0;
     if let Some(cases) = pack.get("cases").and_then(Value::as_array) {
         for item in cases {
-            let Some(map) = item.as_object() else { continue };
+            let Some(map) = item.as_object() else {
+                continue;
+            };
             order += 1;
             let case_name = text_field(map, "name").unwrap_or_else(|| format!("用例 {order}"));
             let kind = text_field(map, "kind").unwrap_or_else(|| "request".into());
-            let timeout_ms = map.get("timeoutMs").and_then(Value::as_i64).unwrap_or(30_000);
+            let timeout_ms = map
+                .get("timeoutMs")
+                .and_then(Value::as_i64)
+                .unwrap_or(30_000);
             let retries = map.get("retries").and_then(Value::as_i64).unwrap_or(0);
             let depends = map.get("dependsOn").and_then(Value::as_array).map(|items| {
                 items
@@ -1163,11 +1249,18 @@ fn insert_pack(
                     .collect::<Vec<_>>()
                     .join(",")
             });
-            let dataset_id = text_field(map, "dataset").and_then(|key| dataset_ids.get(&key).copied());
+            let dataset_id =
+                text_field(map, "dataset").and_then(|key| dataset_ids.get(&key).copied());
             let assertions = map.get("assertions").map(|value| value.to_string());
             let request_id = if kind == "request" {
                 match map.get("request").and_then(Value::as_object) {
-                    Some(request) => Some(insert_pack_request(conn, collection_id, &case_name, request, order)?),
+                    Some(request) => Some(insert_pack_request(
+                        conn,
+                        collection_id,
+                        &case_name,
+                        request,
+                        order,
+                    )?),
                     None => None,
                 }
             } else {

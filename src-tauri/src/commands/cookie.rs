@@ -60,7 +60,11 @@ fn parse_set_cookie(raw: &str, host: &str) -> Option<ParsedCookie> {
             "httponly" => http_only = true,
             "max-age" => {
                 if let Ok(seconds) = attr_value.parse::<i64>() {
-                    max_age = Some(if seconds <= 0 { 0 } else { now_ms() + seconds * 1000 });
+                    max_age = Some(if seconds <= 0 {
+                        0
+                    } else {
+                        now_ms() + seconds * 1000
+                    });
                 }
             }
             "expires" => {
@@ -76,7 +80,11 @@ fn parse_set_cookie(raw: &str, host: &str) -> Option<ParsedCookie> {
 
     Some(ParsedCookie {
         // 未指定 Domain 时只对当前主机生效
-        domain: if domain.is_empty() { host.to_string() } else { domain },
+        domain: if domain.is_empty() {
+            host.to_string()
+        } else {
+            domain
+        },
         path,
         name: name.to_string(),
         value: value.to_string(),
@@ -113,10 +121,11 @@ pub fn cookies_for_url(conn: &Connection, url: &reqwest::Url) -> Vec<String> {
     let secure_request = url.scheme() == "https";
     let now = now_ms();
 
-    let mut stmt = match conn.prepare("SELECT domain, path, name, value, secure, expires_at FROM cookies") {
-        Ok(stmt) => stmt,
-        Err(_) => return Vec::new(),
-    };
+    let mut stmt =
+        match conn.prepare("SELECT domain, path, name, value, secure, expires_at FROM cookies") {
+            Ok(stmt) => stmt,
+            Err(_) => return Vec::new(),
+        };
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -358,7 +367,11 @@ pub fn cookie_save(
         return Err("Cookie 名称不能为空".to_string());
     }
     let path = path.unwrap_or_else(|| "/".to_string());
-    let path = if path.starts_with('/') { path } else { format!("/{path}") };
+    let path = if path.starts_with('/') {
+        path
+    } else {
+        format!("/{path}")
+    };
     let now = now_ms();
     let conn = state.pool.get().map_err(err)?;
     conn.execute(

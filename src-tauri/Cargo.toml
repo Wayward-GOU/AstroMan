@@ -14,14 +14,14 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["compression", "tray-icon", "image-png"] }
+tauri = { version = "2", features = ["compression", "tray-icon", "image-png", "protocol-asset"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-single-instance = "2"
 tauri-plugin-window-state = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = [
-  "json", "stream", "native-tls", "gzip", "multipart", "socks"
+  "json", "stream", "native-tls", "gzip", "brotli", "deflate", "http2", "multipart", "socks"
 ] }
 futures-util = "0.3"
 base64 = "0.22"
@@ -41,6 +41,9 @@ sha1 = "0.10"
 sha2 = "0.10"
 hmac = "0.12"
 regex = "1"
+argon2 = "0.5"
+# 仅用 tower 的 Layer/Service 抽象给 reqwest 加计时连接器（已在依赖树中，无新增体积）
+tower = { version = "0.5", default-features = false }
 sysinfo = { version = "0.33", default-features = false, features = ["system", "disk", "network"] }
 
 [target.'cfg(windows)'.dependencies]
@@ -50,7 +53,8 @@ windows-sys = { version = "0.60", features = [
   "Win32_System_Performance",
   "Win32_NetworkManagement_IpHelper",
   "Win32_NetworkManagement_Ndis",
-  "Win32_Networking_WinSock"
+  "Win32_Networking_WinSock",
+  "Win32_Security_Credentials"
 ] }
 
 [target.'cfg(unix)'.dependencies]

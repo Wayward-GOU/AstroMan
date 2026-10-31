@@ -13,7 +13,9 @@ use crate::models::{
     HttpRequestDetail, HttpResult, KeyValueItem, RequestAuth, RunSummary, SendRequestPayload,
     SlaTargets, StressConfig, StressReport, TestCase, TestDataset, TestRun,
 };
-use crate::python_exec::{self, PythonAttachment, PythonInfo, PythonOutcome, PythonRequestOverride, PythonSpec};
+use crate::python_exec::{
+    self, PythonAttachment, PythonInfo, PythonOutcome, PythonRequestOverride, PythonSpec,
+};
 use crate::state::AppState;
 use crate::test_assert::{self, AssertInput, AssertionOutcome};
 use crate::test_dataset::{self, DatasetRow};
@@ -176,7 +178,9 @@ impl VarBag {
             self.values.insert(key.clone(), value.clone());
         }
         for (key, value) in &row.values {
-            self.values.entry(key.clone()).or_insert_with(|| value.to_string());
+            self.values
+                .entry(key.clone())
+                .or_insert_with(|| value.to_string());
         }
     }
 
@@ -187,13 +191,10 @@ impl VarBag {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
             return;
         };
-        match &value {
-            serde_json::Value::Object(map) => {
-                for (key, child) in map {
-                    util::flatten_json(key, child, &mut self.values);
-                }
+        if let serde_json::Value::Object(map) = &value {
+            for (key, child) in map {
+                util::flatten_json(key, child, &mut self.values);
             }
-            _ => {}
         }
     }
 
@@ -451,10 +452,18 @@ fn python_logs(phase: &str, attempt: i64, outcome: &PythonOutcome) -> Vec<String
             logs.push(format!("[{tag}] {level}{}", item.message));
         }
     }
-    for line in outcome.stdout.lines().filter(|line| !line.trim().is_empty()) {
+    for line in outcome
+        .stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+    {
         logs.push(format!("[{tag}][stdout] {line}"));
     }
-    for line in outcome.stderr.lines().filter(|line| !line.trim().is_empty()) {
+    for line in outcome
+        .stderr
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+    {
         logs.push(format!("[{tag}][stderr] {line}"));
     }
     if outcome.output_truncated {
@@ -636,10 +645,7 @@ fn value_to_items(value: &Value) -> Option<Vec<KeyValueItem>> {
                             continue;
                         }
                         let value = map.get("value").map(value_to_text).unwrap_or_default();
-                        let enabled = map
-                            .get("enabled")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(true);
+                        let enabled = map.get("enabled").and_then(Value::as_bool).unwrap_or(true);
                         out.push(KeyValueItem {
                             key,
                             value,
@@ -679,13 +685,8 @@ fn suite_work_dir(data_dir: &Path, run_id: i64, phase: &str) -> PathBuf {
         .join(phase)
 }
 
-
 /// 先落一条 queued 记录并返回 runId，便于 UI / CLI 立刻拿到句柄
-pub fn create_queued_run(
-    state: &AppState,
-    suite_id: i64,
-    trigger: &str,
-) -> Result<i64, String> {
+pub fn create_queued_run(state: &AppState, suite_id: i64, trigger: &str) -> Result<i64, String> {
     let conn = state.pool.get().map_err(err)?;
     let running: i64 = conn
         .query_row(
@@ -780,7 +781,9 @@ pub async fn run_suite(
         .map(|case| dataset_rows(case, &dataset_map).len() as i64)
         .sum();
 
-    let fail_fast = options.fail_fast.unwrap_or_else(|| suite_config.fail_fast_effective());
+    let fail_fast = options
+        .fail_fast
+        .unwrap_or_else(|| suite_config.fail_fast_effective());
     let run_started_at = now_ms();
     let cancel = {
         let conn = state.pool.get().map_err(err)?;
@@ -901,10 +904,12 @@ pub async fn run_suite(
         let error = if status == "passed" {
             None
         } else {
-            Some(bag.mask(
-                &python_error_message(&outcome, &assertions)
-                    .unwrap_or_else(|| "套件 setup 未通过".to_string()),
-            ))
+            Some(
+                bag.mask(
+                    &python_error_message(&outcome, &assertions)
+                        .unwrap_or_else(|| "套件 setup 未通过".to_string()),
+                ),
+            )
         };
         let case_outcome = CaseOutcome {
             status,
@@ -942,8 +947,7 @@ pub async fn run_suite(
 
             if let Some(reason) = &setup_failure {
                 let outcome = CaseOutcome::failed("skipped", reason.clone());
-                let case_id =
-                    persist_case(state, run_id, case, row, &outcome, &VarBag::default())?;
+                let case_id = persist_case(state, run_id, case, row, &outcome, &VarBag::default())?;
                 emit_case_end(emit, run_id, case_id, case, &outcome);
                 counts.add(outcome.status);
                 continue;
@@ -962,8 +966,7 @@ pub async fn run_suite(
 
             if let Some(reason) = &dependency_reason {
                 let outcome = CaseOutcome::failed("skipped", reason.clone());
-                let case_id =
-                    persist_case(state, run_id, case, row, &outcome, &VarBag::default())?;
+                let case_id = persist_case(state, run_id, case, row, &outcome, &VarBag::default())?;
                 emit_case_end(emit, run_id, case_id, case, &outcome);
                 counts.add(outcome.status);
                 continue;
@@ -1125,10 +1128,12 @@ pub async fn run_suite(
         let error = if status == "passed" {
             None
         } else {
-            Some(bag.mask(
-                &python_error_message(&outcome, &assertions)
-                    .unwrap_or_else(|| "套件 teardown 未通过".to_string()),
-            ))
+            Some(
+                bag.mask(
+                    &python_error_message(&outcome, &assertions)
+                        .unwrap_or_else(|| "套件 teardown 未通过".to_string()),
+                ),
+            )
         };
         let case_outcome = CaseOutcome {
             status,
@@ -1163,9 +1168,11 @@ pub async fn run_suite(
         "cancelled"
     } else if setup_failure.is_some() {
         "error"
-    } else if teardown_failure.is_some() && suite_config.teardown_failure_fatal {
-        "failed"
-    } else if counts.failed > 0 || counts.errored > 0 {
+    } else if (teardown_failure.is_some() && suite_config.teardown_failure_fatal)
+        || counts.failed > 0
+        || counts.errored > 0
+    {
+        // 拆解失败（致命）与用例失败对套件来说都是 failed，只是原因不同
         "failed"
     } else {
         "passed"
@@ -1377,9 +1384,18 @@ fn case_timeout_budget_for(
 /// 名字像密钥的变量：只做打码，不阻止渲染（文档 6.2）
 fn looks_secret(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    ["token", "secret", "password", "passwd", "apikey", "api_key", "credential", "authorization"]
-        .iter()
-        .any(|needle| lower.contains(needle))
+    [
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "apikey",
+        "api_key",
+        "credential",
+        "authorization",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn mark_run_secrets(
@@ -1443,13 +1459,18 @@ fn collect_secret_values(
         }
     }
     // 长值优先替换，避免短值先命中导致长密钥残留
-    values.sort_by(|a, b| b.len().cmp(&a.len()));
+    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
     values
 }
 
 /// `tags` 既支持逗号分隔，也兼容 JSON 数组写法
 fn case_tags(case: &TestCase) -> Vec<String> {
-    let Some(raw) = case.tags.as_deref().map(str::trim).filter(|text| !text.is_empty()) else {
+    let Some(raw) = case
+        .tags
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    else {
         return Vec::new();
     };
     if raw.starts_with('[') {
@@ -1505,7 +1526,12 @@ fn prepare_datasets(
             Some(content) if !content.trim().is_empty() => {
                 test_dataset::parse(&dataset.format, content)?
             }
-            _ => match dataset.path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+            _ => match dataset
+                .path
+                .as_deref()
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+            {
                 Some(path) => {
                     let full = if std::path::Path::new(path).is_absolute() {
                         std::path::PathBuf::from(path)
@@ -1616,13 +1642,28 @@ fn stress_gate_assertions(
     }];
     if let Some(targets) = targets {
         if let Some(limit) = targets.p95_ms.filter(|value| *value > 0.0) {
-            out.push(upper_bound_assertion("SLA · P95", report.p95_rt, limit, "ms"));
+            out.push(upper_bound_assertion(
+                "SLA · P95",
+                report.p95_rt,
+                limit,
+                "ms",
+            ));
         }
         if let Some(limit) = targets.p99_ms.filter(|value| *value > 0.0) {
-            out.push(upper_bound_assertion("SLA · P99", report.p99_rt, limit, "ms"));
+            out.push(upper_bound_assertion(
+                "SLA · P99",
+                report.p99_rt,
+                limit,
+                "ms",
+            ));
         }
         if let Some(limit) = targets.error_rate.filter(|value| *value >= 0.0) {
-            out.push(upper_bound_assertion("SLA · 错误率", report.error_rate, limit, "%"));
+            out.push(upper_bound_assertion(
+                "SLA · 错误率",
+                report.error_rate,
+                limit,
+                "%",
+            ));
         }
         if let Some(limit) = targets.min_rps.filter(|value| *value > 0.0) {
             out.push(AssertionOutcome {
@@ -1778,7 +1819,8 @@ async fn execute_stress_case(
     }
 
     let started = Instant::now();
-    let outcome = match crate::commands::stress::run_stress_case(state, config, Some(cancel)).await {
+    let outcome = match crate::commands::stress::run_stress_case(state, config, Some(cancel)).await
+    {
         Ok(outcome) => outcome,
         Err(error) => return CaseOutcome::failed("error", format!("STRESS_FAILED：{error}")),
     };
@@ -1857,7 +1899,11 @@ fn python_error_message(
     if failed.is_empty() {
         None
     } else {
-        Some(format!("{} 条断言未通过：{}", failed.len(), failed.join("；")))
+        Some(format!(
+            "{} 条断言未通过：{}",
+            failed.len(),
+            failed.join("；")
+        ))
     }
 }
 
@@ -2322,6 +2368,11 @@ fn build_payload(
         auth: Some(auth),
         cookie_enabled: Some(true),
         origin: Some("suite".to_string()),
+        request_key: None,
+        protocol: None,
+        follow_redirects: None,
+        connect_timeout_ms: None,
+        retry: None,
     })
 }
 
@@ -2377,10 +2428,7 @@ fn persist_case(
         Some(item) => format!("{} [第 {} 行]", case.name, item.index + 1),
         None => case.name.clone(),
     };
-    let logs = cap_text(
-        &bag.mask(&outcome.logs.join("\n")),
-        MAX_LOGS,
-    );
+    let logs = cap_text(&bag.mask(&outcome.logs.join("\n")), MAX_LOGS);
     let error = outcome.error.as_deref().map(|text| bag.mask(text));
     conn.execute(
         "INSERT INTO test_run_cases
@@ -2403,7 +2451,11 @@ fn persist_case(
             outcome.request_snapshot,
             outcome.response_snapshot,
             outcome.assertions.len() as i64,
-            outcome.assertions.iter().filter(|item| !item.passed).count() as i64,
+            outcome
+                .assertions
+                .iter()
+                .filter(|item| !item.passed)
+                .count() as i64,
             error,
             logs,
             outcome.python_version,
@@ -2417,7 +2469,14 @@ fn persist_case(
 
     insert_assertions(&conn, run_case_id, &outcome.assertions, bag)?;
     let run_root = state.data_dir.join("test-runs").join(run_id.to_string());
-    insert_artifacts(&conn, run_id, Some(run_case_id), &outcome.attachments, &run_root, now)?;
+    insert_artifacts(
+        &conn,
+        run_id,
+        Some(run_case_id),
+        &outcome.attachments,
+        &run_root,
+        now,
+    )?;
     Ok(run_case_id)
 }
 
@@ -2505,7 +2564,11 @@ fn persist_suite_script(
             outcome.duration_ms,
             outcome.python_duration_ms,
             outcome.assertions.len() as i64,
-            outcome.assertions.iter().filter(|item| !item.passed).count() as i64,
+            outcome
+                .assertions
+                .iter()
+                .filter(|item| !item.passed)
+                .count() as i64,
             error,
             logs,
             outcome.python_version,
@@ -2517,12 +2580,22 @@ fn persist_suite_script(
     let run_case_id = conn.last_insert_rowid();
     insert_assertions(&conn, run_case_id, &outcome.assertions, bag)?;
     let run_root = state.data_dir.join("test-runs").join(run_id.to_string());
-    insert_artifacts(&conn, run_id, Some(run_case_id), &outcome.attachments, &run_root, now)?;
+    insert_artifacts(
+        &conn,
+        run_id,
+        Some(run_case_id),
+        &outcome.attachments,
+        &run_root,
+        now,
+    )?;
     Ok(run_case_id)
 }
 
 /// 读取运行详情（命令与 CLI 共用）
-pub fn load_run_detail(conn: &rusqlite::Connection, run_id: i64) -> Result<crate::models::RunDetail, String> {
+pub fn load_run_detail(
+    conn: &rusqlite::Connection,
+    run_id: i64,
+) -> Result<crate::models::RunDetail, String> {
     let run = conn
         .query_row(
             "SELECT id, suite_id, env_id, env_name, trigger, status, total, passed, failed,
@@ -2746,7 +2819,11 @@ mod tests {
         assert_eq!(detail.cases[0].assertions_failed, 0);
         assert_eq!(detail.assertions.len(), 3);
         assert!(detail.assertions.iter().all(|item| item.passed));
-        assert!(detail.cases[0].response_snapshot.as_deref().unwrap().contains("orderId"));
+        assert!(detail.cases[0]
+            .response_snapshot
+            .as_deref()
+            .unwrap()
+            .contains("orderId"));
         // 套件运行不写单接口历史与快照（T-33）
         let history: i64 = conn
             .query_row("SELECT COUNT(*) FROM request_history", [], |row| row.get(0))
@@ -2795,7 +2872,11 @@ mod tests {
     fn isolated_cookie_mode_keeps_session_in_memory_only() {
         let url = spawn_cookie_server();
         let (root, state) = temp_state("cookie");
-        let suite_id = seed_suite(&state, &url, r#"[{"type":"status","op":"in","value":[200]}]"#);
+        let suite_id = seed_suite(
+            &state,
+            &url,
+            r#"[{"type":"status","op":"in","value":[200]}]"#,
+        );
         {
             let conn = state.pool.get().unwrap();
             let now = util::now_ms();
@@ -3028,7 +3109,11 @@ mod tests {
 
         let conn = state.pool.get().unwrap();
         let detail = load_run_detail(&conn, run_id).unwrap();
-        assert!(detail.cases.iter().all(|case| case.status == "passed"), "{:?}", detail.cases);
+        assert!(
+            detail.cases.iter().all(|case| case.status == "passed"),
+            "{:?}",
+            detail.cases
+        );
         let logs = detail.cases[0].logs.clone().unwrap_or_default();
         assert!(logs.contains("[main] 生成订单"), "{logs}");
         let version = detail.cases[0].python_version.clone().unwrap_or_default();
@@ -3091,7 +3176,10 @@ mod tests {
             .map(|case| (case.name.as_str(), case.status.as_str()))
             .collect();
         assert!(names.contains(&("用例一", "skipped")), "{names:?}");
-        assert!(names.contains(&("[teardown] 套件清理", "passed")), "{names:?}");
+        assert!(
+            names.contains(&("[teardown] 套件清理", "passed")),
+            "{names:?}"
+        );
         let setup = detail
             .cases
             .iter()
@@ -3173,7 +3261,11 @@ mod tests {
 
         let (root, state) = temp_state("py-hooks");
         enable_python(&state);
-        let suite_id = seed_suite(&state, &url, r#"[{"type":"jsonPath","path":"$.pre","op":"eq","value":"1"}]"#);
+        let suite_id = seed_suite(
+            &state,
+            &url,
+            r#"[{"type":"jsonPath","path":"$.pre","op":"eq","value":"1"}]"#,
+        );
         {
             let conn = state.pool.get().unwrap();
             conn.execute(
@@ -3408,8 +3500,11 @@ mod tests {
         let now = util::now_ms();
         {
             let conn = state.pool.get().unwrap();
-            conn.execute("DELETE FROM test_cases WHERE suite_id = ?1", params![suite_id])
-                .unwrap();
+            conn.execute(
+                "DELETE FROM test_cases WHERE suite_id = ?1",
+                params![suite_id],
+            )
+            .unwrap();
             let stress = json!({
                 "name": "压测用例",
                 "method": "GET",
@@ -3510,7 +3605,9 @@ mod tests {
             .map(|item| item.name.as_str())
             .collect();
         assert_eq!(failed.len(), 4, "{failed:?}");
-        assert!(stress_error_summary(&assertions).unwrap().contains("压测门禁未通过"));
+        assert!(stress_error_summary(&assertions)
+            .unwrap()
+            .contains("压测门禁未通过"));
 
         let good = stress_report_fixture(420.0, 800.0, 60.0, 0.0);
         let assertions = stress_gate_assertions(&good, Some(&targets), None);

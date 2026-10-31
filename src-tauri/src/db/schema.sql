@@ -1,6 +1,12 @@
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
+-- 应用元信息（键值）：密钥来源、加密版本、上次备份/自检时间等
+CREATE TABLE IF NOT EXISTS app_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+
 -- 项目
 CREATE TABLE IF NOT EXISTS projects (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -114,6 +120,8 @@ CREATE TABLE IF NOT EXISTS test_reports (
     codes_json     TEXT,
     histogram_json TEXT,
     error_types_json TEXT,
+    scenario_text  TEXT,
+    summary_text   TEXT,
     start_time     INTEGER,
     end_time       INTEGER,
     created_at     INTEGER NOT NULL

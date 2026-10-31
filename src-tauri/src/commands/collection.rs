@@ -54,9 +54,7 @@ pub fn collection_tree(
         )
         .map_err(err)?;
     let rows = stmt.query_map(params![project_id], map_node).map_err(err)?;
-    let nodes = rows
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(err)?;
+    let nodes = rows.collect::<rusqlite::Result<Vec<_>>>().map_err(err)?;
 
     let mut map: HashMap<Option<i64>, Vec<CollectionNode>> = HashMap::new();
     for node in nodes {
@@ -108,11 +106,7 @@ pub fn collection_create(
 }
 
 #[tauri::command]
-pub fn collection_rename(
-    state: State<'_, AppState>,
-    id: i64,
-    name: String,
-) -> Result<(), String> {
+pub fn collection_rename(state: State<'_, AppState>, id: i64, name: String) -> Result<(), String> {
     let name = name.trim().to_string();
     if name.is_empty() {
         return Err("集合名称不能为空".to_string());

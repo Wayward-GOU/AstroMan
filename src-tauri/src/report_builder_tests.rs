@@ -195,8 +195,8 @@ fn generates_all_formats_with_failure_focus_and_attachment_links() {
     // 日志里的 HTML 片段必须被转义
     assert!(html.contains("boom &lt;tag&gt;"));
 
-    let json: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("report.json")).unwrap())
-        .unwrap();
+    let json: Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("report.json")).unwrap()).unwrap();
     assert_eq!(json["schemaVersion"], REPORT_SCHEMA_VERSION);
     assert_eq!(json["run"]["status"], "failed");
     assert_eq!(json["run"]["assertionsTotal"], 6);
@@ -373,10 +373,7 @@ fn cleanup_orphans_removes_unknown_run_dirs() {
     );
     let orphan = state.data_dir.join("test-runs").join("999999");
     std::fs::create_dir_all(&orphan).unwrap();
-    let keep = state
-        .data_dir
-        .join("test-runs")
-        .join(run_id.to_string());
+    let keep = state.data_dir.join("test-runs").join(run_id.to_string());
     std::fs::create_dir_all(&keep).unwrap();
 
     let conn = state.pool.get().unwrap();

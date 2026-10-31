@@ -33,7 +33,9 @@ fn map_detail(row: &Row<'_>) -> rusqlite::Result<HttpRequestDetail> {
         url: row.get(4)?,
         headers: decode_list(headers),
         params: decode_list(query),
-        body_type: row.get::<_, Option<String>>(7)?.unwrap_or_else(|| "none".into()),
+        body_type: row
+            .get::<_, Option<String>>(7)?
+            .unwrap_or_else(|| "none".into()),
         body: row.get::<_, Option<String>>(8)?.unwrap_or_default(),
         pre_script: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
         post_script: row.get::<_, Option<String>>(10)?.unwrap_or_default(),
@@ -120,7 +122,10 @@ pub fn request_search(
 }
 
 #[tauri::command]
-pub fn request_options(state: State<'_, AppState>, project_id: i64) -> Result<Vec<RequestSearchHit>, String> {
+pub fn request_options(
+    state: State<'_, AppState>,
+    project_id: i64,
+) -> Result<Vec<RequestSearchHit>, String> {
     let conn = state.pool.get().map_err(err)?;
     let mut stmt = conn
         .prepare(

@@ -12,6 +12,8 @@
     "build:mac": "node scripts/prepare-cli.mjs --target universal-apple-darwin && tauri build --target universal-apple-darwin --bundles dmg",
     "preview": "vite preview",
     "test": "vitest run",
+    "version:check": "node scripts/sync-version.mjs",
+    "version:set": "node scripts/sync-version.mjs",
     "tauri": "tauri"
   },
   "dependencies": {

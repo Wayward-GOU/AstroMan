@@ -54,8 +54,7 @@ pub fn parse_specs(raw: Option<&str>) -> Result<Vec<AssertionSpec>, String> {
     let Some(text) = raw.map(str::trim).filter(|text| !text.is_empty()) else {
         return Ok(Vec::new());
     };
-    serde_json::from_str::<Vec<AssertionSpec>>(text)
-        .map_err(|e| format!("断言配置格式错误：{e}"))
+    serde_json::from_str::<Vec<AssertionSpec>>(text).map_err(|e| format!("断言配置格式错误：{e}"))
 }
 
 pub fn evaluate(specs: &[AssertionSpec], input: &AssertInput<'_>) -> Vec<AssertionOutcome> {
@@ -86,7 +85,10 @@ fn evaluate_one(spec: &AssertionSpec, input: &AssertInput<'_>) -> AssertionOutco
 fn default_name(spec: &AssertionSpec) -> String {
     let op = spec.op.as_deref().unwrap_or("");
     match spec.kind.as_str() {
-        "status" => format!("状态码 {op} {}", display(&spec.value.clone().unwrap_or(Value::Null))),
+        "status" => format!(
+            "状态码 {op} {}",
+            display(&spec.value.clone().unwrap_or(Value::Null))
+        ),
         "durationMs" => format!(
             "响应时间 {op} {} ms",
             display(&spec.value.clone().unwrap_or(Value::Null))
@@ -97,7 +99,10 @@ fn default_name(spec: &AssertionSpec) -> String {
             display(&spec.value.clone().unwrap_or(Value::Null))
         ),
         "body" => format!("响应体 {op} 指定文本"),
-        "regex" => format!("响应体匹配 {}", display(&spec.value.clone().unwrap_or(Value::Null))),
+        "regex" => format!(
+            "响应体匹配 {}",
+            display(&spec.value.clone().unwrap_or(Value::Null))
+        ),
         "jsonPath" => format!(
             "{} {op} {}",
             spec.path.as_deref().unwrap_or("$"),
@@ -138,7 +143,9 @@ fn check(spec: &AssertionSpec, input: &AssertInput<'_>) -> Result<(), String> {
                 return Err("header 断言缺少 path（头名称）".to_string());
             }
             match lookup_header(input.headers, header) {
-                Some(actual) => compare(op.as_str(), &Value::String(actual.to_string()), spec, input),
+                Some(actual) => {
+                    compare(op.as_str(), &Value::String(actual.to_string()), spec, input)
+                }
                 None if op == "notexists" => Ok(()),
                 None => Err(format!("响应头 {header} 不存在")),
             }
@@ -269,7 +276,11 @@ fn compare(
     if pass {
         Ok(())
     } else {
-        Err(format!("期望 {op} {}，实际 {}", display(&expected), display(actual)))
+        Err(format!(
+            "期望 {op} {}，实际 {}",
+            display(&expected),
+            display(actual)
+        ))
     }
 }
 
@@ -312,7 +323,9 @@ fn value_contains(actual: &Value, expected: &Value, ignore_case: bool) -> bool {
                 text.contains(&needle)
             }
         }
-        Value::Array(items) => items.iter().any(|item| value_eq(item, expected, ignore_case)),
+        Value::Array(items) => items
+            .iter()
+            .any(|item| value_eq(item, expected, ignore_case)),
         _ => false,
     }
 }
@@ -373,7 +386,10 @@ mod tests {
 
     fn headers() -> HashMap<String, String> {
         let mut map = HashMap::new();
-        map.insert("content-type".to_string(), "application/json; charset=utf-8".to_string());
+        map.insert(
+            "content-type".to_string(),
+            "application/json; charset=utf-8".to_string(),
+        );
         map
     }
 

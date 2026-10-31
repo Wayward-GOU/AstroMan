@@ -2,6 +2,30 @@ use chrono::{Local, SecondsFormat};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// 单测用的临时目录
+///
+/// 优先放在工程的 `target/test-tmp` 下：部分沙箱环境会禁止写系统临时目录，
+/// SQLite 会以 `attempt to write a readonly database` 报错，把测试带到坑里。
+#[cfg(test)]
+pub fn test_dir(tag: &str) -> std::path::PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let name = format!("{tag}-{}-{stamp}", std::process::id());
+    let local = std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join("target")
+        .join("test-tmp")
+        .join(&name);
+    if std::fs::create_dir_all(&local).is_ok() {
+        return local;
+    }
+    let fallback = std::env::temp_dir().join(name);
+    let _ = std::fs::create_dir_all(&fallback);
+    fallback
+}
+
 pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -55,7 +79,9 @@ pub fn strip_json_comments(input: &str) -> String {
                 }
                 '*' => {
                     index += 2;
-                    while index + 1 < chars.len() && !(chars[index] == '*' && chars[index + 1] == '/') {
+                    while index + 1 < chars.len()
+                        && !(chars[index] == '*' && chars[index + 1] == '/')
+                    {
                         index += 1;
                     }
                     index = (index + 2).min(chars.len());
@@ -102,7 +128,11 @@ pub fn render_tracked(
     out
 }
 
-fn resolve_expr(expr: &str, vars: &HashMap<String, String>, used_secrets: &mut Vec<String>) -> String {
+fn resolve_expr(
+    expr: &str,
+    vars: &HashMap<String, String>,
+    used_secrets: &mut Vec<String>,
+) -> String {
     // {{secret:NAME}}：与普通变量取值一致，但会进入脱敏清单
     if let Some(secret_expr) = expr.strip_prefix("secret:") {
         let secret_expr = secret_expr.trim();
@@ -449,7 +479,7 @@ mod tests {
         let floats = render("{{randomFloat(1,2,3)}}", &map);
         let parsed: f64 = floats.parse().unwrap();
         assert!((1.0..=2.0).contains(&parsed));
-        assert_eq!(floats.split('.').last().unwrap().len(), 3);
+        assert_eq!(floats.split('.').next_back().unwrap().len(), 3);
     }
 
     #[test]
@@ -500,7 +530,8 @@ mod tests {
 
     #[test]
     fn collect_placeholders_handles_builtin_and_secret_forms() {
-        let names = collect_placeholders("{{ host }}/{{$uuid}}?t={{secret:TOKEN}}&x={{randomInt(1,3)}}");
+        let names =
+            collect_placeholders("{{ host }}/{{$uuid}}?t={{secret:TOKEN}}&x={{randomInt(1,3)}}");
         assert_eq!(
             names,
             vec![

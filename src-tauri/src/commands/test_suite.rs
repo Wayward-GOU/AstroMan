@@ -41,7 +41,7 @@ pub(crate) fn find_suite(conn: &Connection, id: i64) -> Result<TestSuite, String
 
 /// 逗号分隔标签的匹配：带 `%` 的模糊或整词匹配都按包含处理
 fn tag_filter(tag: &str) -> String {
-    format!("%{}%", tag.trim().replace('%', "").replace('_', ""))
+    format!("%{}%", tag.trim().replace(['%', '_'], ""))
 }
 
 #[tauri::command]
@@ -116,7 +116,10 @@ pub fn test_suite_get(state: State<'_, AppState>, id: i64) -> Result<SuiteDetail
 }
 
 #[tauri::command]
-pub fn test_suite_save(state: State<'_, AppState>, payload: TestSuitePayload) -> Result<i64, String> {
+pub fn test_suite_save(
+    state: State<'_, AppState>,
+    payload: TestSuitePayload,
+) -> Result<i64, String> {
     let name = payload.name.trim().to_string();
     if name.is_empty() {
         return Err("套件名称不能为空".to_string());
@@ -218,7 +221,9 @@ pub(crate) fn load_datasets(
              FROM test_datasets WHERE suite_id = ?1 ORDER BY id ASC"
         ))
         .map_err(err)?;
-    let rows = stmt.query_map(params![suite_id], map_dataset).map_err(err)?;
+    let rows = stmt
+        .query_map(params![suite_id], map_dataset)
+        .map_err(err)?;
     rows.collect::<rusqlite::Result<Vec<_>>>().map_err(err)
 }
 

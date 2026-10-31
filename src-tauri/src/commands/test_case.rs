@@ -117,10 +117,24 @@ pub fn test_case_save(state: State<'_, AppState>, payload: TestCasePayload) -> R
         "request" if payload.request_id.is_none() => {
             return Err("HTTP 用例必须绑定一个接口".to_string());
         }
-        "python" if payload.main_script.as_deref().unwrap_or("").trim().is_empty() => {
+        "python"
+            if payload
+                .main_script
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty() =>
+        {
             return Err("Python 用例必须有脚本内容".to_string());
         }
-        "stress" if payload.stress_json.as_deref().unwrap_or("").trim().is_empty() => {
+        "stress"
+            if payload
+                .stress_json
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty() =>
+        {
             return Err("压测用例必须有压测配置快照".to_string());
         }
         _ => {}

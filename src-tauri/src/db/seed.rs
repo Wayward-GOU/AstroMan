@@ -1,4 +1,4 @@
-﻿use crate::models::KeyValueItem;
+use crate::models::KeyValueItem;
 use crate::util::now_ms;
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -130,10 +130,7 @@ const SCENARIOS: &[SeedCollection] = &[
                 name: "API Key 认证",
                 method: "GET",
                 url: "{{base_url}}/headers",
-                headers: &[
-                    ("Accept", "application/json"),
-                    ("X-API-Key", "{{api_key}}"),
-                ],
+                headers: &[("Accept", "application/json"), ("X-API-Key", "{{api_key}}")],
                 params: &[],
                 body_type: "none",
                 body: "",
@@ -590,7 +587,6 @@ pub fn ensure_sample_suite(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
-
 /// 首次建库时写入示例项目
 pub fn seed(conn: &Connection) -> Result<(), String> {
     let project_id = ensure_project(conn)?;
@@ -744,8 +740,10 @@ fn insert_scenarios(conn: &Connection, project_id: i64) -> Result<(), String> {
 
         let collection_id = conn.last_insert_rowid();
         for (request_index, request) in scenario.requests.iter().enumerate() {
-            let headers = serde_json::to_string(&to_items(request.headers)).map_err(|e| e.to_string())?;
-            let query = serde_json::to_string(&to_items(request.params)).map_err(|e| e.to_string())?;
+            let headers =
+                serde_json::to_string(&to_items(request.headers)).map_err(|e| e.to_string())?;
+            let query =
+                serde_json::to_string(&to_items(request.params)).map_err(|e| e.to_string())?;
 
             conn.execute(
                 "INSERT INTO requests (

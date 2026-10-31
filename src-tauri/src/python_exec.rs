@@ -80,7 +80,9 @@ pub fn check(configured: &str, enabled: bool) -> PythonCheck {
                     });
                     break;
                 }
-                too_old.push(format!("{display}（Python {major}.{minor}.{patch}，要求 ≥ 3.9）"));
+                too_old.push(format!(
+                    "{display}（Python {major}.{minor}.{patch}，要求 ≥ 3.9）"
+                ));
             }
             None => tried.push(display),
         }
@@ -103,7 +105,9 @@ pub fn check(configured: &str, enabled: bool) -> PythonCheck {
             } else {
                 format!("（已尝试：{}）", tried.join("，"))
             };
-            format!("未找到可用的 Python 解释器{suffix}；请安装 Python ≥ 3.9 或在设置中填写解释器路径")
+            format!(
+                "未找到可用的 Python 解释器{suffix}；请安装 Python ≥ 3.9 或在设置中填写解释器路径"
+            )
         }
     };
 
@@ -120,7 +124,10 @@ pub fn check(configured: &str, enabled: bool) -> PythonCheck {
 fn candidates(configured: &str) -> Vec<(String, Vec<String>)> {
     let mut out: Vec<(String, Vec<String>)> = Vec::new();
     let mut push = |program: &str, args: &[&str]| {
-        let entry = (program.to_string(), args.iter().map(|item| item.to_string()).collect());
+        let entry = (
+            program.to_string(),
+            args.iter().map(|item| item.to_string()).collect(),
+        );
         if !out.iter().any(|(p, a)| *p == entry.0 && *a == entry.1) {
             out.push(entry);
         }
@@ -212,7 +219,11 @@ pub fn runtime_module_path() -> Option<PathBuf> {
     );
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("resources").join("python").join("astroman_runtime.py"));
+            candidates.push(
+                dir.join("resources")
+                    .join("python")
+                    .join("astroman_runtime.py"),
+            );
             candidates.push(dir.join("python").join("astroman_runtime.py"));
             candidates.push(
                 dir.join("..")
@@ -400,12 +411,10 @@ pub fn run(spec: PythonSpec) -> PythonOutcome {
 
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
-    let stdout_reader = stdout_pipe.map(|pipe| {
-        std::thread::spawn(move || read_capped(pipe, MAX_OUTPUT_BYTES))
-    });
-    let stderr_reader = stderr_pipe.map(|pipe| {
-        std::thread::spawn(move || read_capped(pipe, MAX_OUTPUT_BYTES))
-    });
+    let stdout_reader =
+        stdout_pipe.map(|pipe| std::thread::spawn(move || read_capped(pipe, MAX_OUTPUT_BYTES)));
+    let stderr_reader =
+        stderr_pipe.map(|pipe| std::thread::spawn(move || read_capped(pipe, MAX_OUTPUT_BYTES)));
 
     let deadline = started + spec.timeout;
     let mut status = None;
@@ -493,7 +502,9 @@ pub fn run(spec: PythonSpec) -> PythonOutcome {
         }
     };
 
-    if let Err(message) = resolve_attachments(&mut result.attachments, &work_dir, spec.attachment_budget) {
+    if let Err(message) =
+        resolve_attachments(&mut result.attachments, &work_dir, spec.attachment_budget)
+    {
         outcome.error = Some(format!("PYTHON_ATTACHMENT_INVALID：{message}"));
         outcome.result = Some(result);
         return outcome;
@@ -512,9 +523,8 @@ pub fn run(spec: PythonSpec) -> PythonOutcome {
             outcome.error = Some(message);
         }
         None => {
-            outcome.error = Some(
-                "PYTHON_RESULT_INVALID：result.json 缺少 ok 字段（布尔值）".to_string(),
-            );
+            outcome.error =
+                Some("PYTHON_RESULT_INVALID：result.json 缺少 ok 字段（布尔值）".to_string());
         }
     }
     outcome.result = Some(result);

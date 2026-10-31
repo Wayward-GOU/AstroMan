@@ -1,4 +1,4 @@
-﻿use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 
 const RELEASE_API: &str = "https://api.github.com/repos/Wayward-GOU/AstroMan/releases/latest";
 const USER_AGENT: &str = "AstroMan-Desktop";
@@ -257,7 +257,11 @@ pub fn open_external(target: String) -> Result<(), String> {
     }
     #[cfg(not(windows))]
     {
-        let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        let opener = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
         std::process::Command::new(opener)
             .arg(&target)
             .spawn()

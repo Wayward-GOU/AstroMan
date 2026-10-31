@@ -29,6 +29,7 @@ const labelMap: Record<string, string> = {
   rampUpSec: '爬坡（秒）',
   thinkTimeMs: '思考时间（毫秒）',
   targetRps: '目标 RPS',
+  recordDetail: '明细记录（full/sample/off/auto）',
   rounds: '轮数',
   limit: '条数上限',
   page: '页码',

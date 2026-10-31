@@ -22,11 +22,11 @@ import { formatDateTime } from '@/utils/datetime'
 import {
   clearRuntimeVars,
   renderRuntimeVars,
-  runEnvScript,
-  runPostScript,
-  runPreScript,
+  listRuntimeVars,
+  setRuntimeVars,
   type ScriptRequest,
 } from '@/utils/scriptRunner'
+import { runScriptJob } from '@/utils/scriptHost'
 import type { HttpRequestDetail, HttpResult, RequestSearchHit } from '@/types/models'
 
 const router = useRouter()
@@ -434,19 +434,33 @@ async function runOne(requestId: number, round: number, row: DataRow | null) {
   let outgoing = toScriptRequest(detail)
 
   if (envScript.value.trim()) {
-    const envResult = runEnvScript(envScript.value, outgoing, envVars.value)
+    const envResult = await runScriptJob({
+      phase: 'env',
+      code: envScript.value,
+      request: outgoing,
+      env: envVars.value,
+      vars: listRuntimeVars(),
+    })
     if (envResult.error) {
       pushFailure(detail, round, `环境脚本执行失败：${envResult.error}`)
       return
     }
+    setRuntimeVars(envResult.vars)
     outgoing = envResult.request
   }
   if (detail.preScript?.trim()) {
-    const preResult = runPreScript(detail.preScript, outgoing, envVars.value)
+    const preResult = await runScriptJob({
+      phase: 'pre',
+      code: detail.preScript,
+      request: outgoing,
+      env: envVars.value,
+      vars: listRuntimeVars(),
+    })
     if (preResult.error) {
       pushFailure(detail, round, `前置脚本执行失败：${preResult.error}`)
       return
     }
+    setRuntimeVars(preResult.vars)
     outgoing = preResult.request
   }
 
@@ -499,7 +513,15 @@ async function runOne(requestId: number, round: number, row: DataRow | null) {
   }
 
   if (detail.postScript?.trim() && !result.error) {
-    const postResult = runPostScript(detail.postScript, outgoing, result, envVars.value)
+    const postResult = await runScriptJob({
+      phase: 'post',
+      code: detail.postScript,
+      request: outgoing,
+      response: result,
+      env: envVars.value,
+      vars: listRuntimeVars(),
+    })
+    if (!postResult.error) setRuntimeVars(postResult.vars)
     item.assertions = postResult.assertions
     item.passed = postResult.assertions.filter((a) => a.passed).length
     item.failed = postResult.assertions.filter((a) => !a.passed).length

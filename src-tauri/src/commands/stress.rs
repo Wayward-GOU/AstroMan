@@ -1,22 +1,26 @@
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rusqlite::params;
 use serde_json::json;
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 use crate::commands::http::base64_encode;
 use crate::models::{
-    ErrorTypeCount, HistogramBucket, ReportError, ReportRequestRecord, ReportSample, RequestAuth,
-    StageSummary, StatusCount, StressConfig, StressDone, StressProgress, StressReport, StressStage,
+    ErrorTypeCount, HistogramBucket, RecordDetailMode, ReportError, ReportRequestRecord,
+    ReportSample, RequestAuth, StageSummary, StatusCount, StressConfig, StressDone, StressProgress,
+    StressReport, StressStage,
 };
 use crate::state::{AppState, DbPool};
 use crate::util::{err, now_ms, render, strip_json_comments};
 
+/// 并发上限。前端 `MAX_CONCURRENT` 必须与之保持一致
+const MAX_CONCURRENT: u32 = 5_000;
 /// 延迟直方图上限（毫秒），超出的请求计入最后一个桶
 const MAX_RT_MS: usize = 60_000;
 /// 首字节时间直方图上限
@@ -34,6 +38,43 @@ const MAX_RECORD_RESPONSE: usize = 2000;
 const SNIPPET_LIMIT: usize = 256;
 /// APDEX 的 T 值（毫秒）
 const APDEX_T: f64 = 500.0;
+/// sample 模式下每 N 个请求记录 1 条明细
+const SAMPLE_EVERY: u64 = 100;
+/// auto 模式定档阈值：预估/实测 QPS 达到该值即关闭明细
+const AUTO_OFF_QPS: f64 = 5_000.0;
+/// auto 模式定档阈值：达到该值降为采样
+const AUTO_SAMPLE_QPS: f64 = 2_000.0;
+/// 运行期连续多少个采样点超过阈值后降档
+const AUTO_DOWNGRADE_WINDOW: usize = 3;
+/// 长压测降低采样频率的阈值（秒）
+const SAMPLE_DECIMATE_2S_SEC: u64 = 2 * 3600;
+const SAMPLE_DECIMATE_5S_SEC: u64 = 6 * 3600;
+
+/// 运行期明细采集开关（可被 auto 降档动态修改）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Capture {
+    Off = 0,
+    Sample = 1,
+    Full = 2,
+}
+
+impl Capture {
+    fn from_u8(raw: u8) -> Self {
+        match raw {
+            0 => Capture::Off,
+            1 => Capture::Sample,
+            _ => Capture::Full,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Capture::Off => "off",
+            Capture::Sample => "sample",
+            Capture::Full => "full",
+        }
+    }
+}
 
 struct Metrics {
     total: AtomicU64,
@@ -42,6 +83,12 @@ struct Metrics {
     sum_ms: AtomicU64,
     sum_ttfb: AtomicU64,
     bytes: AtomicU64,
+    /// 发送方向字节（请求行 + 头 + 体），启动时算出的单请求静态字节 × 请求数
+    bytes_sent: AtomicU64,
+    /// 错误明细因通道满或超出上限被丢弃的条数
+    errors_dropped: AtomicU64,
+    /// 请求明细因超出上限被丢弃的条数
+    records_dropped: AtomicU64,
     min_ms: AtomicU64,
     max_ms: AtomicU64,
     concurrent: AtomicU32,
@@ -60,6 +107,9 @@ impl Metrics {
             sum_ms: AtomicU64::new(0),
             sum_ttfb: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
+            bytes_sent: AtomicU64::new(0),
+            errors_dropped: AtomicU64::new(0),
+            records_dropped: AtomicU64::new(0),
             min_ms: AtomicU64::new(u64::MAX),
             max_ms: AtomicU64::new(0),
             concurrent: AtomicU32::new(0),
@@ -70,7 +120,15 @@ impl Metrics {
         }
     }
 
-    fn record(&self, latency_ms: u64, ttfb_ms: u64, status: u16, bytes: u64, ok: bool) {
+    fn record(
+        &self,
+        latency_ms: u64,
+        ttfb_ms: u64,
+        status: u16,
+        bytes: u64,
+        sent_bytes: u64,
+        ok: bool,
+    ) {
         self.total.fetch_add(1, Ordering::Relaxed);
         if ok {
             self.success.fetch_add(1, Ordering::Relaxed);
@@ -80,6 +138,7 @@ impl Metrics {
         self.sum_ms.fetch_add(latency_ms, Ordering::Relaxed);
         self.sum_ttfb.fetch_add(ttfb_ms, Ordering::Relaxed);
         self.bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.bytes_sent.fetch_add(sent_bytes, Ordering::Relaxed);
         self.min_ms.fetch_min(latency_ms, Ordering::Relaxed);
         self.max_ms.fetch_max(latency_ms, Ordering::Relaxed);
         let index = latency_ms.min(MAX_RT_MS as u64) as usize;
@@ -311,6 +370,10 @@ struct RunCtx {
     cancel: Arc<AtomicBool>,
     errors: mpsc::Sender<ReportError>,
     records: mpsc::UnboundedSender<ReportRequestRecord>,
+    /// 明细采集开关，auto 降档时会运行期修改
+    capture: Arc<AtomicU8>,
+    /// 单请求发送字节（请求行 + 头 + 体），压测期间请求内容静态，启动时算一次
+    req_bytes: u64,
 }
 
 struct Attempt {
@@ -390,7 +453,15 @@ fn build_url(
     Ok(url)
 }
 
-async fn read_snippet(mut response: reqwest::Response, limit: usize) -> (String, u64) {
+/// 读取响应体：**始终排空**以保证连接可复用，按需只保留前 `keep` 个字节
+///
+/// 返回（保留的内容, 实际字节数）。
+/// - `keep = Some(n)`：明细模式，保留前 n 字节供快照使用；
+/// - `keep = None`：高吞吐模式，只计数不保留。
+///
+/// 旧实现读满 2000 字节即中断，未读完的 body 会让 hyper 关闭连接，
+/// 于是在高 QPS 下退化成「每请求一次 TCP 握手」，并把流量统计封顶在 2000。
+async fn read_body(mut response: reqwest::Response, keep: Option<usize>) -> (String, u64) {
     let declared = response
         .headers()
         .get(reqwest::header::CONTENT_LENGTH)
@@ -398,28 +469,25 @@ async fn read_snippet(mut response: reqwest::Response, limit: usize) -> (String,
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
 
-    let mut buffer: Vec<u8> = Vec::with_capacity(limit);
-    while buffer.len() < limit {
-        match response.chunk().await {
-            Ok(Some(chunk)) => {
-                let take = (limit - buffer.len()).min(chunk.len());
-                buffer.extend_from_slice(&chunk[..take]);
-                if take < chunk.len() {
-                    break;
-                }
-            }
-            _ => break,
+    let limit = keep.unwrap_or(0);
+    let mut buffer: Vec<u8> = Vec::with_capacity(limit.min(256));
+    let mut drained: u64 = 0;
+    // 读到 None 或出错都停止；出错时已经读到的字节仍然可用
+    while let Ok(Some(chunk)) = response.chunk().await {
+        drained += chunk.len() as u64;
+        if buffer.len() < limit {
+            let take = (limit - buffer.len()).min(chunk.len());
+            buffer.extend_from_slice(&chunk[..take]);
         }
     }
-    let bytes = if declared > 0 {
-        declared
-    } else {
-        buffer.len() as u64
-    };
+    // 有 Content-Length 时以声明值为准（gzip 会自动解压并移除该头，此时按解压后字节计）
+    let bytes = if declared > 0 { declared } else { drained };
     (String::from_utf8_lossy(&buffer).into_owned(), bytes)
 }
 
-async fn send_once(ctx: &RunCtx) -> Attempt {
+async fn send_once(ctx: &RunCtx, capture: Capture) -> Attempt {
+    // 是否需要为明细采集请求/响应内容
+    let keep_detail = capture != Capture::Off;
     let url = match build_url(&ctx.config, &ctx.vars, &ctx.auth) {
         Ok(url) => url,
         Err(error) => {
@@ -439,7 +507,11 @@ async fn send_once(ctx: &RunCtx) -> Attempt {
             }
         }
     };
-    let query = url.query().unwrap_or_default().to_string();
+    let query = if keep_detail {
+        url.query().unwrap_or_default().to_string()
+    } else {
+        String::new()
+    };
     let url_text = url.to_string();
 
     let mut builder = ctx
@@ -447,6 +519,7 @@ async fn send_once(ctx: &RunCtx) -> Attempt {
         .request(ctx.method.clone(), url)
         .timeout(Duration::from_millis(ctx.config.timeout_ms.max(500)));
 
+    // 只有需要落明细时才组装 header 快照，off 模式省掉这些分配
     let mut header_pairs: Vec<(String, String)> = Vec::new();
     let mut has_content_type = false;
     let mut has_authorization = false;
@@ -469,7 +542,9 @@ async fn send_once(ctx: &RunCtx) -> Attempt {
             has_cookie = true;
         }
         let value = render(&item.value, &ctx.vars);
-        header_pairs.push((key.clone(), value.clone()));
+        if keep_detail {
+            header_pairs.push((key.clone(), value.clone()));
+        }
         builder = builder.header(key, value);
     }
 
@@ -478,17 +553,23 @@ async fn send_once(ctx: &RunCtx) -> Attempt {
         match ctx.auth.kind.as_str() {
             "bearer" | "oauth2" if !ctx.auth.token.trim().is_empty() => {
                 let value = format!("Bearer {}", ctx.auth.token.trim());
-                header_pairs.push(("Authorization".to_string(), value.clone()));
+                if keep_detail {
+                    header_pairs.push(("Authorization".to_string(), value.clone()));
+                }
                 builder = builder.header(reqwest::header::AUTHORIZATION, value);
             }
             "basic" => {
                 let raw = format!("{}:{}", ctx.auth.username, ctx.auth.password);
                 let value = format!("Basic {}", base64_encode(raw.as_bytes()));
-                header_pairs.push(("Authorization".to_string(), value.clone()));
+                if keep_detail {
+                    header_pairs.push(("Authorization".to_string(), value.clone()));
+                }
                 builder = builder.header(reqwest::header::AUTHORIZATION, value);
             }
             "apikey" if ctx.auth.add_to != "query" && !ctx.auth.key.trim().is_empty() => {
-                header_pairs.push((ctx.auth.key.clone(), ctx.auth.value.clone()));
+                if keep_detail {
+                    header_pairs.push((ctx.auth.key.clone(), ctx.auth.value.clone()));
+                }
                 builder = builder.header(ctx.auth.key.clone(), ctx.auth.value.clone());
             }
             _ => {}
@@ -498,7 +579,9 @@ async fn send_once(ctx: &RunCtx) -> Attempt {
     // 自动携带本机 Cookie（启动时已按目标 URL 预取）
     if !has_cookie {
         if let Some(cookie) = &ctx.cookie {
-            header_pairs.push(("Cookie".to_string(), cookie.clone()));
+            if keep_detail {
+                header_pairs.push(("Cookie".to_string(), cookie.clone()));
+            }
             builder = builder.header(reqwest::header::COOKIE, cookie.clone());
         }
     }
@@ -513,7 +596,9 @@ async fn send_once(ctx: &RunCtx) -> Attempt {
                 _ => "text/plain; charset=utf-8",
             };
             builder = builder.header(reqwest::header::CONTENT_TYPE, content_type);
-            header_pairs.push(("Content-Type".to_string(), content_type.to_string()));
+            if keep_detail {
+                header_pairs.push(("Content-Type".to_string(), content_type.to_string()));
+            }
         }
         let raw_body = ctx.config.body.as_deref().unwrap_or("");
         // JSON 请求体里的注释在发送前去掉，与 Postman 行为一致
@@ -524,28 +609,46 @@ async fn send_once(ctx: &RunCtx) -> Attempt {
         };
         let rendered = render(&source, &ctx.vars);
         builder = builder.body(rendered.clone());
-        request_body = Some(rendered);
+        if keep_detail {
+            request_body = Some(rendered);
+        }
     }
 
-    let request_headers = headers_json(&header_pairs);
+    let request_headers = if keep_detail {
+        headers_json(&header_pairs)
+    } else {
+        String::new()
+    };
     let started = Instant::now();
     match builder.send().await {
         Ok(response) => {
             let ttfb_ms = started.elapsed().as_millis() as u64;
             let status = response.status();
-            let response_headers = headers_json(
-                &response
-                    .headers()
-                    .iter()
-                    .map(|(key, value)| {
-                        (
-                            key.as_str().to_string(),
-                            value.to_str().unwrap_or_default().to_string(),
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-            );
-            let (text, bytes) = read_snippet(response, MAX_RECORD_RESPONSE).await;
+            let response_headers = if keep_detail {
+                headers_json(
+                    &response
+                        .headers()
+                        .iter()
+                        .map(|(key, value)| {
+                            (
+                                key.as_str().to_string(),
+                                value.to_str().unwrap_or_default().to_string(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                String::new()
+            };
+            let (text, bytes) = read_body(
+                response,
+                if keep_detail {
+                    Some(MAX_RECORD_RESPONSE)
+                } else {
+                    None
+                },
+            )
+            .await;
             let snippet = clip(&text, SNIPPET_LIMIT);
             let response_body = if text.trim().is_empty() {
                 None
@@ -618,6 +721,84 @@ fn classify_error(message: &str) -> &'static str {
     }
 }
 
+/// 估算单请求发送字节：请求行 + 头 + 体
+///
+/// 压测期间请求内容静态，启动时算一次，逐请求只做一次加法。
+/// 头部按实际配置的 key/value 累加，另加 40 字节估算 Host/UA/Accept 等栈自动补充的头。
+fn estimate_request_bytes(config: &StressConfig, method: &reqwest::Method) -> u64 {
+    let mut total = method.as_str().len() + config.url.trim().len() + " HTTP/1.1\r\n".len() + 40;
+    for item in &config.headers {
+        if item.enabled && !item.key.trim().is_empty() {
+            total += item.key.len() + item.value.len() + ": \r\n".len();
+        }
+    }
+    total += config.body.as_deref().map(|body| body.len()).unwrap_or(0);
+    total as u64
+}
+
+/// 采集施压端环境信息（写入 config_json.agent）
+fn collect_agent_info() -> serde_json::Value {
+    let mut sys = System::new();
+    sys.refresh_memory();
+    json!({
+        "tool": "AstroMan",
+        "version": env!("CARGO_PKG_VERSION"),
+        "os": System::name().unwrap_or_default(),
+        "osVersion": System::os_version().unwrap_or_default(),
+        "arch": std::env::consts::ARCH,
+        "host": System::host_name().unwrap_or_default(),
+        "cpuCores": std::thread::available_parallelism().map(|value| value.get()).unwrap_or(0),
+        "memTotalMb": sys.total_memory() / 1024 / 1024,
+    })
+}
+
+/// 压测期间本进程资源峰值采样（每 5 秒一次，避免自身成为负担）
+struct ResourceMonitor {
+    sys: System,
+    pid: sysinfo::Pid,
+    last: Instant,
+    cpu_peak: f32,
+    mem_peak_mb: u64,
+}
+
+impl ResourceMonitor {
+    fn new() -> Self {
+        let mut sys = System::new();
+        sys.refresh_memory();
+        Self {
+            sys,
+            pid: sysinfo::Pid::from_u32(std::process::id()),
+            // 首次采样延后，让 sysinfo 有足够的时间基准
+            last: Instant::now(),
+            cpu_peak: 0.0,
+            mem_peak_mb: 0,
+        }
+    }
+
+    fn sample(&mut self) {
+        if self.last.elapsed() < Duration::from_secs(5) {
+            return;
+        }
+        self.last = Instant::now();
+        self.sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[self.pid]),
+            true,
+            ProcessRefreshKind::nothing().with_cpu().with_memory(),
+        );
+        if let Some(process) = self.sys.process(self.pid) {
+            // sysinfo 的进程 CPU 是「单核百分比」，除以 100 得到核数
+            let cores = process.cpu_usage() / 100.0;
+            if cores > self.cpu_peak {
+                self.cpu_peak = cores;
+            }
+            let mem_mb = process.memory() / 1024 / 1024;
+            if mem_mb > self.mem_peak_mb {
+                self.mem_peak_mb = mem_mb;
+            }
+        }
+    }
+}
+
 /// 当前时刻应生效的并发数与阶段序号
 fn stage_at(stages: &[StressStage], elapsed_sec: u64, fallback: u32) -> (u32, i64) {
     if stages.is_empty() {
@@ -627,11 +808,14 @@ fn stage_at(stages: &[StressStage], elapsed_sec: u64, fallback: u32) -> (u32, i6
     for (index, stage) in stages.iter().enumerate() {
         acc += stage.duration_sec.max(1) as u64;
         if elapsed_sec < acc {
-            return (stage.concurrent.clamp(1, 500), index as i64);
+            return (stage.concurrent.clamp(1, MAX_CONCURRENT), index as i64);
         }
     }
     let last = stages.len() - 1;
-    (stages[last].concurrent.clamp(1, 500), last as i64)
+    (
+        stages[last].concurrent.clamp(1, MAX_CONCURRENT),
+        last as i64,
+    )
 }
 
 async fn take_token(ctx: &RunCtx) -> bool {
@@ -674,6 +858,7 @@ async fn worker(ctx: Arc<RunCtx>, index: u32, workers: u32) {
         remaining -= step;
     }
 
+    let mut seq: u64 = 0;
     loop {
         if ctx.cancel.load(Ordering::Relaxed) || Instant::now() >= ctx.deadline {
             break;
@@ -689,9 +874,11 @@ async fn worker(ctx: Arc<RunCtx>, index: u32, workers: u32) {
             break;
         }
 
+        // 采集开关每请求读一次，auto 降档后立即生效
+        let capture = Capture::from_u8(ctx.capture.load(Ordering::Relaxed));
         ctx.metrics.concurrent.fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
-        let attempt = send_once(&ctx).await;
+        let attempt = send_once(&ctx, capture).await;
         let latency_ms = started.elapsed().as_millis() as u64;
         ctx.metrics.concurrent.fetch_sub(1, Ordering::Relaxed);
         ctx.metrics.record(
@@ -699,6 +886,7 @@ async fn worker(ctx: Arc<RunCtx>, index: u32, workers: u32) {
             attempt.ttfb_ms.min(latency_ms),
             attempt.status,
             attempt.bytes,
+            ctx.req_bytes,
             attempt.ok,
         );
 
@@ -709,39 +897,48 @@ async fn worker(ctx: Arc<RunCtx>, index: u32, workers: u32) {
         } else {
             Some(classify_error(attempt.error.as_deref().unwrap_or("")).to_string())
         };
-        let ttfb_ms = attempt.ttfb_ms.min(latency_ms);
-        let _ = ctx.records.send(ReportRequestRecord {
-            elapsed_ms: ctx.start.elapsed().as_millis() as i64,
-            time_ms: now_ms() - latency_ms as i64,
-            method: ctx.method.as_str().to_string(),
-            url: attempt.url.clone(),
-            status: attempt.status as i64,
-            latency_ms: latency_ms as i64,
-            ttfb_ms: ttfb_ms as i64,
-            bytes: attempt.bytes as i64,
-            success: attempt.ok,
-            body: attempt
-                .body
-                .as_deref()
-                .map(|text| clip(text, MAX_RECORD_BODY)),
-            params: if attempt.params.is_empty() {
-                None
-            } else {
-                Some(attempt.params.clone())
-            },
-            headers: if attempt.headers.is_empty() {
-                None
-            } else {
-                Some(attempt.headers.clone())
-            },
-            response_headers: attempt.response_headers.clone(),
-            response_body: attempt.response_body.clone(),
-            error_type: error_type.clone(),
-            error_message: attempt
-                .error
-                .as_deref()
-                .map(|message| clip(message, MAX_RECORD_ERROR)),
-        });
+        // 明细：off 完全不构造；sample 每 SAMPLE_EVERY 个请求留一条（确定性，可复现）
+        let should_record = match capture {
+            Capture::Off => false,
+            Capture::Full => true,
+            Capture::Sample => seq.is_multiple_of(SAMPLE_EVERY),
+        };
+        seq = seq.wrapping_add(1);
+        if should_record {
+            let ttfb_ms = attempt.ttfb_ms.min(latency_ms);
+            let _ = ctx.records.send(ReportRequestRecord {
+                elapsed_ms: ctx.start.elapsed().as_millis() as i64,
+                time_ms: now_ms() - latency_ms as i64,
+                method: ctx.method.as_str().to_string(),
+                url: attempt.url.clone(),
+                status: attempt.status as i64,
+                latency_ms: latency_ms as i64,
+                ttfb_ms: ttfb_ms as i64,
+                bytes: attempt.bytes as i64,
+                success: attempt.ok,
+                body: attempt
+                    .body
+                    .as_deref()
+                    .map(|text| clip(text, MAX_RECORD_BODY)),
+                params: if attempt.params.is_empty() {
+                    None
+                } else {
+                    Some(attempt.params.clone())
+                },
+                headers: if attempt.headers.is_empty() {
+                    None
+                } else {
+                    Some(attempt.headers.clone())
+                },
+                response_headers: attempt.response_headers.clone(),
+                response_body: attempt.response_body.clone(),
+                error_type: error_type.clone(),
+                error_message: attempt
+                    .error
+                    .as_deref()
+                    .map(|message| clip(message, MAX_RECORD_ERROR)),
+            });
+        }
 
         if !attempt.ok {
             ctx.metrics
@@ -758,7 +955,9 @@ async fn worker(ctx: Arc<RunCtx>, index: u32, workers: u32) {
                 },
                 response_body: attempt.snippet,
             };
-            let _ = ctx.errors.try_send(item);
+            if ctx.errors.try_send(item).is_err() {
+                ctx.metrics.errors_dropped.fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         if ctx.config.think_time_ms > 0 {
@@ -843,13 +1042,13 @@ fn prepare_stress(state: &AppState, config: StressConfig) -> Result<PreparedStre
         .iter()
         .filter(|item| item.duration_sec > 0)
         .map(|item| StressStage {
-            concurrent: item.concurrent.clamp(1, 500),
+            concurrent: item.concurrent.clamp(1, MAX_CONCURRENT),
             duration_sec: item.duration_sec.clamp(1, 3600),
         })
         .collect();
 
     let peak = if stages.is_empty() {
-        config.concurrent.clamp(1, 500)
+        config.concurrent.clamp(1, MAX_CONCURRENT)
     } else {
         stages.iter().map(|item| item.concurrent).max().unwrap_or(1)
     };
@@ -874,17 +1073,48 @@ fn prepare_stress(state: &AppState, config: StressConfig) -> Result<PreparedStre
         .unwrap_or(0);
     let target_rps = rate as f64;
 
+    // 明细采集定档：auto 按「预估 QPS」一次性定档，之后由运行期只降不升
+    let record_detail = config.record_detail;
+    let capture_mode = match record_detail {
+        RecordDetailMode::Full => Capture::Full,
+        RecordDetailMode::Sample => Capture::Sample,
+        RecordDetailMode::Off => Capture::Off,
+        RecordDetailMode::Auto => {
+            // 无目标 RPS 时按 100ms 参考 RT 估算：QPS ≈ 并发 × 10
+            let predicted = if rate > 0 {
+                rate as f64
+            } else {
+                peak as f64 * 10.0
+            };
+            if predicted >= AUTO_OFF_QPS {
+                Capture::Off
+            } else if predicted >= AUTO_SAMPLE_QPS {
+                Capture::Sample
+            } else {
+                Capture::Full
+            }
+        }
+    };
+    let capture = Arc::new(AtomicU8::new(capture_mode as u8));
+    let req_bytes = estimate_request_bytes(&config, &method);
+
     let metrics = Arc::new(Metrics::new());
     let control = Arc::new(Control::new(
-        if stages.is_empty() { peak } else { stages[0].concurrent },
+        if stages.is_empty() {
+            peak
+        } else {
+            stages[0].concurrent
+        },
         rate,
     ));
     let cancel = state.stress_cancel.clone();
     // 按当前配置构建客户端：连接超时、重定向策略可单独覆盖，代理与客户端证书沿用应用设置
+    // 空闲连接上限按压测峰值并发放大，普通请求客户端不受影响
     let client = state.client_with_options(
         config.insecure,
         config.connect_timeout_ms,
         config.follow_redirects,
+        Some(peak as usize),
     )?;
     let stop_rate = config.stop_error_rate.filter(|value| *value > 0.0);
     let stop_min = config.stop_min_requests.unwrap_or(100).max(1);
@@ -898,7 +1128,9 @@ fn prepare_stress(state: &AppState, config: StressConfig) -> Result<PreparedStre
     let config_snapshot = json!({
         "mode": if stages.is_empty() { "fixed" } else { "stages" },
         "method": config.method.clone(),
-        "url": config.url.clone(),
+        // 报告要展示「实际压测的目标」：存渲染后的完整 URL（含变量替换与拼接的查询参数），
+        // 而不是 {{base_url}}/xxx 这样的模板原文
+        "url": prepared_url.as_str().to_string(),
         "headers": config.headers.iter().filter(|h| h.enabled && !h.key.trim().is_empty()).count(),
         "params": config.params.iter().filter(|p| p.enabled && !p.key.trim().is_empty()).count(),
         "bodyType": config.body_type.clone(),
@@ -918,6 +1150,10 @@ fn prepare_stress(state: &AppState, config: StressConfig) -> Result<PreparedStre
         "targetRps": target_rps,
         "stages": stages,
         "sla": config.sla,
+        // 明细采集：请求模式与实际生效模式（auto 可能已降档）
+        "recordDetail": capture_mode.label(),
+        "recordDetailRequested": record_detail.label(),
+        "agent": collect_agent_info(),
     });
     let config_snapshot = config_snapshot.to_string();
 
@@ -935,6 +1171,8 @@ fn prepare_stress(state: &AppState, config: StressConfig) -> Result<PreparedStre
         cancel,
         errors: errors_tx,
         records: records_tx,
+        capture,
+        req_bytes,
     });
 
     Ok(PreparedStress {
@@ -996,9 +1234,26 @@ async fn drive_stress(
     let mut prev_bytes = 0u64;
     let mut left_sec = total_sec;
     let mut auto_stop: Option<String> = None;
+    // 已下发到前端的采样点数量（进度事件只发增量）
+    let mut emitted = 0usize;
+    let mut notice: Option<String> = None;
+    let mut qps_window: VecDeque<f64> = VecDeque::new();
+    let mut monitor = ResourceMonitor::new();
+    // 长压测降低采样频率：> 2h 每 2s、> 6h 每 5s 一个采样点
+    let sample_step: u64 = if total_sec > SAMPLE_DECIMATE_5S_SEC {
+        5
+    } else if total_sec > SAMPLE_DECIMATE_2S_SEC {
+        2
+    } else {
+        1
+    };
 
     let mut ticker = tokio::time::interval(Duration::from_millis(1000));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // 采样间隔必须与被统计的计数区间一致：记录上一次**实际采样**的时刻，
+    // 否则 tick 漂移或降频采样时 qps 会被算成两倍（用相邻 tick 差当时钟的经典错误）
+    let mut last_sample_at = Instant::now();
+    let mut last_sample_sec = 0u64;
 
     loop {
         ticker.tick().await;
@@ -1013,11 +1268,15 @@ async fn drive_stress(
         while let Ok(item) = errors_rx.try_recv() {
             if errors.len() < MAX_ERRORS {
                 errors.push(item);
+            } else {
+                metrics.errors_dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
         while let Ok(item) = records_rx.try_recv() {
             if requests.len() < MAX_REQUEST_RECORDS {
                 requests.push(item);
+            } else {
+                metrics.records_dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
 
@@ -1036,11 +1295,22 @@ async fn drive_stress(
             control.tokens.store(rate as u64, Ordering::Relaxed);
         }
 
-        if elapsed > 0 {
+        monitor.sample();
+
+        if elapsed > 0 && elapsed.saturating_sub(last_sample_sec) >= sample_step {
+            // QPS 按真实采样间隔归一：高负载下 ticker 会漂移，直接取相邻计数差会高估
+            let now_sample = Instant::now();
+            let dt = now_sample
+                .duration_since(last_sample_at)
+                .as_secs_f64()
+                .clamp(0.001, 60.0);
+            last_sample_at = now_sample;
+            last_sample_sec = elapsed;
+            let qps = total.saturating_sub(prev_total) as f64 / dt;
             samples.push(ReportSample {
                 elapsed_sec: elapsed,
                 concurrent: metrics.concurrent.load(Ordering::Relaxed),
-                qps: total.saturating_sub(prev_total) as f64,
+                qps,
                 avg_rt: metrics.avg(),
                 p50_rt: metrics.percentile(0.5),
                 p95_rt: metrics.percentile(0.95),
@@ -1054,9 +1324,35 @@ async fn drive_stress(
             prev_success = success;
             prev_errors = failure;
             prev_bytes = bytes;
+
+            // auto 定档：连续 N 个采样点超阈值后降档，只降不升
+            qps_window.push_back(qps);
+            while qps_window.len() > AUTO_DOWNGRADE_WINDOW {
+                qps_window.pop_front();
+            }
+            if qps_window.len() == AUTO_DOWNGRADE_WINDOW {
+                let lowest = qps_window.iter().cloned().fold(f64::MAX, f64::min);
+                let current = Capture::from_u8(ctx.capture.load(Ordering::Relaxed));
+                if current != Capture::Off && lowest >= AUTO_OFF_QPS {
+                    ctx.capture.store(Capture::Off as u8, Ordering::Relaxed);
+                    notice = Some(format!(
+                        "实测 QPS 已达 {:.0}，已自动关闭逐请求明细（聚合指标不受影响）",
+                        lowest
+                    ));
+                    log::info!("压测自动降档：capture=off，qps={lowest:.0}");
+                } else if current == Capture::Full && lowest >= AUTO_SAMPLE_QPS {
+                    ctx.capture.store(Capture::Sample as u8, Ordering::Relaxed);
+                    notice = Some(format!("实测 QPS 已达 {:.0}，明细已切换为 1% 采样", lowest));
+                    log::info!("压测自动降档：capture=sample，qps={lowest:.0}");
+                }
+                qps_window.clear();
+            }
         }
 
         if let Some(sink) = progress {
+            // 只下发增量采样点，避免长压测下每秒 clone 全量序列
+            let delta: Vec<ReportSample> = samples[emitted.min(samples.len())..].to_vec();
+            emitted = samples.len();
             sink(StressProgress {
                 name: name.clone(),
                 running: true,
@@ -1076,7 +1372,11 @@ async fn drive_stress(
                 stage_index,
                 active_concurrent: active,
                 status_codes: metrics.status_codes(),
-                samples: samples.clone(),
+                samples: delta,
+                record_mode: Capture::from_u8(ctx.capture.load(Ordering::Relaxed))
+                    .label()
+                    .to_string(),
+                notice: notice.take(),
             });
         }
 
@@ -1103,9 +1403,7 @@ async fn drive_stress(
     }
 
     // 等待在途请求结束，最多等 5 秒
-    let wait_all = async {
-        while tasks.join_next().await.is_some() {}
-    };
+    let wait_all = async { while tasks.join_next().await.is_some() {} };
     if tokio::time::timeout(Duration::from_secs(5), wait_all)
         .await
         .is_err()
@@ -1141,6 +1439,20 @@ async fn drive_stress(
     let status_codes = metrics.status_codes();
     let stage_summaries = summarize_stages(&stages, &samples);
     let error_types = metrics.error_types();
+
+    // 运行期指标并入配置快照：避免为统计项新增表列，读取集中在 ReportDetail.config
+    let config_snapshot = with_runtime_metrics(
+        &config_snapshot,
+        json!({
+            "bytesSent": metrics.bytes_sent.load(Ordering::Relaxed),
+            "errorsDropped": metrics.errors_dropped.load(Ordering::Relaxed),
+            "recordsDropped": metrics.records_dropped.load(Ordering::Relaxed),
+            "recordMode": Capture::from_u8(ctx.capture.load(Ordering::Relaxed)).label(),
+            "cpuPeakCores": (monitor.cpu_peak * 10.0).round() / 10.0,
+            "memPeakMb": monitor.mem_peak_mb,
+            "sampleIntervalSec": sample_step,
+        }),
+    );
 
     let report = StressReport {
         id: 0,
@@ -1235,7 +1547,8 @@ pub async fn stress_start(
             .report
             .end_time
             .unwrap_or(0)
-            .saturating_sub(outcome.report.start_time.unwrap_or(0)) as u64
+            .saturating_sub(outcome.report.start_time.unwrap_or(0))
+            as u64
             / 1000;
         let _ = app.emit(
             "stress:done",
@@ -1325,6 +1638,15 @@ fn summarize_stages(stages: &[StressStage], samples: &[ReportSample]) -> Vec<Sta
 pub fn stress_stop(state: State<'_, AppState>) -> Result<(), String> {
     state.stress_cancel.store(true, Ordering::SeqCst);
     Ok(())
+}
+
+/// 把运行期指标合并进配置快照 JSON
+fn with_runtime_metrics(snapshot: &str, metrics: serde_json::Value) -> String {
+    let mut value: serde_json::Value = serde_json::from_str(snapshot).unwrap_or_else(|_| json!({}));
+    if let Some(map) = value.as_object_mut() {
+        map.insert("metrics".to_string(), metrics);
+    }
+    value.to_string()
 }
 
 struct ReportPayload<'a> {
@@ -1520,4 +1842,78 @@ fn save_report(pool: &DbPool, payload: ReportPayload<'_>) -> Result<i64, String>
 
     tx.commit().map_err(err)?;
     Ok(report_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::KeyValueItem;
+
+    fn kv(key: &str, value: &str) -> KeyValueItem {
+        KeyValueItem {
+            key: key.to_string(),
+            value: value.to_string(),
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn capture_maps_from_atomic_u8() {
+        assert_eq!(Capture::from_u8(0), Capture::Off);
+        assert_eq!(Capture::from_u8(1), Capture::Sample);
+        assert_eq!(Capture::from_u8(2), Capture::Full);
+        // 越界按 full 处理，避免脏值把采集关掉
+        assert_eq!(Capture::from_u8(9), Capture::Full);
+        assert_eq!(Capture::Off.label(), "off");
+    }
+
+    #[test]
+    fn record_detail_defaults_to_auto_and_parses_lowercase() {
+        let config: StressConfig = serde_json::from_str(r#"{"url":"http://127.0.0.1/x"}"#).unwrap();
+        assert_eq!(config.record_detail, RecordDetailMode::Auto);
+
+        let config: StressConfig =
+            serde_json::from_str(r#"{"url":"http://127.0.0.1/x","recordDetail":"off"}"#).unwrap();
+        assert_eq!(config.record_detail, RecordDetailMode::Off);
+
+        let config: StressConfig =
+            serde_json::from_str(r#"{"url":"http://127.0.0.1/x","recordDetail":"sample"}"#)
+                .unwrap();
+        assert_eq!(config.record_detail, RecordDetailMode::Sample);
+    }
+
+    #[test]
+    fn estimate_request_bytes_covers_line_headers_and_body() {
+        let mut config: StressConfig =
+            serde_json::from_str(r#"{"url":"http://127.0.0.1/x","body":"payload"}"#).unwrap();
+        config.method = "POST".to_string();
+        config.body_type = "text".to_string();
+        config.headers = vec![kv("X-Trace", "abc")];
+
+        let without = estimate_request_bytes(
+            &StressConfig {
+                body: None,
+                headers: Vec::new(),
+                ..serde_json::from_str(r#"{"url":"http://127.0.0.1/x"}"#).unwrap()
+            },
+            &reqwest::Method::POST,
+        );
+        let with = estimate_request_bytes(&config, &reqwest::Method::POST);
+        // 多了一个头（key + value + ": \r\n"）与 7 字节 body
+        assert_eq!(
+            with - without,
+            ("X-Trace".len() + "abc".len() + 4 + 7) as u64
+        );
+    }
+
+    #[test]
+    fn runtime_metrics_are_merged_into_snapshot() {
+        let snapshot = r#"{"mode":"fixed","recordDetail":"off"}"#;
+        let merged =
+            with_runtime_metrics(snapshot, json!({"bytesSent": 1024, "recordsDropped": 3}));
+        let value: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(value["mode"], "fixed");
+        assert_eq!(value["metrics"]["bytesSent"], 1024);
+        assert_eq!(value["metrics"]["recordsDropped"], 3);
+    }
 }

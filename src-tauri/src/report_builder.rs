@@ -177,7 +177,12 @@ pub fn generate(
             params![relative_dir, run_id],
         )
         .map_err(err)?;
-        let _ = prune_reports(&conn, &state.data_dir, detail.run.suite_id, DEFAULT_KEEP_REPORTS);
+        let _ = prune_reports(
+            &conn,
+            &state.data_dir,
+            detail.run.suite_id,
+            DEFAULT_KEEP_REPORTS,
+        );
     }
 
     Ok(TestRunReport {
@@ -205,7 +210,9 @@ fn normalize_formats(formats: &[String]) -> Result<Vec<String>, String> {
                 continue;
             }
             if !matches!(name.as_str(), "html" | "json" | "junit" | "summary") {
-                return Err(format!("不支持的报告格式：{name}（可选 html/json/junit/summary）"));
+                return Err(format!(
+                    "不支持的报告格式：{name}（可选 html/json/junit/summary）"
+                ));
             }
             if !out.contains(&name) {
                 out.push(name);
@@ -221,8 +228,7 @@ fn write_text(path: &Path, text: &str) -> Result<(), String> {
 
 fn write_case_logs(dir: &Path, detail: &RunDetail) -> Result<(), String> {
     let logs_dir = dir.join("logs");
-    std::fs::create_dir_all(&logs_dir)
-        .map_err(|error| format!("创建日志目录失败：{error}"))?;
+    std::fs::create_dir_all(&logs_dir).map_err(|error| format!("创建日志目录失败：{error}"))?;
     for case in &detail.cases {
         let Some(logs) = case.logs.as_deref() else {
             continue;
@@ -265,7 +271,10 @@ fn copy_attachments(
             let _ = std::fs::create_dir_all(parent);
         }
         if std::fs::copy(&source, &target).is_ok() {
-            copied.push(format!("files/{}", relative.to_string_lossy().replace('\\', "/")));
+            copied.push(format!(
+                "files/{}",
+                relative.to_string_lossy().replace('\\', "/")
+            ));
         }
     }
     Ok(copied)
@@ -276,7 +285,10 @@ fn artifact_path(data_dir: &Path, run_id: i64, raw: &str) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
     } else {
-        data_dir.join("test-runs").join(run_id.to_string()).join(path)
+        data_dir
+            .join("test-runs")
+            .join(run_id.to_string())
+            .join(path)
     }
 }
 
@@ -331,11 +343,7 @@ pub fn list_artifacts(state: &AppState, run_id: i64) -> Result<Vec<ArtifactEntry
 }
 
 /// 把附件复制到用户选择的位置（下载）
-pub fn export_artifact(
-    state: &AppState,
-    artifact_id: i64,
-    target: &str,
-) -> Result<(), String> {
+pub fn export_artifact(state: &AppState, artifact_id: i64, target: &str) -> Result<(), String> {
     let conn = state.pool.get().map_err(err)?;
     let (run_id, path): (i64, String) = conn
         .query_row(
@@ -443,15 +451,14 @@ fn escape_xml(text: &str) -> String {
 
 fn snapshot_value(raw: Option<&str>) -> Value {
     match raw.map(str::trim).filter(|text| !text.is_empty()) {
-        Some(text) => serde_json::from_str::<Value>(text).unwrap_or_else(|_| Value::String(text.to_string())),
+        Some(text) => {
+            serde_json::from_str::<Value>(text).unwrap_or_else(|_| Value::String(text.to_string()))
+        }
         None => Value::Null,
     }
 }
 
-fn assertions_for<'a>(
-    detail: &'a RunDetail,
-    case: &TestRunCase,
-) -> Vec<&'a TestRunAssertion> {
+fn assertions_for<'a>(detail: &'a RunDetail, case: &TestRunCase) -> Vec<&'a TestRunAssertion> {
     detail
         .assertions
         .iter()
@@ -459,7 +466,10 @@ fn assertions_for<'a>(
         .collect()
 }
 
-fn case_artifacts<'a>(artifacts: &'a [ArtifactEntry], case: &TestRunCase) -> Vec<&'a ArtifactEntry> {
+fn case_artifacts<'a>(
+    artifacts: &'a [ArtifactEntry],
+    case: &TestRunCase,
+) -> Vec<&'a ArtifactEntry> {
     artifacts
         .iter()
         .filter(|item| item.run_case_id == Some(case.id))
@@ -522,7 +532,11 @@ fn render_json(
                 })
                 .collect();
             let mut python = Map::new();
-            if let Some(version) = case.python_version.as_deref().filter(|text| !text.is_empty()) {
+            if let Some(version) = case
+                .python_version
+                .as_deref()
+                .filter(|text| !text.is_empty())
+            {
                 python.insert("version".into(), Value::String(version.to_string()));
             }
             if let Some(hash) = case.script_hash.as_deref().filter(|text| !text.is_empty()) {
@@ -626,12 +640,7 @@ fn render_summary(detail: &RunDetail, suite_name: &str) -> String {
     let _ = writeln!(out, "套件：{suite_name}");
     let _ = writeln!(out, "环境：{}", run.env_name.as_deref().unwrap_or("-"));
     let _ = writeln!(out, "触发：{}", run.trigger);
-    let _ = writeln!(
-        out,
-        "状态：{}（{}）",
-        run.status,
-        status_label(&run.status)
-    );
+    let _ = writeln!(out, "状态：{}（{}）", run.status, status_label(&run.status));
     let _ = writeln!(
         out,
         "时间：{} ~ {}",
@@ -644,10 +653,7 @@ fn render_summary(detail: &RunDetail, suite_name: &str) -> String {
         "用例：共 {}，通过 {}，失败 {}，跳过 {}，错误 {}",
         run.total, run.passed, run.failed, run.skipped, run.errored
     );
-    let _ = writeln!(
-        out,
-        "断言：共 {total_assertions}，失败 {failed_assertions}"
-    );
+    let _ = writeln!(out, "断言：共 {total_assertions}，失败 {failed_assertions}");
     if let Some(version) = run.python_version.as_deref() {
         let _ = writeln!(out, "Python：{version}");
     }
@@ -743,11 +749,7 @@ fn render_junit(detail: &RunDetail, suite_name: &str) -> String {
             "passed" => {}
             "skipped" => {
                 let message = case.error.as_deref().unwrap_or("已跳过");
-                let _ = writeln!(
-                    out,
-                    "      <skipped message=\"{}\"/>",
-                    escape_xml(message)
-                );
+                let _ = writeln!(out, "      <skipped message=\"{}\"/>", escape_xml(message));
             }
             "error" => {
                 let message = case.error.as_deref().unwrap_or("执行错误");
@@ -792,11 +794,7 @@ fn render_junit(detail: &RunDetail, suite_name: &str) -> String {
             }
         }
         if let Some(logs) = case.logs.as_deref().filter(|text| !text.trim().is_empty()) {
-            let _ = writeln!(
-                out,
-                "      <system-out>{}</system-out>",
-                escape_xml(logs)
-            );
+            let _ = writeln!(out, "      <system-out>{}</system-out>", escape_xml(logs));
         }
         out.push_str("    </testcase>\n");
     }
@@ -941,10 +939,22 @@ fn render_html(
         ("失败", run.failed.to_string(), "fail"),
         ("跳过", run.skipped.to_string(), ""),
         ("错误", run.errored.to_string(), "err"),
-        ("通过率", format!("{pass_rate:.1}%"), if run.failed + run.errored > 0 { "fail" } else { "ok" }),
+        (
+            "通过率",
+            format!("{pass_rate:.1}%"),
+            if run.failed + run.errored > 0 {
+                "fail"
+            } else {
+                "ok"
+            },
+        ),
         (
             "断言",
-            format!("{}/{}", total_assertions - failed_assertions, total_assertions),
+            format!(
+                "{}/{}",
+                total_assertions - failed_assertions,
+                total_assertions
+            ),
             if failed_assertions > 0 { "fail" } else { "" },
         ),
         ("总耗时", fmt_duration(run.duration_ms), ""),
@@ -976,16 +986,8 @@ fn render_html(
         "<div>解释器：<b>{}</b></div>",
         escape_html(python_path(run).as_deref().unwrap_or("-"))
     );
-    let _ = writeln!(
-        out,
-        "<div>开始：<b>{}</b></div>",
-        fmt_time(run.started_at)
-    );
-    let _ = writeln!(
-        out,
-        "<div>结束：<b>{}</b></div>",
-        fmt_time(run.finished_at)
-    );
+    let _ = writeln!(out, "<div>开始：<b>{}</b></div>", fmt_time(run.started_at));
+    let _ = writeln!(out, "<div>结束：<b>{}</b></div>", fmt_time(run.finished_at));
     out.push_str("</section>\n");
 
     // 失败聚焦
@@ -1010,7 +1012,11 @@ fn render_html(
                 escape_html(&case.name)
             );
             if let Some(error) = case.error.as_deref().filter(|text| !text.trim().is_empty()) {
-                let _ = writeln!(out, "<p class=\"err\">{}</p>", escape_html(&clip(error, 1200)));
+                let _ = writeln!(
+                    out,
+                    "<p class=\"err\">{}</p>",
+                    escape_html(&clip(error, 1200))
+                );
             }
             let failed: Vec<&TestRunAssertion> = assertions_for(detail, case)
                 .into_iter()
@@ -1049,7 +1055,11 @@ fn render_html(
     out.push_str("<div class=\"filters\">\n");
     out.push_str("<button data-filter=\"all\" class=\"active\">全部</button>\n");
     for status in ["passed", "failed", "error", "skipped"] {
-        let count = detail.cases.iter().filter(|case| case.status == status).count();
+        let count = detail
+            .cases
+            .iter()
+            .filter(|case| case.status == status)
+            .count();
         if count == 0 {
             continue;
         }
@@ -1111,14 +1121,22 @@ fn render_html(
             }
             out.push_str("</tbody></table>\n");
         }
-        if let Some(request) = case.request_snapshot.as_deref().filter(|text| !text.trim().is_empty()) {
+        if let Some(request) = case
+            .request_snapshot
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+        {
             let _ = writeln!(
                 out,
                 "<h4>请求</h4><pre>{}</pre>",
                 escape_html(&clip(request, 4000))
             );
         }
-        if let Some(response) = case.response_snapshot.as_deref().filter(|text| !text.trim().is_empty()) {
+        if let Some(response) = case
+            .response_snapshot
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+        {
             let _ = writeln!(
                 out,
                 "<h4>响应</h4><pre>{}</pre>",
@@ -1146,7 +1164,11 @@ fn render_html(
             }
             out.push_str("</ul>\n");
         }
-        if let Some(version) = case.python_version.as_deref().filter(|text| !text.is_empty()) {
+        if let Some(version) = case
+            .python_version
+            .as_deref()
+            .filter(|text| !text.is_empty())
+        {
             let _ = writeln!(
                 out,
                 "<h4>Python</h4><div>版本 {} · 脚本 {}</div>",
@@ -1172,10 +1194,7 @@ fn render_html(
                     item.error_rate
                 );
             }
-            let _ = write!(
-                out,
-                "<div>压测报告 #{report_id}，可在报告页查看详情</div>"
-            );
+            let _ = write!(out, "<div>压测报告 #{report_id}，可在报告页查看详情</div>");
         }
         out.push_str("</div>\n</details>\n");
     }
@@ -1194,7 +1213,11 @@ fn render_html(
                 "<li><a href=\"files/{}\" target=\"_blank\">{}</a>{}</li>",
                 escape_html(&artifact_href(item)),
                 escape_html(&item.name),
-                if item.exists { String::new() } else { "（原文件已丢失）".to_string() }
+                if item.exists {
+                    String::new()
+                } else {
+                    "（原文件已丢失）".to_string()
+                }
             );
         }
         out.push_str("</ul></section>\n");
@@ -1247,9 +1270,7 @@ pub fn prune_reports(
             data_dir.join(report_dir)
         };
         let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(
-            data_dir.join("test-runs").join(run_id.to_string()),
-        );
+        let _ = std::fs::remove_dir_all(data_dir.join("test-runs").join(run_id.to_string()));
         conn.execute(
             "UPDATE test_runs SET report_dir = NULL WHERE id = ?1",
             params![run_id],

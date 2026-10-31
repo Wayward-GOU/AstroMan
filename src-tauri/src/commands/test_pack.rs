@@ -286,7 +286,9 @@ fn collect_scripts(suite: &serde_json::Map<String, Value>, pack: &Value) -> Vec<
     }
     if let Some(cases) = pack.get("cases").and_then(Value::as_array) {
         for (index, item) in cases.iter().enumerate() {
-            let Some(map) = item.as_object() else { continue };
+            let Some(map) = item.as_object() else {
+                continue;
+            };
             let name = text_field(map, "name").unwrap_or_else(|| format!("#{}", index + 1));
             for key in ["preScript", "postScript", "mainScript"] {
                 if text_field(map, key).is_some_and(|text| !text.trim().is_empty()) {
@@ -331,8 +333,12 @@ fn insert_pack(
     let mut dataset_ids: HashMap<String, i64> = HashMap::new();
     if let Some(items) = pack.get("datasets").and_then(Value::as_array) {
         for item in items {
-            let Some(map) = item.as_object() else { continue };
-            let Some(dataset_name) = text_field(map, "name") else { continue };
+            let Some(map) = item.as_object() else {
+                continue;
+            };
+            let Some(dataset_name) = text_field(map, "name") else {
+                continue;
+            };
             let format = text_field(map, "format").unwrap_or_else(|| "json".into());
             let inline = map.get("inline").filter(|value| value.is_array());
             let content = inline
@@ -366,21 +372,28 @@ fn insert_pack(
     let mut order: i64 = 0;
     if let Some(cases) = pack.get("cases").and_then(Value::as_array) {
         for item in cases {
-            let Some(map) = item.as_object() else { continue };
+            let Some(map) = item.as_object() else {
+                continue;
+            };
             order += 1;
             let case_name = text_field(map, "name").unwrap_or_else(|| format!("用例 {order}"));
             let kind = text_field(map, "kind").unwrap_or_else(|| "request".into());
             let request_id = if kind == "request" {
                 match map.get("request").and_then(Value::as_object) {
-                    Some(request) => {
-                        Some(insert_snapshot_request(conn, collection_id, &case_name, request, order)?)
-                    }
+                    Some(request) => Some(insert_snapshot_request(
+                        conn,
+                        collection_id,
+                        &case_name,
+                        request,
+                        order,
+                    )?),
                     None => None,
                 }
             } else {
                 None
             };
-            let dataset_id = text_field(map, "dataset").and_then(|key| dataset_ids.get(&key).copied());
+            let dataset_id =
+                text_field(map, "dataset").and_then(|key| dataset_ids.get(&key).copied());
             conn.execute(
                 "INSERT INTO test_cases
                     (suite_id, name, kind, request_id, dataset_id, depends_on, sort_order, enabled,
@@ -398,17 +411,29 @@ fn insert_pack(
                     string_list(map.get("dependsOn")),
                     order,
                     map.get("enabled").and_then(Value::as_bool).unwrap_or(true) as i64,
-                    map.get("timeoutMs").and_then(Value::as_i64).unwrap_or(30_000),
+                    map.get("timeoutMs")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(30_000),
                     map.get("retries").and_then(Value::as_i64).unwrap_or(0),
-                    map.get("retryOnFailure").and_then(Value::as_bool).unwrap_or(false) as i64,
-                    map.get("continueOnFailure").and_then(Value::as_bool).unwrap_or(false) as i64,
+                    map.get("retryOnFailure")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false) as i64,
+                    map.get("continueOnFailure")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false) as i64,
                     string_list(map.get("tags")),
-                    map.get("variables").filter(|value| !value.is_null()).map(Value::to_string),
-                    map.get("assertions").filter(|value| !value.is_null()).map(Value::to_string),
+                    map.get("variables")
+                        .filter(|value| !value.is_null())
+                        .map(Value::to_string),
+                    map.get("assertions")
+                        .filter(|value| !value.is_null())
+                        .map(Value::to_string),
                     text_field(map, "preScript"),
                     text_field(map, "postScript"),
                     text_field(map, "mainScript"),
-                    map.get("stress").filter(|value| !value.is_null()).map(Value::to_string),
+                    map.get("stress")
+                        .filter(|value| !value.is_null())
+                        .map(Value::to_string),
                     now
                 ],
             )
@@ -436,8 +461,7 @@ pub fn import_pack(
     if !Path::new(path).is_file() {
         return Err(format!("套件包不存在：{path}"));
     }
-    let text =
-        std::fs::read_to_string(path).map_err(|error| format!("读取套件包失败：{error}"))?;
+    let text = std::fs::read_to_string(path).map_err(|error| format!("读取套件包失败：{error}"))?;
     let pack: Value =
         serde_json::from_str(&text).map_err(|error| format!("套件包不是合法 JSON：{error}"))?;
     let suite = pack
@@ -581,8 +605,8 @@ mod tests {
 
         let path = root.join("order.astromantest.json");
         std::fs::write(&path, serde_json::to_string_pretty(&pack).unwrap()).unwrap();
-        let imported = import_pack(&state, path.to_str().unwrap(), Some(project_id), "rename")
-            .unwrap();
+        let imported =
+            import_pack(&state, path.to_str().unwrap(), Some(project_id), "rename").unwrap();
         assert_ne!(imported, suite_id);
 
         let conn = state.pool.get().unwrap();

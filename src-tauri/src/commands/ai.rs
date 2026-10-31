@@ -1,13 +1,8 @@
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use aes_gcm::aead::{Aead, KeyInit};
-use aes_gcm::{Aes256Gcm, Nonce};
-use base64::engine::general_purpose::STANDARD;
-use base64::Engine as _;
 use futures_util::StreamExt;
 use rusqlite::{params, Row};
-use sha2::{Digest, Sha256};
 use tauri::ipc::Channel;
 use tauri::State;
 
@@ -20,52 +15,31 @@ use crate::prompts::HANGZAI_SYSTEM_PROMPT;
 use crate::state::AppState;
 use crate::util::{err, now_ms};
 
-/// 派生 AES-256 密钥的固定种子。
-/// 属于「本机静态混淆」级别：能防止直接打开库文件看到明文 Key，但拿到程序本身仍可解出。
-/// 不引入系统钥匙串，保证 Windows / macOS 行为一致。
-const KEY_SEED: &str = "AstroMan::ai::provider::v1";
+/// AI Key 一律走主密钥加密（`enc:v1:` + AAD 绑定 `ai_providers:api_key`），
+/// 与 v1.0.7 的 `v1:` 静态混淆格式保持向后兼容（见 `secret::legacy_ai_decrypt`）。
 const CIPHER_PREFIX: &str = "v1:";
 /// AI 请求整体超时，长回答（尤其推理模型）留足时间
 const AI_TIMEOUT_SECS: u64 = 300;
-
-fn cipher() -> Aes256Gcm {
-    let mut hasher = Sha256::new();
-    hasher.update(KEY_SEED.as_bytes());
-    let key = hasher.finalize();
-    Aes256Gcm::new_from_slice(&key).expect("SHA-256 输出固定 32 字节")
-}
 
 fn encrypt_key(plain: &str) -> Result<String, String> {
     if plain.is_empty() {
         return Ok(String::new());
     }
-    // 12 字节随机 nonce 取自 UUID v4，避免引入 rand 依赖
-    let raw = uuid::Uuid::new_v4().into_bytes();
-    let nonce_bytes = &raw[..12];
-    let ciphertext = cipher()
-        .encrypt(Nonce::from_slice(nonce_bytes), plain.as_bytes())
-        .map_err(|_| "API Key 加密失败".to_string())?;
-    let mut packed = nonce_bytes.to_vec();
-    packed.extend_from_slice(&ciphertext);
-    Ok(format!("{CIPHER_PREFIX}{}", STANDARD.encode(packed)))
+    crate::secret::encrypt(crate::secret::AAD_AI, plain)
 }
 
 fn decrypt_key(stored: &str) -> String {
-    let Some(body) = stored.strip_prefix(CIPHER_PREFIX) else {
-        // 兼容历史上以明文写入的旧行
-        return stored.to_string();
-    };
-    let Ok(packed) = STANDARD.decode(body) else {
-        return String::new();
-    };
-    if packed.len() <= 12 {
+    if stored.is_empty() {
         return String::new();
     }
-    let (nonce_bytes, ciphertext) = packed.split_at(12);
-    match cipher().decrypt(Nonce::from_slice(nonce_bytes), ciphertext) {
-        Ok(plain) => String::from_utf8(plain).unwrap_or_default(),
-        Err(_) => String::new(),
+    if stored.starts_with(crate::secret::ENC_PREFIX) {
+        return crate::secret::decrypt(crate::secret::AAD_AI, stored);
     }
+    // v1:<b64> 是 v1.0.7 的静态混淆格式；其它形态按历史明文处理
+    if stored.starts_with(CIPHER_PREFIX) {
+        return crate::secret::legacy_ai_decrypt(stored);
+    }
+    stored.to_string()
 }
 
 /// 列表回显用掩码：只留前 4 位与后 2 位，短 Key 全掩码
@@ -324,11 +298,7 @@ fn prepare(
     let base = if provider.base_url.trim().is_empty() {
         default_base(&provider.kind).to_string()
     } else {
-        provider
-            .base_url
-            .trim()
-            .trim_end_matches('/')
-            .to_string()
+        provider.base_url.trim().trim_end_matches('/').to_string()
     };
     let key = provider.api_key.trim();
 
@@ -474,7 +444,11 @@ fn humanize_api_error(status: u16, message: &str) -> String {
         let rest_lower = rest.to_ascii_lowercase();
         let (supported, passed) = match rest_lower.find("but you passed") {
             Some(split) => (
-                rest[..split].trim().trim_end_matches(',').trim().to_string(),
+                rest[..split]
+                    .trim()
+                    .trim_end_matches(',')
+                    .trim()
+                    .to_string(),
                 rest[split + "but you passed".len()..]
                     .trim()
                     .trim_end_matches('.')
@@ -535,7 +509,8 @@ fn humanize_api_error(status: u16, message: &str) -> String {
         || lower.contains("context_length_exceeded")
         || lower.contains("too many tokens")
     {
-        return "内容超出模型上下文长度上限，请精简问题、减少附件，或改用上下文更大的模型。".to_string();
+        return "内容超出模型上下文长度上限，请精简问题、减少附件，或改用上下文更大的模型。"
+            .to_string();
     }
     if status >= 500 {
         return format!("服务商暂时不可用（HTTP {status}），请稍后重试。");
@@ -630,22 +605,24 @@ fn usage_of(kind: &str, json: &serde_json::Value) -> Option<(i64, i64)> {
     match kind {
         "anthropic" => match json.get("type").and_then(|t| t.as_str()).unwrap_or("") {
             "message_start" => pair(
-                json.get("message").and_then(|m| m.get("usage")).and_then(|u| u.get("input_tokens")),
-                json.get("message").and_then(|m| m.get("usage")).and_then(|u| u.get("output_tokens")),
+                json.get("message")
+                    .and_then(|m| m.get("usage"))
+                    .and_then(|u| u.get("input_tokens")),
+                json.get("message")
+                    .and_then(|m| m.get("usage"))
+                    .and_then(|u| u.get("output_tokens")),
             ),
-            "message_delta" => pair(
-                None,
-                json.get("usage").and_then(|u| u.get("output_tokens")),
-            ),
+            "message_delta" => pair(None, json.get("usage").and_then(|u| u.get("output_tokens"))),
             _ => None,
         },
-        "gemini" => json.get("usageMetadata").and_then(|u| {
-            pair(u.get("promptTokenCount"), u.get("candidatesTokenCount"))
-        }),
+        "gemini" => json
+            .get("usageMetadata")
+            .and_then(|u| pair(u.get("promptTokenCount"), u.get("candidatesTokenCount"))),
         _ => json.get("usage").and_then(|u| {
             pair(
                 u.get("prompt_tokens").or_else(|| u.get("input_tokens")),
-                u.get("completion_tokens").or_else(|| u.get("output_tokens")),
+                u.get("completion_tokens")
+                    .or_else(|| u.get("output_tokens")),
             )
         }),
     }
@@ -728,7 +705,10 @@ fn parse_sse(kind: &str, line: &str) -> Result<SseOutcome, String> {
                     .map(|parts| {
                         parts
                             .iter()
-                            .filter(|p| (p.get("thought").and_then(|t| t.as_bool()) == Some(true)) == thought)
+                            .filter(|p| {
+                                (p.get("thought").and_then(|t| t.as_bool()) == Some(true))
+                                    == thought
+                            })
                             .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
                             .collect::<Vec<_>>()
                             .join("")
@@ -898,9 +878,7 @@ pub async fn ai_chat(
 
     // 停止生成：requestId 登记后，前端可随时调用 ai_chat_cancel 置位
     let request_id = payload.request_id.clone();
-    let cancel = request_id
-        .as_deref()
-        .map(|id| state.ai_register(id));
+    let cancel = request_id.as_deref().map(|id| state.ai_register(id));
     let is_cancelled = || -> bool {
         cancel
             .as_ref()
@@ -915,7 +893,9 @@ pub async fn ai_chat(
     // 航仔 的系统提示词由后端统一注入（编译期嵌入），客户端无法覆盖或移除；
     // 前端追加的 system 消息只承载工具协议，排在其后。
     let mut messages = payload.messages.clone();
-    messages.retain(|message| message.role != "system" || message.content.trim() != HANGZAI_SYSTEM_PROMPT.trim());
+    messages.retain(|message| {
+        message.role != "system" || message.content.trim() != HANGZAI_SYSTEM_PROMPT.trim()
+    });
     messages.insert(
         0,
         AiMessage {
@@ -956,66 +936,71 @@ pub async fn ai_chat(
     // 首 delta 之前允许自动重试（429 / 5xx / 网络错误），最多 2 次；
     // 一旦给用户吐出内容就不再静默重试，否则会出现半句话后整段重来
     let mut attempt = 0u32;
-    let response = loop {
-        attempt += 1;
-        let attempt_request = request
-            .try_clone()
-            .ok_or_else(|| "请求体无法复用，已停止重试".to_string())?;
-        match attempt_request.send().await {
-            Ok(response) => {
-                let status = response.status();
-                let retryable = status.as_u16() == 429 || status.is_server_error();
-                if retryable && attempt <= 2 {
-                    let wait = retry_after_secs(response.headers())
-                        .unwrap_or(if attempt == 1 { 1 } else { 3 });
-                    emit(
-                        &on_event,
-                        "retry",
-                        format!(
-                            "服务{}，{wait} 秒后重试（{attempt}/2）",
-                            if status.as_u16() == 429 { "限流" } else { "繁忙" }
-                        ),
-                    );
-                    tokio::time::sleep(Duration::from_secs(wait)).await;
-                    if is_cancelled() {
-                        emit(&on_event, "cancelled", "");
-                        return Ok(());
+    let response =
+        loop {
+            attempt += 1;
+            let attempt_request = request
+                .try_clone()
+                .ok_or_else(|| "请求体无法复用，已停止重试".to_string())?;
+            match attempt_request.send().await {
+                Ok(response) => {
+                    let status = response.status();
+                    let retryable = status.as_u16() == 429 || status.is_server_error();
+                    if retryable && attempt <= 2 {
+                        let wait = retry_after_secs(response.headers())
+                            .unwrap_or(if attempt == 1 { 1 } else { 3 });
+                        emit(
+                            &on_event,
+                            "retry",
+                            format!(
+                                "服务{}，{wait} 秒后重试（{attempt}/2）",
+                                if status.as_u16() == 429 {
+                                    "限流"
+                                } else {
+                                    "繁忙"
+                                }
+                            ),
+                        );
+                        tokio::time::sleep(Duration::from_secs(wait)).await;
+                        if is_cancelled() {
+                            emit(&on_event, "cancelled", "");
+                            return Ok(());
+                        }
+                        continue;
                     }
-                    continue;
+                    break response;
                 }
-                break response;
-            }
-            Err(error) => {
-                if attempt <= 2 {
-                    let wait = if attempt == 1 { 1 } else { 3 };
-                    emit(
-                        &on_event,
-                        "retry",
-                        format!("网络异常，{wait} 秒后重试（{attempt}/2）"),
-                    );
-                    tokio::time::sleep(Duration::from_secs(wait)).await;
-                    if is_cancelled() {
-                        emit(&on_event, "cancelled", "");
-                        return Ok(());
+                Err(error) => {
+                    if attempt <= 2 {
+                        let wait = if attempt == 1 { 1 } else { 3 };
+                        emit(
+                            &on_event,
+                            "retry",
+                            format!("网络异常，{wait} 秒后重试（{attempt}/2）"),
+                        );
+                        tokio::time::sleep(Duration::from_secs(wait)).await;
+                        if is_cancelled() {
+                            emit(&on_event, "cancelled", "");
+                            return Ok(());
+                        }
+                        continue;
                     }
-                    continue;
+                    let text = humanize_network_error(&error.to_string());
+                    emit(&on_event, "error", text.clone());
+                    record_usage(
+                        state.inner(),
+                        &provider,
+                        prompt_chars,
+                        0,
+                        false,
+                        started.elapsed().as_millis() as i64,
+                        Some(&text),
+                        &preview,
+                    );
+                    return Err(text);
                 }
-                let text = humanize_network_error(&error.to_string());
-                emit(&on_event, "error", text.clone());
-                record_usage(
-                    state.inner(),
-                    &provider,
-                    prompt_chars,
-                    0,
-                    false,
-                    started.elapsed().as_millis() as i64,
-                    Some(&text),
-                    &preview,
-                );
-                return Err(text);
             }
-        }
-    };
+        };
 
     let status = response.status();
     if !status.is_success() {
@@ -1053,13 +1038,20 @@ pub async fn ai_chat(
             emit(&on_event, "cancelled", "");
             return Ok(());
         }
-        let (prompt, completion) = usage_of(&provider.kind, &serde_json::from_str(&raw).unwrap_or_default())
-            .unwrap_or((prompt_chars, 0));
+        let (prompt, completion) = usage_of(
+            &provider.kind,
+            &serde_json::from_str(&raw).unwrap_or_default(),
+        )
+        .unwrap_or((prompt_chars, 0));
         return match parse_full_text(&provider.kind, &raw) {
             Ok(text) => {
                 emit(&on_event, "delta", &text);
                 emit(&on_event, "done", "");
-                let completion = if completion > 0 { completion } else { estimate_tokens(&text) };
+                let completion = if completion > 0 {
+                    completion
+                } else {
+                    estimate_tokens(&text)
+                };
                 record_usage(
                     state.inner(),
                     &provider,
@@ -1202,7 +1194,11 @@ pub async fn ai_provider_test(state: State<'_, AppState>, id: i64) -> Result<Str
     let status = response.status();
     let raw = response.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(format!("返回 {}：{}", status.as_u16(), extract_api_error(&raw)));
+        return Err(format!(
+            "返回 {}：{}",
+            status.as_u16(),
+            extract_api_error(&raw)
+        ));
     }
     let text = parse_full_text(&provider.kind, &raw)?;
     let text = text.trim();
@@ -1223,11 +1219,7 @@ pub async fn ai_models_list(
     let base = if provider.base_url.trim().is_empty() {
         default_base(&provider.kind).to_string()
     } else {
-        provider
-            .base_url
-            .trim()
-            .trim_end_matches('/')
-            .to_string()
+        provider.base_url.trim().trim_end_matches('/').to_string()
     };
     let key = provider.api_key.trim();
     let client = state.client(false);
@@ -1241,7 +1233,9 @@ pub async fn ai_models_list(
         ),
         "gemini" => (
             format!("{base}/v1beta/models"),
-            client.get(format!("{base}/v1beta/models")).header("x-goog-api-key", key),
+            client
+                .get(format!("{base}/v1beta/models"))
+                .header("x-goog-api-key", key),
         ),
         _ => (
             format!("{base}/models"),
@@ -1416,11 +1410,7 @@ pub fn ai_session_create(
 }
 
 #[tauri::command]
-pub fn ai_session_rename(
-    state: State<'_, AppState>,
-    id: i64,
-    title: String,
-) -> Result<(), String> {
+pub fn ai_session_rename(state: State<'_, AppState>, id: i64, title: String) -> Result<(), String> {
     if title.trim().is_empty() {
         return Err("标题不能为空".to_string());
     }
@@ -1439,8 +1429,11 @@ pub fn ai_session_delete(state: State<'_, AppState>, id: i64) -> Result<(), Stri
     let tx = conn.transaction().map_err(err)?;
     tx.execute("DELETE FROM ai_messages WHERE session_id = ?1", params![id])
         .map_err(err)?;
-    tx.execute("DELETE FROM ai_tool_logs WHERE session_id = ?1", params![id])
-        .map_err(err)?;
+    tx.execute(
+        "DELETE FROM ai_tool_logs WHERE session_id = ?1",
+        params![id],
+    )
+    .map_err(err)?;
     tx.execute("DELETE FROM ai_sessions WHERE id = ?1", params![id])
         .map_err(err)?;
     tx.commit().map_err(err)?;
@@ -1572,8 +1565,11 @@ pub fn ai_message_add(
 #[tauri::command]
 pub fn ai_message_clear(state: State<'_, AppState>, session_id: i64) -> Result<(), String> {
     let conn = state.pool.get().map_err(err)?;
-    conn.execute("DELETE FROM ai_messages WHERE session_id = ?1", params![session_id])
-        .map_err(err)?;
+    conn.execute(
+        "DELETE FROM ai_messages WHERE session_id = ?1",
+        params![session_id],
+    )
+    .map_err(err)?;
     Ok(())
 }
 
@@ -1588,9 +1584,7 @@ pub fn ai_message_delete_from(
     let conn = state.pool.get().map_err(err)?;
     let compare = if inclusive.unwrap_or(true) { ">=" } else { ">" };
     conn.execute(
-        &format!(
-            "DELETE FROM ai_messages WHERE session_id = ?1 AND created_at {compare} ?2"
-        ),
+        &format!("DELETE FROM ai_messages WHERE session_id = ?1 AND created_at {compare} ?2"),
         params![session_id, created_at],
     )
     .map_err(err)?;
@@ -1623,6 +1617,8 @@ fn purge_old_tool_logs(conn: &rusqlite::Connection) {
     );
 }
 
+// 参数与前端表单一一对应，拆成结构体会让 tauri 命令的调用约定变形
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub fn ai_tool_log_add(
     state: State<'_, AppState>,
@@ -1677,7 +1673,9 @@ pub fn ai_tool_log_list(
     let offset = (page - 1) * page_size;
     let tool = tool.unwrap_or_default();
     let ok_filter = ok.map(|value| value as i64);
-    let days = days.unwrap_or(TOOL_LOG_RETENTION_DAYS).clamp(1, TOOL_LOG_RETENTION_DAYS);
+    let days = days
+        .unwrap_or(TOOL_LOG_RETENTION_DAYS)
+        .clamp(1, TOOL_LOG_RETENTION_DAYS);
     let since = now_ms() - days * DAY_MS;
 
     let total: i64 = conn
@@ -1920,7 +1918,15 @@ pub fn ai_usage_stats(
                     COALESCE(CAST(AVG(latency_ms) AS INTEGER), 0)
              FROM ai_usage_logs WHERE created_at >= ?1",
             params![since],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .map_err(err)?;
 
@@ -2073,6 +2079,7 @@ mod tests {
 
     #[test]
     fn encrypt_decrypt_roundtrip() {
+        crate::secret::install_for_test();
         let plain = "sk-test-不会出现在明文里的密钥";
         let packed = encrypt_key(plain).expect("encrypt");
         assert_ne!(packed, plain);
@@ -2163,10 +2170,16 @@ mod tests {
     #[test]
     fn parse_sse_openai_text_and_done() {
         let line = r#"data: {"choices":[{"delta":{"content":"你好"}}]}"#;
-        assert_eq!(parse_sse("openai", line), Ok(SseOutcome::Text("你好".into())));
+        assert_eq!(
+            parse_sse("openai", line),
+            Ok(SseOutcome::Text("你好".into()))
+        );
         assert_eq!(parse_sse("openai", "data: [DONE]"), Ok(SseOutcome::Done));
         assert_eq!(parse_sse("openai", "event: ping"), Ok(SseOutcome::Ignore));
-        assert_eq!(parse_sse("openai", "data: not-json"), Ok(SseOutcome::Ignore));
+        assert_eq!(
+            parse_sse("openai", "data: not-json"),
+            Ok(SseOutcome::Ignore)
+        );
         let reasoning = r#"data: {"choices":[{"delta":{"reasoning_content":"思考"}}]}"#;
         assert_eq!(
             parse_sse("openai", reasoning),
@@ -2177,7 +2190,10 @@ mod tests {
     #[test]
     fn parse_sse_anthropic_and_gemini() {
         let anth = r#"data: {"type":"content_block_delta","delta":{"text":"hi"}}"#;
-        assert_eq!(parse_sse("anthropic", anth), Ok(SseOutcome::Text("hi".into())));
+        assert_eq!(
+            parse_sse("anthropic", anth),
+            Ok(SseOutcome::Text("hi".into()))
+        );
         let thinking = r#"data: {"type":"content_block_delta","delta":{"thinking":"想"}}"#;
         assert_eq!(
             parse_sse("anthropic", thinking),
@@ -2188,7 +2204,10 @@ mod tests {
             Ok(SseOutcome::Done)
         );
         let gemini = r#"data: {"candidates":[{"content":{"parts":[{"text":"哈"}]}}]}"#;
-        assert_eq!(parse_sse("gemini", gemini), Ok(SseOutcome::Text("哈".into())));
+        assert_eq!(
+            parse_sse("gemini", gemini),
+            Ok(SseOutcome::Text("哈".into()))
+        );
         let blocked = r#"data: {"promptFeedback":{"blockReason":"SAFETY"}}"#;
         assert!(parse_sse("gemini", blocked).is_err());
     }
@@ -2196,10 +2215,7 @@ mod tests {
     #[test]
     fn extract_api_error_reads_message_fields() {
         assert_eq!(extract_api_error(""), "服务无响应内容");
-        assert_eq!(
-            extract_api_error(r#"{"error":{"message":"bad"}}"#),
-            "bad"
-        );
+        assert_eq!(extract_api_error(r#"{"error":{"message":"bad"}}"#), "bad");
         assert_eq!(extract_api_error(r#"{"message":"oops"}"#), "oops");
         assert_eq!(extract_api_error("plain text"), "plain text");
     }

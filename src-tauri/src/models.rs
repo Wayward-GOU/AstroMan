@@ -164,6 +164,39 @@ pub struct SendRequestPayload {
     /// 执行来源：manual（默认）/ batch / suite / cli
     #[serde(default)]
     pub origin: Option<String>,
+    /// 前端生成的请求标识，用于「停止」按钮定位在途请求
+    #[serde(default)]
+    pub request_key: Option<String>,
+    /// 协议偏好：auto（默认）/ http1 / http2
+    #[serde(default)]
+    pub protocol: Option<String>,
+    /// 是否跟随重定向；为空时沿用默认（跟随）
+    #[serde(default)]
+    pub follow_redirects: Option<bool>,
+    /// 按请求覆盖连接超时
+    #[serde(default)]
+    pub connect_timeout_ms: Option<u64>,
+    /// 重试配置
+    #[serde(default)]
+    pub retry: Option<RetryConfig>,
+}
+
+/// 幂等重试配置（4.6）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 最多尝试次数（含首次），上限 4
+    #[serde(default = "default_retry_attempts")]
+    pub max_attempts: u32,
+    /// 允许对非幂等方法重试（默认关闭）
+    #[serde(default)]
+    pub allow_non_idempotent: bool,
+}
+
+fn default_retry_attempts() -> u32 {
+    3
 }
 
 /// multipart/form-data 的表单字段
@@ -198,10 +231,82 @@ pub struct HttpResult {
     pub status: u16,
     pub status_text: String,
     pub duration_ms: u64,
+    /// 解压后的正文长度（与 `body_bytes` 保持一致）
     pub size_bytes: usize,
     pub headers: HashMap<String, String>,
     pub body: String,
     pub truncated: bool,
+    pub error: Option<String>,
+    /// text | json | binary | stream（二进制与超大响应落盘）
+    #[serde(default)]
+    pub body_kind: String,
+    /// 落盘后的相对路径（相对数据目录），前端用 `response_file_path` 换成绝对路径
+    #[serde(default)]
+    pub body_file: Option<String>,
+    /// 正文实际字节数（解压后）
+    #[serde(default)]
+    pub body_bytes: u64,
+    /// 压缩态字节数（来自 Content-Length；gzip/br 时与 body_bytes 不同）
+    #[serde(default)]
+    pub raw_bytes: u64,
+    /// 小片段 Base64（图片 / PDF 首页），供 `asset:` 不可用时兜底
+    #[serde(default)]
+    pub preview_base64: Option<String>,
+    /// 耗时分解
+    #[serde(default)]
+    pub timings: Option<RequestTimings>,
+    /// 实际协商到的协议：HTTP/1.1 / HTTP/2
+    #[serde(default)]
+    pub http_version: String,
+    /// 手工跟随的重定向链
+    #[serde(default)]
+    pub redirects: Vec<RedirectHop>,
+    /// 重试记录（含被放弃的尝试）
+    #[serde(default)]
+    pub retries: Vec<RetryAttempt>,
+    /// 因 HTTP/2 被剔除的请求头
+    #[serde(default)]
+    pub ignored_headers: Vec<String>,
+    /// 用户主动取消
+    #[serde(default)]
+    pub cancelled: bool,
+}
+
+/// 耗时分解（口径见技术方案 4.5）
+///
+/// `connectMs` 只统计「新建 TCP（含 TLS）」；复用连接时为 0 且 `reusedConnection = true`，
+/// 不代表「连接极快」。代理场景下不含代理握手，UI 必须标注。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestTimings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dns_ms: Option<f64>,
+    pub connect_ms: f64,
+    pub ttfb_ms: f64,
+    pub download_ms: f64,
+    pub total_ms: f64,
+    pub reused_connection: bool,
+    pub proxy: bool,
+}
+
+/// 重定向链上的一跳
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedirectHop {
+    pub status: u16,
+    pub location: String,
+    pub host: String,
+    pub duration_ms: f64,
+}
+
+/// 一次重试尝试
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryAttempt {
+    pub attempt: u32,
+    pub status: u16,
+    pub delay_ms: u64,
+    #[serde(default)]
     pub error: Option<String>,
 }
 
@@ -224,12 +329,15 @@ pub struct EnvVariable {
     pub id: Option<i64>,
     #[serde(default)]
     pub key: String,
+    /// 敏感值只返回掩码；`has_value` 表示库里确实有值（用于提示「已设置」）
     #[serde(default)]
     pub value: String,
     #[serde(default)]
     pub is_secret: bool,
     #[serde(default)]
     pub sort_order: i64,
+    #[serde(default)]
+    pub has_value: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -246,6 +354,15 @@ pub struct HistoryItem {
     /// 执行来源：manual / batch / suite / cli
     pub origin: String,
     pub created_at: i64,
+    /// 耗时分解（JSON 字符串，前端解析后画瀑布）
+    #[serde(default)]
+    pub timings_json: Option<String>,
+    /// text | json | binary | stream
+    #[serde(default)]
+    pub body_kind: Option<String>,
+    /// 响应文件相对路径（二进制或超大响应）
+    #[serde(default)]
+    pub body_file: Option<String>,
 }
 
 /// 请求历史统计（用于清理前预览数据规模）
@@ -416,6 +533,32 @@ pub struct SlaTargets {
     pub min_rps: Option<f64>,
 }
 
+/// 逐请求明细的采集策略
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RecordDetailMode {
+    /// 每请求都记录明细
+    Full,
+    /// 按比例采样记录
+    Sample,
+    /// 完全不记录明细（同时关闭响应体读取）
+    Off,
+    /// 由引擎按预估/实测 QPS 自动定档，只降不升
+    #[default]
+    Auto,
+}
+
+impl RecordDetailMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            RecordDetailMode::Full => "full",
+            RecordDetailMode::Sample => "sample",
+            RecordDetailMode::Off => "off",
+            RecordDetailMode::Auto => "auto",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StressConfig {
@@ -477,6 +620,9 @@ pub struct StressConfig {
     pub target_rps: Option<f64>,
     #[serde(default)]
     pub sla: Option<SlaTargets>,
+    /// 逐请求明细采集策略，默认 auto
+    #[serde(default)]
+    pub record_detail: RecordDetailMode,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -619,6 +765,10 @@ pub struct ReportDetail {
     pub histogram: Vec<HistogramBucket>,
     pub stages: Vec<StageSummary>,
     pub config: Option<serde_json::Value>,
+    /// 用户可编辑的测试场景描述
+    pub scenario_text: Option<String>,
+    /// 用户可编辑的报告总结
+    pub summary_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -638,7 +788,12 @@ pub struct StressProgress {
     pub stage_index: i64,
     pub active_concurrent: u32,
     pub status_codes: Vec<StatusCount>,
+    /// 本次新增的采样点（增量，非全量）
     pub samples: Vec<ReportSample>,
+    /// 当前生效的明细采集模式：full / sample / off
+    pub record_mode: String,
+    /// 一次性提示（如自动降档），前端 toast 后即丢弃
+    pub notice: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

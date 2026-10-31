@@ -12,6 +12,9 @@ const MAX_RUNS: i64 = 200;
 const MAX_STORED_BODY: usize = 256 * 1024;
 
 /// 发送请求后写入一条运行快照（由 http 命令内部调用）
+///
+/// 参数就是一次请求的完整快照，拆开传反而更容易漏字段。
+#[allow(clippy::too_many_arguments)]
 pub fn record_run(
     pool: &DbPool,
     payload: &SendRequestPayload,

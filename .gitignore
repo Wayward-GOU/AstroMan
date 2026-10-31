@@ -126,3 +126,7 @@ __pycache__/
 
 # Tauri externalBin 构建产物
 src-tauri/binaries/
+
+# cargo-tarpaulin / llvm 覆盖率中间文件
+*.profraw
+*.profdata

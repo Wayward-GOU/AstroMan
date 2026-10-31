@@ -199,7 +199,10 @@ impl Monitor {
 
         let cpus = self.sys.cpus();
         let cores: Vec<f32> = cpus.iter().map(|cpu| cpu.cpu_usage()).collect();
-        let brand = cpus.first().map(|cpu| cpu.brand().to_string()).unwrap_or_default();
+        let brand = cpus
+            .first()
+            .map(|cpu| cpu.brand().to_string())
+            .unwrap_or_default();
         let vendor = cpus
             .first()
             .map(|cpu| cpu.vendor_id().to_string())
@@ -211,10 +214,8 @@ impl Monitor {
             let usage = disk.usage();
             let key = disk.name().to_string_lossy().to_string();
             let (prev_read, prev_write) = self.prev_disk.get(&key).copied().unwrap_or((0, 0));
-            self.prev_disk.insert(
-                key,
-                (usage.total_read_bytes, usage.total_written_bytes),
-            );
+            self.prev_disk
+                .insert(key, (usage.total_read_bytes, usage.total_written_bytes));
             let total = disk.total_space();
             let available = disk.available_space();
             disks.push(DiskInfo {
@@ -228,16 +229,14 @@ impl Monitor {
                 } else {
                     0.0
                 },
-                read_per_sec: ((usage.total_read_bytes.saturating_sub(prev_read)) as f64
-                    / elapsed) as u64,
-                write_per_sec: ((usage
-                    .total_written_bytes
-                    .saturating_sub(prev_write)) as f64
+                read_per_sec: ((usage.total_read_bytes.saturating_sub(prev_read)) as f64 / elapsed)
+                    as u64,
+                write_per_sec: ((usage.total_written_bytes.saturating_sub(prev_write)) as f64
                     / elapsed) as u64,
                 removable: disk.is_removable(),
             });
         }
-        disks.sort_by(|a, b| b.total.cmp(&a.total));
+        disks.sort_by_key(|disk| std::cmp::Reverse(disk.total));
 
         let mut networks = Vec::new();
         let adapters = crate::netinfo::adapters();
@@ -245,8 +244,7 @@ impl Monitor {
             let total_rx = net.total_received();
             let total_tx = net.total_transmitted();
             let (prev_rx, prev_tx) = self.prev_net.get(name).copied().unwrap_or((0, 0));
-            self.prev_net
-                .insert(name.clone(), (total_rx, total_tx));
+            self.prev_net.insert(name.clone(), (total_rx, total_tx));
             let mac = format_mac(&net.mac_address().0);
             let matched = adapters
                 .iter()
@@ -367,11 +365,7 @@ impl Monitor {
         if by_memory {
             list.sort_by(|a, b| b.memory.cmp(&a.memory).then(b.cpu.total_cmp(&a.cpu)));
         } else {
-            list.sort_by(|a, b| {
-                b.cpu
-                    .total_cmp(&a.cpu)
-                    .then(b.memory.cmp(&a.memory))
-            });
+            list.sort_by(|a, b| b.cpu.total_cmp(&a.cpu).then(b.memory.cmp(&a.memory)));
         }
         if let Some(limit) = limit {
             list.truncate(limit.clamp(1, 500));
@@ -388,7 +382,9 @@ impl Monitor {
         self.sys.refresh_processes_specifics(
             ProcessesToUpdate::Some(&[target]),
             true,
-            ProcessRefreshKind::nothing().with_memory().with_exe(UpdateKind::OnlyIfNotSet),
+            ProcessRefreshKind::nothing()
+                .with_memory()
+                .with_exe(UpdateKind::OnlyIfNotSet),
         );
         let process = self
             .sys
@@ -419,7 +415,9 @@ impl Monitor {
             log::info!("已结束进程 {display}");
             Ok(())
         } else {
-            Err(format!("结束 {display} 失败，可能需要管理员权限或进程已受保护"))
+            Err(format!(
+                "结束 {display} 失败，可能需要管理员权限或进程已受保护"
+            ))
         }
     }
 }

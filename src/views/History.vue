@@ -12,7 +12,7 @@ import { useTabsStore } from '@/stores/tabs'
 import { formatDateTime } from '@/utils/datetime'
 import { historyDiagnosePrompt } from '@/utils/aiScenarios'
 import * as api from '@/api'
-import type { CleanupResult, HistoryItem, HistoryStats } from '@/types/models'
+import type { CleanupResult, HistoryItem, HistoryStats, RequestTimings } from '@/types/models'
 
 const router = useRouter()
 const tabs = useTabsStore()
@@ -226,7 +226,50 @@ const columns = [
   { title: 'URL', dataIndex: 'url', key: 'url', ellipsis: true },
   { title: '状态码', dataIndex: 'statusCode', key: 'statusCode', width: 88 },
   { title: '耗时', dataIndex: 'durationMs', key: 'durationMs', width: 96 },
+  { title: '计时', key: 'timing', width: 76 },
 ]
+
+/* ---------- v1.0.8：历史回看耗时分解 ----------
+   记录里存的是 JSON 字符串，解析失败就当没有（旧数据 / 被裁剪过）。 */
+function parseTimings(item: HistoryItem): RequestTimings | null {
+  if (!item.timingsJson) return null
+  try {
+    const parsed = JSON.parse(item.timingsJson) as RequestTimings
+    if (!parsed || typeof parsed.totalMs !== 'number') return null
+    return parsed
+  } catch {
+    return null
+  }
+}
+
+/** 把耗时拆成瀑布条：dns → connect → ttfb → download */
+function timingBars(item: HistoryItem) {
+  const t = parseTimings(item)
+  if (!t) return []
+  const total = Math.max(t.totalMs, 1)
+  const bars: Array<{ key: string; label: string; ms: number; left: number; width: number; color: string }> = []
+  let cursor = 0
+  const push = (key: string, label: string, ms: number, color: string) => {
+    if (!(ms > 0)) return
+    bars.push({ key, label, ms, left: (cursor / total) * 100, width: Math.max((ms / total) * 100, 1), color })
+    cursor += ms
+  }
+  if (t.dnsMs && t.dnsMs > 0) push('dns', 'DNS', t.dnsMs, '#8b5cf6')
+  push('connect', t.reusedConnection ? '连接(复用)' : 'TCP+TLS', t.connectMs, '#0ea5e9')
+  push('ttfb', '首字节', t.ttfbMs, '#f59e0b')
+  push('download', '下载', t.downloadMs, '#10b981')
+  return bars
+}
+
+function timingCaption(item: HistoryItem): string {
+  const t = parseTimings(item)
+  if (!t) return ''
+  const parts = [`总 ${t.totalMs.toFixed(0)} ms`]
+  if (t.reusedConnection) parts.push('复用连接')
+  if (t.proxy) parts.push('经代理')
+  return parts.join(' · ')
+}
+
 </script>
 
 <template>
@@ -334,6 +377,29 @@ const columns = [
             </template>
             <template v-else-if="column.key === 'durationMs'">
               <span class="mono">{{ fmtMs((record as HistoryItem).durationMs) }}</span>
+            </template>
+            <template v-else-if="column.key === 'timing'">
+              <a-popover v-if="parseTimings(record as HistoryItem)" placement="left">
+                <template #content>
+                  <div class="timing-pop">
+                    <div class="timing-pop-title mono">{{ timingCaption(record as HistoryItem) }}</div>
+                    <div class="timing-pop-bars">
+                      <div v-for="bar in timingBars(record as HistoryItem)" :key="bar.key" class="timing-pop-row">
+                        <span class="timing-pop-label">{{ bar.label }}</span>
+                        <div class="timing-pop-track">
+                          <div
+                            class="timing-pop-bar"
+                            :style="{ left: `${bar.left}%`, width: `${bar.width}%`, background: bar.color }"
+                          />
+                        </div>
+                        <span class="timing-pop-ms mono">{{ bar.ms.toFixed(1) }}</span>
+                      </div>
+                    </div>
+                  </div>
+                </template>
+                <a class="timing-link">分解</a>
+              </a-popover>
+              <span v-else class="timing-none">—</span>
             </template>
           </template>
         </a-table>
@@ -577,5 +643,69 @@ const columns = [
   font-size: 11.5px;
   color: var(--fm-muted);
   margin-top: 6px;
+}
+
+/* ---------- v1.0.8：历史回看耗时分解 ---------- */
+.timing-link {
+  font-size: 12px;
+  color: var(--fm-primary, #1677ff);
+  cursor: pointer;
+}
+
+.timing-none {
+  font-size: 12px;
+  color: var(--fm-text-3, #999);
+}
+
+.timing-pop {
+  min-width: 240px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.timing-pop-title {
+  font-size: 11px;
+  color: var(--fm-text-3, #999);
+}
+
+.timing-pop-bars {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.timing-pop-row {
+  display: grid;
+  grid-template-columns: 62px 1fr 46px;
+  align-items: center;
+  gap: 6px;
+}
+
+.timing-pop-label {
+  font-size: 11px;
+  color: var(--fm-text-2, #666);
+  text-align: right;
+}
+
+.timing-pop-track {
+  position: relative;
+  height: 10px;
+  border-radius: 3px;
+  background: rgba(128, 128, 128, 0.14);
+  overflow: hidden;
+}
+
+.timing-pop-bar {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  border-radius: 3px;
+}
+
+.timing-pop-ms {
+  font-size: 10px;
+  color: var(--fm-text-3, #999);
+  text-align: right;
 }
 </style>

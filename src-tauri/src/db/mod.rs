@@ -3,18 +3,62 @@ use crate::util::err;
 
 mod seed;
 
-/// 数据库结构版本（PRAGMA user_version）。新增表走 schema.sql 不算版本，
-/// 只有需要 ALTER 存量表的升级才递增，供 CLI 判断「版本不兼容」。
-pub const DB_VERSION: i64 = 1;
+/// 数据库结构版本（PRAGMA user_version）
+///
+/// 1 = v1.0.7；2 = v1.0.8（耗时分解、响应体类型、按请求网络配置、app_meta）
+pub const DB_VERSION: i64 = 2;
+
+/// 打开库时发现库版本高于本程序：说明用户降级了应用。
+/// 直接返回错误而不是继续写，避免旧代码用旧结构写坏新数据。
+const E_SCHEMA_FUTURE: &str = "E_SCHEMA: 数据库由更高版本的 AstroMan 创建，请升级应用；\
+如已降级，请从「设置 → 数据备份」恢复对应版本的备份";
 
 pub fn init(pool: &DbPool) -> Result<(), String> {
+    {
+        let conn = pool.get().map_err(err)?;
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(err)?;
+        if version > DB_VERSION {
+            return Err(E_SCHEMA_FUTURE.to_string());
+        }
+    }
+
     let conn = pool.get().map_err(err)?;
-    conn.execute_batch(include_str!("schema.sql")).map_err(err)?;
+    conn.execute_batch(include_str!("schema.sql"))
+        .map_err(err)?;
     drop(conn);
 
     migrate(pool)?;
+    verify_core_tables(pool)?;
     recover_interrupted_runs(pool)?;
     seed_database(pool)
+}
+
+/// 关键表存在性校验：缺表说明库损坏或结构被外力改过，交给恢复流程处理
+fn verify_core_tables(pool: &DbPool) -> Result<(), String> {
+    let conn = pool.get().map_err(err)?;
+    let mut missing = Vec::new();
+    for table in ["projects", "collections", "requests", "environments"] {
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            )
+            .map_err(err)?;
+        if exists == 0 {
+            missing.push(table);
+        }
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "E_CORRUPT: 数据库缺少核心表（{}），可能已损坏，请在启动提示中从备份恢复",
+            missing.join("、")
+        ))
+    }
 }
 
 /// 上次异常退出（崩溃 / 强杀）遗留的 queued / running 运行标记为 error，
@@ -30,76 +74,175 @@ fn recover_interrupted_runs(pool: &DbPool) -> Result<(), String> {
     Ok(())
 }
 
-/// 老版本数据库补列：已存在的列会报错，直接忽略
-fn migrate(pool: &DbPool) -> Result<(), String> {
-    let conn = pool.get().map_err(err)?;
-    let statements = [
-        "ALTER TABLE test_reports ADD COLUMN p75_rt REAL DEFAULT 0",
-        "ALTER TABLE test_reports ADD COLUMN p90_rt REAL DEFAULT 0",
-        "ALTER TABLE test_reports ADD COLUMN p999_rt REAL DEFAULT 0",
-        "ALTER TABLE test_reports ADD COLUMN stddev_rt REAL DEFAULT 0",
-        "ALTER TABLE test_reports ADD COLUMN ttfb_avg REAL DEFAULT 0",
-        "ALTER TABLE test_reports ADD COLUMN ttfb_p95 REAL DEFAULT 0",
-        "ALTER TABLE test_reports ADD COLUMN apdex REAL DEFAULT 0",
-        "ALTER TABLE test_reports ADD COLUMN bytes_total INTEGER DEFAULT 0",
-        "ALTER TABLE test_reports ADD COLUMN target_rps REAL DEFAULT 0",
-        "ALTER TABLE test_reports ADD COLUMN config_json TEXT",
-        "ALTER TABLE test_reports ADD COLUMN stages_json TEXT",
-        "ALTER TABLE test_reports ADD COLUMN codes_json TEXT",
-        "ALTER TABLE test_reports ADD COLUMN histogram_json TEXT",
-        "ALTER TABLE test_reports ADD COLUMN error_types_json TEXT",
-        "ALTER TABLE report_samples ADD COLUMN p50_rt REAL DEFAULT 0",
-        "ALTER TABLE report_samples ADD COLUMN ttfb_avg REAL DEFAULT 0",
-        "ALTER TABLE report_samples ADD COLUMN bytes INTEGER DEFAULT 0",
-        "ALTER TABLE report_requests ADD COLUMN body TEXT",
-        "ALTER TABLE report_requests ADD COLUMN params TEXT",
-        "ALTER TABLE report_requests ADD COLUMN req_headers TEXT",
-        "ALTER TABLE report_requests ADD COLUMN res_headers TEXT",
-        "ALTER TABLE report_requests ADD COLUMN res_body TEXT",
-        "ALTER TABLE environments ADD COLUMN script TEXT",
-        "ALTER TABLE requests ADD COLUMN auth TEXT",
-        "ALTER TABLE test_plans ADD COLUMN config_json TEXT",
-        "ALTER TABLE test_plans ADD COLUMN updated_at INTEGER DEFAULT 0",
-        "ALTER TABLE ai_providers ADD COLUMN kind TEXT NOT NULL DEFAULT 'openai'",
-        "ALTER TABLE ai_messages ADD COLUMN reasoning TEXT",
-        "ALTER TABLE ai_usage_logs ADD COLUMN request_preview TEXT",
-        "ALTER TABLE ai_providers ADD COLUMN max_tokens INTEGER DEFAULT 0",
-        "ALTER TABLE ai_providers ADD COLUMN timeout_secs INTEGER DEFAULT 300",
-        "ALTER TABLE ai_sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE ai_sessions ADD COLUMN summary TEXT",
-        "ALTER TABLE ai_sessions ADD COLUMN summary_until INTEGER DEFAULT 0",
-        "ALTER TABLE ai_messages ADD COLUMN token_count INTEGER DEFAULT 0",
-        "ALTER TABLE ai_tool_logs ADD COLUMN round INTEGER DEFAULT 0",
-        "ALTER TABLE ai_tool_logs ADD COLUMN trace_id TEXT",
-        "ALTER TABLE ai_tool_logs ADD COLUMN timeout INTEGER DEFAULT 0",
-        // v1.0.8：执行记录来源（manual | batch | suite | cli），老数据默认手工
-        "ALTER TABLE request_history ADD COLUMN origin TEXT NOT NULL DEFAULT 'manual'",
-        "ALTER TABLE request_runs ADD COLUMN origin TEXT NOT NULL DEFAULT 'manual'",
-    ];
-    for sql in statements {
-        let _ = conn.execute(sql, []);
+/// 存量表补列清单：(表, 列, 列定义)
+///
+/// 改成结构化清单而不是整条 SQL，是为了在执行前先 `PRAGMA table_info` 判存：
+/// 老代码用 `let _ = conn.execute(...)` 吞掉所有错误，真实的「表不存在 / 库只读 /
+/// 磁盘满」也被一并吞掉，用户只会看到功能莫名失效（文档 4.0.3 / 7.2）。
+const COLUMN_MIGRATIONS: &[(&str, &str, &str)] = &[
+    ("test_reports", "p75_rt", "REAL DEFAULT 0"),
+    ("test_reports", "p90_rt", "REAL DEFAULT 0"),
+    ("test_reports", "p999_rt", "REAL DEFAULT 0"),
+    ("test_reports", "stddev_rt", "REAL DEFAULT 0"),
+    ("test_reports", "ttfb_avg", "REAL DEFAULT 0"),
+    ("test_reports", "ttfb_p95", "REAL DEFAULT 0"),
+    ("test_reports", "apdex", "REAL DEFAULT 0"),
+    ("test_reports", "bytes_total", "INTEGER DEFAULT 0"),
+    ("test_reports", "target_rps", "REAL DEFAULT 0"),
+    ("test_reports", "config_json", "TEXT"),
+    ("test_reports", "stages_json", "TEXT"),
+    ("test_reports", "codes_json", "TEXT"),
+    ("test_reports", "histogram_json", "TEXT"),
+    ("test_reports", "error_types_json", "TEXT"),
+    // v1.0.8 压测报告：可编辑的场景描述与总结
+    ("test_reports", "scenario_text", "TEXT"),
+    ("test_reports", "summary_text", "TEXT"),
+    ("report_samples", "p50_rt", "REAL DEFAULT 0"),
+    ("report_samples", "ttfb_avg", "REAL DEFAULT 0"),
+    ("report_samples", "bytes", "INTEGER DEFAULT 0"),
+    ("report_requests", "body", "TEXT"),
+    ("report_requests", "params", "TEXT"),
+    ("report_requests", "req_headers", "TEXT"),
+    ("report_requests", "res_headers", "TEXT"),
+    ("report_requests", "res_body", "TEXT"),
+    ("environments", "script", "TEXT"),
+    ("requests", "auth", "TEXT"),
+    ("test_plans", "config_json", "TEXT"),
+    ("test_plans", "updated_at", "INTEGER DEFAULT 0"),
+    ("ai_providers", "kind", "TEXT NOT NULL DEFAULT 'openai'"),
+    ("ai_messages", "reasoning", "TEXT"),
+    ("ai_usage_logs", "request_preview", "TEXT"),
+    ("ai_providers", "max_tokens", "INTEGER DEFAULT 0"),
+    ("ai_providers", "timeout_secs", "INTEGER DEFAULT 300"),
+    ("ai_sessions", "pinned", "INTEGER NOT NULL DEFAULT 0"),
+    ("ai_sessions", "summary", "TEXT"),
+    ("ai_sessions", "summary_until", "INTEGER DEFAULT 0"),
+    ("ai_messages", "token_count", "INTEGER DEFAULT 0"),
+    ("ai_tool_logs", "round", "INTEGER DEFAULT 0"),
+    ("ai_tool_logs", "trace_id", "TEXT"),
+    ("ai_tool_logs", "timeout", "INTEGER DEFAULT 0"),
+    // v1.0.8：执行记录来源（manual | batch | suite | cli），老数据默认手工
+    (
+        "request_history",
+        "origin",
+        "TEXT NOT NULL DEFAULT 'manual'",
+    ),
+    ("request_runs", "origin", "TEXT NOT NULL DEFAULT 'manual'"),
+    // v1.0.8：耗时分解、响应体类型、按请求网络配置
+    ("request_history", "timings_json", "TEXT"),
+    ("request_history", "body_kind", "TEXT"),
+    ("request_history", "body_file", "TEXT"),
+    ("requests", "net_json", "TEXT"),
+];
+
+fn column_exists(conn: &rusqlite::Connection, table: &str, column: &str) -> Result<bool, String> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(err)?;
+    let mut rows = stmt.query([]).map_err(err)?;
+    while let Some(row) = rows.next().map_err(err)? {
+        let name: String = row.get(1).map_err(err)?;
+        if name.eq_ignore_ascii_case(column) {
+            return Ok(true);
+        }
     }
-    // 依赖 updated_at 的索引必须在补列之后创建，否则老库会在建索引时报「no such column」
+    Ok(false)
+}
+
+/// 判存式补列：只有「列已存在」被忽略，其它错误一律上报
+pub fn add_column_if_missing(
+    conn: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+    ddl: &str,
+) -> Result<bool, String> {
+    if column_exists(conn, table, column)? {
+        return Ok(false);
+    }
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_plans_project ON test_plans(project_id, updated_at DESC)",
+        &format!("ALTER TABLE {table} ADD COLUMN {column} {ddl}"),
         [],
     )
-    .map_err(err)?;
-    conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS idx_history_origin ON request_history(origin, created_at DESC);
-         CREATE INDEX IF NOT EXISTS idx_runs_origin ON request_runs(origin, created_at DESC);",
-    )
-    .map_err(err)?;
+    .map_err(|e| format!("E_SCHEMA: 为 {table} 添加列 {column} 失败：{e}"))?;
+    Ok(true)
+}
 
-    // 库版本号：CLI 与后续迁移据此判断兼容性，只升不降
+/// 老版本数据库补列 + 补索引 + 版本号推进，整体包在一个事务里
+fn migrate(pool: &DbPool) -> Result<(), String> {
+    let conn = pool.get().map_err(err)?;
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(err)?;
-    if version < DB_VERSION {
-        conn.execute_batch(&format!("PRAGMA user_version = {DB_VERSION}"))
-            .map_err(err)?;
+
+    {
+        let tx = conn.unchecked_transaction().map_err(err)?;
+        for (table, column, ddl) in COLUMN_MIGRATIONS {
+            add_column_if_missing(&tx, table, column, ddl)?;
+        }
+        // 依赖 updated_at 的索引必须在补列之后创建，否则老库会在建索引时报「no such column」
+        tx.execute(
+            "CREATE INDEX IF NOT EXISTS idx_plans_project ON test_plans(project_id, updated_at DESC)",
+            [],
+        )
+        .map_err(err)?;
+        tx.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_history_origin ON request_history(origin, created_at DESC);
+             CREATE INDEX IF NOT EXISTS idx_runs_origin ON request_runs(origin, created_at DESC);",
+        )
+        .map_err(err)?;
+        if version < DB_VERSION {
+            tx.execute_batch(&format!("PRAGMA user_version = {DB_VERSION}"))
+                .map_err(err)?;
+        }
+        tx.commit().map_err(err)?;
+    }
+
+    if version > 0 && version < DB_VERSION {
+        log::info!("数据库已从结构版本 {version} 升级到 {DB_VERSION}");
     }
     Ok(())
+}
+
+/// 读取 app_meta 中的一项（表不存在时返回 None，便于迁移早期调用）
+pub fn meta_get(conn: &rusqlite::Connection, key: &str) -> Option<String> {
+    conn.query_row("SELECT value FROM app_meta WHERE key = ?1", [key], |row| {
+        row.get::<_, Option<String>>(0)
+    })
+    .ok()
+    .flatten()
+}
+
+pub fn meta_set(conn: &rusqlite::Connection, key: &str, value: &str) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO app_meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![key, value],
+    )
+    .map_err(err)?;
+    Ok(())
+}
+
+/// 诊断包与备份列表用：各表行数
+pub fn table_counts(conn: &rusqlite::Connection) -> Vec<(String, i64)> {
+    let mut names = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    ) {
+        if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
+            names = rows.filter_map(Result::ok).collect();
+        }
+    }
+    names
+        .into_iter()
+        .map(|name| {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM \"{name}\""), [], |row| {
+                    row.get(0)
+                })
+                .unwrap_or(0);
+            (name, count)
+        })
+        .collect()
 }
 
 /// 首次启动写入示例数据；已有数据库则按需补齐示例场景
@@ -132,10 +275,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!(
-            "astroman-db-{tag}-{}-{stamp}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("astroman-db-{tag}-{}-{stamp}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let manager = SqliteConnectionManager::file(dir.join("astroman.db")).with_init(|conn| {
             conn.execute_batch(
@@ -150,7 +291,9 @@ mod tests {
 
     fn has_column(pool: &DbPool, table: &str, column: &str) -> bool {
         let conn = pool.get().unwrap();
-        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})")).unwrap();
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
         let found = stmt
             .query_map([], |row| row.get::<_, String>(1))
             .unwrap()
@@ -189,7 +332,9 @@ mod tests {
 
         assert!(has_column(&pool, "request_history", "origin"));
         assert!(has_column(&pool, "request_runs", "origin"));
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(version, DB_VERSION);
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
@@ -268,10 +413,16 @@ mod tests {
         init(&pool).unwrap();
         let conn = pool.get().unwrap();
         let origin: String = conn
-            .query_row("SELECT origin FROM request_history WHERE id = 1", [], |row| row.get(0))
+            .query_row(
+                "SELECT origin FROM request_history WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(origin, "manual");
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(version, DB_VERSION);
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);

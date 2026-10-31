@@ -94,6 +94,12 @@ export function clearRuntimeVars() {
   runtimeVars.clear()
 }
 
+/** 用 Worker 回传的变量表整体替换本地表（超时则调用方不调用，等价于回滚） */
+export function setRuntimeVars(next: Record<string, string>) {
+  runtimeVars.clear()
+  Object.entries(next ?? {}).forEach(([key, value]) => runtimeVars.set(key, value))
+}
+
 /** 只替换脚本写入的变量，环境变量仍交给后端渲染 */
 export function renderRuntimeVars(text: string): string {
   if (!text || !text.includes('{{') || !runtimeVars.size) return text
@@ -102,26 +108,26 @@ export function renderRuntimeVars(text: string): string {
   )
 }
 
-function createVars(env: Record<string, string>): VarsFacade {
+function createVars(env: Record<string, string>, store: Map<string, string>): VarsFacade {
   return {
     get(key) {
       const name = String(key)
-      if (runtimeVars.has(name)) return runtimeVars.get(name)
+      if (store.has(name)) return store.get(name)
       return Object.prototype.hasOwnProperty.call(env, name) ? env[name] : undefined
     },
     set(key, value) {
       const name = String(key)
-      runtimeVars.set(name, value === undefined || value === null ? '' : String(value))
+      store.set(name, value === undefined || value === null ? '' : String(value))
     },
     unset(key) {
-      runtimeVars.delete(String(key))
+      store.delete(String(key))
     },
     has(key) {
       const name = String(key)
-      return runtimeVars.has(name) || Object.prototype.hasOwnProperty.call(env, name)
+      return store.has(name) || Object.prototype.hasOwnProperty.call(env, name)
     },
     all() {
-      return { ...env, ...Object.fromEntries(runtimeVars) }
+      return { ...env, ...Object.fromEntries(store) }
     },
   }
 }
@@ -247,6 +253,7 @@ export function runPreScript(
   request: ScriptRequest,
   env: Record<string, string>,
   phase: ScriptPhase = 'pre',
+  store: Map<string, string> = runtimeVars,
 ): PreScriptResult {
   const logs: ScriptLog[] = []
   const started = performance.now()
@@ -264,7 +271,7 @@ export function runPreScript(
       rsa: RsaFacade,
       cipher: CipherFacade,
     ) => void
-    runner(target, createVars(env), { ...env }, createConsole(phase, logs), createRsa(), createCipher())
+    runner(target, createVars(env, store), { ...env }, createConsole(phase, logs), createRsa(), createCipher())
     return { request: target, logs, durationMs: Math.round(performance.now() - started) }
   } catch (e) {
     return {
@@ -291,6 +298,7 @@ export function runPostScript(
   request: ScriptRequest,
   result: HttpResult,
   env: Record<string, string>,
+  store: Map<string, string> = runtimeVars,
 ): PostScriptResult {
   const logs: ScriptLog[] = []
   const assertions: ScriptAssertion[] = []
@@ -341,7 +349,7 @@ export function runPostScript(
     runner(
       { ...request, headers: { ...request.headers }, params: { ...request.params } },
       response,
-      createVars(env),
+      createVars(env, store),
       { ...env },
       createConsole('post', logs),
       createRsa(),
@@ -363,3 +371,59 @@ export function runPostScript(
     }
   }
 }
+
+/* ---------- 可序列化的任务协议（Worker / 主线程共用） ---------- */
+
+/** Worker 任务的输入：全部是结构化克隆可传的纯数据 */
+export interface ScriptJob {
+  phase: ScriptPhase
+  code: string
+  request: ScriptRequest
+  /** 后置脚本才有 */
+  response?: HttpResult
+  env: Record<string, string>
+  /** 执行前的运行时变量快照，用于超时回滚 */
+  vars: Record<string, string>
+}
+
+export interface ScriptJobResult {
+  request: ScriptRequest
+  vars: Record<string, string>
+  logs: ScriptLog[]
+  assertions: ScriptAssertion[]
+  error?: string
+  durationMs: number
+}
+
+/**
+ * 执行一条脚本任务：Worker 内同步跑，主线程降级时也直接调它。
+ *
+ * 语义约定（方案 4.1）：**一次执行要么全成功、要么完全回滚**。
+ * 出错或超时时返回的 `vars` 仍是执行前的快照，调用方据此丢弃半成品写入。
+ */
+export function executeScriptJob(job: ScriptJob): ScriptJobResult {
+  const store = new Map(Object.entries(job.vars ?? {}))
+  if (job.phase === 'post') {
+    const result = runPostScript(job.code, job.request, job.response as HttpResult, job.env, store)
+    return {
+      request: job.request,
+      vars: Object.fromEntries(store),
+      logs: result.logs,
+      assertions: result.assertions,
+      error: result.error,
+      durationMs: result.durationMs,
+    }
+  }
+  const result = runPreScript(job.code, job.request, job.env, job.phase, store)
+  return {
+    request: result.request,
+    vars: Object.fromEntries(store),
+    logs: result.logs,
+    assertions: [],
+    error: result.error,
+    durationMs: result.durationMs,
+  }
+}
+
+/** 阶段中文名，超时文案要用 */
+export const SCRIPT_PHASE_LABEL: Record<ScriptPhase, string> = PHASE_LABEL

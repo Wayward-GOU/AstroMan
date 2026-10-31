@@ -2,7 +2,7 @@
 import { computed, onMounted, reactive, ref, watch, type Component } from 'vue'
 import { useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
-import { open } from '@tauri-apps/plugin-dialog'
+import { open, save as saveFile } from '@tauri-apps/plugin-dialog'
 import {
   DatabaseOutlined,
   SafetyCertificateOutlined,
@@ -19,6 +19,9 @@ import {
   KeyOutlined,
   RobotOutlined,
   InfoCircleOutlined,
+  SafetyOutlined,
+  CloudServerOutlined,
+  ExperimentOutlined,
 } from '@ant-design/icons-vue'
 import PageHeader from '@/components/PageHeader.vue'
 import * as api from '@/api'
@@ -26,7 +29,17 @@ import { themes, currentThemeId, setTheme } from '@/stores/theme'
 import { isMac, openDirLabel, platformLabel, shortcutText } from '@/utils/platform'
 import { checkForUpdates, isAutoUpdateEnabled, setAutoUpdateEnabled } from '@/utils/updater'
 import { toolNames } from '@/utils/aiTools'
-import type { AppInfo, AppSettings, PythonCheckResult, StorageInfo, UpdateInfo } from '@/types/models'
+import { scriptTimeoutMs, setScriptTimeoutMs, SCRIPT_TIMEOUT_RANGE } from '@/utils/scriptHost'
+import type {
+  AppInfo,
+  AppSettings,
+  BackupItem,
+  CheckResult,
+  PythonCheckResult,
+  SecretStatus,
+  StorageInfo,
+  UpdateInfo,
+} from '@/types/models'
 
 const router = useRouter()
 
@@ -44,6 +57,8 @@ interface Section {
 const sections: Section[] = [
   { key: 'appearance', label: '外观', desc: '主题配色与界面风格', icon: BgColorsOutlined },
   { key: 'storage', label: '数据与存储', desc: '数据库位置、备份与隐私', icon: DatabaseOutlined },
+  { key: 'backup', label: '备份与自检', desc: '快照、恢复、数据库体检', icon: CloudServerOutlined },
+  { key: 'security', label: '密钥与加密', desc: '主密钥、口令、密钥包', icon: SafetyOutlined },
   { key: 'network', label: '网络与安全', desc: '代理、客户端证书、Python 授权', icon: GlobalOutlined },
   { key: 'assistant', label: 'AI 助手', desc: '航仔与模型服务', icon: RobotOutlined },
   { key: 'update', label: '版本更新', desc: '检查并安装新版本', icon: CloudDownloadOutlined },
@@ -107,6 +122,9 @@ onMounted(async () => {
   } catch (e) {
     message.error(String(e))
   }
+  // 备份与密钥状态各自独立拉取：任一失败不阻塞设置页其它内容
+  void loadBackups()
+  void loadSecrets()
 })
 
 async function saveNetwork() {
@@ -254,6 +272,302 @@ async function restartApp() {
   } catch (e) {
     message.error(String(e))
   }
+}
+
+/* ---------- 备份与自检（v1.0.8） ---------- */
+const backups = ref<BackupItem[]>([])
+const backupLoading = ref(false)
+const backupBusy = ref(false)
+const backupDir = ref('')
+const restoreTarget = ref<BackupItem | null>(null)
+const checkResult = ref<CheckResult | null>(null)
+const checking = ref(false)
+
+const backupTotalSize = computed(() => backups.value.reduce((sum, item) => sum + item.size, 0))
+
+function fmtBackupSize(bytes: number): string {
+  if (!bytes) return '0 B'
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`
+}
+
+function fmtBackupTime(ts: number): string {
+  if (!ts) return '-'
+  const d = new Date(ts * 1000)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+async function loadBackups() {
+  backupLoading.value = true
+  try {
+    const [list, dir] = await Promise.all([api.backupList(), api.backupDirPath()])
+    backups.value = list
+    backupDir.value = dir
+  } catch (e) {
+    message.error(String(e))
+  } finally {
+    backupLoading.value = false
+  }
+}
+
+async function createBackup() {
+  backupBusy.value = true
+  try {
+    const item = await api.backupCreate()
+    message.success(`已创建备份 ${item.name}`)
+    await loadBackups()
+  } catch (e) {
+    message.error(String(e))
+  } finally {
+    backupBusy.value = false
+  }
+}
+
+function askRestore(item: BackupItem) {
+  restoreTarget.value = item
+}
+
+async function confirmRestore() {
+  const item = restoreTarget.value
+  if (!item) return
+  backupBusy.value = true
+  try {
+    await api.backupRestore(item.name)
+    restoreTarget.value = null
+    Modal.confirm({
+      title: '恢复已排队',
+      content: '已把备份标记为待恢复。重启应用后会在打开数据库之前完成替换，期间你的当前数据会先自动备份一份。',
+      okText: '立即重启',
+      cancelText: '稍后手动重启',
+      onOk: () => restartApp(),
+    })
+  } catch (e) {
+    message.error(String(e))
+  } finally {
+    backupBusy.value = false
+  }
+}
+
+async function cancelRestore() {
+  try {
+    await api.backupCancelRestore()
+    message.success('已取消待恢复标记')
+  } catch (e) {
+    message.error(String(e))
+  }
+}
+
+async function deleteBackup(item: BackupItem) {
+  backupBusy.value = true
+  try {
+    await api.backupDelete(item.name)
+    message.success('已删除备份')
+    await loadBackups()
+  } catch (e) {
+    message.error(String(e))
+  } finally {
+    backupBusy.value = false
+  }
+}
+
+async function runCheck(deep: boolean) {
+  checking.value = true
+  try {
+    checkResult.value = await api.dbCheck(deep)
+    if (checkResult.value.ok) {
+      message.success(`数据库检查通过（${checkResult.value.durationMs} ms）`)
+    } else {
+      message.error('数据库检查发现问题，详见下方结果')
+    }
+  } catch (e) {
+    message.error(String(e))
+  } finally {
+    checking.value = false
+  }
+}
+
+async function exportDiagnostics() {
+  try {
+    const target = await saveFile({ defaultPath: 'astroman-diagnostics.zip' })
+    if (!target) return
+    const path = await api.diagnosticsExport(target)
+    message.success(`诊断包已导出到 ${path}`)
+  } catch (e) {
+    message.error(String(e))
+  }
+}
+
+async function openBackupDir() {
+  try {
+    const dir = backupDir.value || (await api.backupDirPath())
+    await api.storageOpen(dir)
+  } catch (e) {
+    message.error(String(e))
+  }
+}
+
+/* ---------- 密钥与加密（v1.0.8） ---------- */
+const secrets = ref<SecretStatus | null>(null)
+const secretsLoading = ref(false)
+const passOpen = ref(false)
+const passBusy = ref(false)
+const passForm = reactive({ password: '', confirm: '' })
+const unlockOpen = ref(false)
+const unlockBusy = ref(false)
+const unlockPassword = ref('')
+const keypackOpen = ref(false)
+const keypackBusy = ref(false)
+const keypackMode = ref<'export' | 'import'>('export')
+const keypackForm = reactive({ password: '', confirm: '' })
+
+/** 口令模式未解锁时，所有敏感值都读不出来 —— 界面上要先提示这件事 */
+const secretsLocked = computed(() => secrets.value?.locked === true)
+
+async function loadSecrets() {
+  secretsLoading.value = true
+  try {
+    secrets.value = await api.secretsStatus()
+  } catch (e) {
+    message.error(String(e))
+  } finally {
+    secretsLoading.value = false
+  }
+}
+
+function openPassModal() {
+  passForm.password = ''
+  passForm.confirm = ''
+  passOpen.value = true
+}
+
+async function submitPassphrase() {
+  if (passForm.password.length < 8) {
+    message.warning('口令至少 8 位')
+    return
+  }
+  if (passForm.password !== passForm.confirm) {
+    message.warning('两次输入的口令不一致')
+    return
+  }
+  passBusy.value = true
+  try {
+    secrets.value = await api.secretsSetPassphrase(passForm.password, passForm.confirm)
+    passOpen.value = false
+    passForm.password = ''
+    passForm.confirm = ''
+    message.success('已切换到口令模式，下次启动需要输入这个口令')
+  } catch (e) {
+    message.error(String(e))
+  } finally {
+    passBusy.value = false
+  }
+}
+
+function openUnlock() {
+  unlockPassword.value = ''
+  unlockOpen.value = true
+}
+
+async function submitUnlock() {
+  if (!unlockPassword.value) {
+    message.warning('请输入口令')
+    return
+  }
+  unlockBusy.value = true
+  try {
+    secrets.value = await api.secretsUnlock(unlockPassword.value)
+    unlockOpen.value = false
+    unlockPassword.value = ''
+    message.success('已解锁')
+  } catch (e) {
+    message.error(String(e))
+  } finally {
+    unlockBusy.value = false
+  }
+}
+
+function openKeypack(mode: 'export' | 'import') {
+  keypackMode.value = mode
+  keypackForm.password = ''
+  keypackForm.confirm = ''
+  keypackOpen.value = true
+}
+
+async function submitKeypack() {
+  if (!keypackForm.password) {
+    message.warning('请设置密钥包口令')
+    return
+  }
+  if (keypackMode.value === 'export' && keypackForm.password !== keypackForm.confirm) {
+    message.warning('两次输入的口令不一致')
+    return
+  }
+  keypackBusy.value = true
+  try {
+    if (keypackMode.value === 'export') {
+      const target = await saveFile({ defaultPath: 'astroman-keypack.json' })
+      if (!target) return
+      const path = await api.secretsExport(keypackForm.password, target)
+      keypackOpen.value = false
+      message.success(`密钥包已导出到 ${path}`)
+    } else {
+      const pickedRaw = await open({
+        multiple: false,
+        filters: [{ name: '密钥包', extensions: ['json'] }],
+      })
+      const picked = typeof pickedRaw === 'string' ? pickedRaw : ''
+      if (!picked) return
+      // 先只读预检，避免选错文件把密钥覆盖成垃圾
+      const pack = await api.secretsInspectPack(picked)
+      Modal.confirm({
+        title: '确认导入这个密钥包？',
+        content: `来源：${pack.source || '未知'} · 创建于 ${fmtBackupTime(pack.createdAt)}。导入后当前主密钥会被替换，之前用旧密钥加密的值需要重新填写。`,
+        okText: '导入',
+        cancelText: '取消',
+        onOk: async () => {
+          secrets.value = await api.secretsImport(keypackForm.password, picked)
+          keypackOpen.value = false
+          message.success('密钥包已导入')
+        },
+      })
+    }
+  } catch (e) {
+    message.error(String(e))
+  } finally {
+    keypackBusy.value = false
+  }
+}
+
+function askResetSecrets() {
+  Modal.confirm({
+    title: '重置全部密钥值？',
+    content: '会把所有敏感环境变量与 AI 接口 Key 清空，且不可恢复。如果还要继续用这些密钥，请先导出密钥包。',
+    okText: '确认清空',
+    okType: 'danger',
+    cancelText: '取消',
+    onOk: async () => {
+      try {
+        const count = await api.secretsReset(true)
+        secrets.value = await api.secretsStatus()
+        message.success(`已清空 ${count} 个密钥值`)
+      } catch (e) {
+        message.error(String(e))
+      }
+    },
+  })
+}
+
+/* ---------- 脚本沙箱超时（v1.0.8） ---------- */
+const scriptTimeout = ref(scriptTimeoutMs())
+
+function changeScriptTimeout(value: number | null) {
+  if (typeof value !== 'number') return
+  setScriptTimeoutMs(value)
+  scriptTimeout.value = scriptTimeoutMs()
+  message.success(`脚本超时已设为 ${scriptTimeout.value} ms`)
 }
 
 /* ---------- 自动更新 ---------- */
@@ -465,6 +779,242 @@ async function openReleasePage() {
                     <template #icon><ReloadOutlined /></template>
                     恢复默认
                   </a-button>
+                </div>
+              </div>
+            </div>
+          </a-spin>
+        </div>
+
+        <!-- ============ 备份与自检 ============ -->
+        <div v-else-if="active === 'backup'" class="panel">
+          <div class="group">
+            <div class="group-title">
+              数据库快照
+              <span class="tag">{{ backups.length }} 份 · {{ fmtBackupSize(backupTotalSize) }}</span>
+            </div>
+            <div class="group-desc">
+              每天启动后自动做一次快照；恢复前会先给你当前的数据再做一份，不会直接覆盖
+            </div>
+
+            <div class="row">
+              <div class="row-label">
+                <div class="row-title">备份目录</div>
+                <div class="row-desc mono">{{ backupDir || '-' }}</div>
+              </div>
+              <div class="row-control">
+                <a-button size="small" :disabled="!backupDir" @click="openBackupDir">
+                  <template #icon><FolderOpenOutlined /></template>
+                  {{ openDirLabel }}
+                </a-button>
+              </div>
+            </div>
+
+            <div class="group-actions">
+              <a-button type="primary" :loading="backupBusy" @click="createBackup">
+                <template #icon><CloudServerOutlined /></template>
+                立即备份
+              </a-button>
+              <a-button :loading="backupLoading" @click="loadBackups">
+                <template #icon><ReloadOutlined /></template>
+                刷新列表
+              </a-button>
+              <a-button :disabled="!backups.length" @click="cancelRestore">
+                取消待恢复
+              </a-button>
+            </div>
+          </div>
+
+          <div class="group">
+            <div class="group-title">快照列表</div>
+            <a-spin :spinning="backupLoading">
+              <div v-if="backups.length" class="backup-list">
+                <div v-for="item in backups" :key="item.name" class="backup-row">
+                  <div class="backup-main">
+                    <div class="backup-name mono">{{ item.name }}</div>
+                    <div class="backup-meta">
+                      <span class="backup-kind" :class="`kind-${item.kind}`">{{ item.kindLabel }}</span>
+                      <span>{{ fmtBackupTime(item.createdAt) }}</span>
+                      <span>{{ fmtBackupSize(item.size) }}</span>
+                      <span>schema v{{ item.schemaVersion }} · {{ item.tables }} 张表</span>
+                    </div>
+                  </div>
+                  <div class="backup-actions">
+                    <a-button size="small" @click="askRestore(item)">恢复</a-button>
+                    <a-button size="small" type="text" danger @click="deleteBackup(item)">删除</a-button>
+                  </div>
+                </div>
+              </div>
+              <div v-else class="empty-line">
+                还没有备份。点「立即备份」现在做一份，或者在下次启动时等自动快照。
+              </div>
+            </a-spin>
+          </div>
+
+          <div class="group">
+            <div class="group-title">数据库体检</div>
+            <div class="group-desc">
+              快速检查秒级完成（每次启动自动跑）；完整性检查会逐页校验，数据量大时需要几分钟
+            </div>
+            <div class="group-actions">
+              <a-button size="small" :loading="checking" @click="runCheck(false)">快速检查</a-button>
+              <a-button size="small" :loading="checking" danger @click="runCheck(true)">
+                <template #icon><ExperimentOutlined /></template>
+                完整性检查
+              </a-button>
+            </div>
+            <div v-if="checkResult" class="check-result" :class="{ bad: !checkResult.ok }">
+              <div class="check-line">
+                <span class="check-dot" />
+                {{ checkResult.ok ? '检查通过' : '发现问题' }}
+                <span class="mono">· {{ checkResult.durationMs }} ms · schema v{{ checkResult.schemaVersion }} · {{ checkResult.tables }} 张表</span>
+              </div>
+              <pre v-if="!checkResult.ok" class="check-detail mono">{{ checkResult.detail }}</pre>
+            </div>
+          </div>
+
+          <div class="group">
+            <div class="group-title">诊断包</div>
+            <div class="group-desc">
+              导出日志片段、环境信息与表统计，用于排查问题；不含请求正文与密钥
+            </div>
+            <div class="group-actions">
+              <a-button size="small" @click="exportDiagnostics">
+                <template #icon><CopyOutlined /></template>
+                导出诊断包
+              </a-button>
+            </div>
+          </div>
+        </div>
+
+        <!-- ============ 密钥与加密 ============ -->
+        <div v-else-if="active === 'security'" class="panel">
+          <a-spin :spinning="secretsLoading">
+            <div class="group">
+              <div class="group-title">
+                主密钥
+                <span class="tag" :class="{ accent: secrets && !secrets.degraded, warn: secrets?.degraded }">
+                  {{ secrets?.sourceLabel || '读取中' }}
+                </span>
+              </div>
+              <div class="group-desc">
+                敏感环境变量与 AI 接口 Key 都用主密钥加密后再入库，库里的密文搬到别的列会解密失败
+              </div>
+
+              <a-alert
+                v-if="secretsLocked"
+                type="warning"
+                show-icon
+                class="sec-alert"
+                message="主密钥未解锁"
+                :description="secrets?.lockedReason || '口令模式下需要先输入口令，敏感值才能读取；解锁前相关请求会因为变量为空而失败。'"
+                action
+              >
+                <template #action>
+                  <a-button size="small" type="primary" @click="openUnlock">解锁</a-button>
+                </template>
+              </a-alert>
+
+              <a-alert
+                v-if="secrets?.degraded"
+                type="warning"
+                show-icon
+                class="sec-alert"
+                message="当前处于降级模式，等同于没有加密"
+                description="系统钥匙串不可用，主密钥落在数据目录的 keys/master.key 里。任何能读这个目录的程序都能拿到你的密钥。"
+              />
+
+              <div class="row">
+                <div class="row-label">
+                  <div class="row-title">加密覆盖</div>
+                  <div class="row-desc">
+                    环境变量 {{ secrets?.encryptedEnvCount ?? 0 }} 条 · AI 接口 Key {{ secrets?.encryptedAiCount ?? 0 }} 条
+                  </div>
+                </div>
+                <div class="row-control">
+                  <a-button size="small" :loading="secretsLoading" @click="loadSecrets">
+                    <template #icon><ReloadOutlined /></template>
+                    刷新
+                  </a-button>
+                </div>
+              </div>
+
+              <div class="row">
+                <div class="row-label">
+                  <div class="row-title">系统钥匙串</div>
+                  <div class="row-desc">
+                    {{ secrets?.keyringAvailable ? '可用（推荐）' : '不可用，已降级到文件模式' }}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="group">
+              <div class="group-title">口令模式</div>
+              <div class="group-desc">
+                用你自己的口令派生主密钥，密钥不落盘。适合把数据目录放在移动硬盘或同步盘的情况。
+                <br />
+                注意：忘记口令无法找回，只能重置后重新填写所有密钥。
+              </div>
+              <div class="group-actions">
+                <a-button
+                  size="small"
+                  type="primary"
+                  :disabled="secrets?.source === 'passphrase'"
+                  @click="openPassModal"
+                >
+                  <template #icon><KeyOutlined /></template>
+                  {{ secrets?.source === 'passphrase' ? '已启用口令模式' : '切换到口令模式' }}
+                </a-button>
+                <a-button v-if="secretsLocked" size="small" @click="openUnlock">解锁</a-button>
+              </div>
+            </div>
+
+            <div class="group">
+              <div class="group-title">密钥包</div>
+              <div class="group-desc">
+                换电脑或重装前先导出密钥包，否则之前加密的密钥值在新机器上解不开
+              </div>
+              <div class="group-actions">
+                <a-button size="small" @click="openKeypack('export')">导出密钥包</a-button>
+                <a-button size="small" @click="openKeypack('import')">导入密钥包</a-button>
+              </div>
+            </div>
+
+            <div class="group">
+              <div class="group-title">脚本沙箱</div>
+              <div class="group-desc">
+                前置 / 后置脚本在独立的 Worker 里执行，超时会被强制终止，本次脚本写入的变量会回滚
+              </div>
+              <div class="row">
+                <div class="row-label">
+                  <div class="row-title">脚本超时</div>
+                  <div class="row-desc">超过这个时间直接终止本次脚本，避免死循环卡住界面</div>
+                </div>
+                <div class="row-control">
+                  <a-input-number
+                    :value="scriptTimeout"
+                    :min="SCRIPT_TIMEOUT_RANGE.min"
+                    :max="SCRIPT_TIMEOUT_RANGE.max"
+                    :step="500"
+                    size="small"
+                    style="width: 120px"
+                    @change="changeScriptTimeout"
+                  />
+                  <span class="mono unit">ms</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="group danger-group">
+              <div class="group-title">重置</div>
+              <div class="group-desc">清空全部密钥值。此操作不可撤销</div>
+              <div class="row">
+                <div class="row-label">
+                  <div class="row-title">清空所有密钥值</div>
+                  <div class="row-desc">环境变量里的 secret 与 AI 接口 Key 会被置空</div>
+                </div>
+                <div class="row-control">
+                  <a-button danger size="small" @click="askResetSecrets">重置密钥</a-button>
                 </div>
               </div>
             </div>
@@ -828,6 +1378,104 @@ async function openReleasePage() {
         </div>
       </section>
     </div>
+
+    <!-- ============ v1.0.8 弹窗：恢复确认 / 口令 / 解锁 / 密钥包 ============ -->
+    <a-modal
+      :open="!!restoreTarget"
+      title="从备份恢复"
+      ok-text="排队恢复"
+      cancel-text="取消"
+      :confirm-loading="backupBusy"
+      @ok="confirmRestore"
+      @cancel="restoreTarget = null"
+    >
+      <div class="modal-body">
+        <p>
+          即将用 <span class="mono">{{ restoreTarget?.name }}</span>
+          （{{ fmtBackupTime(restoreTarget?.createdAt || 0) }} 的快照）替换当前数据库。
+        </p>
+        <p class="modal-note">
+          恢复会在重启应用时、打开数据库之前完成；替换前会先把当前数据备份成一份 pre-restore 快照，
+          所以这一步本身是可回退的。
+        </p>
+      </div>
+    </a-modal>
+
+    <a-modal
+      v-model:open="passOpen"
+      title="切换到口令模式"
+      ok-text="启用"
+      cancel-text="取消"
+      :confirm-loading="passBusy"
+      @ok="submitPassphrase"
+    >
+      <div class="modal-body">
+        <p class="modal-note">
+          口令用来派生主密钥，不会保存在任何地方。忘记口令就无法解开已加密的密钥值，
+          只能用「重置密钥」重新填写，或提前导出的密钥包恢复。
+        </p>
+        <a-input-password
+          v-model:value="passForm.password"
+          placeholder="口令（至少 8 位）"
+          autocomplete="new-password"
+        />
+        <a-input-password
+          v-model:value="passForm.confirm"
+          placeholder="再次输入口令"
+          autocomplete="new-password"
+        />
+      </div>
+    </a-modal>
+
+    <a-modal
+      v-model:open="unlockOpen"
+      title="解锁主密钥"
+      ok-text="解锁"
+      cancel-text="取消"
+      :confirm-loading="unlockBusy"
+      @ok="submitUnlock"
+    >
+      <div class="modal-body">
+        <p class="modal-note">输入启动时设置的口令，解锁后本次运行期间敏感值可用。</p>
+        <a-input-password
+          v-model:value="unlockPassword"
+          placeholder="口令"
+          autocomplete="current-password"
+          @press-enter="submitUnlock"
+        />
+      </div>
+    </a-modal>
+
+    <a-modal
+      v-model:open="keypackOpen"
+      :title="keypackMode === 'export' ? '导出密钥包' : '导入密钥包'"
+      :ok-text="keypackMode === 'export' ? '导出' : '选择文件并导入'"
+      cancel-text="取消"
+      :confirm-loading="keypackBusy"
+      @ok="submitKeypack"
+    >
+      <div class="modal-body">
+        <p class="modal-note">
+          <template v-if="keypackMode === 'export'">
+            密钥包用你设置的口令加密，导出后请和数据库分开保存 —— 两者放在一起就失去了保护意义。
+          </template>
+          <template v-else>
+            导入会用密钥包里的主密钥替换当前主密钥，随后自动用新密钥重新加密已有密钥值。
+          </template>
+        </p>
+        <a-input-password
+          v-model:value="keypackForm.password"
+          :placeholder="keypackMode === 'export' ? '设置密钥包口令' : '密钥包口令'"
+          autocomplete="off"
+        />
+        <a-input-password
+          v-if="keypackMode === 'export'"
+          v-model:value="keypackForm.confirm"
+          placeholder="再次输入口令"
+          autocomplete="off"
+        />
+      </div>
+    </a-modal>
   </div>
 </template>
 
@@ -1350,5 +1998,159 @@ kbd {
   .panel-footer :deep(.ant-btn) {
     width: 100%;
   }
+}
+
+/* ---------- v1.0.8：备份与自检 ---------- */
+.backup-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.backup-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 11px;
+  border-radius: 7px;
+  border: 1px solid var(--fm-border, rgba(0, 0, 0, 0.07));
+  background: var(--fm-surface-2, rgba(0, 0, 0, 0.02));
+}
+
+.backup-main {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.backup-name {
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.backup-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--fm-text-3, #999);
+}
+
+.backup-kind {
+  padding: 0 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  line-height: 16px;
+  background: rgba(128, 128, 128, 0.14);
+  color: var(--fm-text-2, #666);
+}
+
+.backup-kind.kind-daily {
+  background: rgba(14, 165, 233, 0.14);
+  color: #0284c7;
+}
+
+.backup-kind.kind-weekly {
+  background: rgba(139, 92, 246, 0.14);
+  color: #7c3aed;
+}
+
+.backup-kind.kind-manual {
+  background: rgba(16, 185, 129, 0.14);
+  color: #059669;
+}
+
+.backup-kind.kind-pre-restore,
+.backup-kind.kind-pre-migrate {
+  background: rgba(217, 119, 6, 0.14);
+  color: #b45309;
+}
+
+.backup-actions {
+  display: flex;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+
+.empty-line {
+  padding: 14px 0;
+  font-size: 12px;
+  color: var(--fm-text-3, #999);
+}
+
+.check-result {
+  margin-top: 10px;
+  padding: 9px 11px;
+  border-radius: 7px;
+  background: rgba(16, 185, 129, 0.1);
+  border: 1px solid rgba(16, 185, 129, 0.28);
+}
+
+.check-result.bad {
+  background: rgba(220, 38, 38, 0.08);
+  border-color: rgba(220, 38, 38, 0.28);
+}
+
+.check-line {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  color: #047857;
+}
+
+.check-result.bad .check-line {
+  color: #b91c1c;
+}
+
+.check-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.check-detail {
+  margin: 6px 0 0;
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: #b91c1c;
+  max-height: 160px;
+  overflow: auto;
+}
+
+/* ---------- v1.0.8：密钥与加密 ---------- */
+.sec-alert {
+  margin: 8px 0;
+}
+
+.tag.warn {
+  color: #b45309;
+  background: rgba(217, 119, 6, 0.12);
+  border-color: rgba(217, 119, 6, 0.3);
+}
+
+.unit {
+  font-size: 11px;
+  color: var(--fm-text-3, #999);
+  margin-left: 6px;
+}
+
+/* ---------- v1.0.8：设置页弹窗 ---------- */
+.modal-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.modal-note {
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--fm-text-3, #999);
+  margin: 0;
 }
 </style>

@@ -10,6 +10,8 @@ import type {
   AiUsagePage,
   AiUsageStats,
   AppSettings,
+  BackupItem,
+  CheckResult,
   CleanupResult,
   CollectionNode,
   CookieItem,
@@ -22,6 +24,7 @@ import type {
   HttpRequestDetail,
   HttpResult,
   IpLookupInfo,
+  KeyPack,
   MonitorProcess,
   MonitorSnapshot,
   PlanSummary,
@@ -32,6 +35,7 @@ import type {
   RequestRun,
   RequestSearchHit,
   RequestSummary,
+  SecretStatus,
   SendRequestPayload,
   StorageInfo,
   PreflightReport,
@@ -123,6 +127,10 @@ export const envActivate = (projectId: number, id: number) =>
   invoke<void>('env_activate', { projectId, id })
 
 export const envDelete = (id: number) => invoke<void>('env_delete', { id })
+
+/** 读取环境的非敏感变量值（用于界面变量渲染预览；敏感值不返回） */
+export const envPlainVars = (envId: number) =>
+  invoke<Record<string, string>>('env_plain_vars', { envId })
 
 export const envVarSave = (envId: number, variables: EnvVariable[]) =>
   invoke<void>('env_var_save', { envId, variables })
@@ -252,6 +260,17 @@ export const reportWriteFile = (path: string, data: number[]) =>
 
 export const reportRequests = (id: number, page = 1, pageSize = 50, success?: boolean | null) =>
   invoke<ReportRequestsPage>('report_requests', { id, page, pageSize, success: success ?? null })
+
+/** 保存报告的场景描述与总结 */
+export const reportUpdateTexts = (id: number, scenarioText: string, summaryText: string) =>
+  invoke<void>('report_update_texts', { id, scenarioText, summaryText })
+
+/** 清理某份报告的逐请求明细（保留汇总与采样） */
+export const reportClearDetails = (id: number) => invoke<number>('report_clear_details', { id })
+
+/** 明细 / 错误 CSV 流式导出，返回写入行数 */
+export const reportExportDetailCsv = (id: number, kind: 'requests' | 'errors', path: string) =>
+  invoke<number>('report_export_detail_csv', { id, kind, path })
 
 // cURL 导入
 export const curlParse = (text: string) => invoke<CurlParsed>('curl_parse', { text })
@@ -531,3 +550,73 @@ export const testArtifactList = (runId: number) =>
 
 export const testArtifactExport = (artifactId: number, path: string) =>
   invoke<void>('test_artifact_export', { artifactId, path })
+
+/* ---------- v1.0.8：请求取消 / 二进制响应 ---------- */
+
+/** 取消在途请求；返回 false 表示请求已结束（取消失败无所谓） */
+export const httpCancel = (requestId: string) =>
+  invoke<boolean>('http_cancel', { requestId })
+
+/** 把 Base64 内容写成本地文件（另存为响应体） */
+export const fileWriteBinary = (path: string, base64: string) =>
+  invoke<void>('file_write_binary', { path, base64 })
+
+/** 拷贝文件（响应体另存为，走流式拷贝不占内存）；返回字节数 */
+export const fileCopy = (src: string, dst: string) =>
+  invoke<number>('file_copy', { src, dst })
+
+/** 把响应落盘的相对路径换成绝对路径（只接受 responses/ 前缀） */
+export const responseFilePath = (relPath: string) =>
+  invoke<string>('response_file_path', { relPath })
+
+/* ---------- v1.0.8：备份 / 自检 / 诊断 ---------- */
+
+export const backupList = () => invoke<BackupItem[]>('backup_list')
+
+export const backupCreate = () => invoke<BackupItem>('backup_create')
+
+/** 恢复备份：写入 restore.pending 标记，需重启应用生效 */
+export const backupRestore = (name: string) => invoke<BackupItem>('backup_restore', { name })
+
+export const backupCancelRestore = () => invoke<void>('backup_cancel_restore')
+
+export const backupDelete = (name: string) => invoke<void>('backup_delete', { name })
+
+export const backupDirPath = () => invoke<string>('backup_dir_path')
+
+/** 数据库自检：deep=true 走 integrity_check（慢 1~2 个数量级） */
+export const dbCheck = (deep = false) => invoke<CheckResult>('db_check', { deep })
+
+/** 导出诊断包（日志尾巴 + 环境信息 + 表统计），返回写入路径 */
+export const diagnosticsExport = (path: string) =>
+  invoke<string>('diagnostics_export', { path })
+
+/* ---------- v1.0.8：密钥与主密钥 ---------- */
+
+export const secretsStatus = () => invoke<SecretStatus>('secrets_status')
+
+/** 口令模式解锁；未解锁时所有敏感值不可用 */
+export const secretsUnlock = (password: string) =>
+  invoke<SecretStatus>('secrets_unlock', { password })
+
+/** 切换到口令模式：会用新密钥整体重加密已有密文 */
+export const secretsSetPassphrase = (password: string, confirm: string) =>
+  invoke<SecretStatus>('secrets_set_passphrase', { password, confirm })
+
+/** 导出密钥包（换机 / 重装前必须做）；返回写入路径 */
+export const secretsExport = (password: string, path: string) =>
+  invoke<string>('secrets_export', { password, path })
+
+export const secretsImport = (password: string, path: string) =>
+  invoke<SecretStatus>('secrets_import', { password, path })
+
+/** 清空全部密钥值，需显式 confirmed */
+export const secretsReset = (confirmed: boolean) =>
+  invoke<number>('secrets_reset', { confirmed })
+
+/** 只读预检密钥包文件，避免导入时选错文件 */
+export const secretsInspectPack = (path: string) =>
+  invoke<KeyPack>('secrets_inspect_pack', { path })
+
+/** 清掉日志脱敏用的敏感值缓存（切换环境后调用） */
+export const secretsClearCache = () => invoke<void>('secrets_clear_cache')

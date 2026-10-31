@@ -24,6 +24,10 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      # 版本号在 package.json / tauri.conf.json / Cargo.toml 各存一份，漏改一处就会
+      # 出现「关于页显示的版本和安装包不一致」，这里先拦住
+      - name: 版本号一致性
+        run: npm run version:check
       - run: npm run test
       - run: npm run build
 
@@ -37,6 +41,8 @@ jobs:
           node-version: 22
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: './src-tauri -> target'
@@ -45,7 +51,60 @@ jobs:
       - run: npm run build
       # externalBin 要求 CLI 产物先存在；同时验证 CLI 能独立编译
       - run: node scripts/prepare-cli.mjs --target x86_64-pc-windows-msvc
+
+      # 格式门禁：统一风格，避免 review 时混进纯排版改动
+      - name: cargo fmt --check
+        run: cargo fmt --check --all
+        working-directory: src-tauri
+
+      # clippy -D warnings：warning 在本地会被忽略，进 CI 才知道攒了多少
+      - name: cargo clippy
+        run: cargo clippy --lib --all-targets -- -D warnings
+        working-directory: src-tauri
+
       - run: cargo test --lib
         working-directory: src-tauri
       - run: cargo build --bin astroman-cli
         working-directory: src-tauri
+
+  coverage:
+    name: Rust 覆盖率门禁
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      # tarpaulin 的 ptrace 后端只支持 Linux x86_64，所以单独开一个 Linux job
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+          key: coverage
+      # tauri 在 Linux 编译需要 WebKitGTK 等系统库（Windows runner 自带，这里要显式装）
+      - name: 安装 Linux 构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf libxdo-dev libssl-dev
+      - run: npm ci
+      - run: npm run build
+      # 编译 lib 时 tauri-build 会校验 externalBin 存在，占位文件即可，不必真编译 CLI
+      - run: node scripts/prepare-cli.mjs --placeholder --target x86_64-unknown-linux-gnu
+      # 用预编译二进制，省掉每次现编 tarpaulin 的几分钟
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-tarpaulin
+      # 阈值写在 tarpaulin.toml，改门槛只改一处；低于阈值 tarpaulin 以非零退出码结束
+      - name: 覆盖率（低于 fail-under 即失败）
+        run: cargo tarpaulin --config tarpaulin.toml
+        working-directory: src-tauri
+      - name: 上传覆盖率报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: src-tauri/target/coverage/
+          if-no-files-found: ignore

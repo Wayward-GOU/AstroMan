@@ -362,7 +362,9 @@ mod unix {
         if addr_len != 6 {
             return String::new();
         }
-        let base = (*link).sdl_data.as_ptr() as *const u8;
+        // 用 addr_of! 直接取字段地址：写成 `(*link).sdl_data.as_ptr()` 会对裸指针解引用的
+        // 结果做隐式自动借用，rustc 的 dangerous_implicit_autorefs 会直接报错
+        let base = std::ptr::addr_of!((*link).sdl_data).cast::<u8>();
         format_mac(std::slice::from_raw_parts(base.add(name_len), addr_len))
     }
 
@@ -373,7 +375,11 @@ mod unix {
         if (*link).sll_halen as usize != 6 {
             return String::new();
         }
-        format_mac(&(*link).sll_addr[..6])
+        // `&(*link).sll_addr[..6]` 会先对裸指针解引用目标做隐式自动借用（切片 index 的
+        // 自动取引用），dangerous_implicit_autorefs 默认 deny；sll_addr 是 Copy 数组，
+        // 先整体读出来再切片，既符合 lint 要求也不会拷贝出额外语义
+        let mac = (*link).sll_addr;
+        format_mac(&mac[..6])
     }
 
     /// 默认网关变化不频繁，30 秒内复用上一次的系统路由查询结果

@@ -63,6 +63,22 @@ Windows 下 `cargo check` 若报 `hit restricted ... D:\Software\Rust\cargo\.glo
 5. 应用内更新检查走 `commands/update.rs` 的 `RELEASE_API`（`https://api.github.com/repos/Wayward-GOU/AstroMan/releases/latest`），仓库地址已改为 AstroMan
 6. macOS 用户安装脚本 `scripts/install-macos.sh`（`REPO=Wayward-GOU/AstroMan`）从 Release 下载 dmg，并绕过未签名校验；README 中的安装命令同源
 
+### macOS universal 与 sidecar（externalBin）
+
+`bundle.externalBin` 是 `binaries/astroman-cli`，Tauri 按 target triple 找 `binaries/astroman-cli-<triple>`。`--target universal-apple-darwin` 有两个坑，都已在 `scripts/prepare-cli.mjs` 里处理，别再手写一份：
+
+1. **tauri-cli 的 universal 构建只 lipo 主程序**（`interface/rust/desktop.rs` 里只有 `lipo -create ... out_dir/bin_name`），sidecar 不会跟着合并；而 macOS bundler 打包时固定从 `target/universal-apple-darwin/release/astroman-cli` 取文件，取不到就报 `Failed to copy binary from ... does not exist`。脚本在 lipo 出 `binaries/astroman-cli-universal-apple-darwin` 之后，会把它复制到这个路径预置好
+2. **单架构文件必须是真二进制**：`binaries/astroman-cli-aarch64-apple-darwin` 与 `-x86_64-apple-darwin` 若只是 0 字节占位（只为让 `tauri-build` 通过校验而写的那种），被拷进 `target/<triple>/release/` 的 sidecar 就是空文件。脚本现在编译完每个架构就 `install()` 覆盖占位
+
+排错先跑这两条，输出都应是 `x86_64 arm64`：
+
+```bash
+lipo -archs src-tauri/binaries/astroman-cli-universal-apple-darwin
+lipo -archs src-tauri/target/universal-apple-darwin/release/astroman-cli
+```
+
+`release.yml` 里的 `Verify macOS universal CLI` 步骤会在 Rust 编译前就做这两项断言，省掉 3 分钟白等。
+
 ## 构建排错
 
 | 现象 | 原因 / 处理 |
@@ -73,3 +89,4 @@ Windows 下 `cargo check` 若报 `hit restricted ... D:\Software\Rust\cargo\.glo
 | 托盘图标没变 | `tray.png` 是编译期嵌入，需重新编译，仅替换文件不生效 |
 | 安装包名仍是旧名 | 检查 `productName` 是否被改动，以及构建前是否重新加载了配置 |
 | 安装包/客户端界面还是旧版 | 安装版把 `dist/` 编进二进制，只跑 `npm run build` 或重启旧 exe 不会更新；必须重新 `npm run build:win` / `build:mac`（`beforeBuildCommand` 会自动再构建一次前端） |
+| macOS 报 `Failed to copy binary from ".../universal-apple-darwin/release/astroman-cli" does not exist` | universal 构建不合并 sidecar；不要跳过 `prepare-cli.mjs --target universal-apple-darwin`，它会把 fat binary 预置到该路径（详见上一节） |

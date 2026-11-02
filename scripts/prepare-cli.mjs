@@ -92,12 +92,27 @@ if (requested === 'universal-apple-darwin') {
   }
   placeholder('universal-apple-darwin')
   const arm = build('aarch64-apple-darwin')
+  // 单架构产物要真正落到 binaries/，否则 tauri-build 拷进 target/<triple>/release/
+  // 的只是占位空文件，sidecar 会变成 0 字节
+  install(arm, 'aarch64-apple-darwin')
   const intel = build('x86_64-apple-darwin')
+  install(intel, 'x86_64-apple-darwin')
   const universal = join(binDir, 'astroman-cli-universal-apple-darwin')
   rmSync(universal, { force: true })
   run('lipo', ['-create', arm, intel, '-output', universal])
   chmodSync(universal, 0o755)
   console.log(`CLI 已就绪：${universal}`)
+
+  // tauri-cli 的 universal 构建（interface/rust/desktop.rs）只对主程序做 lipo，
+  // 不会生成 sidecar 的 universal 副本；而 macOS bundler 打包时固定从
+  // target/universal-apple-darwin/release/astroman-cli 取文件，取不到就报
+  // 「Failed to copy binary ... does not exist」。这里提前把 fat binary 放到位。
+  const stagedDir = join(tauriDir, 'target', 'universal-apple-darwin', 'release')
+  mkdirSync(stagedDir, { recursive: true })
+  const staged = join(stagedDir, `astroman-cli${exeSuffix}`)
+  copyFileSync(universal, staged)
+  chmodSync(staged, 0o755)
+  console.log(`CLI universal 副本已就位：${staged}`)
 } else {
   const triple = requested || hostTriple()
   if (!triple) {

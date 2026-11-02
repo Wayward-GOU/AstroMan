@@ -62,6 +62,18 @@ jobs:
       - name: Prepare CLI binary
         run: node scripts/prepare-cli.mjs --target ${{ matrix.cli }}
 
+      # universal 构建不会合并 sidecar，先确认 fat binary 与 bundler 取文件的路径都就位
+      - name: Verify macOS universal CLI
+        if: matrix.platform == 'macos-latest'
+        run: |
+          archs=$(lipo -archs src-tauri/binaries/astroman-cli-universal-apple-darwin)
+          echo "universal CLI archs: $archs"
+          case "$archs" in *arm64*) ;; *) echo "::error::universal CLI 缺少 arm64 切片"; exit 1 ;; esac
+          case "$archs" in *x86_64*) ;; *) echo "::error::universal CLI 缺少 x86_64 切片"; exit 1 ;; esac
+          test -x src-tauri/target/universal-apple-darwin/release/astroman-cli \
+            || { echo "::error::sidecar 未预置到 target/universal-apple-darwin/release/"; exit 1; }
+          lipo -archs src-tauri/target/universal-apple-darwin/release/astroman-cli
+
       - name: Build and upload to release
         uses: tauri-apps/tauri-action@v0
         env:

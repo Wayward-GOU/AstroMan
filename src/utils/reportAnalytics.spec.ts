@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { ReportDetail, ReportSample, StageSummary } from '@/types/models'
-import { detectKnee, downsample, percentile, qpsP10, scoreReport, selfCheck } from './reportAnalytics'
+import { detectKnee, downsample, percentile, qpsOverview, qpsP10, scoreReport, selfCheck } from './reportAnalytics'
 
 function sample(elapsedSec: number, qps: number, p95: number): ReportSample {
   return {
@@ -107,6 +107,45 @@ describe('reportAnalytics', () => {
     const withoutWarmup = qpsP10(samples, { rampUpSec: 10 })
     expect(withoutWarmup.used).toBe(29)
     expect(withoutWarmup.value).toBe(100)
+  })
+
+  it('最低 QPS 与 90% 分布同窗口，不被升压首秒拉低', () => {
+    const samples = Array.from({ length: 30 }, (_, index) =>
+      sample(index + 1, index < 5 ? 30 : 500, 10),
+    )
+    const overview = qpsOverview(detail({ samples }), { rampUpSec: 5 })
+    // 升压段的 30 req/s 不参与，最低值应落在稳态的 500
+    expect(overview.min).toBe(500)
+    expect(overview.ninety).toBe(500)
+  })
+
+  it('QPS 指标组：平均取后端聚合值，90% 分布取采样 P10，达成率与 SLA 同口径', () => {
+    const base = detail()
+    const overview = qpsOverview(base)
+    // 平均 / 峰值沿用后端聚合值，避免与 SLA、列表页数字不一致
+    expect(overview.avg).toBe(1600)
+    expect(overview.max).toBe(1950)
+    expect(overview.min).toBe(1000)
+    expect(overview.ninety).toBe(1000)
+    expect(overview.target).toBe(0)
+    expect(overview.attainment).toBeNull()
+    expect(overview.perConcurrent).toBeCloseTo(4, 5)
+
+    const withTarget = qpsOverview({
+      ...base,
+      report: { ...base.report, targetRps: 2000 },
+    })
+    expect(withTarget.target).toBe(2000)
+    expect(withTarget.attainment).toBeCloseTo(80, 5)
+  })
+
+  it('采样为空时 90% 分布与最低 QPS 归零，平均 / 峰值退回后端聚合值', () => {
+    const overview = qpsOverview(detail({ samples: [] }))
+    expect(overview.ninety).toBe(0)
+    expect(overview.min).toBe(0)
+    expect(overview.used).toBe(0)
+    expect(overview.avg).toBe(1600)
+    expect(overview.max).toBe(1950)
   })
 
   it('阶梯数据能检出饱和拐点', () => {

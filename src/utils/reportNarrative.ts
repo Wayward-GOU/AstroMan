@@ -102,7 +102,7 @@ export function gradeReport(detail: ReportDetail): GradeResult {
   if (sla?.p95Ms && report.p95Rt > sla.p95Ms) failed.push('P95 延迟')
   if (sla?.p99Ms && report.p99Rt > sla.p99Ms) failed.push('P99 延迟')
   if (sla?.errorRate && report.errorRate > sla.errorRate) failed.push('错误率')
-  if (sla?.minRps && report.avgQps < sla.minRps) failed.push('平均 RPS')
+  if (sla?.minRps && report.avgQps < sla.minRps) failed.push('平均 QPS')
 
   if (failed.length) {
     return {

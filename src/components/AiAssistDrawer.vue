@@ -4,11 +4,11 @@ import { useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
 import {
   CopyOutlined,
-  RobotOutlined,
   SendOutlined,
   SettingOutlined,
   ThunderboltOutlined,
 } from '@ant-design/icons-vue'
+import AstroBuddyIcon from '@/components/AstroBuddyIcon.vue'
 import { useAiAssistStore } from '@/stores/aiAssist'
 import { renderMarkdown } from '@/utils/markdown'
 
@@ -96,7 +96,7 @@ function goChat() {
   >
     <template #title>
       <div class="assist-title">
-        <span class="assist-bot"><RobotOutlined /></span>
+        <span class="assist-bot"><AstroBuddyIcon /></span>
         <div class="assist-title-text">
           <span class="assist-name">{{ store.title }}</span>
           <span class="assist-sub">航仔 · 基于当前页面数据分析</span>
@@ -141,7 +141,7 @@ function goChat() {
       </div>
 
       <div v-if="store.pending" class="assist-start">
-        <div class="assist-start-icon"><RobotOutlined /></div>
+        <div class="assist-start-icon"><AstroBuddyIcon /></div>
         <div class="assist-start-title">开始分析？</div>
         <p class="assist-start-text">
           我先把当前页面的数据整理好了，还没发给模型。点「开始分析」才会真正调用模型并消耗额度，内容多时通常要等十几秒到一分钟。
@@ -169,7 +169,7 @@ function goChat() {
       </div>
 
       <div v-if="!store.messages.length && !store.streaming && !store.pending" class="assist-empty">
-        <RobotOutlined class="assist-empty-icon" />
+        <AstroBuddyIcon class="assist-empty-icon" />
         <p>分析已结束，可以继续追问。</p>
       </div>
 

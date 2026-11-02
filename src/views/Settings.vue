@@ -426,6 +426,13 @@ const keypackForm = reactive({ password: '', confirm: '' })
 /** 口令模式未解锁时，所有敏感值都读不出来 —— 界面上要先提示这件事 */
 const secretsLocked = computed(() => secrets.value?.locked === true)
 
+/** 密钥能读到但解不开：多半是钥匙串条目被别的实例覆盖过 */
+const mismatchText = computed(() => {
+  const count = secrets.value?.brokenSecretCount ?? 0
+  const head = count > 0 ? `已保存的 ${count} 条密钥值都解不出来。` : ''
+  return `${head}这些 Key 不会自动恢复，需要在「设置 → AI」或环境变量里重新填写一次；如果你导出过密钥包，导入它可以直接解开原有数据。`
+})
+
 async function loadSecrets() {
   secretsLoading.value = true
   try {
@@ -922,6 +929,20 @@ async function openReleasePage() {
                 message="当前处于降级模式，等同于没有加密"
                 description="系统钥匙串不可用，主密钥落在数据目录的 keys/master.key 里。任何能读这个目录的程序都能拿到你的密钥。"
               />
+
+              <a-alert
+                v-if="secrets?.keyMismatch"
+                type="error"
+                show-icon
+                class="sec-alert"
+                message="主密钥与已保存的密钥值不匹配"
+                :description="mismatchText"
+                action
+              >
+                <template #action>
+                  <a-button size="small" @click="openKeypack('import')">导入密钥包</a-button>
+                </template>
+              </a-alert>
 
               <div class="row">
                 <div class="row-label">

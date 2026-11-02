@@ -691,6 +691,36 @@ const STRESS_MODE_LABELS: Record<string, string> = {
   count: '定次数',
 }
 
+/**
+ * 自动化测试域的三个枚举。
+ * kind 是写入时的机器值（request / python / stress），所以只额外给中文标签、不改原值，
+ * 避免模型把「脚本用例」回填到 test_case_create 的 kind 上被 SCHEMAS 的 enum 拦下。
+ */
+const TEST_CASE_KIND_LABELS: Record<string, string> = {
+  request: '接口用例',
+  python: '脚本用例',
+  stress: '压测用例',
+}
+
+/** 运行状态：queued → running → passed / failed / error / cancelled；用例级别另有 skipped */
+const TEST_RUN_STATUS_LABELS: Record<string, string> = {
+  queued: '排队中',
+  running: '运行中',
+  passed: '通过',
+  failed: '失败',
+  error: '错误',
+  skipped: '跳过',
+  cancelled: '已取消',
+  stopped: '已停止',
+}
+
+const TEST_TRIGGER_LABELS: Record<string, string> = {
+  ui: '界面手动',
+  ai: '航仔发起',
+  cli: '命令行',
+  schedule: '定时计划',
+}
+
 const BODY_TYPE_LABELS: Record<string, string> = {
   none: '无请求体',
   json: 'JSON',
@@ -2033,6 +2063,7 @@ const SPECS: ToolSpec[] = [
           id: item.id,
           name: item.name,
           kind: item.kind,
+          kindLabel: cnLabel(TEST_CASE_KIND_LABELS, item.kind, ''),
           enabled: item.enabled,
           requestId: item.requestId ?? null,
           datasetId: item.datasetId ?? null,
@@ -2198,9 +2229,9 @@ const SPECS: ToolSpec[] = [
       const failures = detail.cases.filter((item) => item.status === 'failed' || item.status === 'error')
       return {
         id: detail.run.id,
-        status: detail.run.status,
+        status: cnLabel(TEST_RUN_STATUS_LABELS, detail.run.status, '未知'),
         env: detail.run.envName ?? '',
-        trigger: detail.run.trigger,
+        trigger: cnLabel(TEST_TRIGGER_LABELS, detail.run.trigger, '未知'),
         durationMs: detail.run.durationMs,
         total: detail.run.total,
         passed: detail.run.passed,
@@ -2210,7 +2241,8 @@ const SPECS: ToolSpec[] = [
         failures: failures.slice(0, 20).map((item) => ({
           name: item.name,
           kind: item.kind,
-          status: item.status,
+          kindLabel: cnLabel(TEST_CASE_KIND_LABELS, item.kind, ''),
+          status: cnLabel(TEST_RUN_STATUS_LABELS, item.status, '未知'),
           error: item.error ?? '',
           assertions: detail.assertions
             .filter((a) => a.runCaseId === item.id && !a.passed)
@@ -2863,6 +2895,10 @@ export function isWriteTool(tool: string): boolean {
 export function toolLabel(tool: string): string {
   return TOOL_LABELS[tool] ?? tool
 }
+
+/** 测试用例类型的中文名；认不出就返回空串，由调用方决定退回原值还是标「未知」 */
+export const testCaseKindLabel = (kind: unknown): string =>
+  TEST_CASE_KIND_LABELS[str(kind).trim().toLowerCase()] ?? ''
 
 /**
  * 常用工具直接注入提示词；其余长尾工具只列名字，

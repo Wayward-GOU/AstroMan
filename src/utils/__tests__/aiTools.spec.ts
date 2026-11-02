@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   isWriteTool,
   maskSensitive,
+  testCaseKindLabel,
   TOOL_CATALOG,
   toolCatalogStats,
   toolNames,
@@ -182,5 +183,14 @@ describe('阶段四：工具生态', () => {
       '必须是',
     )
     expect(validateToolArgs('test_run_get', { runId: 12 })).toBeNull()
+  })
+
+  it('用例类型有中文名，未知值返回空串由调用方兜底', () => {
+    expect(testCaseKindLabel('request')).toBe('接口用例')
+    expect(testCaseKindLabel('python')).toBe('脚本用例')
+    expect(testCaseKindLabel('stress')).toBe('压测用例')
+    expect(testCaseKindLabel('REQUEST')).toBe('接口用例')
+    expect(testCaseKindLabel('network')).toBe('')
+    expect(testCaseKindLabel(undefined)).toBe('')
   })
 })

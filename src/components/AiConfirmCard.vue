@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { isDangerousTool, toolLabel, validateToolArgs } from '@/utils/aiTools'
+import { isDangerousTool, testCaseKindLabel, toolLabel, validateToolArgs } from '@/utils/aiTools'
 
 const props = defineProps<{
   tool: string
@@ -28,7 +28,7 @@ const labelMap: Record<string, string> = {
   durationSec: '时长（秒）',
   rampUpSec: '爬坡（秒）',
   thinkTimeMs: '思考时间（毫秒）',
-  targetRps: '目标 RPS',
+  targetRps: '目标 QPS',
   recordDetail: '明细记录（full/sample/off/auto）',
   rounds: '轮数',
   limit: '条数上限',
@@ -48,9 +48,23 @@ const labelMap: Record<string, string> = {
   slaP95: 'P95 阈值（毫秒）',
   slaP99: 'P99 阈值（毫秒）',
   slaErrorRate: '错误率阈值（%）',
-  slaMinRps: '最低 RPS',
+  slaMinRps: '最低 QPS',
   success: '仅看成功请求',
   requestIds: '请求 ID 列表',
+  suiteId: '测试套件',
+  runId: '运行记录',
+  datasetId: '数据集',
+  kind: '类型',
+  tags: '标签',
+  config: '套件配置',
+  dependsOn: '依赖用例',
+  failFast: '失败即停',
+  vars: '临时变量',
+  secrets: '临时密钥',
+  formats: '报告格式',
+  setupScript: '前置脚本',
+  teardownScript: '后置脚本',
+  mainScript: '主脚本',
 }
 
 /** 预览值：短参数直接展示，长参数（如整条 cURL、大 Body）完整保留并单独滚动 */
@@ -64,6 +78,8 @@ interface PreviewValue {
 
 function display(value: unknown): PreviewValue {
   if (value === null || value === undefined) return { text: '—', long: false, size: 0 }
+  // 布尔参数写成「是 / 否」，避免整张表里混着 true / false 的机器值
+  if (typeof value === 'boolean') return { text: value ? '是' : '否', long: false, size: 0 }
   if (typeof value === 'string') {
     const text = value.trim()
     if (!text) return { text: '（空）', long: false, size: 0 }
@@ -81,13 +97,21 @@ function display(value: unknown): PreviewValue {
   return { text: String(value), long: false, size: 0 }
 }
 
+/** 参数名的中文标签；`id` 在测试域要指明是套件还是用例 */
+function rowLabel(key: string): string {
+  if (key === 'id' && props.tool.startsWith('test_suite')) return '测试套件'
+  if (key === 'id' && props.tool.startsWith('test_case')) return '测试用例'
+  return labelMap[key] ?? key
+}
+
 const rows = computed(() =>
   Object.entries(props.args ?? {})
     .filter(([, value]) => value !== undefined && value !== null && value !== '')
     .map(([key, value]) => ({
       key,
-      label: labelMap[key] ?? key,
-      value: display(value),
+      label: rowLabel(key),
+      // 用例类型是机器值（request / python / stress），卡上按中文名展示
+      value: display(key === 'kind' ? testCaseKindLabel(value) || value : value),
     })),
 )
 
@@ -101,7 +125,17 @@ const targets = computed(() => {
   push(args.collectionId, '集合')
   push(args.requestId, '接口')
   push(args.envId, '环境')
-  push(args.id, '对象')
+  push(args.suiteId, '测试套件')
+  push(args.runId, '运行记录')
+  // test_* 的删除 / 修改只传 id，按工具前缀说清它是套件还是用例
+  push(
+    args.id,
+    props.tool.startsWith('test_suite')
+      ? '测试套件'
+      : props.tool.startsWith('test_case')
+        ? '测试用例'
+        : '对象',
+  )
   if (typeof args.path === 'string' && args.path.trim()) list.push(`文件 ${args.path}`)
   return list.length ? [...new Set(list)] : ['本机数据']
 })

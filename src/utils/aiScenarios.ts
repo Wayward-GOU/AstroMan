@@ -12,6 +12,7 @@ import type {
   StressStage,
   WorkspaceStats,
 } from '@/types/models'
+import { qpsOverview } from './reportAnalytics'
 
 function clip(text: string, max = 8000): string {
   return text.length > max ? `${text.slice(0, max)}\n…（已截断）` : text
@@ -194,17 +195,19 @@ ${block(
 export function reportReviewPrompt(detail: ReportDetail): string {
   const report = detail.report
   const config = detail.config
+  const qps = qpsOverview(detail, { rampUpSec: config?.rampUpSec ?? 0 })
   return `请解读这份压测报告并给出结论。
 
 【压测基本信息】
 计划：${report.planName}
 状态：${report.status}
 并发：${report.concurrency}
-目标 RPS：${report.targetRps ?? '未设置'}
+目标 QPS：${qps.target || '未设置'}
 总请求：${report.totalRequests}，成功 ${report.successCount}，失败 ${report.errorCount}
 错误率：${((report.errorRate ?? 0) * 100).toFixed(2)}%
 平均耗时：${Math.round(report.avgRt)}ms，P50 ${Math.round(report.p50Rt)}ms，P95 ${Math.round(report.p95Rt)}ms，P99 ${Math.round(report.p99Rt)}ms
-平均 QPS：${report.avgQps}，最高 QPS：${report.maxQps}
+平均 QPS：${qps.avg.toFixed(1)}，峰值 QPS：${qps.max.toFixed(1)}，90% 分布 QPS：${qps.ninety.toFixed(1)}
+单并发 QPS：${qps.perConcurrent.toFixed(2)}，目标达成率：${qps.attainment === null ? '未设目标' : `${qps.attainment.toFixed(1)}%`}
 Apdex：${report.apdex}
 
 【配置与 SLA】
@@ -276,7 +279,7 @@ SLA：${settings.slaEnabled ? `P95 ≤ ${settings.slaP95}ms，P99 ≤ ${settings
 
 请输出：
 1. 压测目标与前置条件（环境、数据准备、是否可压线上）；
-2. 推荐参数：模式（固定并发 / 梯度）、并发、时长、爬坡、思考时间、目标 RPS、SLA 阈值，并说明依据；
+2. 推荐参数：模式（固定并发 / 梯度）、并发、时长、爬坡、思考时间、目标 QPS、SLA 阈值，并说明依据；
 3. 风险与止损策略（错误率、超时、下游依赖）；
 4. 观察指标与判定标准；
 5. 最后给出一段可直接使用的参数（JSON，字段名用 concurrent / durationSec / rampUpSec / thinkTimeMs / targetRps / stages / sla）。`

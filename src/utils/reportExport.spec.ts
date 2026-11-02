@@ -168,6 +168,18 @@ describe('buildReportHtml · 正式报告结构', () => {
     expect(html).toContain('明细数据与导出')
   })
 
+  it('执行摘要包含完整 QPS 指标组', () => {
+    expect(html).toContain('平均 QPS')
+    expect(html).toContain('90% 分布 QPS')
+    expect(html).toContain('单并发 QPS')
+    // 平均 5000 / 并发 200 = 25
+    expect(html).toContain('25.00')
+    // 目标 5000 / 平均 5000 = 100%
+    expect(html).toContain('5,000 / 100.0%')
+    // 口径定义同步给出单并发 QPS 的解释
+    expect(html).toContain('单连接吞吐效率')
+  })
+
   it('自动生成的结论、发现与应用建议非空', () => {
     expect(html).toContain('关键发现')
     expect(html).toContain('优化建议')
@@ -202,6 +214,30 @@ describe('buildReportSheets', () => {
     expect(names).toContain('优化建议')
     expect(names).toContain('配置快照')
     expect(names).toContain('概览')
+  })
+
+  it('概览页与采样表包含 QPS 指标组', () => {
+    const sheets = buildReportSheets(makeDetail(60), requests)
+    const overview = sheets.find((sheet) => sheet.name === '概览')
+    const labels = (overview?.rows ?? []).map((row) => row[0])
+    expect(labels).toContain('平均 QPS')
+    expect(labels).toContain('峰值 QPS')
+    expect(labels).toContain('90% 分布 QPS')
+    expect(labels).toContain('单并发 QPS')
+    expect(labels).toContain('目标 QPS')
+    expect(labels).toContain('目标达成率(%)')
+
+    const value = (label: string) =>
+      overview?.rows.find((row) => row[0] === label)?.[1]
+    expect(value('平均 QPS')).toBe(5000)
+    expect(value('单并发 QPS')).toBe(25)
+    // 目标 5000 ÷ 平均 5000 = 100%
+    expect(value('目标达成率(%)')).toBe(100)
+
+    const sampleSheet = sheets.find((sheet) => sheet.name === '采样明细')
+    expect(sampleSheet?.rows[0]).toContain('QPS')
+    const stageSheet = sheets.find((sheet) => sheet.name === '分阶段汇总')
+    expect(stageSheet?.rows[0]).toContain('平均 QPS')
   })
 
   it('压测模式显示为中文而不是原始枚举', () => {

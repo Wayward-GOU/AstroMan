@@ -13,10 +13,12 @@ description: AstroMan 的打包、图标、托盘与发布流程。需要构建 
 | Windows 安装包 | `npm run build:win` | `AstroMan_<版本>_x64-setup.exe`（NSIS） |
 | macOS 安装包 | `npm run build:mac` | `AstroMan_<版本>_universal.dmg` |
 | 仅校验 Rust | `cd src-tauri && cargo check` | — |
-| 前端单测 | `npm run test` | vitest 46 条 |
-| Rust 单测 | `cd src-tauri && cargo test` | 22 条 |
+| 前端单测 | `npm run test` | vitest：10 spec / 134 条 |
+| Rust 单测 | `cd src-tauri && cargo test --lib` | 101 条 |
+| 覆盖率（本地） | `cd src-tauri && cargo tarpaulin --config tarpaulin.toml --engine llvm` | `target/coverage/` |
+| 版本号 | `npm run version:check` / `npm run version:set 1.0.8` | 三处版本一致 |
 
-产物统一在 `src-tauri/target/release/bundle/` 下。
+产物统一在 `src-tauri/target/release/bundle/` 下。测试与门禁的完整口径见 skill `astroman-testing`。
 
 Windows 下 `cargo check` 若报 `hit restricted ... D:\Software\Rust\cargo\.global-cache-journal`，说明被沙箱拦住了，需要在关闭沙箱的状态下执行，这不是代码错误。
 
@@ -54,11 +56,12 @@ Windows 下 `cargo check` 若报 `hit restricted ... D:\Software\Rust\cargo\.glo
 
 ## 发版流程
 
-1. 同步版本号：`package.json`、`package-lock.json`（2 处）、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock` 的 `astroman` 条目、`src-tauri/tauri.conf.json`（当前 1.0.7）
-2. 提交后打 tag：`git tag v1.0.7 && git push origin v1.0.7`，同时把 `.github/workflows/release.yml` 里的 `releaseBody` 更新成本次版本说明（GitHub Release 直接用它）；版本说明追加到 `### 本次更新（x.y.z）` 段落
-3. `.github/workflows/release.yml` 在 tag 推送时自动构建 Windows NSIS 与 macOS universal dmg，上传到 GitHub Release
-4. 应用内更新检查走 `commands/update.rs` 的 `RELEASE_API`（`https://api.github.com/repos/Wayward-GOU/AstroMan/releases/latest`），仓库地址已改为 AstroMan
-5. macOS 用户安装脚本 `scripts/install-macos.sh`（`REPO=Wayward-GOU/AstroMan`）从 Release 下载 dmg，并绕过未签名校验；README 中的安装命令同源
+1. 同步版本号：`npm run version:set 1.0.8` 一次写入 `package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml` 三处；脚本**不动** lock 文件——`package-lock.json` 用 `npm install --package-lock-only` 跟上，`Cargo.lock` 跑一次 `cargo check` 会自动同步。`npm run version:check` 必须通过（CI 的 `frontend` job 第一步就是它）
+2. 提交前跑一遍与 CI 同源的门禁：`npm run test`、`npm run build`、`cargo fmt --check --all`、`cargo clippy --lib --all-targets -- -D warnings`、`cargo test --lib`；覆盖率由 `src-tauri/tarpaulin.toml` 的 `fail-under`（当前 25%）判定，报告在 `target/coverage/`
+3. 提交后打 tag：`git tag v1.0.8 && git push origin v1.0.8`，同时把 `.github/workflows/release.yml` 里的 `releaseBody` 更新成本次版本说明（GitHub Release 直接用它）；版本说明追加到 `### 本次更新（x.y.z）` 段落
+4. `.github/workflows/release.yml` 在 tag 推送时自动构建 Windows NSIS 与 macOS universal dmg，上传到 GitHub Release
+5. 应用内更新检查走 `commands/update.rs` 的 `RELEASE_API`（`https://api.github.com/repos/Wayward-GOU/AstroMan/releases/latest`），仓库地址已改为 AstroMan
+6. macOS 用户安装脚本 `scripts/install-macos.sh`（`REPO=Wayward-GOU/AstroMan`）从 Release 下载 dmg，并绕过未签名校验；README 中的安装命令同源
 
 ## 构建排错
 

@@ -16,13 +16,13 @@ import {
   PushpinFilled,
   PushpinOutlined,
   ReloadOutlined,
-  RobotOutlined,
   SearchOutlined,
   SendOutlined,
   SettingOutlined,
   StopOutlined,
   ThunderboltOutlined,
 } from '@ant-design/icons-vue'
+import AstroBuddyIcon from '@/components/AstroBuddyIcon.vue'
 import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog'
 import PageHeader from '@/components/PageHeader.vue'
 import AiConfirmCard from '@/components/AiConfirmCard.vue'
@@ -53,8 +53,12 @@ import {
   fileExists,
   fileReadText,
   fileWriteText,
+  testCaseGet,
+  testPreflight,
+  testRunGet,
+  testSuiteGet,
 } from '@/api'
-import { isDangerousTool, isWriteTool, maskSensitive, TOOL_CATALOG, executeTool, toolLabel, type ToolResult } from '@/utils/aiTools'
+import { isDangerousTool, isWriteTool, maskSensitive, testCaseKindLabel, TOOL_CATALOG, executeTool, toolLabel, type ToolResult } from '@/utils/aiTools'
 import { callKey, hasNativeToolSyntax, parseSegments, sanitizeAssistant, stripNativeTags, type Segment } from '@/utils/aiProtocol'
 import { buildContext, estimateMessages, estimateTokens, SUMMARY_PREFIX } from '@/utils/contextBudget'
 import { estimateCost, fmtUsd, priceOf } from '@/utils/aiPricing'
@@ -610,7 +614,7 @@ ${TOOL_CATALOG}
    - 写前后置脚本用 request_script_save，不要用 request_update 覆盖整条请求（它会把没提到的字段清空）。
 9. 压测计划：用户只是要方案、没指向具体接口时，直接给方案（不调工具），末尾可问「要不要按这个方案建一份计划」。用户指定了本机具体接口时，按「读接口 → 给完整计划 → 等确认 → 保存」四步：
    - 先 request_search / request_options 定位接口，再 request_get 读 method、url、body 等真实信息，不要凭空假设；
-   - 然后用文字把计划完整列出来（模式、并发、时长、爬坡、思考时间、目标 RPS、SLA 阈值、观察指标与风险），并问「确认后我保存为压测计划，是否继续」；
+   - 然后用文字把计划完整列出来（模式、并发、时长、爬坡、思考时间、目标 QPS、SLA 阈值、观察指标与风险），并问「确认后我保存为压测计划，是否继续」；
    - 用户同意后才调用 plan_save；保存成功再问是否立即 stress_start，不要连跳两步自动开跑；
    - 默认从 10 并发 × 30 秒起步，更大压力必须先征得同意。
 10. 日常对话、通用问答不要调用工具，也不要用工具块凑格式；全部使用中文，简洁可执行。
@@ -1232,14 +1236,188 @@ const CONFIRM_TEXT: Record<string, string> = {
   env_delete: '将删除该环境及其变量，无法撤销；引用此环境的请求会回退到无环境。',
   env_script_save: '将覆盖该环境的环境脚本，之后每次发送请求前都会执行新脚本。',
   report_delete: '将永久删除该份压测报告与采样数据，无法撤销。',
+  test_suite_create: '将在本机新建一个测试套件，之后可往里添加用例。',
+  test_suite_update: '将修改测试套件的名称 / 标签 / 配置或前后置脚本。',
+  test_suite_delete: '将删除该测试套件及其全部用例、数据集与运行记录，无法撤销。',
+  test_case_create: '将往套件里新增一条测试用例。',
+  test_case_update: '将修改该测试用例的断言 / 脚本 / 压测快照。',
+  test_case_delete: '将永久删除该测试用例，无法撤销。',
+  test_run_start: '将真实执行整个测试套件，按顺序发送请求或运行脚本。',
+  test_run_stop: '将立即停止正在运行的测试套件，已完成的用例结果会保留。',
+  test_report_export: '将为该次运行生成并写出测试报告文件。',
 }
 
 function describeWrite(tool: string): string {
   return CONFIRM_TEXT[tool] ?? '该操作会修改本机数据，确认后立即执行。'
 }
 
-/** 把工具参数整理成人能看懂的预览，重点展示计划类工具的配置 */
-function previewArgs(tool: string, args: Record<string, unknown>): string {
+/** 确认卡「参数」表里用到的中文字段名（测试域） */
+const TEST_FIELD_LABELS: Record<string, string> = {
+  name: '名称',
+  description: '描述',
+  envId: '环境',
+  tags: '标签',
+  config: '套件配置',
+  setupScript: '前置脚本',
+  teardownScript: '后置脚本',
+  requestId: '绑定的接口',
+  datasetId: '数据集',
+  dependsOn: '依赖用例',
+  assertions: '断言',
+  variables: '变量',
+  preScript: '前置脚本',
+  postScript: '后置脚本',
+  mainScript: '主脚本',
+  stress: '压测配置',
+  timeoutMs: '超时（毫秒）',
+  retries: '重试次数',
+  kind: '类型',
+  failFast: '失败即停',
+  vars: '临时变量',
+  secrets: '临时密钥',
+  formats: '报告格式',
+}
+
+/** 只挑出用户真正改到的字段，忽略 id 类入参 */
+function changedFields(args: Record<string, unknown>, skip: string[]): string[] {
+  return Object.keys(args)
+    .filter((key) => !skip.includes(key))
+    .filter((key) => args[key] !== undefined && args[key] !== null && args[key] !== '')
+    .map((key) => TEST_FIELD_LABELS[key] ?? key)
+}
+
+function countKeys(value: unknown): number {
+  return value && typeof value === 'object' ? Object.keys(value as Record<string, unknown>).length : 0
+}
+
+/** 测试域的确认卡预览：能查到名字的（套件 / 用例 / 运行）顺带补上名字 */
+async function previewTest(tool: string, args: Record<string, unknown>): Promise<string> {
+  const text = (key: string) => (args[key] === undefined || args[key] === null ? '' : String(args[key]))
+  const num = (key: string) => {
+    const value = typeof args[key] === 'number' ? (args[key] as number) : Number(args[key])
+    return Number.isFinite(value) && value > 0 ? value : 0
+  }
+  const lines: string[] = []
+
+  if (tool === 'test_run_start') {
+    const suiteId = num('suiteId')
+    const envId = num('envId')
+    try {
+      const preflight = await testPreflight(suiteId, envId || undefined)
+      lines.push(
+        `套件：${preflight.suiteName}`,
+        `环境：${preflight.envName || '套件默认环境'}`,
+        `用例：启用 ${preflight.enabledCases} / 共 ${preflight.totalCases} 个`,
+        `预检：${
+          preflight.errors
+            ? `${preflight.errors} 个错误，执行会被拦截`
+            : preflight.warnings
+              ? `全部通过，${preflight.warnings} 条提示`
+              : '全部通过'
+        }`,
+      )
+    } catch (error) {
+      lines.push(`套件：#${suiteId || '?'}`, `预检：读取失败（${String(error)}）`)
+    }
+    lines.push(`失败即停：${args.failFast === true ? '是' : '否'}`)
+    const vars = countKeys(args.vars)
+    const secrets = countKeys(args.secrets)
+    if (vars) lines.push(`临时变量：${vars} 个`)
+    if (secrets) lines.push(`临时密钥：${secrets} 个（仅本次运行使用，不落库）`)
+    return lines.join('\n')
+  }
+
+  if (tool === 'test_run_stop') {
+    const runId = num('runId')
+    lines.push(`运行：#${runId || '?'}（停止后已完成的用例结果会保留）`)
+    try {
+      const { run } = await testRunGet(runId)
+      const done = run.passed + run.failed + run.skipped + run.errored
+      lines.push(`进度：已完成 ${done} / ${run.total} 个用例`)
+      if (done) {
+        lines.push(
+          `结果：通过 ${run.passed}，失败 ${run.failed}，错误 ${run.errored}，跳过 ${run.skipped}`,
+        )
+      }
+      if (run.envName) lines.push(`环境：${run.envName}`)
+    } catch {
+      // 读不到就只报 id，不影响确认
+    }
+    return lines.join('\n')
+  }
+
+  if (tool === 'test_report_export') {
+    const formats = Array.isArray(args.formats) ? args.formats.map((item) => String(item)) : []
+    lines.push(`运行：#${text('runId') || '?'}`, `格式：${formats.join(' / ') || '默认（html + json）'}`)
+    return lines.join('\n')
+  }
+
+  if (tool === 'test_suite_delete' || tool === 'test_case_delete') {
+    const id = num('id')
+    try {
+      if (tool === 'test_suite_delete') {
+        const detail = await testSuiteGet(id)
+        const enabled = detail.cases.filter((item) => item.enabled).length
+        lines.push(
+          `套件：${detail.suite.name}`,
+          `用例：${detail.cases.length} 个（启用 ${enabled} 个）`,
+          `数据集：${detail.datasets.length} 个`,
+          '删除后连同全部运行记录一起消失',
+        )
+      } else {
+        const item = await testCaseGet(id)
+        lines.push(
+          `用例：${item.name || '(未命名)'}`,
+          `类型：${testCaseKindLabel(item.kind) || item.kind}`,
+          `所属套件：#${item.suiteId}`,
+        )
+        if (item.requestId) lines.push(`绑定接口：#${item.requestId}`)
+      }
+    } catch {
+      lines.push(`${tool === 'test_suite_delete' ? '套件' : '用例'}：#${id || '?'}`)
+    }
+    return lines.join('\n')
+  }
+
+  if (tool === 'test_suite_create' || tool === 'test_suite_update') {
+    if (tool === 'test_suite_create') {
+      lines.push(`套件：${text('name') || '(未命名)'}`, `项目：#${text('projectId') || '未指定'}`)
+      if (text('tags')) lines.push(`标签：${text('tags')}`)
+      lines.push(`套件配置：${countKeys(args.config) ? `${countKeys(args.config)} 项` : '默认'}`)
+      const scripts = ['setupScript', 'teardownScript'].filter((key) => text(key)).length
+      if (scripts) lines.push(`脚本：${scripts} 段（前置 / 后置）`)
+    } else {
+      lines.push(`套件：#${text('id') || '?'}`, `将修改：${changedFields(args, ['id']).join('、') || '无'}`)
+    }
+    return lines.join('\n')
+  }
+
+  if (tool === 'test_case_create' || tool === 'test_case_update') {
+    if (tool === 'test_case_create') {
+      lines.push(
+        `所属套件：#${text('suiteId') || '?'}`,
+        `用例：${text('name') || '(未命名)'}（${testCaseKindLabel(args.kind) || text('kind') || '类型未指定'}）`,
+      )
+      if (text('requestId')) lines.push(`绑定接口：#${text('requestId')}`)
+      if (text('datasetId')) lines.push(`数据集：#${text('datasetId')}`)
+      const assertions = Array.isArray(args.assertions) ? args.assertions.length : 0
+      lines.push(`断言：${assertions ? `${assertions} 条` : '未设置'}`)
+      if (text('mainScript')) lines.push(`主脚本：${text('mainScript').split('\n').length} 行`)
+      if (countKeys(args.stress)) lines.push('压测：内联压测快照（并发 / 时长 / SLA 见参数表）')
+    } else {
+      lines.push(`用例：#${text('id') || '?'}`, `将修改：${changedFields(args, ['id']).join('、') || '无'}`)
+    }
+    return lines.join('\n')
+  }
+
+  return lines.join('\n')
+}
+
+/** 把工具参数整理成人能看懂的预览，重点展示计划类与测试运行这类需要人工核对的配置 */
+async function previewArgs(
+  tool: string,
+  args: Record<string, unknown>,
+): Promise<string | undefined> {
   const text = (key: string) => (args[key] === undefined || args[key] === null ? '' : String(args[key]))
   if (tool === 'plan_save' || tool === 'stress_start') {
     const mode = text('mode') || (Array.isArray(args.stages) ? 'stages' : 'fixed')
@@ -1271,8 +1449,11 @@ function previewArgs(tool: string, args: Record<string, unknown>): string {
     if (text('envId')) lines.push(`环境：#${text('envId')}`)
     return lines.join('\n')
   }
-  const json = JSON.stringify(args, null, 2)
-  return json.length > 1600 ? `${json.slice(0, 1600)}\n…（参数过长已截断）` : json
+  if (tool.startsWith('test_')) {
+    const preview = await previewTest(tool, args)
+    return preview || undefined
+  }
+  return undefined
 }
 
 /** 最近一条真实用户输入（跳过工具结果回灌的伪用户消息） */
@@ -1328,6 +1509,8 @@ async function runToolSegment(item: ChatItem, index: number, seg: Segment) {
     if (exportTools.has(seg.tool) && typeof seg.args.path === 'string') {
       overwrite = await fileExists(seg.args.path).catch(() => false)
     }
+    // 计划类 / 测试域：先把人话预览算出来（test_run_start 会顺带查一次预检），再弹卡
+    const planText = await previewArgs(seg.tool, effectiveArgs)
     const confirmed = await new Promise<boolean>((resolve) => {
       Modal.confirm({
         title: overwrite
@@ -1340,10 +1523,7 @@ async function runToolSegment(item: ChatItem, index: number, seg: Segment) {
           description: describeWrite(seg.tool),
           overwrite,
           path: typeof effectiveArgs.path === 'string' ? effectiveArgs.path : undefined,
-          planText:
-            seg.tool === 'plan_save' || seg.tool === 'stress_start'
-              ? previewArgs(seg.tool, effectiveArgs)
-              : undefined,
+          planText,
         }),
         okText: overwrite ? '覆盖写入' : '确认执行',
         okType: isDangerousTool(seg.tool) || overwrite ? 'danger' : 'primary',
@@ -2062,7 +2242,7 @@ const suggestions = [
 
 const capabilities = [
   {
-    icon: RobotOutlined,
+    icon: AstroBuddyIcon,
     title: '聊 & 答',
     items: ['技术概念讲解', '方案与文案撰写', '报错排查思路', '代码解释与改写'],
   },
@@ -2230,7 +2410,7 @@ onMounted(async () => {
         </div>
 
         <div v-if="!canChat" class="chat-empty">
-          <RobotOutlined class="empty-icon" />
+          <AstroBuddyIcon class="empty-icon" />
           <h3>还没有可用的模型</h3>
           <p>航仔 由你自己的 API 驱动，密钥经加密后只保存在本机。不配置则不提供任何 AI 能力。</p>
           <a-button type="primary" @click="serviceOpen = true">去配置服务</a-button>
@@ -2240,7 +2420,7 @@ onMounted(async () => {
           <div ref="scrollRef" class="chat-scroll">
             <div v-if="messages.length === 0" class="chat-hint">
               <div class="hint-hero">
-                <div class="hint-avatar"><RobotOutlined /></div>
+                <div class="hint-avatar"><AstroBuddyIcon /></div>
                 <div class="hint-hero-text">
                   <div class="hint-title">你好，我是航仔</div>
                   <p class="hint-sub">

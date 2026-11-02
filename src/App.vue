@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, type Component } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { theme as AntTheme } from 'ant-design-vue'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
@@ -14,7 +14,6 @@ import {
   ToolOutlined,
   ThunderboltOutlined,
   PlayCircleOutlined,
-  RobotOutlined,
   SearchOutlined,
   EnterOutlined,
   MenuFoldOutlined,
@@ -22,6 +21,8 @@ import {
   ArrowLeftOutlined,
 } from '@ant-design/icons-vue'
 import AppLogo from '@/components/AppLogo.vue'
+import AstroBuddy from '@/components/AstroBuddy.vue'
+import AstroBuddyIcon from '@/components/AstroBuddyIcon.vue'
 import AiAssistDrawer from '@/components/AiAssistDrawer.vue'
 import ErrorDialog from '@/components/ErrorDialog.vue'
 import { currentTheme, currentThemeId, setTheme, themes } from '@/stores/theme'
@@ -110,7 +111,7 @@ interface NavItem {
   label: string
   hint: string
   to: string
-  icon: typeof AppstoreOutlined
+  icon: Component
   group: string
 }
 
@@ -120,7 +121,7 @@ const navs: NavItem[] = [
   { key: 'stress', label: '压测', hint: '选择接口发起压测', to: '/stress', icon: ThunderboltOutlined, group: '测试' },
   { key: 'runner', label: '批量运行', hint: '集合 Runner · 数据驱动', to: '/runner', icon: PlayCircleOutlined, group: '测试' },
   { key: 'automation', label: '自动化测试', hint: '套件 · 断言 · Python · 报告', to: '/automation', icon: ExperimentOutlined, group: '测试' },
-  { key: 'ai', label: '航仔', hint: 'AI 助手 · 自动建请求并分析', to: '/ai', icon: RobotOutlined, group: '智能' },
+  { key: 'ai', label: '航仔', hint: 'AI 助手 · 自动建请求并分析', to: '/ai', icon: AstroBuddyIcon, group: '智能' },
   { key: 'history', label: '历史记录', hint: '数据概览 · 最近发送记录', to: '/history', icon: HistoryOutlined, group: '智能' },
   { key: 'monitor', label: '系统监视', hint: 'CPU · 内存 · 磁盘 · 网络', to: '/monitor', icon: LineChartOutlined, group: '系统' },
   { key: 'tools', label: '工具箱', hint: 'JSON · 加解密 · 时间戳', to: '/tools', icon: ToolOutlined, group: '系统' },
@@ -505,70 +506,7 @@ const theme = computed(() => {
         <div v-if="zoomNotice" class="zoom-notice">{{ Math.round(zoom * 100) }}%</div>
       </transition>
 
-      <transition name="zoom-fade">
-        <button
-          v-if="!route.path.startsWith('/ai')"
-          class="hi-float"
-          type="button"
-          aria-label="打开航仔"
-          @click="go('/ai')"
-        >
-          <span class="hi-float-halo" />
-          <svg class="hi-bot" viewBox="0 0 64 64" aria-hidden="true">
-            <defs>
-              <linearGradient id="hiShell" x1="0" y1="0" x2="0.4" y2="1">
-                <stop offset="0" stop-color="#ffffff" />
-                <stop offset="1" stop-color="#dce6f2" />
-              </linearGradient>
-              <linearGradient id="hiFace" x1="0" y1="0" x2="1" y2="1">
-                <stop offset="0" stop-color="#2c3646" />
-                <stop offset="1" stop-color="#111722" />
-              </linearGradient>
-            </defs>
-
-            <path d="M32 9 L32 14" stroke="#a8b6c8" stroke-width="1.8" stroke-linecap="round" />
-            <circle cx="32" cy="6.4" r="2.4" class="hi-antenna" />
-
-            <rect x="8.5" y="27" width="4" height="9" rx="2" fill="#cbd8e6" />
-            <rect x="51.5" y="27" width="4" height="9" rx="2" fill="#cbd8e6" />
-
-            <rect x="13.5" y="14.5" width="39" height="32" rx="10" fill="#c2cfdf" />
-            <rect
-              x="11.5"
-              y="12.5"
-              width="41"
-              height="32"
-              rx="10"
-              fill="url(#hiShell)"
-              stroke="#c9d6e5"
-              stroke-width="1"
-            />
-            <rect x="16.5" y="17.5" width="32" height="22" rx="6.5" fill="url(#hiFace)" />
-
-            <g class="hi-eyes">
-              <path d="M25.5 24.8 L29 28.5 L25.5 32.2 L22 28.5 Z" fill="#7ee7ff" />
-              <path d="M38.5 24.8 L42 28.5 L38.5 32.2 L35 28.5 Z" fill="#7ee7ff" />
-            </g>
-
-            <rect x="19" y="47" width="26" height="9" rx="4.5" fill="#c2cfdf" />
-            <rect
-              x="18"
-              y="45.5"
-              width="26"
-              height="9"
-              rx="4.5"
-              fill="url(#hiShell)"
-              stroke="#c9d6e5"
-              stroke-width="1"
-            />
-
-            <circle cx="15.5" cy="50" r="3.2" fill="#dbe5f1" stroke="#c9d6e5" stroke-width="1" />
-            <circle cx="48.5" cy="50" r="3.2" fill="#dbe5f1" stroke="#c9d6e5" stroke-width="1" />
-          </svg>
-          <span class="hi-float-tip">航仔 · AI 助手</span>
-          <span class="hi-float-dot" />
-        </button>
-      </transition>
+      <AstroBuddy v-if="!route.path.startsWith('/ai')" @open="go('/ai')" />
 
       <a-modal
         v-model:open="paletteOpen"
@@ -1072,198 +1010,6 @@ const theme = computed(() => {
   font-variant-numeric: tabular-nums;
   pointer-events: none;
   box-shadow: 0 8px 24px rgba(15, 23, 42, 0.28);
-}
-
-/* 全局悬浮入口：航仔 小机器人，贴右侧屏幕垂直居中 */
-.hi-float {
-  position: fixed;
-  right: 14px;
-  top: 50%;
-  margin-top: -27px;
-  z-index: 900;
-  width: 54px;
-  height: 54px;
-  padding: 0;
-  border: none;
-  border-radius: 50%;
-  background: transparent;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  opacity: 0.78;
-  transition: transform 0.22s cubic-bezier(0.2, 0.8, 0.3, 1.2), opacity 0.2s ease;
-}
-
-.hi-float:hover,
-.hi-float:focus-visible {
-  opacity: 1;
-}
-
-.hi-float::before {
-  content: '';
-  position: absolute;
-  inset: 0;
-  border-radius: 50%;
-  background: radial-gradient(circle at 50% 34%, #ffffff 0%, #eff5fc 60%, #e1ebf7 100%);
-  border: 1px solid rgba(148, 170, 196, 0.34);
-  box-shadow: 0 10px 24px rgba(52, 84, 120, 0.22), 0 2px 6px rgba(52, 84, 120, 0.12);
-  transition: box-shadow 0.22s ease;
-}
-
-.hi-float-halo {
-  position: absolute;
-  inset: -11px;
-  border-radius: 50%;
-  background: radial-gradient(
-    circle,
-    color-mix(in srgb, var(--fm-primary) 46%, transparent) 0%,
-    transparent 68%
-  );
-  filter: blur(3px);
-  animation: hi-halo 4.2s ease-in-out infinite;
-  pointer-events: none;
-}
-
-.hi-bot {
-  position: relative;
-  width: 40px;
-  height: 40px;
-  animation: hi-bob 4.2s ease-in-out infinite;
-  will-change: transform;
-}
-
-.hi-eyes {
-  transform-box: fill-box;
-  transform-origin: center;
-  animation: hi-blink 5.4s steps(1) infinite;
-}
-
-.hi-eyes path {
-  filter: drop-shadow(0 0 2.5px rgba(126, 231, 255, 0.85));
-}
-
-.hi-antenna {
-  fill: #38d9a9;
-  animation: hi-antenna 2.8s ease-in-out infinite;
-}
-
-.hi-float:hover {
-  transform: translateY(-2px) scale(1.06);
-}
-
-.hi-float:hover::before {
-  box-shadow: 0 14px 30px rgba(52, 84, 120, 0.28), 0 3px 8px rgba(52, 84, 120, 0.14);
-}
-
-.hi-float:active {
-  transform: scale(0.96);
-}
-
-.hi-float:hover .hi-bot,
-.hi-float:hover .hi-float-halo {
-  animation-play-state: paused;
-}
-
-.hi-float-tip {
-  position: absolute;
-  right: 64px;
-  top: 50%;
-  padding: 5px 10px;
-  border-radius: 8px;
-  background: rgba(17, 23, 34, 0.92);
-  color: #fff;
-  font-size: 12px;
-  white-space: nowrap;
-  opacity: 0;
-  transform: translateY(-50%) translateX(6px);
-  transition: opacity 0.18s ease, transform 0.18s ease;
-  pointer-events: none;
-}
-
-.hi-float:hover .hi-float-tip {
-  opacity: 1;
-  transform: translateY(-50%) translateX(0);
-}
-
-.hi-float-dot {
-  position: absolute;
-  right: 2px;
-  bottom: 4px;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: #38d9a9;
-  border: 2px solid #fff;
-  animation: hi-dot 2.6s ease-out infinite;
-}
-
-@keyframes hi-bob {
-  0%,
-  100% {
-    transform: translateY(0);
-  }
-  50% {
-    transform: translateY(-3.5px);
-  }
-}
-
-@keyframes hi-halo {
-  0%,
-  100% {
-    opacity: 0.36;
-    transform: scale(0.96);
-  }
-  50% {
-    opacity: 0.68;
-    transform: scale(1.04);
-  }
-}
-
-@keyframes hi-blink {
-  0%,
-  92%,
-  100% {
-    transform: scaleY(1);
-  }
-  94%,
-  97% {
-    transform: scaleY(0.12);
-  }
-}
-
-@keyframes hi-antenna {
-  0%,
-  100% {
-    fill: #38d9a9;
-    opacity: 1;
-  }
-  50% {
-    fill: #5ce8bd;
-    opacity: 0.55;
-  }
-}
-
-@keyframes hi-dot {
-  0% {
-    box-shadow: 0 0 0 0 rgba(56, 217, 169, 0.55);
-  }
-  70% {
-    box-shadow: 0 0 0 7px rgba(56, 217, 169, 0);
-  }
-  100% {
-    box-shadow: 0 0 0 0 rgba(56, 217, 169, 0);
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .hi-bot,
-  .hi-float-halo,
-  .hi-eyes,
-  .hi-antenna,
-  .hi-float-dot {
-    animation: none;
-  }
 }
 
 .zoom-fade-enter-active,

@@ -29,6 +29,20 @@ description: AstroMan 的 Rust/Tauri 后端开发规范。改数据库 schema、
 | `commands/system.rs` / `commands/winstats.rs` | 应用信息、工作区统计、首页数据大屏聚合（`dashboard_metrics`）、Windows 进程指标 |
 | `commands/update.rs` | 版本检查与下载 |
 | `commands/ai.rs` | AI 助手「航仔」：服务商、流式对话、会话消息、工具流水（详见 `astroman-ai`） |
+| `commands/test_suite.rs` / `commands/test_case.rs` | 测试套件、用例、数据集的 CRUD（`test_suite_save` 兼新建与更新） |
+| `commands/test_run.rs` | 运行启动 / 停止 / 查询 / 当前运行；`test_run_start` 建 queued 记录后立即返回 `runId`，执行在后台任务 |
+| `commands/test_preflight.rs` | 运行前预检：缺接口 / 缺脚本 / 缺变量 / 依赖环，`strictScripts` 时把跳过项升级为 error |
+| `commands/test_report.rs` | 运行产物生成（HTML / JSON / JUnit / summary）与附件导出 |
+| `commands/test_pack.rs` | 套件包 `*.astromantest.json` 导入导出（含请求快照与数据集，同名冲突 skip / overwrite / rename） |
+| `test_runner.rs` | 套件执行内核：依赖跳过、失败策略、重试、并发、数据行、setup / teardown、进度事件；**不依赖 Tauri**，CLI 复用 |
+| `test_assert.rs` | 6 类声明式断言：`status` / `durationMs` / `header` / `body` / `regex` / `jsonPath` |
+| `test_dataset.rs` | CSV / JSON 数据集解析，嵌套字段摊平成 `a.b.c` 供 `{{a.b.c}}` 渲染 |
+| `python_exec.rs` | Python 子进程：解释器探测、`context.json` / `result.json` 协议、超时与输出上限、附件白名单 |
+| `report_builder.rs` | 运行报告渲染（HTML / JSON / JUnit / summary），桌面端与 CLI 共用同一份产物 |
+| `net_probe.rs` | 建连计时探针：连接器 `call()` 未触发时 `connectMs = 0` 且 `reusedConnection = true`；压测不使用它 |
+| `secret.rs` | 主密钥（钥匙串 / 口令 / 文件三种来源）、AES-256-GCM 字段加解密、密钥包导入导出、启动密钥校验 |
+| `backup.rs` | 快照（日 / 周 / pre-migrate / pre-restore）、恢复、`quick_check` 自检、诊断包 |
+| `logging.rs` | 按天滚动落盘、脱敏、`tail` 取诊断日志 |
 | `state.rs` | AppState、连接池、reqwest 客户端（普通/忽略证书）、AI 在途请求取消表 `ai_cancels: HashMap<requestId, AtomicBool>` |
 | `models.rs` | 全部前后端数据模型 |
 | `util.rs` | `err`、`now_ms`、`render`、`strip_json_comments` 等工具 |
@@ -69,6 +83,23 @@ description: AstroMan 的 Rust/Tauri 后端开发规范。改数据库 schema、
 
 示例数据在 `db/seed.rs`：空库 `seed()`，已有库 `upgrade_sample()` 补齐示例场景。
 
+## 主密钥与钥匙串（`secret.rs`）
+
+敏感字段（`environment_variables.value`、`ai_providers.api_key`）全部走同一套加密，**不要自己拼 AES**。
+
+- 密文格式 `enc:v1:base64(nonce12 || ciphertext)`，AAD 固定为 `表名:列名`（`format!("{table}:{col}")`）。AAD 绑死列，密文搬到别的列解密必然失败
+- 模块级入口：`secret::encrypt(aad, plain)` / `secret::decrypt(aad, stored)`；业务里不要直接用 `SecretStore` 内部方法
+- 三种来源 `KeySource`：`Keyring`（Windows 凭据管理器 / macOS Keychain，推荐）、`Passphrase`（Argon2id 派生，密钥不落盘）、`File`（`数据目录/keys/master.key`，界面上明确写「等同于没有加密」）
+- 钥匙串条目按数据目录派生：`AstroMan/master-key/<数据目录 sha256 前 8 字节>`，`KEYRING_USER = "master-key"`。多份安装 / 开发实例 / 测试库不再共用一条，避免互相覆盖
+- `SecretStore::bootstrap(data_dir, pool)` 顺序固定：取密钥 → 迁移旧共享条目 → `verify_key` → `encrypt_plaintext` 补齐历史明文
+- `verify_key` 三重确认：`app_meta.key_check` 哨兵密文 → `app_meta.key_fingerprint`（sha256 前 8 字节）→ 对已有 `enc:v1:` 样本抽样解密（老库兜底）。**校验失败时绝不能写 `key_check`**，否则会把错钥匙固化成「已验证」
+- 校验失败只告警一次并置 `mismatch`，不再逐条刷 `解密失败` 日志；`store()?.mismatch()` 非空时设置页显示受影响条数 + 两条恢复路径（导入密钥包 / 重新填写）
+- `import_keypack` / `set_passphrase` 在重加密失败时不整体报错——密钥已丢失时，这条路是唯一恢复手段，不能因为「用错钥匙重加密」直接失败
+- **测试与 CI 永不写钥匙串**：`keyring_allowed()` 在 `cfg!(test)` 或 `ASTROMAN_DISABLE_KEYRING=1` 时返回 false，自动降级文件密钥。历史事故：`AppState::headless` 用临时库跑测试，`bootstrap` 在新库上生成新主密钥并写进全局共享条目，把真实安装的密钥覆盖了
+- 改密钥相关代码后必须跑 `cargo test --lib secret::`（10 条），并确认没有新增写钥匙串的路径
+
+新增敏感列的做法：写入前 `secret::encrypt`，读取时 `secret::decrypt`；列表接口只返回掩码 `••••••` + `hasValue`，提交值为掩码或空时沿用旧密文。
+
 ## 关键上限常量
 
 | 常量 | 位置 | 值 |
@@ -90,6 +121,21 @@ description: AstroMan 的 Rust/Tauri 后端开发规范。改数据库 schema、
 - 结束后写 `test_reports` / `report_samples` / `report_requests`，分位、状态码分布、错误类型、直方图以 JSON 列存储
 - 压测请求自身也会写历史，注意不要绕过 `MAX_HISTORY` 裁剪
 - 请求体与手动发送走同一套规则：`body_type == "json"` 时先 `strip_json_comments` 再渲染变量，保证「请求编辑器能发、压测也能发」
+
+## 自动化测试执行内核（v1.0.8 新增）
+
+七张表：`test_suites` / `test_cases` / `test_datasets` / `test_runs` / `test_run_cases` / `test_run_assertions` / `test_artifacts`。老库由 `db/mod.rs::migrate()` 逐列补齐，不改存量数据。
+
+- 入口固定两条：`test_runner::create_queued_run(state, suite_id, trigger)` 建 queued 记录并返回 `runId`，`test_runner::run_suite(...)` 后台执行；桌面端与 CLI 都走这里，**不要另写一套执行循环**
+- 引擎不依赖 Tauri：进度与用例结果通过 `TestEvent` 回调交给命令层，命令层再 `emit`；CLI 直接把回调打到 stdout
+- 运行状态：`queued → running → completed / stopped / error`；用例状态：`passed / failed / skipped / error`。统计写 `test_runs.passed/failed/skipped/errored/duration_ms`
+- 快照与日志上限：请求 256KB、响应 1MB、日志 64KB，进度事件 200ms 一次（`PROGRESS_INTERVAL`），别把全量快照塞进事件
+- Python 边界常量集中在 `python_exec.rs`：协议 `1.0`、默认超时 60s、输出 1MB、`result.json` 5MB、单附件 10MB、附件合计 100MB、最低 Python 3.9；解释器路径、授权开关与超时由设置页控制
+- 与压测互斥：`kind=stress` 用例跑前要等 `stress_running` 释放，`waitTimeoutSec` 控制最长等待；停止运行会在一秒内中断压测
+- 产物目录 `<数据目录>/test-reports/<runId>/`（`report.html` / `report.json` / `junit.xml` / `summary.txt` / `logs/` / `files/`），**库里只存相对路径**，切换数据目录后历史仍可读；每套件保留 50 份，启动时清理无主目录
+- 改断言、钩子或数据行语义后至少跑 `cargo test --lib test_runner:: test_assert:: test_dataset:: python_exec::`（合计 32 条）
+
+完整流程（预检项、退出码、套件包、AI 12 个测试域工具）见 skill `astroman-automation`。
 
 ## 统计聚合
 

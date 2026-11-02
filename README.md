@@ -106,10 +106,11 @@ AstroMan 是一款**本地优先**的 HTTP API 研发工具箱：接口调试、
 - **脚本与加密**：同步 JS 沙箱，前后置脚本、断言、`vars` / `env` / `cipher` / `rsa`，覆盖 MD5 / HMAC / AES / DES / 3DES / RSA
 - **批量运行**：集合级 Runner，迭代、间隔、CSV / JSON 数据驱动，脚本与断言全部生效
 - **自动化测试**：可保存的测试套件与用例（HTTP / Python / 压测），声明式断言、Python 前后置钩子、数据驱动、失败重试、运行历史与 HTML / JSON / JUnit 报告；套件包可在机器间导入导出
-- **本地压测**：固定并发 / 阶梯加压、RPS 限速、自动停止、SLA 验收、实时曲线、JSON / HTML / Excel 报告与横向对比；套件内压测用例支持 SLA 与基线回归门禁
+- **本地压测**：固定并发 / 阶梯加压、RPS 限速、自动停止、SLA 验收、实时曲线、统一口径的 QPS 指标组（平均 / 峰值 / 90% 分布 / 单并发 / 目标达成率）、JSON / HTML / Excel 报告与横向对比；套件内压测用例支持 SLA 与基线回归门禁
 - **导入导出**：cURL、Postman / Apifox、OpenAPI 3.0 / Swagger 2.0 导入；项目 JSON、OpenAPI 导出
 - **离线工具箱**：9 大分类 92 个工具，全部本地计算，支持收藏与最近使用
-- **航仔 AI Agent**：三协议模型接入、74 个业务工具 + `tool_search`、写操作确认、上下文预算与摘要、复盘时间线
+- **航仔 AI Agent**：三协议模型接入、73 个业务工具 + `tool_search`（共 74 个）、写操作确认、上下文预算与摘要、复盘时间线
+- **外观**：21 套配色主题（14 浅 / 7 深，含低饱和「陶土红」）、可拖到窗口任意位置的宇航员挂件、64px 窄侧栏与命令面板
 - **本地优先**：SQLite 存储、无账号、无云依赖；数据目录可自定义与迁移
 - **跨平台**：Windows 10/11（x64 / x86）与 macOS 10.15+（Intel / Apple Silicon）
 
@@ -134,7 +135,7 @@ AstroMan 是一款**本地优先**的 HTTP API 研发工具箱：接口调试、
 3. 新建请求，填方法 / URL / Params / Headers / Body，点发送
 4. 需要签名或密文时，在请求的「脚本」页写前置 / 后置脚本
 5. 需要回归时用「批量运行」，需要容量摸底时用「压测」
-6. 右侧机器人打开「航仔」，配置模型服务后可用自然语言操作软件
+6. 点击右侧的宇航员挂件「航仔」（可按住拖到任意位置，单击进入），配置模型服务后可用自然语言操作软件
 
 完整步骤：[快速开始](docs/quick-start.md) · 变量与脚本：[脚本 API](docs/script-api.md)
 
@@ -216,13 +217,14 @@ AstroMan/
 ## 参与贡献
 
 - 提交前请先看 [开发与打包](docs/development.md)
+- 提交前本地过一遍与 CI 同源的门禁：`npm run test`、`npm run build`、`cargo fmt --check --all`、`cargo clippy --all-targets -- -D warnings`、`cargo test --lib`；覆盖率门槛见 [测试与质量门禁](docs/development.md#测试与质量门禁)
 - 新增 IPC 命令必须注册到 `src-tauri/src/lib.rs` 的 `generate_handler!`
-- UI 变更请遵循现有设计令牌与 Ant Design Vue 组件规范
+- UI 变更请遵循现有设计令牌与 Ant Design Vue 组件规范（颜色只用 `--fm-*`，主题在 `src/stores/theme.ts`）
 - Issue / PR 请附复现步骤、系统版本与截图
 
 ## License
 
-当前仓库尚未添加 `LICENSE` 文件，正式开源发布前将补充（倾向 MIT）。在此之前，请勿将代码用于未授权的商业分发。
+[MIT](LICENSE) © AstroMan
 
 ---
 

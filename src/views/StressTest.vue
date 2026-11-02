@@ -510,6 +510,16 @@ const currentRps = computed(() => {
   return 0
 })
 
+/** 至今平均 QPS = 已完成请求数 ÷ 已运行秒数，避免首秒抖动放大瞬时值 */
+const avgQps = computed(() => {
+  const seconds = progress.value?.elapsedSec ?? done.value?.elapsedSec ?? 0
+  const total = progress.value?.total ?? done.value?.total ?? 0
+  return seconds > 0 ? total / seconds : 0
+})
+
+/** 本次压测的采样峰值 QPS */
+const peakQps = computed(() => samples.value.reduce((max, item) => Math.max(max, item.qps), 0))
+
 function fmt(v: number | undefined | null, digits = 1) {
   if (v === undefined || v === null || Number.isNaN(v)) return '-'
   return v >= 1000 ? v.toFixed(0) : v.toFixed(digits)
@@ -784,7 +794,7 @@ function backToRequest() {
             </div>
 
             <div class="field">
-              <div class="label">目标 RPS 限速</div>
+              <div class="label">目标 QPS 限速</div>
               <a-input-number v-model:value="settings.targetRps" :min="0" :max="100000" :step="10" style="width: 100%" />
               <div class="hint">0 表示不限速；设置后每秒最多发出该数量的请求</div>
             </div>
@@ -819,7 +829,7 @@ function backToRequest() {
                   <a-input-number v-model:value="settings.slaErrorRate" :min="0" :max="100" :step="0.5" size="small" style="width: 100%" />
                 </div>
                 <div class="field">
-                  <div class="label">平均 RPS ≥</div>
+                  <div class="label">平均 QPS ≥</div>
                   <a-input-number v-model:value="settings.slaMinRps" :min="0" :max="100000" size="small" style="width: 100%" />
                 </div>
               </div>
@@ -873,8 +883,12 @@ function backToRequest() {
                 <span class="stat-value mono">{{ progress?.total ?? done?.total ?? 0 }}</span>
               </div>
               <div class="stat">
-                <span class="stat-label">当前 RPS</span>
+                <span class="stat-label">当前 QPS</span>
                 <span class="stat-value mono">{{ fmt(currentRps) }}</span>
+              </div>
+              <div class="stat">
+                <span class="stat-label">平均 QPS</span>
+                <span class="stat-value mono">{{ fmt(avgQps) }}</span>
               </div>
               <div class="stat">
                 <span class="stat-label">平均延迟</span>
@@ -907,7 +921,7 @@ function backToRequest() {
           <div class="fm-card chart-card">
             <div class="chart-head">
               <span class="chart-title">吞吐量 QPS</span>
-              <span class="chart-sub">按秒统计</span>
+              <span class="chart-sub">按秒统计 · 峰值 {{ fmt(peakQps) }} QPS</span>
             </div>
             <LineChart :series="qpsSeries" :labels="chartLabels" unit="" />
           </div>
@@ -1241,7 +1255,7 @@ function backToRequest() {
                     <div class="hint">每个线程两次请求之间的固定间隔</div>
                   </div>
                   <div class="field">
-                    <div class="label">目标 RPS 限速</div>
+                    <div class="label">目标 QPS 限速</div>
                     <a-input-number
                       v-model:value="settings.targetRps"
                       :min="0"
@@ -1321,7 +1335,7 @@ function backToRequest() {
                     />
                   </div>
                   <div class="field">
-                    <div class="label">平均 RPS ≥</div>
+                    <div class="label">平均 QPS ≥</div>
                     <a-input-number v-model:value="settings.slaMinRps" :min="0" :max="100000" style="width: 100%" />
                   </div>
                 </div>
@@ -1681,7 +1695,7 @@ function backToRequest() {
 
 .stats {
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
   gap: 10px;
   margin-top: 16px;
 }

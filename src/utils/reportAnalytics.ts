@@ -29,19 +29,19 @@ export function median(values: number[]): number {
 }
 
 /**
- * 90% 分布 QPS：每秒采样 QPS 的 P10
+ * 取「稳态窗口」内的每秒 QPS
  *
- * 参考样本中的「90% QPS」含义是「90% 的时间不低于该值」，因此取 P10。
- * 必须剔除三种失真：
+ * 剔除三种失真，供 90% 分布与最低 QPS 共用同一批采样点：
  *   1. 增压（ramp-up）阶段的低值；
  *   2. 首秒（采样窗口不完整）；
  *   3. 末尾不完整秒。
+ * 样本太少（不足 3 个可用点）时退回全量，避免短压测直接算不出来。
  */
-export function qpsP10(
+export function stableQpsValues(
   samples: ReportSample[],
   options: { rampUpSec?: number } = {},
-): { value: number; used: number; dropped: number } {
-  if (!samples.length) return { value: 0, used: 0, dropped: 0 }
+): number[] {
+  if (!samples.length) return []
   const rampUp = Math.max(0, Math.round(options.rampUpSec ?? 0))
   // 无明确 ramp-up 配置时，至少剔除首 5%（且不少于 1 个、不多于 5 个）采样点
   const fallbackWarmup = Math.min(5, Math.max(1, Math.round(samples.length * 0.05)))
@@ -49,7 +49,21 @@ export function qpsP10(
   const usable = samples.filter(
     (item, index) => item.elapsedSec > warmupBoundary && index < samples.length - 1,
   )
-  const values = (usable.length >= 3 ? usable : samples).map((item) => item.qps)
+  return (usable.length >= 3 ? usable : samples).map((item) => item.qps)
+}
+
+/**
+ * 90% 分布 QPS：每秒采样 QPS 的 P10
+ *
+ * 参考样本中的「90% QPS」含义是「90% 的时间不低于该值」，因此取 P10；
+ * 采样窗口与最低 QPS 共用 `stableQpsValues()`。
+ */
+export function qpsP10(
+  samples: ReportSample[],
+  options: { rampUpSec?: number } = {},
+): { value: number; used: number; dropped: number } {
+  const values = stableQpsValues(samples, options)
+  if (!values.length) return { value: 0, used: 0, dropped: 0 }
   return {
     value: percentile(values, 0.1),
     used: values.length,
@@ -81,6 +95,61 @@ export function sampleSummary(samples: ReportSample[]): {
       0.95,
     ),
     avgRt: rtValues.reduce((sum, value) => sum + value, 0) / rtValues.length,
+  }
+}
+
+export interface QpsOverview {
+  /** 平均 QPS（后端按总请求 / 实际耗时聚合，非采样点平均） */
+  avg: number
+  /** 峰值 QPS（所有采样点中的最大值，仅反映瞬时能力） */
+  max: number
+  /** 最低 QPS：稳态窗口内的最小采样值（与 90% 分布同一窗口，不含升压段与末点） */
+  min: number
+  /** 90% 分布 QPS：每秒采样 QPS 的 P10，已剔除升压段与末点 */
+  ninety: number
+  /** 90% 分布口径实际参与计算的采样点数 */
+  used: number
+  /** 被剔除的采样点数（升压段、首末不完整秒） */
+  dropped: number
+  /** 目标 QPS，0 表示未限速 / 未设目标 */
+  target: number
+  /** 目标达成率（%）= 平均 QPS / 目标 QPS，与 SLA minRps 同口径；无目标为 null */
+  attainment: number | null
+  /** 单并发 QPS = 平均 QPS / 并发数，用于横向对比不同并发档位的效率 */
+  perConcurrent: number
+}
+
+/**
+ * QPS 指标汇总
+ *
+ * 页面与两种导出（HTML / Excel）共用同一口径，避免同一个报告里
+ * 「平均 QPS」在页面用后端聚合值、在导出里用采样点平均值而对不上。
+ * 90% 分布 QPS 依赖每秒采样，因此明细关闭（recordDetail=off）不影响本函数，
+ * 但若采样序列为空则退回 0，由调用方标注「采样不足」。
+ */
+export function qpsOverview(
+  detail: ReportDetail,
+  options: { rampUpSec?: number } = {},
+): QpsOverview {
+  const report = detail.report
+  const samples = detail.samples ?? []
+  const summary = sampleSummary(samples)
+  const ninety = qpsP10(samples, options)
+  const stable = stableQpsValues(samples, options)
+  const avg = report.avgQps || summary.avgQps
+  const max = report.maxQps || summary.maxQps
+  const target = report.targetRps ?? 0
+  const concurrency = report.concurrency ?? 0
+  return {
+    avg,
+    max,
+    min: stable.length ? Math.min(...stable) : 0,
+    ninety: samples.length ? ninety.value : 0,
+    used: ninety.used,
+    dropped: ninety.dropped,
+    target,
+    attainment: target > 0 ? (avg / target) * 100 : null,
+    perConcurrent: concurrency > 0 ? avg / concurrency : 0,
   }
 }
 
@@ -242,7 +311,7 @@ export function scoreReport(detail: ReportDetail): ScoreResult {
       detail:
         target > 0
           ? `${capacityLabel} ${capacityQps.toFixed(0)} / 目标 ${target.toFixed(0)} QPS`
-          : '未设置目标 RPS，本项不评分',
+          : '未设置目标 QPS，本项不评分',
     },
     {
       key: 'stability',
@@ -276,7 +345,7 @@ export function scoreReport(detail: ReportDetail): ScoreResult {
     total,
     grade,
     ruleNote:
-      '容量 = 阶段稳态 RPS 峰值（固定并发取平均）/ 目标 × 100（无目标不评分）；稳定性 = 100 − 变异系数 × 150；错误 = 100 − 错误率 × 20；尾部延迟 = 100 − (P99/平均 − 1) × 25',
+      '容量 = 阶段稳态 QPS 峰值（固定并发取平均）/ 目标 × 100（无目标不评分）；稳定性 = 100 − 变异系数 × 150；错误 = 100 − 错误率 × 20；尾部延迟 = 100 − (P99/平均 − 1) × 25',
   }
 }
 

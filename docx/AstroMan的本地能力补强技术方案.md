@@ -1,8 +1,8 @@
 # AstroMan 本地能力补强技术方案（v1.0.8 – v1.3）
 
 > 文档性质：v1.0.8 的第二批能力（本地能力补强，接在「自动化测试」批次之后），覆盖请求内核、数据安全、协议支持、工具箱与工程质量
-> 文档版本：**v1.1**（2026-10-30 修订；校正 9 处与代码不符的事实、补 9 处实现陷阱、补验收自动化矩阵与 MVP 裁剪）
-> 代码基线：AstroMan **v1.0.8**（三处版本号均为 1.0.8）：「自动化测试」批次已落地，本批次完成后前端 10 个 spec / 128 条测试，`ci.yml` 已加 fmt / clippy / 版本一致性 / 覆盖率四道门禁
+> 文档版本：**v1.3.1**（2026-11-02 修订；v1.3 在 v1.2 基础上补：交互现状改为 21 套主题 + 可拖拽宇航员挂件、测试计数按代码实测校正为前端 10 spec / 129 条与 Rust 101 条、覆盖率门禁标出 v1.0.8 落地值 25% 与 Windows 本地 LLVM 后端差异；v1.3.1 补压测报告 QPS 指标组，测试计数同步为 134 条）
+> 代码基线：AstroMan **v1.0.8**（三处版本号均为 1.0.8）：「自动化测试」批次已落地，本批次完成后前端 10 个 spec / 134 条测试，`ci.yml` 已加 fmt / clippy / 版本一致性 / 覆盖率四道门禁
 > 目标版本：v1.0.8 / v1.1.0 / v1.2.0 / v1.3.0
 > 边界：**不做云**——不做账号、不做团队同步、不做云端报告托管、不做分布式压测调度
 > 关键决策：脚本沙箱走 Web Worker 而非下沉 Rust；Mock 用 axum 内嵌进程内服务；备份用 `VACUUM INTO`；主密钥交系统钥匙串；耗时分解只承诺可测口径，不伪造 DNS/TLS 分段
@@ -23,8 +23,8 @@
 | 测试与压测 | 批量运行、压测引擎（并发/阶梯/RPS/SLA）、报告 JSON/HTML/Excel、报告横向对比 | [stress.rs](../src-tauri/src/commands/stress.rs)、[reportExport.ts](../src/utils/reportExport.ts) |
 | AI | 三协议、61 个业务工具 + `tool_search`、确认卡、上下文预算、用量统计 | [ai.rs](../src-tauri/src/commands/ai.rs)、[aiTools.ts](../src/utils/aiTools.ts) |
 | 工具箱 | 9 分类 **92 个**离线工具，Rust 侧哈希/HMAC/IP 查询，已支持 `keywords`/`aliases` 检索 | [registry.ts](../src/tools/registry.ts)（2201 行） |
-| 工程 | 前端 9 spec / 121 条、Rust 81 条 / 14 文件；`ci.yml` 跑 `npm test` + `build` + `cargo test --lib` + CLI 编译 | [.github/workflows/ci.yml](../.github/workflows/ci.yml) |
-| 交互 | 8 套主题、命令面板、多标签、自动保存、托盘、自动更新 | [App.vue](../src/App.vue)、[Settings.vue](../src/views/Settings.vue) |
+| 工程 | 前端 10 spec / 134 条、Rust 101 条 / 19 文件；`ci.yml` 跑 `npm test` + `build` + `cargo test --lib` + CLI 编译，另加 `fmt --check`、`clippy -D warnings`、版本一致性、tarpaulin 覆盖率四类检查 | [.github/workflows/ci.yml](../.github/workflows/ci.yml)、[tarpaulin.toml](../src-tauri/tarpaulin.toml) |
+| 交互 | **21 套主题**（14 浅 / 7 深）、可拖拽的宇航员挂件「航仔」、命令面板、多标签、自动保存、托盘、自动更新 | [theme.ts](../src/stores/theme.ts)、[AstroBuddy.vue](../src/components/AstroBuddy.vue)、[App.vue](../src/App.vue)、[Settings.vue](../src/views/Settings.vue) |
 
 ### 0.2 还差什么（一句话版）
 
@@ -46,7 +46,7 @@
 | G-12 | 无 Flow 编排 | 差异化卖点缺席，跨接口传参靠手工 | P2 | v1.2.0 |
 | G-13 | 工具箱偏"通用"，缺专业刚需 | 国密、证书、造数、编码转换全无 | P1 | v1.1.0 / v1.2.0 |
 | G-14 | 无示例库与接口沉淀 | 响应示例、字段说明、接口变更无处存放 | P2 | v1.1.0 |
-| G-15 | 工程质量欠账 | 测试已 9 spec / 121 条 + Rust 81 条；CI 仅跑测试与构建，缺 `clippy`/`fmt`/覆盖率门禁；日志不落盘、无 LICENSE | P0 | 持续 |
+| G-15 | 工程质量欠账 | 测试 10 spec / 134 条 + Rust 101 条；`fmt` / `clippy` / 版本一致性 / 覆盖率四道门禁已进 CI，日志已落盘，LICENSE 已补；剩余 E2E 与覆盖率抬升 | P2 | 持续 |
 | G-16 | 国际化 / Linux / 无障碍 | 英文用户与 Linux 用户直接劝退 | P2 | v1.3.0 |
 | G-17 | 大集合性能未知 | 万级接口时树、搜索、渲染可能先崩 | P2 | v1.3.0 |
 | G-18 | 本地协作能力弱 | 项目模板、环境对比、文件交换缺失 | P2 | v1.1.0 / v1.3.0 |
@@ -155,7 +155,7 @@ flowchart LR
 
 ### 1.6 交互
 
-已有命令面板、多标签、自动保存、8 套主题、托盘、自动更新。缺口：
+已有命令面板、多标签、自动保存、**21 套主题**（14 浅 / 7 深，含低饱和「陶土红」）、可拖拽的宇航员挂件、托盘、自动更新。缺口：
 - 编辑器与集合树无撤销/重做；删除只有二次确认，没有回收站；
 - 无变量检查器（不知道某个 `{{var}}` 最终来自哪一层、是否未定义）；
 - 无接口级"示例/文档"沉淀；
@@ -163,16 +163,16 @@ flowchart LR
 
 ### 1.7 工程
 
-| 项 | 现状 | 目标 |
+| 项 | 现状（v1.0.8 实测） | 目标 / 剩余 |
 |---|---|---|
-| 前端单测 | **9 个 spec、121 条**：AI 工具/协议/预算/注入、curl 解析、报告分析/导出/叙述、工具箱 40 条 | ≥ 220 条，补脚本引擎、转换器、变量解析 |
-| Rust 单测 | **81 条 / 14 个文件**：`test_runner` 16、`ai` 14、`util` 11、`python_exec` 8、`stress` 4 等 | ≥ 160 条，补密钥、备份、计时口径、混合压测 |
+| 前端单测 | **10 个 spec、134 条**：AI 工具/协议/预算/注入、curl 解析、脚本沙箱、报告分析/导出/叙述、工具箱 40 条 | ≥ 220 条，补转换器、变量解析 |
+| Rust 单测 | **101 条 / 19 个文件**：`test_runner` 16、`ai` 14、`util` 11、`secret` 10、`python_exec` 8、`report_builder` 5、`stress` 4 等 | ≥ 160 条，补备份、计时口径、混合压测 |
 | 集成 | 无（沙箱内临时目录 SQLite 有 readonly 局限） | 30 条：Mock 起服务 → 发起请求 → 断言计时/落盘 |
 | E2E | 无 | 20 条核心链路（tauri-driver，Windows 优先） |
-| CI | **已有** `ci.yml`：前端 `npm test` + `build`；Windows 跑 `cargo test --lib` + CLI 编译 | 补 `clippy -D warnings`、`fmt --check`、覆盖率门禁、E2E 任务 |
-| 日志 | `env_logger` 输出到 stdout，无落盘 | 滚动文件 + 诊断包导出 |
-| 版本号 | 三处已一致（1.0.8），靠人工同步 | 发布脚本校验一致并自动改写 |
-| LICENSE | 缺失（README 自述待补） | MIT |
+| CI | **四道门禁已补齐**：`fmt --check`、`clippy -D warnings`、版本一致性、`cargo-tarpaulin` 覆盖率（`fail-under = 25`，独立 Linux job）；前端 `npm test` + `build`、Windows `cargo test --lib` + CLI 编译照旧 | E2E 夜间任务；覆盖率按版本抬到 60% |
+| 日志 | 已落盘 `logs/astroman-YYYYMMDD.log`，单文件 5MB、保留 7 天，写入前脱敏 | — |
+| 版本号 | `scripts/sync-version.mjs` 支持校验与改写三处版本，CI 第一步即校验 | — |
+| LICENSE | MIT 已补（`LICENSE`，README 同步） | — |
 
 ### 1.8 事实校正表（v1.1 相对初稿）
 
@@ -425,10 +425,12 @@ sequenceDiagram
 **设计**
 
 1. **主密钥**：首次启动生成 32 字节随机数，存入系统钥匙串。
-   - Windows：Credential Manager（`keyring` crate，service = `com.astroman.app`，user = `master-key`）
-   - macOS：Keychain（同上）
+   - Windows：Credential Manager（Win32 `CredReadW/CredWriteW`，条目名 = `AstroMan/master-key/<数据目录指纹>`，user = `master-key`）。**条目必须按数据目录派生**：所有安装共用一个条目时，任何一份新库（开发实例、测试库、第二份安装）首次启动都会生成新密钥并覆盖它，把正在使用的那份数据锁死。
+   - macOS：Keychain（同上，条目名同样带数据目录指纹）。
    - 降级：钥匙串不可用时写 `数据目录/keys/master.key`（Unix 0600 / Windows 仅当前用户 ACL），设置页显示黄色告警。
+   - **测试与 CI 不碰钥匙串**：`cargo test` 的临时库会走 `bootstrap`，若允许写钥匙串就会污染真实安装，故 `keyring_allowed()` 在 `cfg!(test)` 下恒为 false，另有 `ASTROMAN_DISABLE_KEYRING=1` 供 CI / 排障强制走文件密钥。
    - **必须写进 UI 与文档的事实**：降级模式下，密钥文件与密文在同一个目录树里，**拿库即拿密钥，加密退化为混淆，不构成安全边界**。告警文案不能只说"建议启用钥匙串"，要直说"当前保护等级等同于无加密，仅防误读"。同时提供第三种模式——**口令模式**（用户设口令，`Argon2id` 派生主密钥，不落盘任何密钥材料），作为钥匙串不可用时的真正替代，代价是每次启动需输入一次。
+   - **启动校验**（对「钥匙串被清空 / 被覆盖」这条风险的落地点）：`app_meta.key_check` 存一段哨兵明文密文、`key_fingerprint` 存密钥 sha256 前 8 字节；两者都缺的历史库改为对已有 `enc:v1:` 样本抽样解密。任一不匹配即置 `keyMismatch`，设置页显示"主密钥与已保存的密钥值不匹配 + 受影响条数"，并给出「导入密钥包 / 重新填写」两条恢复路径；**校验失败时不写 `key_check`**，避免把错钥匙固化成"已验证"。
 2. **加密格式**：`enc:v1:<base64(nonce12 || ciphertext)>`，AES-256-GCM，AAD 绑定「表名:字段名」防止密文搬到其他字段。
 3. **加密范围**：`env_variables.value`（`is_secret = 1`）、`ai_providers.api_key`、`oauth` 客户端密钥、未来 Mock 的鉴权头。
 4. **迁移**：启动时 `user_version < 2` 触发一次性迁移：读取旧值 → 加密 → 写回；迁移失败则整体回滚并提示"密钥迁移失败，请先备份"，绝不静默丢值。
@@ -1065,8 +1067,8 @@ CREATE TABLE flow_run_steps (
 
 | 层 | 现状（实测） | 目标 | 重点 |
 |---|---|---|---|
-| Rust 单测 | **81 条 / 14 文件**（`test_runner` 16、`ai` 14、`util` 11、`python_exec` 8、`stress` 4…） | ≥ 160 条 | `render`/secret 脱敏、密钥加解密、备份恢复、计时口径、migrate 判存 |
-| TS 单测 | **9 文件 / 121 条**（`toolbox` 40、`aiTools` 19、`aiProtocol` 14、`reportNarrative` 13、`reportExport` 9、`contextBudget` 9…） | ≥ 220 条 | `scriptHost` 超时与重建、转换器、变量解析、新增工具纯函数 |
+| Rust 单测 | **101 条 / 19 文件**（`test_runner` 16、`ai` 14、`util` 11、`secret` 10、`python_exec` 8、`stress` 4…） | ≥ 160 条 | `render`/secret 脱敏、密钥加解密、备份恢复、计时口径、migrate 判存 |
+| TS 单测 | **10 文件 / 134 条**（`toolbox` 38、`aiTools` 20、`aiProtocol` 14、`reportNarrative` 13、`reportExport` 11、`contextBudget` 9…） | ≥ 220 条 | `scriptHost` 超时与重建、转换器、变量解析、新增工具纯函数 |
 | 集成 | 无 | 30 条 | 本地 Mock 起服务 → `send_http_request` → 断言计时/二进制落盘 |
 | E2E | 无 | 20 条 | 建项目 → 建接口 → 发送 → 保存示例 → 跑套件（tauri-driver，Windows 优先） |
 
@@ -1458,6 +1460,7 @@ CREATE TABLE IF NOT EXISTS trash (                 -- 回收站
 3. **启用 `assetProtocol` 必须同时打开 tauri 的 `protocol-asset` feature**，否则构建脚本会直接报 allowlist 不匹配并中断编译（`cargo check` 阶段就能发现）。
 4. **`env_var_save` 的掩码回写**：方案只说了「返回掩码」，没说不做防护会怎样 —— 提交值为 `••••••` 时若不识别，会把整环境的密钥值写成掩码字符串。已改为先读旧密文、掩码或空值时沿用旧值。
 5. **`cargo clippy -D warnings` 首次接入共 29 条告警**（4 条 `too_many_arguments`、2 条 `if_same_then_else`、3 条 `sort_by_key`、其余为 `useless_vec` / `redundant_closure` / `type_complexity` 等），已按语义修复或加注理由后 allow；`cargo fmt --all` 涉及 40 个文件，属预期的一次性成本。
+6. **共享钥匙串条目把真实密钥冲掉了（2026-10-31 线上事故）**：`bootstrap` 只在库里没有 `key_source` 时生成新主密钥，但条目名是全局固定的 `AstroMan/master-key`；`cargo test --lib` 里有 4 处测试经 `AppState::headless` 用临时库跑，每跑一次就生成一把新密钥并写进同一个条目，真实安装随后读到的是新密钥 —— 库里 `enc:v1:` 的 AI Key 全部解不开，日志只剩 `解密失败（ai_providers:api_key）`。修复分三处：① 条目名按数据目录指纹派生（旧共享条目首次启动自动迁移）；② 测试构建与 `ASTROMAN_DISABLE_KEYRING=1` 一律不写钥匙串；③ 启动用 `key_check` / 指纹 / 抽样解密三重校验，不匹配时不再静默清空而是给出 `keyMismatch` 与受影响条数。数据侧用 `pre-migrate` 快照里的旧格式密文（静态 SHA256 密钥）还原出明文，再用当前主密钥重新加密写回，已通过 `api.deepseek.com/models` 校验。
 
 已知未完成项：
 
@@ -1597,7 +1600,9 @@ v1.0.8 是**第一个会改数据库结构 + 改密钥格式**的版本，"装�
 | 日期 | 版本 | 内容 |
 |---|---|---|
 | 2026-10-30 | v0.1 | 初稿：基于 v1.0.7 代码与 v1.0.8 方案，输出 18 项缺口、4 个版本、49 个任务（T-28 ~ T-76） |
-| 2026-10-30 | v1.2 | v1.0.8 全部 19 个任务落地：新增 9.1.1 落地记录（模块分布 + 5 处方案偏差修正 + 3 项未完成说明）；任务表状态更新为「已完成」；版本号统一到 1.0.8 |
+| 2026-10-30 | v1.2 | v1.0.8 全部 19 个任务落地：新增 9.1.1 落地记录（模块分布 + 5 处方案偏差修正 + 3 项未完成说明）；任务表状态更新为「已完成」；版本号统一到 1.0.8；4.2 补主密钥「条目按数据目录派生 + 启动三重校验 + 测试构建不碰钥匙串」，9.1.1 补共享条目事故与修复记录 |
+| 2026-10-31 | v1.3 | 校正四处过时计数与描述：① 0.1 表现状「9 spec / 121 条」「Rust 81 条」→ 10 spec / 129 条、Rust 101 条 / 19 文件，CI 描述补四类检查；② 0.1 表与 1.6 的「8 套主题」→ 21 套（14 浅 / 7 深）并补可拖拽宇航员挂件；③ 4.14 测试金字塔现状同步为 101 条 / 129 条，注明覆盖率 v1.0.8 落地 25%、Windows 本地需 `--engine llvm`；④ 补齐主题与挂件的代码位置索引（`theme.ts` / `AstroBuddy.vue` / `AstroBuddyIcon.vue`） |
+| 2026-11-02 | v1.3.1 | 压测报告补 QPS 指标组：新增 `qpsOverview()` 统一平均 / 峰值 / 最低 / 90% 分布 / 单并发 / 目标达成率，报告详情页、HTML 与 Excel 导出同口径；前端测试 129 → 134 条 |
 | 2026-10-30 | v1.1 | ① 按代码实测校正 9 处事实（前端测试 4/23→9/121、Rust「仅 db」→81 条/14 文件、工具箱 75→92、`registry.ts` 1746→2201、`aiTools.ts` 2602→3056、`TextToolbox`/`JsonWorkbench`「超 800 行」实为 545/399 已拆分、搜索已支持 `aliases`、CI 已存在只是缺门禁）；② 新增 1.8 事实校正表与 0.5 90 天 MVP 裁剪；③ 新增 4.0 通用工程约定（时钟归属 Rust、重任务互斥、错误码、资源上限、敏感出口、依赖准入）；④ 补 9 处实现陷阱（Worker 二进制 clone、超时变量回滚、WAL 明文残留、`VACUUM INTO` 三约束、压缩响应预览顺序、代理下连接计时失准、h2 禁用头、Postman 优先级冲突、混合压测 top-N 抖动）；⑤ 新增 9.0 验收自动化矩阵与 10.1 回滚方案；⑥ 补 R-13~R-17；⑦ 工具箱去重后 92→115（原计划 +25，实为 +23）；⑧ 4.2 补"降级文件密钥等于无加密"的安全边界澄清与口令模式（Argon2id），v1.0.8 +1 人日、MVP +1.5 人日；⑨ 人日口径统一到 156 人日（39.5 + 49.5 + 35 + 32） |
 
 **参考**

@@ -1004,8 +1004,8 @@ onBeforeUnmount(stopPolling)
             placeholder="压测配置 JSON"
           />
           <div class="stress-hint">
-            SLA 达标判定由后端完成：P95 / P99 / 错误率 / 最小 RPS 任一超标即用例失败；填
-            baselineReportId 可做基线回归（P95/P99 超基线 1.2 倍、RPS 低于基线 80%、错误率高于基线 0.5% 即失败）
+            SLA 达标判定由后端完成：P95 / P99 / 错误率 / 最小 QPS 任一超标即用例失败；填
+            baselineReportId 可做基线回归（P95/P99 超基线 1.2 倍、QPS 低于基线 80%、错误率高于基线 0.5% 即失败）
           </div>
         </div>
         <label v-if="caseEditor.form.kind === 'request'" class="wide">

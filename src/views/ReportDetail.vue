@@ -22,7 +22,7 @@ import { formatDateTime } from '@/utils/datetime'
 import * as api from '@/api'
 import type { ReportDetail, ReportRequestRecord, ReportRequestsPage } from '@/types/models'
 import { buildReportHtml, buildReportSheets } from '@/utils/reportExport'
-import { detectKnee, qpsP10, scoreReport, selfCheck } from '@/utils/reportAnalytics'
+import { detectKnee, qpsOverview, scoreReport, selfCheck } from '@/utils/reportAnalytics'
 import { buildXlsx } from '@/utils/xlsx'
 
 const route = useRoute()
@@ -154,7 +154,7 @@ onMounted(async () => {
   } finally {
     loading.value = false
   }
-  loadRequests()
+  await loadRequests()
 })
 
 const report = computed(() => detail.value?.report ?? null)
@@ -183,9 +183,11 @@ const config = computed(() => detail.value?.config ?? null)
 const metrics = computed(() => config.value?.metrics ?? null)
 const bytesSent = computed(() => metrics.value?.bytesSent ?? 0)
 
-/** 90% 分布 QPS（已剔除升压段与末点） */
-const ninetyQps = computed(() =>
-  qpsP10(samples.value, { rampUpSec: config.value?.rampUpSec ?? 0 }),
+/** QPS 指标组：平均 / 峰值 / 90% 分布 / 单并发 / 目标达成率，页面与导出同一口径 */
+const qps = computed(() =>
+  detail.value
+    ? qpsOverview(detail.value, { rampUpSec: config.value?.rampUpSec ?? 0 })
+    : null,
 )
 const knee = computed(() => (detail.value ? detectKnee(detail.value) : null))
 const score = computed(() => (detail.value ? scoreReport(detail.value) : null))
@@ -216,8 +218,16 @@ const statsRows = computed(() => {
     { label: 'P95', value: `${fmtNum(current.p95Rt)} ms` },
     { label: 'P99', value: `${fmtNum(current.p99Rt)} ms` },
     { label: '标准差', value: `${fmtNum(current.stddevRt)} ms` },
-    { label: '90% 分布 QPS', value: fmtNum(ninetyQps.value.value) },
-    { label: '峰值 QPS', value: fmtNum(current.maxQps) },
+    { label: '平均 QPS', value: fmtNum(qps.value?.avg) },
+    { label: '峰值 QPS', value: fmtNum(qps.value?.max) },
+    { label: '90% 分布 QPS', value: fmtNum(qps.value?.ninety) },
+    { label: '单并发 QPS', value: fmtNum(qps.value?.perConcurrent, 2) },
+    ...(qps.value?.target
+      ? [
+          { label: '目标 QPS', value: fmtNum(qps.value.target) },
+          { label: '目标达成率', value: `${fmtNum(qps.value.attainment, 1)}%` },
+        ]
+      : []),
     { label: '接收带宽', value: `${(current.bytesTotal / seconds / 1024).toFixed(1)} KB/s` },
     { label: '发送带宽', value: `${(bytesSent.value / seconds / 1024).toFixed(1)} KB/s` },
   ]
@@ -388,7 +398,7 @@ const slaChecks = computed(() => {
   }
   if (sla.minRps) {
     rows.push({
-      label: '平均 RPS',
+      label: '平均 QPS',
       target: `≥ ${sla.minRps}`,
       actual: fmtNum(r.avgQps),
       pass: r.avgQps >= sla.minRps,
@@ -570,8 +580,10 @@ function remove() {
               <span>耗时 {{ durationSec }} 秒</span>
               <span class="dot-sep">·</span>
               <span>峰值并发 {{ report.concurrency }}</span>
-              <span v-if="report.targetRps > 0" class="dot-sep">·</span>
-              <span v-if="report.targetRps > 0">目标 {{ fmtNum(report.targetRps, 0) }} RPS</span>
+              <span v-if="qps?.target" class="dot-sep">·</span>
+              <span v-if="qps?.target">目标 {{ fmtNum(qps.target, 0) }} QPS</span>
+              <span v-if="qps?.attainment != null" class="dot-sep">·</span>
+              <span v-if="qps?.attainment != null">达成 {{ fmtNum(qps.attainment, 0) }}%</span>
             </div>
             <div v-if="config?.url" class="target-line">
               <span class="method-chip">{{ config.method || 'GET' }}</span>
@@ -600,11 +612,19 @@ function remove() {
           </div>
           <div class="metric-card fm-card">
             <span class="m-label">平均 QPS</span>
-            <span class="m-value mono">{{ fmtNum(report.avgQps) }}</span>
+            <span class="m-value mono">{{ fmtNum(qps?.avg) }}</span>
           </div>
           <div class="metric-card fm-card">
             <span class="m-label">峰值 QPS</span>
-            <span class="m-value mono">{{ fmtNum(report.maxQps) }}</span>
+            <span class="m-value mono">{{ fmtNum(qps?.max) }}</span>
+          </div>
+          <div class="metric-card fm-card" title="每秒采样 QPS 的 P10：90% 的时间吞吐不低于该值，已剔除升压段与首末不完整秒">
+            <span class="m-label">90% 分布 QPS</span>
+            <span class="m-value mono">{{ fmtNum(qps?.ninety) }}</span>
+          </div>
+          <div class="metric-card fm-card" title="平均 QPS ÷ 并发数，用于对比不同并发档位下单连接的吞吐效率">
+            <span class="m-label">单并发 QPS</span>
+            <span class="m-value mono">{{ fmtNum(qps?.perConcurrent, 2) }}</span>
           </div>
           <div class="metric-card fm-card">
             <span class="m-label">平均延迟</span>
@@ -987,7 +1007,7 @@ function remove() {
               <span class="c-value mono">{{ config.rampUpSec }} s</span>
             </div>
             <div class="config-item">
-              <span class="c-label">目标 RPS</span>
+              <span class="c-label">目标 QPS</span>
               <span class="c-value mono">{{ config.targetRps ? fmtNum(config.targetRps, 0) : '不限速' }}</span>
             </div>
             <div class="config-item">
@@ -1421,7 +1441,7 @@ function remove() {
 
 .metrics {
   display: grid;
-  grid-template-columns: repeat(8, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 10px;
   margin-top: 16px;
 }

@@ -6,7 +6,7 @@ import type {
   StatusCount,
 } from '@/types/models'
 import type { CellValue, XlsxSheet } from './xlsx'
-import { detectKnee, downsample, qpsP10, scoreReport, selfCheck } from './reportAnalytics'
+import { detectKnee, downsample, qpsOverview, scoreReport, selfCheck, type QpsOverview } from './reportAnalytics'
 import { buildAdvice, buildFindings, cdfPoints, gradeReport, type FindingLevel } from './reportNarrative'
 
 /* ---------- 通用格式化 ---------- */
@@ -174,7 +174,7 @@ function slaRows(detail: ReportDetail): SlaRow[] {
   }
   if (sla.minRps) {
     rows.push({
-      label: '平均 RPS',
+      label: '平均 QPS',
       target: `≥ ${sla.minRps}`,
       actual: fmtNum(report.avgQps),
       pass: report.avgQps >= sla.minRps,
@@ -937,32 +937,37 @@ ${rings}${axes}<polygon points="${shape}" fill="rgba(20,101,90,.14)" stroke="#14
 
 /* ---------- 报告渲染 ---------- */
 
-function kpiBlock(detail: ReportDetail, ninetyQps: number): string {
+function kpiBlock(detail: ReportDetail, qps: QpsOverview): string {
   const report = detail.report
   const cards = [
-    { k: '总请求数', v: fmtInt(report.totalRequests), u: '', n: `并发 ${report.concurrency}` },
+    { k: '总请求数', v: fmtInt(report.totalRequests), u: '', n: `并发 ${fmtInt(report.concurrency)}` },
     {
-      k: '平均 RPS',
-      v: fmtInt(report.avgQps),
+      k: '平均 QPS',
+      v: fmtInt(qps.avg),
       u: 'req/s',
-      n: `峰值 ${fmtInt(report.maxQps)}`,
+      n: `峰值 ${fmtInt(qps.max)}`,
+    },
+    {
+      k: '90% 分布 QPS',
+      v: qps.used > 0 ? fmtInt(qps.ninety) : '—',
+      u: qps.used > 0 ? 'req/s' : '',
+      n: qps.used > 0 ? `剔除 ${fmtInt(qps.dropped)} 个升温采样点` : '采样不足，无法计算',
+    },
+    {
+      k: '单并发 QPS',
+      v: fmtNum(qps.perConcurrent, 2),
+      u: 'req/s',
+      n: `平均 QPS ÷ ${fmtInt(report.concurrency)} 并发`,
     },
     {
       k: '成功率',
       v: (100 - report.errorRate).toFixed(2),
       u: '%',
-      n: `失败 ${fmtInt(report.errorCount)} 次`,
+      n: `失败 ${fmtInt(report.errorCount)} 次 · 错误率 ${report.errorRate.toFixed(2)}%`,
     },
-    { k: '错误率', v: report.errorRate.toFixed(2), u: '%', n: `90% 时间 ≥ ${fmtInt(ninetyQps)} RPS` },
     { k: '平均响应时间', v: fmtNum(report.avgRt), u: 'ms', n: `TTFB ${fmtNum(report.ttfbAvg)} ms` },
     { k: 'P95 延迟', v: fmtNum(report.p95Rt), u: 'ms', n: `P99 ${fmtNum(report.p99Rt)} ms` },
     { k: 'APDEX', v: report.apdex.toFixed(3), u: '', n: apdexGrade(report.apdex) },
-    {
-      k: '持续时长',
-      v: fmtDuration(report.startTime, report.endTime),
-      u: '',
-      n: fmtDate(report.startTime),
-    },
   ]
   return `<div class="kpis">${cards
     .map(
@@ -1089,7 +1094,7 @@ function renderHtml(detail: ReportDetail, requests: ReportRequestRecord[] = []):
   const seconds = durationSeconds(detail)
   const rows = downsample(samples, CHART_MAX_POINTS)
 
-  const ninety = qpsP10(samples, { rampUpSec: config?.rampUpSec ?? 0 })
+  const qps = qpsOverview(detail, { rampUpSec: config?.rampUpSec ?? 0 })
   const knee = detectKnee(detail)
   const score = scoreReport(detail)
   const checks = selfCheck(detail)
@@ -1111,13 +1116,13 @@ function renderHtml(detail: ReportDetail, requests: ReportRequestRecord[] = []):
   /* ---- 03 吞吐 ---- */
   const throughput = lineChart('吞吐量（每秒完成请求数）', {
     xs: rows.map((item) => item.elapsedSec),
-    series: [{ name: '实际 RPS', color: '#14655a', values: rows.map((item) => item.qps), area: true }],
+    series: [{ name: '实际 QPS', color: '#14655a', values: rows.map((item) => item.qps), area: true }],
     unit: 'req/s',
     refLines: report.targetRps
       ? [{ value: report.targetRps, label: `目标 ${fmtInt(report.targetRps)} req/s`, color: '#37628f' }]
       : [],
     band: rampUp > 1 ? { from: 0, to: rampUp, label: '升压期' } : undefined,
-    note: `90% 分布 ${fmtInt(ninety.value)} req/s`,
+    note: `90% 分布 ${fmtInt(qps.ninety)} req/s`,
   })
 
   const stacked = stackedBars(
@@ -1178,8 +1183,14 @@ function renderHtml(detail: ReportDetail, requests: ReportRequestRecord[] = []):
     ['样本总数', fmtInt(report.totalRequests)],
     ['成功 / 失败', `${fmtInt(report.successCount)} / ${fmtInt(report.errorCount)}`],
     ['错误率', `${report.errorRate.toFixed(3)}%`],
-    ['吞吐量（平均 / 峰值）', `${fmtNum(report.avgQps)} / ${fmtNum(report.maxQps)} req/s`],
-    ['90% 分布 RPS', `${fmtInt(ninety.value)} req/s`],
+    ['平均 / 峰值 QPS', `${fmtInt(qps.avg)} / ${fmtInt(qps.max)} req/s`],
+    ['90% 分布 QPS', qps.used > 0 ? `${fmtInt(qps.ninety)} req/s` : '—'],
+    ['最低 QPS（稳态下限）', qps.used > 0 ? `${fmtInt(qps.min)} req/s` : '—'],
+    ['单并发 QPS', `${fmtNum(qps.perConcurrent, 2)} req/s`],
+    [
+      '目标 QPS / 达成率',
+      qps.target ? `${fmtInt(qps.target)} / ${fmtNum(qps.attainment, 1)}%` : '未设目标',
+    ],
     ['平均响应时间', `${fmtNum(report.avgRt)} ms`],
     ['中位数 P50', `${fmtNum(report.p50Rt)} ms`],
     ['P90 / P95', `${fmtNum(report.p90Rt)} / ${fmtNum(report.p95Rt)} ms`],
@@ -1316,7 +1327,9 @@ function renderHtml(detail: ReportDetail, requests: ReportRequestRecord[] = []):
 <div class="statement-t">${escapeHtml(grade.label)} · ${escapeHtml(grade.reason)}</div>
 <div class="statement-d">${escapeHtml(grade.statement)} 共执行 <b>${fmtInt(
     report.totalRequests,
-  )}</b> 次请求，平均吞吐 <b>${fmtNum(report.avgQps)}</b> req/s，平均响应时间 <b>${fmtNum(
+  )}</b> 次请求，平均吞吐 <b>${fmtInt(qps.avg)}</b> QPS（90% 分布 <b>${fmtInt(
+    qps.ninety,
+  )}</b> QPS，峰值 <b>${fmtInt(qps.max)}</b>），平均响应时间 <b>${fmtNum(
     report.avgRt,
   )}</b> ms，错误率 <b>${report.errorRate.toFixed(2)}%</b>。</div>
 </div>`
@@ -1356,9 +1369,13 @@ ${tableHtml(
     'Executive Summary',
     `${statement}
 <div class="sub">核心指标</div>
-${kpiBlock(detail, ninety.value)}
+${kpiBlock(detail, qps)}
 <div class="strip">
-  <div><span>90% 分布 RPS</span><b>${fmtInt(ninety.value)}</b></div>
+  <div><span>目标 / 达成</span><b>${
+    qps.target
+      ? `${fmtInt(qps.target)} / ${fmtNum(qps.attainment, 1)}%`
+      : '不限速'
+  }</b></div>
   <div><span>总流量</span><b>${fmtBytes(totalTraffic)}</b></div>
   <div><span>接收 / 发送</span><b>${fmtBytes(bytesReceived)} / ${fmtBytes(bytesSent)}</b></div>
   <div><span>明细模式</span><b>${escapeHtml(recordModeLabel(recordMode))}</b></div>
@@ -1390,7 +1407,7 @@ ${findingsBlock(detail)}`,
     ],
     ['升压时间', rampUp ? `${rampUp} s` : '—'],
     ['思考时间', config?.thinkTimeMs ? `${config.thinkTimeMs} ms` : '无'],
-    ['目标 RPS', report.targetRps ? `${fmtInt(report.targetRps)}（限速）` : '不限速'],
+    ['目标 QPS', report.targetRps ? `${fmtInt(report.targetRps)}（限速）` : '不限速'],
     ['明细采集', escapeHtml(recordModeLabel(recordMode))],
     [
       '熔断条件',
@@ -1435,7 +1452,7 @@ ${findingsBlock(detail)}`,
     }
 ${
       report.targetRps
-        ? `<div class="note">按 Little 定律，理论所需并发 ≈ 目标 RPS × (平均响应时间 + 思考时间) = ${fmtInt(
+        ? `<div class="note">按 Little 定律，理论所需并发 ≈ 目标 QPS × (平均响应时间 + 思考时间) = ${fmtInt(
             report.targetRps,
           )} × (${fmtNum(report.avgRt / 1000, 3)}s + ${fmtNum(
             (config?.thinkTimeMs ?? 0) / 1000,
@@ -1518,7 +1535,7 @@ ${
   stageRows.length
     ? `<div class="sub">分阶段明细<span class="hint">稳态值取阶段中位，扩展效率 = 吞吐增幅 / 并发增幅</span></div>
 ${tableHtml(
-        ['阶段', '并发', '时长', '请求数', '错误', '平均 RPS', '稳态 RPS', '平均 RT', 'P95', '吞吐增幅', '扩展效率'],
+        ['阶段', '并发', '时长', '请求数', '错误', '平均 QPS', '稳态 QPS', '平均 RT', 'P95', '吞吐增幅', '扩展效率'],
         stageRows,
         [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
       )}`
@@ -1553,14 +1570,18 @@ ${
     ['请求数', '成功请求数 + 失败请求数。失败包含连接错误、超时、以及状态码非 2xx 的响应。'],
     ['平均响应时间', '全部请求耗时的算术平均，含失败请求，用于反映整体体验而非仅成功路径。'],
     ['P50 / P95 / P99', '对逐请求耗时做线性插值分位数，表示「该比例请求不超过此值」。'],
-    ['RPS / QPS', '每秒完成请求数，按实际采样间隔 Δt 归一，非按固定 1 秒估算。'],
-    ['90% 分布 RPS', '每秒采样 RPS 的 P10，含义为「90% 的时间吞吐不低于该值」；已剔除升压段与首末不完整采样。'],
-    ['峰值 RPS', '所有采样点中的最大每秒请求数，仅反映瞬时能力，不代表可持续承载。'],
+    ['QPS / RPS', '同义，报告统一以 QPS 呈现。每秒完成请求数，按实际采样间隔 Δt 归一，非按固定 1 秒估算。'],
+    ['平均 QPS', '总请求数 ÷ 实际施压时长（后端聚合），不取每秒采样的算术平均，避免末尾不完整秒拉低结果。'],
+    ['90% 分布 QPS', '每秒采样 QPS 的 P10，含义为「90% 的时间吞吐不低于该值」；已剔除升压段与首末不完整采样。验收与横向对比优先用该值，而非峰值。'],
+    ['峰值 QPS', '所有采样点中的最大每秒请求数，仅反映瞬时能力，不代表可持续承载。'],
+    ['最低 QPS', '稳态窗口内的最小每秒请求数（与 90% 分布同口径，已剔除升压段与末点），用于观察抖动下限，不作为容量结论依据。'],
+    ['单并发 QPS', '平均 QPS ÷ 并发数，反映单连接吞吐效率；并发翻倍而该值接近减半，说明新增并发只在排队、吞吐已到瓶颈。'],
+    ['目标达成率', '平均 QPS ÷ 目标 QPS；与 SLA「最小 QPS」同一口径，超过 100% 表示超出限速目标。'],
     ['TTFB', '首字节时间，从请求发出到收到响应首字节的耗时，可区分网络/排队与服务端处理。'],
     ['APDEX', '(满意请求数 + 容忍请求数 / 2) / 总请求数，容忍阈值 T = 4 × 平均响应时间。'],
     ['错误率', '失败请求数 / 总请求数。SLA 判定与红黄绿结论均以此口径为准。'],
     ['总流量', '发送字节 + 接收字节；趋势图中的带宽按每秒采样折算。'],
-    ['稳态 RPS', '该阶段剔除前 20%（升压）与后 10%（切换抖动）后采样 RPS 的中位数。'],
+    ['稳态 QPS', '该阶段剔除前 20%（升压）与后 10%（切换抖动）后采样 QPS 的中位数。'],
     ['扩展效率', '吞吐增幅百分比 ÷ 并发增幅百分比；100% 表示线性扩展，明显低于 100% 说明已接近瓶颈。'],
   ]
 
@@ -1704,6 +1725,7 @@ export function buildReportSheets(
 ): XlsxSheet[] {
   const report = detail.report
   const sla = slaRows(detail)
+  const qps = qpsOverview(detail, { rampUpSec: detail.config?.rampUpSec ?? 0 })
 
   const overview: CellValue[][] = [
     ['压测报告', report.planName],
@@ -1721,9 +1743,13 @@ export function buildReportSheets(
     ['失败请求数', report.errorCount],
     ['错误率(%)', report.errorRate],
     ['成功率(%)', Number((100 - report.errorRate).toFixed(4))],
-    ['平均 RPS', report.avgQps],
-    ['峰值 RPS', report.maxQps],
-    ['目标 RPS', report.targetRps || '不限速'],
+    ['平均 QPS', qps.avg],
+    ['峰值 QPS', qps.max],
+    ['90% 分布 QPS', Number(qps.ninety.toFixed(1))],
+    ['最低 QPS', qps.used > 0 ? Number(qps.min.toFixed(1)) : '—'],
+    ['单并发 QPS', Number(qps.perConcurrent.toFixed(4))],
+    ['目标 QPS', qps.target || '不限速'],
+    ['目标达成率(%)', qps.attainment === null ? '未设目标' : Number(qps.attainment.toFixed(2))],
     ['并发数', report.concurrency],
     ['平均响应时间(ms)', report.avgRt],
     ['最小响应时间(ms)', report.minRt],
@@ -1742,7 +1768,7 @@ export function buildReportSheets(
   }
 
   const samples: CellValue[][] = [
-    ['时间(s)', '并发', 'RPS', '平均 RT(ms)', 'P50(ms)', 'P95(ms)', 'P99(ms)', 'TTFB(ms)', '流量(B)', '成功数', '失败数'],
+    ['时间(s)', '并发', 'QPS', '平均 RT(ms)', 'P50(ms)', 'P95(ms)', 'P99(ms)', 'TTFB(ms)', '流量(B)', '成功数', '失败数'],
     ...detail.samples.map((sample: ReportSample) => [
       sample.elapsedSec,
       sample.concurrent,
@@ -1839,7 +1865,7 @@ export function buildReportSheets(
   ]
 
   const stages: CellValue[][] = [
-    ['阶段', '并发', '时长(s)', '请求数', '错误数', '平均 RPS', '平均 RT(ms)', 'P95(ms)'],
+    ['阶段', '并发', '时长(s)', '请求数', '错误数', '平均 QPS', '平均 RT(ms)', 'P95(ms)'],
     ...detail.stages.map((stage) => [
       `第 ${stage.index + 1} 阶段`,
       stage.concurrent,
@@ -1866,7 +1892,7 @@ export function buildReportSheets(
         ['超时时间(ms)', config.timeoutMs ?? '-'],
         ['思考时间(ms)', config.thinkTimeMs ?? '-'],
         ['加压时间(s)', config.rampUpSec ?? '-'],
-        ['目标 RPS', config.targetRps || '不限速'],
+        ['目标 QPS', config.targetRps || '不限速'],
         ['明细记录模式', recordModeLabel(config.recordDetail)],
         [
           '阶梯配置',
@@ -1877,7 +1903,7 @@ export function buildReportSheets(
         ['SLA P95(ms)', config.sla?.p95Ms ?? '-'],
         ['SLA P99(ms)', config.sla?.p99Ms ?? '-'],
         ['SLA 错误率(%)', config.sla?.errorRate ?? '-'],
-        ['SLA 最小 RPS', config.sla?.minRps ?? '-'],
+        ['SLA 最小 QPS', config.sla?.minRps ?? '-'],
         ['施压端主机', config.agent?.host ?? '-'],
         ['报告生成时间', fmtTime(Date.now())],
       ]

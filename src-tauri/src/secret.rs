@@ -7,12 +7,15 @@
 //! 本模块做三件事：
 //! 1. 主密钥：优先进系统钥匙串（Windows 凭据管理器），可用口令模式（Argon2id，不落盘），
 //!    最后才降级到文件——并且明确告诉用户「文件密钥与密文同目录，等于无加密」。
+//!    钥匙串条目**按数据目录派生**，并且在 `key_check` / 指纹 / 抽样解密里校验，
+//!    避免多份安装或测试库互相覆盖后静默解不开（v1.0.8 曾因共享条目踩坑）。
 //! 2. 字段加密：`enc:v1:<base64(nonce12 || ciphertext)>`，AES-256-GCM，
 //!    AAD 绑定「表名:列名」，把密文搬到别的列会直接解密失败。
 //! 3. 迁移：把历史明文值就地加密，重复执行幂等。
 //!
 //! 全局单例是为了避免把 `SecretStore` 穿过几十个既有调用点；
-//! 单元测试用 `SecretStore::from_key` 构造独立实例，互不影响。
+//! 单元测试用 `SecretStore::from_key` 构造独立实例，互不影响，且测试构建
+//! 永远不会写入系统钥匙串（`keyring_allowed`）。
 
 use std::path::{Path, PathBuf};
 
@@ -33,10 +36,18 @@ pub const ENC_PREFIX: &str = "enc:v1:";
 pub const MASK: &str = "••••••";
 
 const KEY_LEN: usize = 32;
+/// 条目名前缀，实际条目为 `AstroMan/master-key/<数据目录指纹>`。
+/// v1.0.8 之前所有安装共用不带后缀的这一个条目：任何一份新库（开发实例、测试库）
+/// 首次启动都会把正在使用的密钥覆盖掉，因此改为按数据目录派生
 const KEYRING_TARGET: &str = "AstroMan/master-key";
 const KEYRING_USER: &str = "master-key";
 const KEY_CHECK_AAD: &str = "app_meta:key_check";
 const KEY_CHECK_TEXT: &str = "astroman-master-key-check";
+/// 密钥指纹（sha256 前 8 字节）用于没有 key_check 的历史库做校验
+const META_KEY_CHECK: &str = "key_check";
+const META_KEY_FP: &str = "key_fingerprint";
+/// CI / 排障用：设置后强制走本地密钥文件，绝不碰系统钥匙串
+const DISABLE_KEYRING_ENV: &str = "ASTROMAN_DISABLE_KEYRING";
 
 /// 环境变量值的加密上下文
 pub const AAD_ENV: &str = "env_variables:value";
@@ -97,6 +108,11 @@ pub struct SecretStatus {
     pub encrypted_env_count: i64,
     pub encrypted_ai_count: i64,
     pub key_created_at: Option<i64>,
+    /// 主密钥与库内密文不匹配（通常是钥匙串条目被其它实例覆盖后重新生成）
+    pub key_mismatch: bool,
+    pub key_mismatch_reason: Option<String>,
+    /// 不匹配时，解不开的已加密值条数（用于提示用户重填）
+    pub broken_secret_count: i64,
 }
 
 struct Inner {
@@ -104,6 +120,9 @@ struct Inner {
     source: KeySource,
     locked: Option<String>,
     keyring_available: bool,
+    /// 密钥能读到但和库内密文对不上：值解不出来，但**仍保留密钥**，
+    /// 这样用户重新填写密钥时能正常加密写回
+    mismatch: Option<String>,
 }
 
 /// 主密钥持有者：加密只在这里发生，其它模块只拿到密文/明文
@@ -115,13 +134,18 @@ pub struct SecretStore {
 
 impl SecretStore {
     /// 启动时初始化：读钥匙串 / 读文件 / 等待口令解锁；首次启动生成主密钥
+    ///
+    /// 拿到密钥后会先校验「这把钥匙是不是加密这批密文的那把」（`key_check` /
+    /// 指纹 / 抽样解密）。对不上时**不静默清空**，而是记一条明确告警并置
+    /// `keyMismatch`，让设置页能提示用户重填；否则整库密钥值会悄悄变空。
     pub fn bootstrap(data_dir: &Path, pool: &DbPool) -> Result<Self, String> {
         let conn = pool.get().map_err(err)?;
         let source_raw = crate::db::meta_get(&conn, "key_source");
         drop(conn);
 
+        let target = keyring_target(data_dir);
         let (key, source, locked, keyring_available) = match source_raw.as_deref() {
-            Some("keyring") => match keyring_read() {
+            Some("keyring") => match read_key_any(&target) {
                 Ok(key) => (Some(key), KeySource::Keyring, None, true),
                 Err(reason) => {
                     log::warn!("读取系统钥匙串失败：{reason}");
@@ -159,13 +183,19 @@ impl SecretStore {
             // 首次启动（或 v1.0.7/1.0.8 老库）：生成新主密钥
             _ => {
                 let key = random_key();
-                let (source, keyring_available) = match keyring_write(&key) {
-                    Ok(()) => (KeySource::Keyring, true),
-                    Err(reason) => {
-                        log::warn!("系统钥匙串不可用（{reason}），降级为本地密钥文件");
-                        write_file_key(data_dir, &key)?;
-                        (KeySource::File, false)
+                let (source, keyring_available) = if keyring_allowed() {
+                    match keyring_write(&target, &key) {
+                        Ok(()) => (KeySource::Keyring, true),
+                        Err(reason) => {
+                            log::warn!("系统钥匙串不可用（{reason}），降级为本地密钥文件");
+                            write_file_key(data_dir, &key)?;
+                            (KeySource::File, false)
+                        }
                     }
+                } else {
+                    // 测试 / CI：只写数据目录内的密钥文件，绝不碰用户真实凭据
+                    write_file_key(data_dir, &key)?;
+                    (KeySource::File, false)
                 };
                 let conn = pool.get().map_err(err)?;
                 crate::db::meta_set(&conn, "crypto_version", "1")?;
@@ -176,6 +206,18 @@ impl SecretStore {
             }
         };
 
+        // 有密钥就校验一次：能读到但解不开，说明这把钥匙不是加密数据的那把
+        let mismatch = match key {
+            Some(ref key) => match verify_key(pool, key) {
+                Ok(()) => None,
+                Err(reason) => {
+                    log::warn!("{reason}");
+                    Some(reason)
+                }
+            },
+            None => None,
+        };
+
         let store = Self {
             data_dir: data_dir.to_path_buf(),
             inner: parking_lot::RwLock::new(Inner {
@@ -183,11 +225,13 @@ impl SecretStore {
                 source,
                 locked,
                 keyring_available,
+                mismatch,
             }),
         };
 
-        // 未锁定时顺手把历史明文加密（幂等，失败不阻断启动，但会记日志）
-        if !store.is_locked() {
+        // 未锁定且密钥可信时，顺手把历史明文加密（幂等，失败不阻断启动）
+        // 密钥不可信时绝不做这一步，否则等于用错钥匙把明文锁死
+        if !store.is_locked() && store.mismatch().is_none() {
             match store.encrypt_plaintext(pool) {
                 Ok(0) => {}
                 Ok(count) => log::info!("已加密 {count} 条历史明文密钥值"),
@@ -207,12 +251,18 @@ impl SecretStore {
                 source,
                 locked: None,
                 keyring_available: matches!(source, KeySource::Keyring),
+                mismatch: None,
             }),
         }
     }
 
     pub fn is_locked(&self) -> bool {
         self.inner.read().key.is_none()
+    }
+
+    /// 密钥可读但与库内密文不匹配时的说明（None 表示正常）
+    pub fn mismatch(&self) -> Option<String> {
+        self.inner.read().mismatch.clone()
     }
 
     pub fn source(&self) -> KeySource {
@@ -238,7 +288,11 @@ impl SecretStore {
     ///
     /// 调用方多为「渲染请求」路径，失败时返回空串比 panic / 500 安全：
     /// 用户会看到请求因缺少值而失败，同时日志里有明确原因。
+    /// 已知密钥不匹配时不再逐条刷日志（启动时已经告警过一次）。
     pub fn decrypt(&self, aad: &str, stored: &str) -> String {
+        if self.mismatch().is_some() {
+            return String::new();
+        }
         match self.decrypt_checked(aad, stored) {
             Ok(value) => value,
             Err(error) => {
@@ -276,6 +330,12 @@ impl SecretStore {
             ),
             Err(_) => (0, 0, None),
         };
+        let mismatch = inner.mismatch.clone();
+        let broken = if mismatch.is_some() {
+            count_broken(pool, inner.key.as_ref()).unwrap_or(0)
+        } else {
+            0
+        };
         SecretStatus {
             source: inner.source.as_str().to_string(),
             source_label: inner.source.label().to_string(),
@@ -286,11 +346,18 @@ impl SecretStore {
             encrypted_env_count: env_count,
             encrypted_ai_count: ai_count,
             key_created_at: created,
+            key_mismatch: mismatch.is_some(),
+            key_mismatch_reason: mismatch,
+            broken_secret_count: broken,
         }
     }
 
     /// 把历史明文加密（幂等）：环境变量中 is_secret=1 的值 + AI Key
     pub fn encrypt_plaintext(&self, pool: &DbPool) -> Result<usize, String> {
+        if let Some(reason) = self.mismatch() {
+            // 钥匙不对时加密明文＝用错钥匙把数据锁死，宁可不动
+            return Err(reason);
+        }
         let key = self.current_key()?;
         let mut conn = pool.get().map_err(err)?;
         let tx = conn.transaction().map_err(err)?;
@@ -345,6 +412,11 @@ impl SecretStore {
                 // v1:<b64> 是 v1.0.7 的静态混淆格式，先按老方式解开
                 let plain = legacy_ai_decrypt(&stored);
                 if plain.is_empty() {
+                    // 解不开就别装作迁移成功：这条值已经丢了，明确告诉用户
+                    log::warn!(
+                        "AI 服务商 #{id} 的旧格式密钥（v1:）无法解密，已跳过迁移；\
+请在「设置 → AI」重新填写该服务商的 Key"
+                    );
                     continue;
                 }
                 updates.push((id, encrypt_with(&key, AAD_AI, &plain)?));
@@ -371,15 +443,17 @@ impl SecretStore {
         let salt = random_salt();
         let new_key = derive_key(&passphrase, &salt)?;
 
-        self.rotate(pool, &old_key, &new_key)?;
+        // 密钥已不匹配时旧值本来就解不开，重加密必然失败；
+        // 此时直接换成新密钥，让用户能重新开始（旧值已在别处提示重填）
+        if self.mismatch().is_none() {
+            self.rotate(pool, &old_key, &new_key)?;
+        } else {
+            log::warn!("当前主密钥与库内密文不匹配，跳过重加密，直接切换到口令模式");
+        }
 
         let conn = pool.get().map_err(err)?;
         crate::db::meta_set(&conn, "kdf_salt", &B64.encode(salt))?;
-        crate::db::meta_set(
-            &conn,
-            "key_check",
-            &encrypt_with(&new_key, KEY_CHECK_AAD, KEY_CHECK_TEXT)?,
-        )?;
+        write_key_meta(&conn, &new_key)?;
         crate::db::meta_set(&conn, "key_source", KeySource::Passphrase.as_str())?;
         drop(conn);
 
@@ -387,6 +461,7 @@ impl SecretStore {
         inner.key = Some(new_key);
         inner.source = KeySource::Passphrase;
         inner.locked = None;
+        inner.mismatch = None;
         Ok(())
     }
 
@@ -417,8 +492,12 @@ impl SecretStore {
             let mut inner = self.inner.write();
             inner.key = Some(key);
             inner.locked = None;
+            inner.mismatch = None;
         }
-        // 解锁后补做历史明文加密
+        // 解锁成功后刷新校验信息，并把历史明文补加密（幂等）
+        if let Ok(conn) = pool.get() {
+            let _ = write_key_meta(&conn, &key);
+        }
         let _ = self.encrypt_plaintext(pool);
         Ok(())
     }
@@ -478,16 +557,27 @@ impl SecretStore {
         let mut new_key = [0u8; KEY_LEN];
         new_key.copy_from_slice(&plain);
 
-        // 未锁定时可以把现有值重加密到新密钥；锁定态（密钥丢失）直接沿用包内密钥
+        // 未锁定时可以把现有值重加密到新密钥；锁定态（密钥丢失）直接沿用包内密钥。
+        // 已知密钥不匹配时不能重加密——旧值本来就解不开，强行 rotate 会整体失败，
+        // 而「导入密钥包」正是这种情况下的恢复手段，必须能走通。
+        let reusable = self.mismatch().is_none();
         if let Ok(old_key) = self.current_key() {
             if old_key != new_key {
-                self.rotate(pool, &old_key, &new_key)?;
+                if reusable {
+                    self.rotate(pool, &old_key, &new_key)?;
+                } else {
+                    log::warn!("当前主密钥与库内密文不匹配，跳过重加密，直接采用导入的密钥");
+                }
             }
         }
         {
             let mut inner = self.inner.write();
             inner.key = Some(new_key);
             inner.locked = None;
+            inner.mismatch = None;
+        }
+        if let Ok(conn) = pool.get() {
+            write_key_meta(&conn, &new_key)?;
         }
         Ok(())
     }
@@ -507,6 +597,10 @@ impl SecretStore {
                 [],
             )
             .map_err(err)?;
+        // 值都清掉了，就不该再报「解不开」；下次启动校验也没有密文可比对
+        if env + ai > 0 {
+            self.inner.write().mismatch = None;
+        }
         Ok(env + ai)
     }
 
@@ -701,6 +795,162 @@ pub fn legacy_ai_decrypt(stored: &str) -> String {
     }
 }
 
+/* ---------- 密钥校验：确认「这把钥匙」就是加密这批密文的那把 ---------- */
+
+fn mismatch_reason() -> String {
+    "E_KEY_MISMATCH: 当前主密钥与库内已保存的密钥值不匹配（通常是钥匙串条目被\
+其它实例覆盖或重置过）。已保存的 Key 无法解出，请在「设置 → 安全」导入密钥包，\
+或在各服务商里重新填写一次"
+        .to_string()
+}
+
+/// 带校验信息写入：`key_check`（能直接验明文）+ 密钥指纹（老库兜底）
+fn write_key_meta(conn: &rusqlite::Connection, key: &[u8; KEY_LEN]) -> Result<(), String> {
+    crate::db::meta_set(
+        conn,
+        META_KEY_CHECK,
+        &encrypt_with(key, KEY_CHECK_AAD, KEY_CHECK_TEXT)?,
+    )?;
+    crate::db::meta_set(conn, META_KEY_FP, &key_fingerprint(key))?;
+    Ok(())
+}
+
+fn key_fingerprint(key: &[u8; KEY_LEN]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(key);
+    hasher.finalize()[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// 取若干条已加密样本（AAD 必须一起带上，否则解不开）
+fn enc_samples(conn: &rusqlite::Connection, limit: i64) -> Vec<(&'static str, String)> {
+    let mut samples = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT value FROM env_variables
+         WHERE is_secret = 1 AND value LIKE 'enc:v1:%' LIMIT ?1",
+    ) {
+        if let Ok(rows) = stmt.query_map([limit], |row| row.get::<_, String>(0)) {
+            samples.extend(rows.filter_map(Result::ok).map(|value| (AAD_ENV, value)));
+        }
+    }
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT api_key_enc FROM ai_providers
+         WHERE api_key_enc LIKE 'enc:v1:%' LIMIT ?1",
+    ) {
+        if let Ok(rows) = stmt.query_map([limit], |row| row.get::<_, String>(0)) {
+            samples.extend(rows.filter_map(Result::ok).map(|value| (AAD_AI, value)));
+        }
+    }
+    samples
+}
+
+/// 校验主密钥：有 `key_check` 用它，没有指纹就比指纹，再没有就抽样解密。
+/// 三种信息都缺（全新库 / 纯明文老库）时视为通过，并顺手补写校验信息。
+///
+/// 补写校验信息属于「附带好处」，失败只记日志——写不进去不能阻断启动。
+fn verify_key(pool: &DbPool, key: &[u8; KEY_LEN]) -> Result<(), String> {
+    let conn = pool.get().map_err(err)?;
+    if let Some(check) = crate::db::meta_get(&conn, META_KEY_CHECK) {
+        return match decrypt_with(key, KEY_CHECK_AAD, &check) {
+            Ok(text) if text == KEY_CHECK_TEXT => Ok(()),
+            _ => Err(mismatch_reason()),
+        };
+    }
+    if let Some(fingerprint) = crate::db::meta_get(&conn, META_KEY_FP) {
+        if fingerprint != key_fingerprint(key) {
+            return Err(mismatch_reason());
+        }
+        if let Err(error) = write_key_meta(&conn, key) {
+            log::warn!("补写密钥校验信息失败（不影响使用）：{error}");
+        }
+        return Ok(());
+    }
+
+    let samples = enc_samples(&conn, 5);
+    if !samples.is_empty()
+        && !samples
+            .iter()
+            .any(|(aad, value)| decrypt_with(key, aad, value).is_ok())
+    {
+        // 有密文但一条都解不开：钥匙不对。这里绝不能写 key_check，
+        // 否则下次启动会把这把错钥匙当成「已验证」，问题被永久掩盖
+        return Err(mismatch_reason());
+    }
+    if let Err(error) = write_key_meta(&conn, key) {
+        log::warn!("补写密钥校验信息失败（不影响使用）：{error}");
+    }
+    Ok(())
+}
+
+/// 统计解不开的已加密值条数（状态页展示用）
+fn count_broken(pool: &DbPool, key: Option<&[u8; KEY_LEN]>) -> Result<i64, String> {
+    let Some(key) = key else {
+        return Ok(0);
+    };
+    let conn = pool.get().map_err(err)?;
+    let mut broken = 0i64;
+    for (aad, value) in enc_samples(&conn, 500) {
+        if decrypt_with(key, aad, &value).is_err() {
+            broken += 1;
+        }
+    }
+    Ok(broken)
+}
+
+/* ---------- 钥匙串条目命名 ---------- */
+
+/// 数据目录归一化：大小写与末尾分隔符在不同来源下不一致，先统一再哈希
+fn normalize_path(path: &Path) -> String {
+    let text = path.to_string_lossy().replace('/', "\\");
+    let trimmed = text.trim_end_matches('\\');
+    trimmed.to_lowercase()
+}
+
+/// 每个数据目录一个钥匙串条目：开发实例、测试库、第二份安装不会互相覆盖
+fn keyring_target(data_dir: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(normalize_path(data_dir).as_bytes());
+    let digest = hasher.finalize();
+    let suffix: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+    format!("{KEYRING_TARGET}/{suffix}")
+}
+
+/// 测试构建与 CI 一律不碰系统钥匙串，避免把正在使用的密钥覆盖掉
+fn keyring_allowed() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    if let Some(value) = std::env::var_os(DISABLE_KEYRING_ENV) {
+        let text = value.to_string_lossy();
+        if !text.is_empty() && text != "0" && !text.eq_ignore_ascii_case("false") {
+            return false;
+        }
+    }
+    true
+}
+
+/// 先读本目录条目；老版本只有共享条目，读到后顺手迁移过来
+fn read_key_any(target: &str) -> Result<[u8; KEY_LEN], String> {
+    match keyring_read(target) {
+        Ok(key) => Ok(key),
+        Err(primary) => {
+            // 老版本只有不带后缀的共享条目，读到后迁移到本目录专属条目
+            let legacy = keyring_read(KEYRING_TARGET).map_err(|legacy_error| {
+                format!("{primary}；旧共享条目也不可用（{legacy_error}）")
+            })?;
+            match keyring_write(target, &legacy) {
+                Ok(()) => log::info!("已把主密钥迁移到本数据目录专属的钥匙串条目"),
+                Err(error) => log::warn!("迁移钥匙串条目失败（不影响本次启动）：{error}"),
+            }
+            Ok(legacy)
+        }
+    }
+}
+
 fn random_key() -> [u8; KEY_LEN] {
     let mut key = [0u8; KEY_LEN];
     // 两段 UUID v4 拼接：16 字节随机 × 2，避免引入 rand 依赖
@@ -778,19 +1028,19 @@ fn write_file_key(data_dir: &Path, key: &[u8; KEY_LEN]) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn keyring_read() -> Result<[u8; KEY_LEN], String> {
+fn keyring_read(target_name: &str) -> Result<[u8; KEY_LEN], String> {
     use windows_sys::Win32::Security::Credentials::{
         CredFree, CredReadW, CREDENTIALW, CRED_TYPE_GENERIC,
     };
 
-    let target: Vec<u16> = KEYRING_TARGET
+    let target: Vec<u16> = target_name
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
     let mut ptr: *mut CREDENTIALW = std::ptr::null_mut();
     let ok = unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut ptr) };
     if ok == 0 || ptr.is_null() {
-        return Err("凭据管理器中未找到 AstroMan 主密钥".to_string());
+        return Err(format!("凭据管理器中未找到 {target_name}"));
     }
     let result = unsafe {
         let cred = &*ptr;
@@ -809,12 +1059,12 @@ fn keyring_read() -> Result<[u8; KEY_LEN], String> {
 }
 
 #[cfg(windows)]
-fn keyring_write(key: &[u8; KEY_LEN]) -> Result<(), String> {
+fn keyring_write(target_name: &str, key: &[u8; KEY_LEN]) -> Result<(), String> {
     use windows_sys::Win32::Security::Credentials::{
         CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
     };
 
-    let mut target: Vec<u16> = KEYRING_TARGET
+    let mut target: Vec<u16> = target_name
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
@@ -848,12 +1098,12 @@ fn keyring_write(key: &[u8; KEY_LEN]) -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
-fn keyring_read() -> Result<[u8; KEY_LEN], String> {
+fn keyring_read(_target_name: &str) -> Result<[u8; KEY_LEN], String> {
     Err("当前平台暂未接入系统钥匙串".to_string())
 }
 
 #[cfg(not(windows))]
-fn keyring_write(_key: &[u8; KEY_LEN]) -> Result<(), String> {
+fn keyring_write(_target_name: &str, _key: &[u8; KEY_LEN]) -> Result<(), String> {
     Err("当前平台暂未接入系统钥匙串".to_string())
 }
 
@@ -928,5 +1178,44 @@ mod tests {
         packed.extend_from_slice(&ct);
         let stored = format!("v1:{}", B64.encode(packed));
         assert_eq!(legacy_ai_decrypt(&stored), "sk-old");
+    }
+
+    #[test]
+    fn keyring_target_is_per_data_dir() {
+        let a = keyring_target(Path::new("D:/AstroMan/data"));
+        let b = keyring_target(Path::new("D:/AstroMan/data-alt"));
+        assert_ne!(a, b, "不同数据目录必须拿到不同条目，否则会互相覆盖主密钥");
+        assert!(a.starts_with(KEYRING_TARGET));
+        // 大小写与末尾分隔符不应影响结果，否则升级后读不到原条目
+        let again = keyring_target(Path::new("d:\\astroman\\DATA\\"));
+        assert_eq!(a, again);
+    }
+
+    #[test]
+    fn keyring_is_never_touched_by_tests() {
+        // 这条断言保护真实安装：测试库里 bootstrap 一旦写钥匙串，
+        // 就会把用户正在使用的主密钥覆盖掉（v1.0.8 曾发生）
+        assert!(!keyring_allowed());
+    }
+
+    #[test]
+    fn fingerprint_is_short_and_key_dependent() {
+        let a = key_fingerprint(&[1u8; KEY_LEN]);
+        let b = key_fingerprint(&[2u8; KEY_LEN]);
+        assert_eq!(a.len(), 16);
+        assert_ne!(a, b);
+        assert_eq!(a, key_fingerprint(&[1u8; KEY_LEN]));
+    }
+
+    #[test]
+    fn mismatch_keeps_key_usable_for_new_writes() {
+        // 密钥不匹配时仍要能加密（否则用户连重填 Key 都做不到）
+        let store = SecretStore::from_key(std::env::temp_dir(), [4u8; KEY_LEN], KeySource::File);
+        store.inner.write().mismatch = Some(mismatch_reason());
+        assert!(store.mismatch().is_some());
+        let cipher = store.encrypt(AAD_AI, "sk-new").unwrap();
+        assert!(cipher.starts_with(ENC_PREFIX));
+        // 已知不匹配时不再逐条打印解密告警，直接返回空串
+        assert_eq!(store.decrypt(AAD_AI, &cipher), "");
     }
 }

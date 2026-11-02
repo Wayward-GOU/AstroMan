@@ -193,7 +193,7 @@ const features = computed(() => [
     key: 'stress',
     icon: ThunderboltOutlined,
     title: '本地压测',
-    desc: '参考 JMeter 的参数模型，支持固定并发与阶梯加压、目标 RPS 限速、SLA 阈值与自动停止。',
+    desc: '参考 JMeter 的参数模型，支持固定并发与阶梯加压、目标 QPS 限速、SLA 阈值与自动停止。',
     points: ['并发 / 时长 / 思考时间', 'P95 · P99 · 错误率', '逐请求明细可导出'],
     go: () => router.push('/stress'),
   },

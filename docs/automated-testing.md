@@ -42,7 +42,7 @@ Python 钩子：`pre`（可改请求 / 写变量）、`post`（读响应 / 加�
 ```
 
 - 四项 SLA 任一超标 → 用例 `failed`，失败原因写入断言与 JUnit `<failure>`。
-- `baselineReportId` 指向历史压测报告：P95 / P99 超基线 1.2 倍、平均 RPS 低于基线 80%、错误率高于基线 +0.5% → `failed`。
+- `baselineReportId` 指向历史压测报告：P95 / P99 超基线 1.2 倍、平均 QPS 低于基线 80%、错误率高于基线 +0.5% → `failed`。
 - `slaOverride` 可覆盖配置里的 SLA；`waitTimeoutSec` 指定等待其他压测结束的最长秒数。
 - 压测与手工压测互斥；停止套件运行会在一秒内中断压测。
 - 报告 HTML / JSON 内嵌核心指标与 SLA 断言，并给出原压测报告编号。

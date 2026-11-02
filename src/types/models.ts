@@ -1235,6 +1235,11 @@ export interface SecretStatus {
   encryptedEnvCount: number
   encryptedAiCount: number
   keyCreatedAt?: number | null
+  /** 主密钥能读到但与库内密文不匹配：已保存的 Key 解不出来 */
+  keyMismatch?: boolean
+  keyMismatchReason?: string | null
+  /** 不匹配时解不开的条数 */
+  brokenSecretCount?: number
 }
 
 /** 密钥包文件内容（导出 / 导入） */

@@ -41,10 +41,7 @@ pub struct PlanInput {
 }
 
 #[tauri::command]
-pub fn plan_list(
-    state: State<'_, AppState>,
-    project_id: i64,
-) -> Result<Vec<PlanSummary>, String> {
+pub fn plan_list(state: State<'_, AppState>, project_id: i64) -> Result<Vec<PlanSummary>, String> {
     let conn = state.pool.get().map_err(err)?;
     let mut stmt = conn
         .prepare(

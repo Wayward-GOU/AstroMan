@@ -4,7 +4,6 @@ import { useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
 import { open, save } from '@tauri-apps/plugin-dialog'
 import {
-  PlusOutlined,
   ArrowRightOutlined,
   ThunderboltOutlined,
   DeploymentUnitOutlined,
@@ -15,31 +14,21 @@ import {
   ToolOutlined,
   LineChartOutlined,
   FundProjectionScreenOutlined,
-  ClockCircleOutlined,
-  ReloadOutlined,
   SettingOutlined,
   ApiOutlined,
   SafetyCertificateOutlined,
   RocketOutlined,
   PlayCircleOutlined,
-  BarChartOutlined,
   FileTextOutlined,
+  ExperimentOutlined,
 } from '@ant-design/icons-vue'
 import AiSparkIcon from '@/components/AiSparkIcon.vue'
 import PageHeader from '@/components/PageHeader.vue'
-import { formatDateTime } from '@/utils/datetime'
 import { useProjectStore } from '@/stores/project'
 import { useAiAssistStore } from '@/stores/aiAssist'
 import { dashboardInsightPrompt } from '@/utils/aiScenarios'
 import * as api from '@/api'
-import type {
-  DashboardMetrics,
-  HistoryItem,
-  MonitorSnapshot,
-  StorageInfo,
-  StressReport,
-  WorkspaceStats,
-} from '@/types/models'
+import type { DashboardMetrics, StorageInfo, WorkspaceStats } from '@/types/models'
 
 const router = useRouter()
 const store = useProjectStore()
@@ -50,8 +39,6 @@ const newName = ref('')
 const newDesc = ref('')
 const submitting = ref(false)
 
-const history = ref<HistoryItem[]>([])
-const reports = ref<StressReport[]>([])
 const stats = ref<WorkspaceStats | null>(null)
 const metrics = ref<DashboardMetrics | null>(null)
 
@@ -67,8 +54,6 @@ function aiInsight() {
   })
 }
 const storage = ref<StorageInfo | null>(null)
-const snapshot = ref<MonitorSnapshot | null>(null)
-const monitorLoading = ref(false)
 const appVersion = ref('')
 
 const recentProject = computed(() => {
@@ -81,12 +66,6 @@ const headerSubtitle = computed(() =>
     ? `${stats.value.projectCount} 个项目 · ${stats.value.requestCount} 个接口 · 数据全部保存在本机`
     : '本地 API 调试、压测与工具箱，数据不出这台电脑',
 )
-
-const overallRate = computed(() => {
-  const s = stats.value
-  if (!s || s.reportRequestTotal === 0) return null
-  return (s.reportSuccessTotal / s.reportRequestTotal) * 100
-})
 
 const kpis = computed(() => {
   const s = stats.value
@@ -101,7 +80,7 @@ const kpis = computed(() => {
       label: '项目',
       value: s?.projectCount ?? store.projects.length,
       note: '按项目组织接口',
-      go: openProject,
+      go: () => router.push('/projects'),
     },
     {
       key: 'request',
@@ -129,7 +108,7 @@ const kpis = computed(() => {
       label: '压测报告',
       value: s?.reportCount ?? null,
       note: s ? `近 7 天新增 ${s.recentReports} 份` : '结束后自动生成',
-      go: () => router.push('/reports'),
+      go: () => router.push('/stress'),
     },
     {
       key: 'history',
@@ -143,6 +122,13 @@ const kpis = computed(() => {
 
 const launches = computed(() => [
   {
+    key: 'automation',
+    title: '自动化测试',
+    desc: '测试场景：套件、断言、Python 与回归报告',
+    icon: ExperimentOutlined,
+    go: () => router.push('/automation'),
+  },
+  {
     key: 'stress',
     title: '发起压测',
     desc: '选择接口，配置并发、时长与 SLA',
@@ -154,7 +140,7 @@ const launches = computed(() => [
     title: '压测报告',
     desc: '分位、阶段汇总与逐请求明细',
     icon: FundProjectionScreenOutlined,
-    go: () => router.push('/reports'),
+    go: () => router.push('/stress'),
   },
   {
     key: 'tools',
@@ -186,15 +172,6 @@ const launches = computed(() => [
   },
 ])
 
-const toolLinks = [
-  { id: 'json-workbench', label: 'JSON 格式化' },
-  { id: 'json2java', label: 'JSON → Java' },
-  { id: 'timestamp', label: '时间戳转换' },
-  { id: 'mybatis', label: 'MyBatis SQL' },
-  { id: 'regex', label: '正则测试' },
-  { id: 'ip-lookup', label: 'IP 查询' },
-]
-
 const features = computed(() => [
   {
     key: 'debug',
@@ -205,10 +182,18 @@ const features = computed(() => [
     go: goProject,
   },
   {
+    key: 'automation',
+    icon: ExperimentOutlined,
+    title: '自动化测试',
+    desc: '把接口组合保存成测试套件，配好断言与变量链后可反复运行；支持 Python 钩子与压测用例，结果产出 HTML / JSON / JUnit。',
+    points: ['HTTP / Python / 压测用例', '运行前预检与依赖跳过', 'CLI 同源执行与 CI 门禁'],
+    go: () => router.push('/automation'),
+  },
+  {
     key: 'stress',
     icon: ThunderboltOutlined,
     title: '本地压测',
-    desc: '参考 JMeter 的参数模型，支持固定并发与阶梯加压、目标 RPS 限速、SLA 阈值与自动停止。',
+    desc: '参考 JMeter 的参数模型，支持固定并发与阶梯加压、目标 QPS 限速、SLA 阈值与自动停止。',
     points: ['并发 / 时长 / 思考时间', 'P95 · P99 · 错误率', '逐请求明细可导出'],
     go: () => router.push('/stress'),
   },
@@ -239,127 +224,6 @@ const highlights = computed(() => {
     { label: '环境变量组', value: s ? fmtInt(s.environmentCount) : '—' },
   ]
 })
-
-/* ---------- 数据大屏 ---------- */
-
-const dashDays = computed(() => metrics.value?.days ?? [])
-const codeBuckets = computed(() => metrics.value?.codeBuckets ?? [])
-const topRequests = computed(() => metrics.value?.topRequests ?? [])
-const reportPoints = computed(() => metrics.value?.reportPoints ?? [])
-const methodBuckets = computed(() => metrics.value?.methodBuckets ?? [])
-const hourBuckets = computed(() => metrics.value?.hourBuckets ?? [])
-const latencyBuckets = computed(() => metrics.value?.latencyBuckets ?? [])
-const topProjects = computed(() => metrics.value?.topProjects ?? [])
-
-const trendTotal = computed(() => dashDays.value.reduce((sum, d) => sum + d.total, 0))
-const trendSuccess = computed(() => dashDays.value.reduce((sum, d) => sum + d.success, 0))
-const trendRate = computed(() =>
-  trendTotal.value ? (trendSuccess.value / trendTotal.value) * 100 : 0,
-)
-const trendAvgRt = computed(() => {
-  const weighted = dashDays.value.reduce((sum, d) => sum + d.avgRt * d.total, 0)
-  return trendTotal.value ? weighted / trendTotal.value : 0
-})
-const trendPeak = computed(() => Math.max(1, ...dashDays.value.map((d) => d.total)))
-
-const historyTotal = computed(() => codeBuckets.value.reduce((sum, b) => sum + b.count, 0))
-const reportPeak = computed(() =>
-  Math.max(1, ...reportPoints.value.map((r) => r.p95Rt)),
-)
-const todayTotal = computed(() => hourBuckets.value.reduce((sum, h) => sum + h.count, 0))
-const hourPeak = computed(() => Math.max(1, ...hourBuckets.value.map((h) => h.count)))
-const methodPeak = computed(() => Math.max(1, ...methodBuckets.value.map((b) => b.count)))
-const latencyTotal = computed(() => latencyBuckets.value.reduce((sum, b) => sum + b.count, 0))
-const latencyPeak = computed(() => Math.max(1, ...latencyBuckets.value.map((b) => b.count)))
-const projectPeak = computed(() => Math.max(1, ...topProjects.value.map((p) => p.count)))
-const todayPeakHour = computed(() => {
-  const peak = hourBuckets.value.reduce(
-    (best, item) => (item.count > best.count ? item : best),
-    hourBuckets.value[0] ?? { hour: 0, count: 0 },
-  )
-  return peak.count ? `${String(peak.hour).padStart(2, '0')}:00` : '—'
-})
-
-function trendBarHeight(point: { total: number }) {
-  return point.total ? Math.max(6, (point.total / trendPeak.value) * 100) : 0
-}
-
-function trendSegment(point: { total: number }, value: number) {
-  return point.total ? (value / point.total) * 100 : 0
-}
-
-function monthDay(date: string) {
-  return date.slice(5)
-}
-
-function trendTitle(point: { date: string; total: number; success: number; avgRt: number }) {
-  const rate = point.total ? ((point.success / point.total) * 100).toFixed(0) : 0
-  return `${point.date} · ${point.total} 次请求 · 成功率 ${rate}% · 平均 ${fmtMs(point.avgRt)}`
-}
-
-function bucketClass(label: string) {
-  if (label === '2xx') return 'ok'
-  if (label === '3xx') return 'info'
-  if (label === '4xx') return 'warn'
-  if (label === '5xx') return 'danger'
-  return 'other'
-}
-
-function bucketPercent(count: number) {
-  return historyTotal.value ? `${((count / historyTotal.value) * 100).toFixed(2)}%` : '0%'
-}
-
-function bucketText(count: number) {
-  if (!historyTotal.value) return '0%'
-  return `${((count / historyTotal.value) * 100).toFixed(1)}%`
-}
-
-function reportBarWidth(report: { p95Rt: number }) {
-  return `${Math.max(6, (report.p95Rt / reportPeak.value) * 100)}%`
-}
-
-function reportTone(report: { errorRate: number }) {
-  if (report.errorRate >= 1) return 'danger'
-  if (report.errorRate >= 0.1) return 'warn'
-  return 'ok'
-}
-
-function hourHeight(point: { count: number }) {
-  return point.count ? Math.max(4, (point.count / hourPeak.value) * 100) : 0
-}
-
-function hourTitle(point: { hour: number; count: number }) {
-  return `${String(point.hour).padStart(2, '0')}:00 - ${String(point.hour).padStart(2, '0')}:59 · ${point.count} 次`
-}
-
-function methodWidth(bucket: { count: number }) {
-  return `${bucket.count ? Math.max(6, (bucket.count / methodPeak.value) * 100) : 0}%`
-}
-
-function methodTone(label: string) {
-  if (label === 'GET') return 'ok'
-  if (label === 'POST') return 'info'
-  if (label === 'PUT' || label === 'PATCH') return 'warn'
-  if (label === 'DELETE') return 'danger'
-  return 'other'
-}
-
-function latencyWidth(bucket: { count: number }) {
-  return `${bucket.count ? Math.max(6, (bucket.count / latencyPeak.value) * 100) : 0}%`
-}
-
-function latencyTone(index: number) {
-  return ['ok', 'ok', 'info', 'warn', 'danger'][index] ?? 'other'
-}
-
-function latencyText(bucket: { count: number }) {
-  if (!latencyTotal.value) return '0%'
-  return `${((bucket.count / latencyTotal.value) * 100).toFixed(1)}%`
-}
-
-function projectWidth(item: { count: number }) {
-  return `${Math.max(6, (item.count / projectPeak.value) * 100)}%`
-}
 
 const runnerSteps = [
   {
@@ -393,6 +257,49 @@ const runnerUrlExample = '{{base_url}}/api/login'
 const runnerVarExample = '{{username}}'
 const runnerEnvExample = '{{base_url}}'
 
+/* ---------- 测试场景示例 ---------- */
+const suiteSteps = [
+  {
+    title: '建一个测试套件',
+    desc: '在「自动化测试」里新建套件；也可以在批量运行页点「另存为测试套件」，把勾选好的接口与数据文件直接带过来。',
+  },
+  {
+    title: '编排用例并写断言',
+    desc: 'HTTP 用例绑定接口，用状态码 / JSONPath / Header / 正则做声明式断言；复杂逻辑用 Python 前后置钩子，容量门禁用压测用例。',
+  },
+  {
+    title: '运行前自动预检',
+    desc: '点「运行」会先检查解释器、数据集、依赖环与缺失 secret；接口自带的 JS 钩子与环境脚本会被列出并跳过，需要时改写为 Python。',
+  },
+  {
+    title: '看报告或接 CI',
+    desc: '每次运行产出 HTML / JSON / JUnit 与日志；桌面端与 astroman-cli 使用同一内核，可直接作为流水线门禁。',
+  },
+]
+
+const suiteAssertionExample = `[
+  { "type": "status", "op": "eq", "value": 200 },
+  { "type": "jsonPath", "path": "$.args.keyword",
+    "op": "eq", "value": "astroman" }
+]`
+const suiteCliExample =
+  'astroman-cli test run --suite "示例回归（httpbin）" \\\n  --report junit,html --out ./artifacts'
+
+const suiteSampleCases = [
+  {
+    name: '查询参数回显',
+    detail: 'HTTP 用例 · 绑定「GET 查询参数」· 断言 200 与 $.args.keyword = astroman',
+  },
+  {
+    name: '创建 JSON 并回显',
+    detail: 'HTTP 用例 · 绑定「POST 创建 JSON」· 断言 200 与 $.json.name = AstroMan、耗时 ≤ 10s',
+  },
+  {
+    name: 'Bearer 认证通过',
+    detail: 'HTTP 用例 · 绑定「Bearer Token 认证」· 断言 200 与 $.authenticated = true',
+  },
+]
+
 const steps = computed(() => [
   {
     key: '01',
@@ -424,27 +331,34 @@ const steps = computed(() => [
   },
   {
     key: '05',
+    title: '沉淀回归套件',
+    desc: '把常用接口保存成自动化测试套件，配好断言、变量链与失败策略后反复运行；示例项目已内置「示例回归（httpbin）」可直接试跑。',
+    action: '打开自动化测试',
+    go: () => router.push('/automation'),
+  },
+  {
+    key: '06',
     title: '签名与加密',
     desc: '脚本页「插入示例」可一键填入 MD5 / HMAC 签名、AES 加密、RSA 加密，生成的值用 {{变量}} 引用。',
     action: '打开项目',
     go: goProject,
   },
   {
-    key: '06',
+    key: '07',
     title: '导入现成接口',
     desc: '项目页可粘贴 cURL 一键解析；工作台可导入项目 JSON，用于同事共享或换机迁移。',
     action: '打开项目',
     go: goProject,
   },
   {
-    key: '07',
+    key: '08',
     title: '用航仔 提效',
     desc: '在「航仔」里说一句话就能建项目、写接口、发请求、写签名脚本、查压测报告，并能导出执行记录。',
     action: '打开航仔',
     go: () => router.push({ name: 'ai' }),
   },
   {
-    key: '08',
+    key: '09',
     title: '数据与备份',
     desc: '数据默认存在本机 SQLite；设置页可查看路径、迁移目录，项目页可导出 JSON 备份。',
     action: '打开设置',
@@ -492,6 +406,16 @@ const tips = [
     title: '压测参数怎么起步',
     desc: '建议 10～30 并发、30 秒时长起步，观察错误率与 P95 后再加；可配 P95 / P99 / 错误率 SLA 自动判定。',
     code: '',
+  },
+  {
+    title: '把批量运行固化成套件',
+    desc: '在批量运行页勾选好接口跑通后，点「另存为测试套件」，接口、断言与 CSV 数据文件会一起带进自动化测试页，之后一键复跑。',
+    code: '批量运行 → 另存为测试套件 → 自动化测试页运行（自动预检）',
+  },
+  {
+    title: '压测用例做容量门禁',
+    desc: '套件里选「压测用例」，粘贴压测配置 JSON，可加 slaOverride 设阈值、baselineReportId 与历史报告对比；回归时延迟或错误率恶化会自动判失败。',
+    code: '{\n  "slaOverride": { "p95Ms": 800, "errorRate": 1.0 },\n  "baselineReportId": 12\n}',
   },
   {
     title: 'AI 助手：自然语言操作',
@@ -546,6 +470,22 @@ const faqs = [
     a: '批量运行按顺序发送：一次选中多个接口，配合迭代次数或 CSV 数据逐轮跑，适合回归与数据驱动场景，每条结果都能单独查看；压测是在固定并发下持续施压，关注 QPS、P95/P99 与错误率。需要按数据批量跑接口用「批量运行」，需要并发能力去「压测」。',
   },
   {
+    q: '测试场景（自动化套件）和批量运行、压测有什么区别？',
+    a: '三者共用同一套请求执行内核，侧重不同。批量运行是临时任务：现场勾选接口、跑完看结果，不留长期资产；测试场景把「跑哪些接口、按什么顺序、断言什么」固化成可命名、可反复运行的套件，支持用例间依赖（前置用例失败时后续自动跳过）、setup/teardown、数据集与 Python 钩子，每次运行落库并产出 HTML / JSON / JUnit 报告；压测用例是套件里的一种特殊用例，用 SLA 阈值或与基线报告对比来做容量门禁。一句话：临时验一批用批量运行，要长期回归用测试场景，要看并发能力去压测。',
+  },
+  {
+    q: '测试场景里的 Python 脚本怎么保证安全？',
+    a: 'Python 默认不执行：只有在「设置 → 网络与安全」里打开 Python 脚本开关后才会真正跑，导入含 Python 脚本的套件包时同样要求本机已授权，否则直接拒绝导入。脚本在本机子进程里运行，带超时、输出与附件大小上限；解释器可在同一处指定，留空则按 python3 / python / py -3 自动探测，点「探测」能先看到版本。每次点「运行」都会自动先预检，解释器不可用、缺数据集、依赖成环、缺 secret 都会提前列出并阻止运行。',
+  },
+  {
+    q: '接口自带的 JS 脚本能在测试场景里跑吗？',
+    a: '不能直接跑，预检会把这些接口列出来提醒你。测试场景的前后置钩子用 Python；需要保留原逻辑时，把 JS 里的签名或取值改写为 Python 即可，运行时提供环境变量、变量表、响应对象、断言与加解密（MD5 / HMAC / AES / RSA）等常用能力。',
+  },
+  {
+    q: '怎么在 CI 里跑测试套件？',
+    a: '用随安装包提供的 astroman-cli：astroman-cli test run --suite "套件名" --report junit,html --out ./artifacts，还可加 --project / --env 定位套件、--fail-fast 遇错即停。它与桌面端使用同一个 Rust 执行内核，退出码 0 表示全部通过，非 0 分别对应用例失败、预检不通过、参数错误等情况，可直接作为流水线门禁；JUnit 结果还能被 CI 原生展示。',
+  },
+  {
     q: '怎么把项目分享给同事？',
     a: '项目页顶部或工作台项目卡片菜单里选「导出项目」，会得到 *.astroman.json（含集合、接口、脚本与断言）。对方在工作台点「导入项目 → 导入项目 JSON」即可复原；重名时会自动加「（导入）」后缀，不影响原有项目。',
   },
@@ -592,47 +532,17 @@ onMounted(async () => {
     loading.value = false
   }
 
-  const [his, reps, st, storageInfo, info, dash] = await Promise.allSettled([
-    api.historyList(8),
-    api.reportList(4),
+  const [st, storageInfo, info, dash] = await Promise.allSettled([
     api.workspaceStats(),
     api.storageInfo(),
     api.appInfo(),
     api.dashboardMetrics(),
   ])
-  if (his.status === 'fulfilled') history.value = his.value
-  if (reps.status === 'fulfilled') reports.value = reps.value
   if (st.status === 'fulfilled') stats.value = st.value
   if (storageInfo.status === 'fulfilled') storage.value = storageInfo.value
   if (info.status === 'fulfilled') appVersion.value = info.value.version
   if (dash.status === 'fulfilled') metrics.value = dash.value
-
-  await loadMonitor()
 })
-
-async function loadMonitor() {
-  monitorLoading.value = true
-  try {
-    snapshot.value = await api.winstatsSnapshot()
-  } catch (e) {
-    message.error(String(e))
-  } finally {
-    monitorLoading.value = false
-  }
-}
-
-const diskWorst = computed(() => {
-  const disks = snapshot.value?.disks ?? []
-  if (!disks.length) return null
-  return disks.reduce((a, b) => (b.percent > a.percent ? b : a))
-})
-
-const primaryIp = computed(() => {
-  const ips = snapshot.value?.ips ?? []
-  return ips.find((item) => item.primary)?.address ?? ips[0]?.address ?? '-'
-})
-
-const gpuPrimary = computed(() => snapshot.value?.gpus?.[0] ?? null)
 
 /* ---------- 创建 / 删除 / 导入 ---------- */
 
@@ -741,22 +651,6 @@ function onImportMenu(info: { key: string | number }) {
   else if (info.key === 'api') importApiProject()
 }
 
-function clearHistory() {
-  Modal.confirm({
-    title: '清空全部请求历史？',
-    content: '只删除本机记录的请求历史，不会影响项目、接口与压测报告。按时间范围清理请前往「请求历史」页。',
-    okText: '清空',
-    okType: 'danger',
-    cancelText: '取消',
-    async onOk() {
-      await api.dataCleanup({ history: true, vacuum: true })
-      history.value = []
-      refreshStats()
-      message.success('历史已清空')
-    },
-  })
-}
-
 /* ---------- 跳转 ---------- */
 
 function goProject() {
@@ -771,18 +665,6 @@ function goEnvironment() {
 
 function goSettings() {
   router.push('/settings')
-}
-
-function openHistory(row: HistoryItem) {
-  if (row.requestId) router.push(`/request/${row.requestId}`)
-}
-
-function openReport(report: StressReport) {
-  router.push(`/reports/${report.id}`)
-}
-
-function openTool(id: string) {
-  router.push({ path: '/tools', query: { tool: id } })
 }
 
 /* ---------- 格式化 ---------- */
@@ -803,35 +685,6 @@ function fmtBytes(value: number) {
   return `${size >= 100 || index === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[index]}`
 }
 
-function fmtMs(value?: number | null) {
-  if (value == null) return '-'
-  return value >= 1000 ? `${(value / 1000).toFixed(2)} s` : `${Math.round(value)} ms`
-}
-
-function fmtPercent(value: number) {
-  return `${value.toFixed(1)}%`
-}
-
-function fmtWhen(value?: number | null) {
-  return formatDateTime(value)
-}
-
-function reportRate(report: StressReport) {
-  return report.totalRequests > 0 ? (report.successCount / report.totalRequests) * 100 : 0
-}
-
-function tone(value: number) {
-  if (value >= 85) return 'danger'
-  if (value >= 65) return 'warn'
-  return 'ok'
-}
-
-function statusColor(code?: number | null) {
-  if (!code) return 'var(--fm-muted)'
-  if (code < 300) return 'var(--fm-success)'
-  if (code < 400) return 'var(--fm-warning)'
-  return 'var(--fm-danger)'
-}
 </script>
 
 <template>
@@ -858,9 +711,9 @@ function statusColor(code?: number | null) {
         <template #icon><ThunderboltOutlined /></template>
         发起压测
       </a-button>
-      <a-button type="primary" @click="createOpen = true">
-        <template #icon><PlusOutlined /></template>
-        新建项目
+      <a-button type="primary" @click="router.push('/projects')">
+        <template #icon><FolderOpenOutlined /></template>
+        项目管理
       </a-button>
     </PageHeader>
 
@@ -875,23 +728,17 @@ function statusColor(code?: number | null) {
           <span class="meta-dot" />
           <span>{{ storage?.isCustom ? '自定义数据目录' : '默认数据目录' }}</span>
         </div>
-        <h2 class="console-title">
-          {{ recentProject ? `继续「${recentProject.name}」` : '创建第一个项目，开始调试' }}
-        </h2>
+        <h2 class="console-title">本地工作区已就绪</h2>
         <p class="console-desc">
-          {{
-            recentProject
-              ? recentProject.description || '项目已就绪，打开后即可编辑接口、发送请求或直接发起压测。'
-              : '项目、请求、环境变量与压测报告全部保存在本机 SQLite，无需登录，断网可用。'
-          }}
+          项目、接口、环境变量与压测报告全部保存在本机 SQLite，无需登录，断网可用。
         </p>
         <div class="console-actions">
-          <a-button type="primary" @click="goProject">
+          <a-button type="primary" @click="router.push('/projects')">
             <template #icon><FolderOpenOutlined /></template>
-            {{ recentProject ? '进入项目' : '新建项目' }}
+            进入项目管理
           </a-button>
           <a-button :disabled="!recentProject" @click="goEnvironment">环境变量</a-button>
-          <a-button @click="router.push('/reports')">查看报告</a-button>
+          <a-button @click="router.push('/stress')">查看报告</a-button>
         </div>
         <div class="console-meta">
           <DatabaseOutlined />
@@ -920,6 +767,84 @@ function statusColor(code?: number | null) {
         </span>
         <ArrowRightOutlined class="launch-arrow" />
       </button>
+    </div>
+
+    <!-- 测试场景介绍 -->
+    <section class="runner-band suite-band fm-card">
+      <div class="runner-copy">
+        <span class="runner-eyebrow"><ExperimentOutlined /> 自动化测试 · 测试场景</span>
+        <h2 class="runner-title">把回归沉淀成套件，一键跑完再出报告</h2>
+        <p class="runner-desc">
+          测试场景把「这次跑哪些接口」变成可保存、可反复运行的套件：用例绑定接口并声明断言，
+          前后置逻辑用 Python 钩子，容量门禁用压测用例（SLA 与基线对比自动判定）。
+          点「运行」会先自动预检，缺数据集、依赖成环、脚本未授权都会提前列出；结果落库并可导出
+          HTML / JSON / JUnit，方便归档或接进流水线。
+        </p>
+        <div class="runner-tags">
+          <span>套件可保存</span>
+          <span>声明式断言</span>
+          <span>Python 前后置</span>
+          <span>压测 SLA 门禁</span>
+          <span>预检与失败策略</span>
+          <span>CLI / CI 同源</span>
+        </div>
+        <div class="runner-actions">
+          <a-button type="primary" @click="router.push('/automation')">
+            <template #icon><ExperimentOutlined /></template>
+            打开自动化测试
+          </a-button>
+          <a-button :disabled="!recentProject" @click="router.push('/runner')">
+            从批量运行迁移
+          </a-button>
+        </div>
+      </div>
+
+      <div class="runner-steps">
+        <div v-for="(s, i) in suiteSteps" :key="s.title" class="runner-step">
+          <span class="runner-step-index mono">0{{ i + 1 }}</span>
+          <div class="runner-step-body">
+            <div class="runner-step-title">{{ s.title }}</div>
+            <div class="runner-step-desc">{{ s.desc }}</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 测试场景示例 -->
+    <div class="fm-card runner-example">
+      <div class="example-head">
+        <span class="example-title">
+          <FileTextOutlined /> 示例：内置的「示例回归（httpbin）」
+        </span>
+        <span class="example-note">示例项目自带 3 个用例，可直接运行</span>
+      </div>
+      <div class="example-grid">
+        <div class="example-col">
+          <div class="example-label">用例编排</div>
+          <div class="example-results">
+            <div v-for="c in suiteSampleCases" :key="c.name">
+              <b class="mono">{{ c.name }}</b> {{ c.detail }}
+            </div>
+          </div>
+        </div>
+        <div class="example-col">
+          <div class="example-label">断言写法（JSON）</div>
+          <pre class="example-code mono">{{ suiteAssertionExample }}</pre>
+        </div>
+        <div class="example-col">
+          <div class="example-label">运行产物</div>
+          <div class="example-results">
+            <div><b class="mono">预检</b> 解释器 / 数据集 / 依赖 / secret</div>
+            <div><b class="mono">结果</b> 通过 · 失败 · 跳过（依赖未满足）</div>
+            <div><b class="mono">报告</b> HTML / JSON / JUnit + 运行日志</div>
+          </div>
+        </div>
+      </div>
+      <div class="example-foot">
+        没有接口？先在示例项目里试跑，或到批量运行勾选好接口后点「另存为测试套件」直接带过来。
+        命令行与桌面端使用同一执行内核，可接进流水线做门禁：
+        <pre class="example-code mono">{{ suiteCliExample }}</pre>
+      </div>
     </div>
 
     <!-- 批量运行介绍 -->
@@ -1040,437 +965,11 @@ function statusColor(code?: number | null) {
       </div>
     </div>
 
-    <!-- 主体 -->
-    <div class="main-grid">
-      <div class="col-main">
-        <div class="section-head">
-          <div>
-            <h2 class="section-title">我的项目</h2>
-            <div class="section-desc">
-              {{ store.projects.length }} 个项目<template v-if="stats"> · {{ fmtInt(stats.collectionCount) }} 个集合 · {{ fmtInt(stats.requestCount) }} 个接口</template>
-            </div>
-          </div>
-          <a-button type="link" size="small" @click="createOpen = true">
-            <template #icon><PlusOutlined /></template>
-            新建项目
-          </a-button>
-        </div>
-
-        <a-spin :spinning="loading">
-          <div v-if="store.projects.length" class="project-grid">
-            <div
-              v-for="p in store.projects"
-              :key="p.id"
-              class="fm-card project-card"
-              @click="router.push(`/project/${p.id}`)"
-            >
-              <div class="project-top">
-                <span class="dot" :style="{ background: p.color || 'var(--fm-primary)' }" />
-                <span class="project-name">{{ p.name }}</span>
-                <a-dropdown :trigger="['click']">
-                  <a class="more" @click.stop>···</a>
-                  <template #overlay>
-                    <a-menu>
-                      <a-menu-item key="export" @click="exportProjectJson(p.id, p.name)">
-                        导出项目 JSON
-                      </a-menu-item>
-                      <a-menu-item key="delete" danger @click="removeProject(p.id, p.name)">
-                        删除项目
-                      </a-menu-item>
-                    </a-menu>
-                  </template>
-                </a-dropdown>
-              </div>
-              <div class="project-desc">{{ p.description || '暂无描述' }}</div>
-              <div class="project-foot">
-                <span class="project-meta">更新于 {{ fmtWhen(p.updatedAt) }}</span>
-                <span class="project-open">进入 <ArrowRightOutlined /></span>
-              </div>
-            </div>
-
-            <button class="new-project-card" @click="createOpen = true">
-              <PlusOutlined />
-              <span>新建项目</span>
-            </button>
-          </div>
-          <div v-else class="fm-card panel-empty">
-            <div class="empty-mark">📁</div>
-            <div class="empty-title">还没有项目</div>
-            <div class="empty-desc">创建一个项目开始调试，或者导入 AstroMan 项目、Postman 集合或 Apifox 数据。</div>
-            <div class="empty-actions">
-              <a-button type="primary" @click="createOpen = true">新建项目</a-button>
-              <a-button @click="importProject">导入项目 JSON</a-button>
-              <a-button @click="importApiProject">导入 Postman/Apifox</a-button>
-            </div>
-          </div>
-        </a-spin>
-      </div>
-
-      <aside class="col-side">
-        <!-- 最近压测 -->
-        <div class="side-card fm-card">
-          <div class="side-head">
-            <span class="side-title">最近压测</span>
-            <span v-if="overallRate != null" class="side-note mono">{{ overallRate.toFixed(1) }}% 成功率</span>
-            <a class="side-link" @click="router.push('/reports')">全部</a>
-          </div>
-          <div v-if="reports.length" class="report-list">
-            <div v-for="r in reports" :key="r.id" class="report-row" @click="openReport(r)">
-              <div class="report-row-top">
-                <span class="status-dot" :class="{ stopped: r.status === 'stopped' }" />
-                <span class="report-name">{{ r.planName }}</span>
-                <span class="report-when">{{ fmtWhen(r.createdAt) }}</span>
-              </div>
-              <div class="report-row-metrics">
-                <span>请求 <b class="mono">{{ fmtInt(r.totalRequests) }}</b></span>
-                <span>P95 <b class="mono">{{ fmtMs(r.p95Rt) }}</b></span>
-                <span>错误率 <b class="mono">{{ fmtPercent(r.errorRate) }}</b></span>
-              </div>
-            </div>
-          </div>
-          <div v-else class="side-empty">
-            还没有压测报告，选择接口发起一次压测即可自动生成。
-            <a class="side-link" @click="router.push('/stress')">去压测</a>
-          </div>
-        </div>
-
-        <!-- 本机状态 -->
-        <div class="side-card fm-card">
-          <div class="side-head">
-            <span class="side-title">本机状态</span>
-            <a-button type="text" size="small" class="icon-btn" :loading="monitorLoading" @click="loadMonitor">
-              <template #icon><ReloadOutlined /></template>
-            </a-button>
-          </div>
-          <template v-if="snapshot">
-            <div class="metric">
-              <div class="metric-head">
-                <span>CPU</span>
-                <span class="mono">{{ fmtPercent(snapshot.cpu.total) }}</span>
-              </div>
-              <div class="metric-bar">
-                <div class="metric-fill" :class="tone(snapshot.cpu.total)" :style="{ width: `${snapshot.cpu.total}%` }" />
-              </div>
-            </div>
-            <div class="metric">
-              <div class="metric-head">
-                <span>内存</span>
-                <span class="mono">{{ fmtPercent(snapshot.memory.percent) }}</span>
-              </div>
-              <div class="metric-bar">
-                <div class="metric-fill" :class="tone(snapshot.memory.percent)" :style="{ width: `${snapshot.memory.percent}%` }" />
-              </div>
-            </div>
-            <div v-if="diskWorst" class="metric">
-              <div class="metric-head">
-                <span>磁盘 · {{ diskWorst.name || diskWorst.mount }}</span>
-                <span class="mono">{{ fmtPercent(diskWorst.percent) }}</span>
-              </div>
-              <div class="metric-bar">
-                <div class="metric-fill" :class="tone(diskWorst.percent)" :style="{ width: `${diskWorst.percent}%` }" />
-              </div>
-            </div>
-            <div v-if="gpuPrimary" class="metric">
-              <div class="metric-head">
-                <span>GPU</span>
-                <span class="mono">{{ fmtPercent(gpuPrimary.usage) }}</span>
-              </div>
-              <div class="metric-bar">
-                <div class="metric-fill" :class="tone(gpuPrimary.usage)" :style="{ width: `${gpuPrimary.usage}%` }" />
-              </div>
-            </div>
-            <div class="monitor-foot">
-              <span class="mono">{{ primaryIp }}</span>
-              <a class="side-link" @click="router.push('/monitor')">详细监视</a>
-            </div>
-          </template>
-          <div v-else class="side-empty">正在读取本机状态…</div>
-        </div>
-
-        <!-- 常用工具 -->
-        <div class="side-card fm-card">
-          <div class="side-head">
-            <span class="side-title">常用工具</span>
-            <a class="side-link" @click="router.push('/tools')">工具箱</a>
-          </div>
-          <div class="tool-chips">
-            <button v-for="tool in toolLinks" :key="tool.id" class="tool-chip" @click="openTool(tool.id)">
-              {{ tool.label }}
-            </button>
-          </div>
-        </div>
-      </aside>
-    </div>
-
-    <!-- 数据大屏 -->
-    <div class="section-head dash-head">
-      <div>
-        <h2 class="section-title">数据大屏</h2>
-        <div class="section-desc">根据本机请求历史与压测报告实时汇总，清空历史后同步归零</div>
-      </div>
-      <div class="dash-legend">
-        <span class="legend-dot ok" />成功
-        <span class="legend-dot err" />失败
-      </div>
-    </div>
-
-    <div class="dash-grid">
-      <!-- 请求趋势 -->
-      <div class="fm-card dash-card trend-card">
-        <div class="dash-card-head">
-          <div>
-            <div class="dash-title">近 14 天请求趋势</div>
-            <div class="dash-sub">按发送时间统计，包含单接口调试与批量运行</div>
-          </div>
-          <div class="dash-kpis">
-            <span><b class="mono">{{ fmtInt(trendTotal) }}</b> 次请求</span>
-            <span><b class="mono">{{ trendRate.toFixed(1) }}%</b> 成功率</span>
-            <span><b class="mono">{{ fmtMs(trendAvgRt) }}</b> 平均耗时</span>
-          </div>
-        </div>
-        <div v-if="trendTotal" class="trend-plot">
-          <div v-for="d in dashDays" :key="d.date" class="trend-col" :title="trendTitle(d)">
-            <div class="trend-slot">
-              <div class="trend-bar" :style="{ height: `${trendBarHeight(d)}%` }">
-                <span class="trend-seg ok" :style="{ height: `${trendSegment(d, d.success)}%` }" />
-                <span
-                  class="trend-seg err"
-                  :style="{ height: `${trendSegment(d, d.total - d.success)}%` }"
-                />
-              </div>
-            </div>
-            <span class="trend-day mono">{{ monthDay(d.date) }}</span>
-          </div>
-        </div>
-        <div v-else class="dash-empty">
-          还没有请求记录。发送一次请求或跑一轮批量运行后，这里会自动生成趋势图。
-        </div>
-      </div>
-
-      <!-- 状态码分布 -->
-      <div class="fm-card dash-card">
-        <div class="dash-card-head">
-          <div class="dash-title">状态码分布</div>
-          <span class="dash-total mono">{{ fmtInt(historyTotal) }} 次</span>
-        </div>
-        <div v-if="historyTotal" class="code-stack">
-          <span
-            v-for="b in codeBuckets"
-            :key="b.label"
-            class="code-seg"
-            :class="bucketClass(b.label)"
-            :style="{ width: bucketPercent(b.count) }"
-          />
-        </div>
-        <div class="code-legend">
-          <div v-for="b in codeBuckets" :key="b.label" class="code-row">
-            <span class="legend-dot" :class="bucketClass(b.label)" />
-            <span class="code-label">{{ b.label }}</span>
-            <span class="code-count mono">{{ fmtInt(b.count) }}</span>
-            <span class="code-pct mono">{{ bucketText(b.count) }}</span>
-          </div>
-        </div>
-        <div v-if="!historyTotal" class="dash-empty">暂无请求记录。</div>
-      </div>
-
-      <!-- 方法分布 -->
-      <div class="fm-card dash-card">
-        <div class="dash-card-head">
-          <div class="dash-title">请求方法分布</div>
-          <span class="dash-total mono">{{ fmtInt(historyTotal) }} 次</span>
-        </div>
-        <div v-if="historyTotal" class="bar-list">
-          <div v-for="b in methodBuckets" :key="b.label" class="bar-row">
-            <span class="bar-label method-label" :class="`tone-text-${methodTone(b.label)}`">
-              {{ b.label }}
-            </span>
-            <span class="bar-track">
-              <span
-                class="bar-fill"
-                :class="methodTone(b.label)"
-                :style="{ width: methodWidth(b) }"
-              />
-            </span>
-            <span class="bar-value mono">{{ fmtInt(b.count) }}</span>
-          </div>
-        </div>
-        <div v-else class="dash-empty">暂无请求记录。</div>
-      </div>
-
-      <!-- 今日时段分布 -->
-      <div class="fm-card dash-card hour-card">
-        <div class="dash-card-head">
-          <div>
-            <div class="dash-title">今日各时段请求量</div>
-            <div class="dash-sub">按本地时间 0-23 点，峰值时段 {{ todayPeakHour }}</div>
-          </div>
-          <div class="dash-kpis">
-            <span><b class="mono">{{ fmtInt(todayTotal) }}</b> 次</span>
-          </div>
-        </div>
-        <div v-if="todayTotal" class="hour-plot">
-          <div v-for="h in hourBuckets" :key="h.hour" class="hour-col" :title="hourTitle(h)">
-            <div class="hour-slot">
-              <div class="hour-bar" :style="{ height: `${hourHeight(h)}%` }" />
-            </div>
-            <span v-if="h.hour % 3 === 0" class="hour-tick mono">{{ h.hour }}</span>
-            <span v-else class="hour-tick mono" />
-          </div>
-        </div>
-        <div v-else class="dash-empty">今天还没有请求，发一次就会出现在这里。</div>
-      </div>
-
-      <!-- 耗时分布 -->
-      <div class="fm-card dash-card">
-        <div class="dash-card-head">
-          <div class="dash-title">响应耗时分布</div>
-          <span class="dash-total mono">共 {{ fmtInt(latencyTotal) }} 次</span>
-        </div>
-        <div v-if="latencyTotal" class="bar-list">
-          <div v-for="(b, i) in latencyBuckets" :key="b.label" class="bar-row">
-            <span class="bar-label">{{ b.label }}</span>
-            <span class="bar-track">
-              <span
-                class="bar-fill"
-                :class="latencyTone(i)"
-                :style="{ width: latencyWidth(b) }"
-              />
-            </span>
-            <span class="bar-value mono">{{ latencyText(b) }}</span>
-          </div>
-        </div>
-        <div v-else class="dash-empty">暂无请求记录。</div>
-      </div>
-
-      <!-- 项目调用量 -->
-      <div class="fm-card dash-card">
-        <div class="dash-card-head">
-          <div class="dash-title">项目调用量 Top 5</div>
-          <a class="dash-link" @click="router.push('/projects')">我的项目</a>
-        </div>
-        <div v-if="topProjects.length" class="bar-list">
-          <div v-for="p in topProjects" :key="p.name" class="bar-row">
-            <span class="bar-label project-label" :title="p.name">{{ p.name }}</span>
-            <span class="bar-track">
-              <span class="bar-fill ok" :style="{ width: projectWidth(p) }" />
-            </span>
-            <span class="bar-value mono">{{ fmtInt(p.count) }}</span>
-            <span class="bar-value mono" :class="{ 'tone-danger': p.successRate < 95 }">
-              {{ p.successRate.toFixed(0) }}%
-            </span>
-          </div>
-        </div>
-        <div v-else class="dash-empty">还没有调用记录。</div>
-      </div>
-
-      <!-- 高频接口 -->
-      <div class="fm-card dash-card top-card">
-        <div class="dash-card-head">
-          <div class="dash-title">高频接口 Top 5</div>
-          <a class="dash-link" @click="router.push('/history')">全部历史</a>
-        </div>
-        <div v-if="topRequests.length" class="top-list">
-          <div v-for="(t, i) in topRequests" :key="`${t.method}-${t.url}`" class="top-row">
-            <span class="top-rank mono">{{ i + 1 }}</span>
-            <span class="method-tag" :class="`method-${t.method}`">{{ t.method }}</span>
-            <span class="top-name" :title="t.url">{{ t.name }}</span>
-            <span class="top-meta mono">{{ fmtInt(t.count) }} 次</span>
-            <span class="top-meta mono">{{ fmtMs(t.avgRt) }}</span>
-            <span class="top-rate mono" :class="{ low: t.successRate < 95 }">
-              {{ t.successRate.toFixed(0) }}%
-            </span>
-          </div>
-        </div>
-        <div v-else class="dash-empty">还没有调用记录。</div>
-      </div>
-
-      <!-- 压测走势 -->
-      <div class="fm-card dash-card report-card">
-        <div class="dash-card-head">
-          <div class="dash-title">最近压测 P95 走势</div>
-          <a class="dash-link" @click="router.push('/reports')">全部报告</a>
-        </div>
-        <div v-if="reportPoints.length" class="report-chart">
-          <div
-            v-for="r in reportPoints"
-            :key="r.id"
-            class="report-chart-row"
-            @click="router.push(`/reports/${r.id}`)"
-          >
-            <span class="report-chart-name" :title="r.name">{{ r.name }}</span>
-            <span class="report-chart-track">
-              <span
-                class="report-chart-fill"
-                :class="reportTone(r)"
-                :style="{ width: reportBarWidth(r) }"
-              />
-            </span>
-            <span class="report-chart-value mono">{{ fmtMs(r.p95Rt) }}</span>
-            <span class="report-chart-value mono" :class="`tone-${reportTone(r)}`">
-              {{ r.errorRate.toFixed(1) }}%
-            </span>
-          </div>
-          <div class="report-chart-foot">柱长为 P95 延迟，右侧为错误率；红色表示错误率 ≥ 1%</div>
-        </div>
-        <div v-else class="dash-empty">
-          还没有压测报告。<a class="dash-link" @click="router.push('/stress')">去发起压测</a>
-        </div>
-      </div>
-    </div>
-
-    <!-- 最近请求 -->
-    <div id="recent-history" class="section-head">
-      <div>
-        <h2 class="section-title">最近请求</h2>
-        <div class="section-desc">每次发送自动记录，最多保留最近 100000 条</div>
-      </div>
-      <div v-if="history.length" class="head-actions">
-        <a-button size="small" @click="clearHistory">清空历史</a-button>
-        <a-button size="small" @click="router.push('/history')">查看全部</a-button>
-        <a-button type="link" size="small" @click="goProject">去发送请求</a-button>
-      </div>
-    </div>
-
-    <div v-if="history.length" class="fm-card history-card">
-      <div class="history-head">
-        <span>方法</span>
-        <span>接口</span>
-        <span>URL</span>
-        <span class="right">状态</span>
-        <span class="right">耗时</span>
-        <span class="right">时间</span>
-      </div>
-      <div
-        v-for="h in history"
-        :key="h.id"
-        class="history-row"
-        :class="{ clickable: h.requestId }"
-        @click="openHistory(h)"
-      >
-        <span class="method-tag" :class="`method-${h.method}`">{{ h.method }}</span>
-        <span class="history-name" :title="h.requestName ?? ''">{{ h.requestName || '—' }}</span>
-        <span class="history-url mono" :title="h.url">{{ h.url }}</span>
-        <span class="history-status mono right" :style="{ color: statusColor(h.statusCode) }">
-          {{ h.statusCode ?? 'ERR' }}
-        </span>
-        <span class="history-duration mono right">{{ fmtMs(h.durationMs) }}</span>
-        <span class="history-when right">{{ fmtWhen(h.createdAt) }}</span>
-      </div>
-    </div>
-    <div v-else class="fm-card history-empty">
-      <ClockCircleOutlined class="empty-clock" />
-      <div>
-        <div class="empty-title">还没有发送过请求</div>
-        <div class="empty-desc">进入项目后点「发送」，这里就会记录每次请求的时间、状态与耗时。</div>
-      </div>
-      <a-button size="small" class="history-empty-btn" @click="goProject">打开项目</a-button>
-    </div>
-
     <!-- 上手引导 -->
     <div class="section-head">
       <div>
         <h2 class="section-title">使用说明</h2>
-        <div class="section-desc">从建项目到签名加密、压测与备份，右侧是常见问题</div>
+        <div class="section-desc">从建项目到调试、批量运行、回归套件、压测与备份，右侧是常见问题</div>
       </div>
     </div>
 
@@ -1915,26 +1414,6 @@ function statusColor(code?: number | null) {
   opacity: 1;
 }
 
-/* ---------- 主体双栏 ---------- */
-.main-grid {
-  display: grid;
-  grid-template-columns: minmax(0, 2.15fr) minmax(280px, 1fr);
-  gap: 18px;
-  align-items: start;
-  margin-top: 2px;
-}
-
-.col-main {
-  min-width: 0;
-}
-
-.col-side {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-  min-width: 0;
-}
-
 /* ---------- 项目 ---------- */
 .project-grid {
   display: grid;
@@ -2073,289 +1552,6 @@ function statusColor(code?: number | null) {
   margin-top: 16px;
 }
 
-/* ---------- 侧栏卡片 ---------- */
-.side-card {
-  padding: 14px 16px;
-}
-
-.side-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 6px;
-}
-
-.side-title {
-  font-size: 12.5px;
-  font-weight: 600;
-  flex: 1;
-}
-
-.side-note {
-  font-size: 10.5px;
-  color: var(--fm-success);
-}
-
-.side-link {
-  font-size: 11px;
-  color: var(--fm-primary);
-  cursor: pointer;
-}
-
-.side-empty {
-  padding: 12px 0 4px;
-  font-size: 11.5px;
-  line-height: 1.7;
-  color: var(--fm-muted);
-}
-
-.report-row {
-  padding: 9px 0;
-  border-bottom: 1px solid var(--fm-border);
-  cursor: pointer;
-}
-
-.report-row:last-child {
-  border-bottom: none;
-  padding-bottom: 2px;
-}
-
-.report-row-top {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-}
-
-.status-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--fm-success);
-  flex-shrink: 0;
-}
-
-.status-dot.stopped {
-  background: var(--fm-warning);
-}
-
-.report-name {
-  flex: 1;
-  font-size: 12px;
-  font-weight: 600;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.report-row:hover .report-name {
-  color: var(--fm-primary);
-}
-
-.report-when {
-  font-size: 10px;
-  color: var(--fm-muted);
-  flex-shrink: 0;
-}
-
-.report-row-metrics {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 12px;
-  margin: 5px 0 0 13px;
-  font-size: 10.5px;
-  color: var(--fm-muted);
-}
-
-.report-row-metrics b {
-  color: var(--fm-text-2);
-  font-weight: 600;
-}
-
-/* ---------- 本机状态 ---------- */
-.icon-btn {
-  width: 22px;
-  height: 22px;
-  padding: 0;
-  color: var(--fm-muted);
-}
-
-.metric {
-  margin-top: 9px;
-}
-
-.metric-head {
-  display: flex;
-  justify-content: space-between;
-  font-size: 11px;
-  color: var(--fm-muted);
-  margin-bottom: 4px;
-}
-
-.metric-head .mono {
-  color: var(--fm-text-2);
-}
-
-.metric-bar {
-  height: 4px;
-  border-radius: 3px;
-  background: var(--fm-surface-alt);
-  overflow: hidden;
-}
-
-.metric-fill {
-  height: 100%;
-  border-radius: 3px;
-  background: var(--fm-primary);
-  transition: width 0.4s ease;
-}
-
-.metric-fill.ok {
-  background: var(--fm-primary);
-}
-
-.metric-fill.warn {
-  background: var(--fm-warning);
-}
-
-.metric-fill.danger {
-  background: var(--fm-danger);
-}
-
-.monitor-foot {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-top: 12px;
-  padding-top: 10px;
-  border-top: 1px dashed var(--fm-border);
-  font-size: 11px;
-  color: var(--fm-text-2);
-}
-
-/* ---------- 常用工具 ---------- */
-.tool-chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  padding: 4px 0 2px;
-}
-
-.tool-chip {
-  padding: 3px 9px;
-  border-radius: 6px;
-  border: 1px solid var(--fm-border);
-  background: transparent;
-  color: var(--fm-text-2);
-  font-size: 11px;
-  cursor: pointer;
-  transition: border-color 0.16s, color 0.16s, background 0.16s;
-}
-
-.tool-chip:hover {
-  border-color: var(--fm-primary);
-  color: var(--fm-primary);
-  background: var(--fm-primary-soft);
-}
-
-/* ---------- 最近请求 ---------- */
-.head-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.history-card {
-  overflow: hidden;
-}
-
-.history-head {
-  display: grid;
-  grid-template-columns: 64px 140px minmax(0, 1fr) 64px 80px 108px;
-  gap: 12px;
-  padding: 8px 16px;
-  border-bottom: 1px solid var(--fm-border);
-  background: var(--fm-surface-alt);
-  font-size: 10.5px;
-  font-weight: 600;
-  letter-spacing: 0.3px;
-  color: var(--fm-muted);
-}
-
-.history-row {
-  display: grid;
-  grid-template-columns: 64px 140px minmax(0, 1fr) 64px 80px 108px;
-  align-items: center;
-  gap: 12px;
-  padding: 9px 16px;
-  border-bottom: 1px solid var(--fm-border);
-  font-size: 11.5px;
-  transition: background 0.14s;
-}
-
-.history-row:last-child {
-  border-bottom: none;
-}
-
-.history-row.clickable {
-  cursor: pointer;
-}
-
-.history-row:hover {
-  background: var(--fm-surface-alt);
-}
-
-.right {
-  text-align: right;
-}
-
-.history-name {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--fm-text-2);
-}
-
-.history-url {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--fm-muted);
-}
-
-.history-status,
-.history-duration {
-  font-weight: 600;
-}
-
-.history-when {
-  font-size: 10.5px;
-  color: var(--fm-muted);
-}
-
-.history-empty {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  padding: 20px 22px;
-}
-
-.empty-clock {
-  font-size: 22px;
-  color: var(--fm-border-strong);
-}
-
-.history-empty .empty-desc {
-  margin-top: 3px;
-}
-
-.history-empty .empty-title {
-  margin-bottom: 0;
-}
-
-.history-empty .history-empty-btn {
-  margin-left: auto;
-}
-
 /* ---------- 使用说明 ---------- */
 .help-grid {
   display: grid;
@@ -2488,508 +1684,6 @@ function statusColor(code?: number | null) {
   color: var(--fm-text-2);
 }
 
-/* ---------- 数据大屏 ---------- */
-.dash-head {
-  margin-top: 20px;
-  margin-bottom: 12px;
-}
-
-.dash-legend {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  font-size: 11px;
-  color: var(--fm-muted);
-}
-
-.legend-dot {
-  display: inline-block;
-  width: 7px;
-  height: 7px;
-  flex-shrink: 0;
-  border-radius: 50%;
-  background: var(--fm-border-strong);
-}
-
-.legend-dot.ok {
-  background: var(--fm-success);
-}
-
-.legend-dot.err {
-  background: var(--fm-danger);
-}
-
-.legend-dot.info {
-  background: var(--fm-primary);
-}
-
-.legend-dot.warn {
-  background: var(--fm-warning);
-}
-
-.legend-dot.danger {
-  background: var(--fm-danger);
-}
-
-.legend-dot.other {
-  background: var(--fm-border-strong);
-}
-
-.dash-grid {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 12px;
-}
-
-/* 宽图占两列，其余卡片一列，整体更紧凑 */
-.trend-card,
-.hour-card,
-.top-card,
-.report-card {
-  grid-column: span 2;
-}
-
-.dash-card {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-  padding: 13px 15px;
-}
-
-.dash-card-head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.dash-title {
-  font-size: 12.5px;
-  font-weight: 600;
-}
-
-.dash-sub {
-  margin-top: 2px;
-  font-size: 10.5px;
-  color: var(--fm-muted);
-}
-
-.dash-kpis {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 12px;
-  font-size: 10.5px;
-  color: var(--fm-muted);
-}
-
-.dash-kpis b {
-  color: var(--fm-text);
-  font-weight: 600;
-}
-
-.dash-total {
-  font-size: 11px;
-  color: var(--fm-muted);
-}
-
-.dash-link {
-  font-size: 11px;
-  color: var(--fm-primary);
-  cursor: pointer;
-}
-
-.dash-empty {
-  padding: 28px 0 14px;
-  font-size: 11.5px;
-  line-height: 1.7;
-  color: var(--fm-muted);
-  text-align: center;
-}
-
-/* 通用横向条形图：方法 / 耗时 / 项目共用 */
-.bar-list {
-  display: flex;
-  flex-direction: column;
-  gap: 7px;
-  margin-top: 12px;
-}
-
-.bar-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-}
-
-.bar-label {
-  flex: 0 0 62px;
-  overflow: hidden;
-  font-size: 10.5px;
-  color: var(--fm-muted);
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.method-label {
-  font-weight: 600;
-  color: var(--fm-text);
-}
-
-.project-label {
-  flex: 0 0 78px;
-  color: var(--fm-text);
-}
-
-.bar-track {
-  position: relative;
-  flex: 1 1 auto;
-  height: 7px;
-  overflow: hidden;
-  border-radius: 4px;
-  background: var(--fm-surface-alt);
-}
-
-.bar-fill {
-  display: block;
-  height: 100%;
-  border-radius: 4px;
-  background: var(--fm-border-strong);
-  transition: width 0.35s ease;
-}
-
-.bar-fill.ok {
-  background: var(--fm-success);
-}
-
-.bar-fill.info {
-  background: var(--fm-primary);
-}
-
-.bar-fill.warn {
-  background: var(--fm-warning);
-}
-
-.bar-fill.danger {
-  background: var(--fm-danger);
-}
-
-.bar-value {
-  flex: 0 0 42px;
-  font-size: 10.5px;
-  color: var(--fm-muted);
-  text-align: right;
-}
-
-.tone-text-ok {
-  color: var(--fm-success);
-}
-
-.tone-text-info {
-  color: var(--fm-primary);
-}
-
-.tone-text-warn {
-  color: var(--fm-warning);
-}
-
-.tone-text-danger {
-  color: var(--fm-danger);
-}
-
-.tone-danger {
-  color: var(--fm-danger);
-}
-
-/* 今日各时段柱状图 */
-.hour-plot {
-  display: flex;
-  gap: 2px;
-  height: 96px;
-  margin-top: 12px;
-}
-
-.hour-col {
-  display: flex;
-  flex: 1 1 0;
-  flex-direction: column;
-  gap: 5px;
-  min-width: 0;
-}
-
-.hour-slot {
-  position: relative;
-  flex: 1 1 auto;
-  min-height: 0;
-}
-
-.hour-bar {
-  position: absolute;
-  right: 0;
-  bottom: 0;
-  left: 0;
-  border-radius: 3px 3px 1px 1px;
-  background: var(--fm-primary);
-  opacity: 0.85;
-  transition: height 0.35s ease;
-}
-
-.hour-tick {
-  height: 12px;
-  font-size: 9px;
-  color: var(--fm-muted);
-  text-align: center;
-}
-
-/* 请求趋势 */
-.trend-plot {
-  display: flex;
-  gap: 6px;
-  height: 128px;
-  margin-top: 12px;
-}
-
-.trend-col {
-  display: flex;
-  flex: 1 1 0;
-  flex-direction: column;
-  gap: 6px;
-  min-width: 0;
-}
-
-.trend-slot {
-  position: relative;
-  flex: 1 1 auto;
-  min-height: 0;
-}
-
-.trend-bar {
-  position: absolute;
-  bottom: 0;
-  left: 0;
-  right: 0;
-  width: 100%;
-  max-width: 24px;
-  margin: 0 auto;
-  display: flex;
-  flex-direction: column-reverse;
-  overflow: hidden;
-  border-radius: 4px 4px 2px 2px;
-  background: var(--fm-surface-alt);
-  transition: height 0.35s ease;
-}
-
-.trend-seg {
-  display: block;
-  width: 100%;
-  flex-shrink: 0;
-}
-
-.trend-seg.ok {
-  background: var(--fm-primary);
-}
-
-.trend-seg.err {
-  background: var(--fm-danger);
-}
-
-.trend-day {
-  font-size: 9.5px;
-  color: var(--fm-muted);
-  text-align: center;
-  white-space: nowrap;
-}
-
-/* 状态码分布 */
-.code-stack {
-  display: flex;
-  height: 8px;
-  margin: 14px 0 12px;
-  border-radius: 4px;
-  overflow: hidden;
-  background: var(--fm-surface-alt);
-}
-
-.code-seg {
-  height: 100%;
-  transition: width 0.3s;
-}
-
-.code-seg.ok {
-  background: var(--fm-success);
-}
-
-.code-seg.info {
-  background: var(--fm-primary);
-}
-
-.code-seg.warn {
-  background: var(--fm-warning);
-}
-
-.code-seg.danger {
-  background: var(--fm-danger);
-}
-
-.code-seg.other {
-  background: var(--fm-border-strong);
-}
-
-.code-legend {
-  display: flex;
-  flex-direction: column;
-  gap: 7px;
-}
-
-.code-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 11px;
-}
-
-.code-label {
-  width: 34px;
-  color: var(--fm-text-2);
-}
-
-.code-count {
-  flex: 1;
-  text-align: right;
-  color: var(--fm-text-2);
-}
-
-.code-pct {
-  width: 48px;
-  text-align: right;
-  color: var(--fm-muted);
-}
-
-/* 高频接口 */
-.top-list {
-  display: flex;
-  flex-direction: column;
-  margin-top: 10px;
-}
-
-.top-row {
-  display: grid;
-  grid-template-columns: 16px 46px minmax(0, 1fr) 54px 58px 40px;
-  align-items: center;
-  gap: 8px;
-  padding: 7px 0;
-  border-bottom: 1px solid var(--fm-border);
-  font-size: 11px;
-}
-
-.top-row:last-child {
-  border-bottom: none;
-}
-
-.top-rank {
-  font-size: 10px;
-  color: var(--fm-muted);
-}
-
-.top-row .method-tag {
-  justify-self: start;
-}
-
-.top-name {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--fm-text);
-}
-
-.top-meta {
-  font-size: 10.5px;
-  color: var(--fm-muted);
-  text-align: right;
-}
-
-.top-rate {
-  font-size: 10.5px;
-  color: var(--fm-success);
-  text-align: right;
-}
-
-.top-rate.low {
-  color: var(--fm-danger);
-}
-
-/* 压测走势 */
-.report-chart {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  margin-top: 12px;
-}
-
-.report-chart-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 86px 66px 46px;
-  align-items: center;
-  gap: 8px;
-  cursor: pointer;
-}
-
-.report-chart-name {
-  font-size: 11px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.report-chart-row:hover .report-chart-name {
-  color: var(--fm-primary);
-}
-
-.report-chart-track {
-  height: 6px;
-  border-radius: 4px;
-  overflow: hidden;
-  background: var(--fm-surface-alt);
-}
-
-.report-chart-fill {
-  display: block;
-  height: 100%;
-  border-radius: 4px;
-  background: var(--fm-primary);
-}
-
-.report-chart-fill.warn {
-  background: var(--fm-warning);
-}
-
-.report-chart-fill.danger {
-  background: var(--fm-danger);
-}
-
-.report-chart-value {
-  font-size: 10.5px;
-  color: var(--fm-muted);
-  text-align: right;
-}
-
-.report-chart-value.tone-ok {
-  color: var(--fm-success);
-}
-
-.report-chart-value.tone-warn {
-  color: var(--fm-warning);
-}
-
-.report-chart-value.tone-danger {
-  color: var(--fm-danger);
-}
-
-.report-chart-foot {
-  margin-top: 2px;
-  font-size: 10px;
-  color: var(--fm-muted);
-}
-
 /* ---------- 批量运行 ---------- */
 .runner-band {
   display: grid;
@@ -2999,6 +1693,12 @@ function statusColor(code?: number | null) {
   padding: 20px 22px;
   background:
     radial-gradient(120% 160% at 0% 0%, var(--fm-primary-soft) 0%, transparent 60%),
+    var(--fm-surface);
+}
+
+.suite-band {
+  background:
+    radial-gradient(110% 150% at 100% 0%, var(--fm-primary-soft) 0%, transparent 58%),
     var(--fm-surface);
 }
 
@@ -3179,6 +1879,11 @@ function statusColor(code?: number | null) {
   font-size: 10.5px;
 }
 
+.example-foot .example-code {
+  margin-top: 8px;
+  font-size: 10.5px;
+}
+
 /* ---------- 响应式 ---------- */
 @media (max-width: 1180px) {
   .console {
@@ -3190,33 +1895,9 @@ function statusColor(code?: number | null) {
     border-top: 1px solid var(--fm-border);
   }
 
-  .main-grid {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .col-side {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(258px, 1fr));
-    align-items: start;
-  }
-
-  .dash-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
 }
 
 @media (max-width: 980px) {
-  .dash-grid {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .trend-card,
-  .hour-card,
-  .top-card,
-  .report-card {
-    grid-column: auto;
-  }
-
   .intro-band {
     grid-template-columns: minmax(0, 1fr);
     gap: 18px;
@@ -3236,18 +1917,8 @@ function statusColor(code?: number | null) {
     grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 
-  .history-head,
-  .history-row {
-    grid-template-columns: 60px minmax(0, 1fr) 58px 78px 96px;
-  }
-
   .help-grid {
     grid-template-columns: minmax(0, 1fr);
-  }
-
-  .history-head span:nth-child(2),
-  .history-name {
-    display: none;
   }
 }
 
@@ -3283,38 +1954,6 @@ function statusColor(code?: number | null) {
   .help-grid {
     grid-template-columns: minmax(0, 1fr);
   }
-
-  .history-head,
-  .history-row {
-    grid-template-columns: 56px minmax(0, 1fr) 52px 88px;
-  }
-
-  .history-head span:nth-child(5),
-  .history-duration {
-    display: none;
-  }
-
-  .history-head,
-  .history-row {
-    padding-left: 12px;
-    padding-right: 12px;
-  }
-}
-
-@media (max-width: 620px) {
-  .history-head,
-  .history-row {
-    grid-template-columns: 54px minmax(0, 1fr) 48px;
-  }
-
-  .history-head span:nth-child(6),
-  .history-when {
-    display: none;
-  }
-
-  .history-empty {
-    flex-wrap: wrap;
-  }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -3323,8 +1962,7 @@ function statusColor(code?: number | null) {
   }
 
   .launch,
-  .project-card,
-  .metric-fill {
+  .project-card {
     transition: none;
   }
 }

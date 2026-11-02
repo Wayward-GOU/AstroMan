@@ -1,8 +1,9 @@
 # AstroMan
 
 <p align="center">
-  <img src="docs/social-preview.png" alt="AstroMan — Sail across the API universe" width="720" />
+  <img src="docs/social-preview.png" alt="AstroMan — Sail across the API universe" width="1020" />
 </p>
+
 
 <p align="center">
   <strong>Sail across the API universe · 航行于 API 星际</strong>
@@ -22,16 +23,94 @@ AstroMan 是一款**本地优先**的 HTTP API 研发工具箱：接口调试、
 
 > 原项目名 **FbinHttp**，自 1.0.7 起更名为 **AstroMan**；内置 AI 助手「小HI」同步更名为「航仔」。旧数据首次启动自动迁移。
 
+## 产品定位
+
+市面上的工具各占一段：Postman 强在调试与协作，JMeter 强在压测，在线工具箱强在零散小工具——但三者互不相通，一个日常联调往往要在三个窗口间来回倒。AstroMan 补的就是这个交集。
+
+### 能力对标
+
+> 表格只写**已实现**的能力，未实现的方向统一标「规划中」，与 [路线图](docs/roadmap.md) 保持一致。
+
+| 能力维度 | Postman | Apifox | JMeter | **AstroMan** |
+| --- | --- | --- | --- | --- |
+| 单接口调试 | 强 | 强 | 弱 | 强 |
+| 环境 / 变量管理 | 强 | 强 | 弱 | 强 |
+| 脚本扩展与签名 | 强（JS 沙箱） | 中 | 中（需 Java / Groovy） | 强（JS 沙箱 + `cipher` / `rsa` 内置加解密） |
+| 用例集合 / 断言 | 强 | 强 | 中（断言强、组织弱） | 强 |
+| 批量回归 / 数据驱动 | 强（Runner） | 强（自动化测试） | 中 | 强（集合 Runner + CSV / JSON 驱动） |
+| 链路 / 流程编排 | 中（`setNextRequest`） | 中 | 中（控制器组合） | 弱（仅集合顺序批量，Flow 规划中） |
+| 性能压测 | 弱（付费、云端配额） | 弱（轻量） | 强（专业） | 强（单机轻量：固定 / 阶梯并发、RPS 限速、SLA 判定） |
+| 压测报告 | 弱 | 弱 | 中（需插件） | 强（JSON / HTML / Excel，支持报告横向对比） |
+| 定时拨测 / 巡检 | 中（Monitor，付费云端） | 中（定时任务） | 无（需外挂 Jenkins） | 无（规划中） |
+| 离线工具箱 | 无 | 无 | 无 | 强（9 分类 92 个工具，纯本地计算） |
+| AI 辅助 | 中（付费，云端） | 中（以问答为主） | 无 | 强（自带 Key，74 个工具可直接操作软件） |
+| 文档 / 团队协作 | 强 | 强（一体化） | 无 | 弱（仅 OpenAPI 导出，无多人协作） |
+| 导入兼容 | — | 支持 Postman 迁移 | — | cURL / Postman / Apifox / OpenAPI 3.0 / Swagger 2.0 |
+| 数据存放 | 云端为主 | 云端为主 | 本地 | 本地 SQLite，无账号、无遥测 |
+| 部署形态 | 桌面 + SaaS | 桌面 + SaaS | 桌面 / CLI | 桌面（Windows / macOS） |
+| 资源占用 | 高（Electron） | 高（Electron） | 偏高（JVM） | 低（Tauri，标准安装包约 5MB） |
+| 中文体验 | 一般 | 强 | 一般 | 强（原生中文，含国内模型预设） |
+| 开源 | 否（闭源） | 否（闭源） | 是（Apache-2.0） | 是 |
+
+**怎么读这张表：**
+
+- **领先**：离线工具箱、可实操的 AI Agent、本地数据、体积与资源占用、压测报告的展示与导出。
+- **持平**：单接口调试、环境变量、脚本、断言、批量回归——日常主力场景不输 Postman。
+- **待补齐**：链路编排 Flow、定时巡检、团队协作、WebSocket、分布式压测。团队协作与云端 Mock 类场景，当前不适合选它。
+
+### 差异化定位
+
+- **一个应用覆盖四件事**：接口调试、批量回归、性能压测、离线工具，不必在 Postman + JMeter + 在线工具箱之间来回切换，也不会因为工具站要联网而卡在内网。
+- **本地优先，没有账号体系**：项目、历史、报告、模型 Key 全部落在本机 SQLite。内网、隔离网、客户现场可直接用，不用申请席位，也不用担心数据被同步到别人的服务器。
+- **AI 真的能干活**：航仔不止聊天，能建项目、改接口、发请求、写脚本、跑批量、发起压测，写操作一律先给计划再执行；模型用你自己的 Key，可接 DeepSeek / Kimi / 智谱 / 通义千问 / Ollama。
+- **不做 JMeter 的界面复刻**：不堆线程组、配置元件这些工程化概念，保持 Postman 式低门槛交互，压测结果直接产出可交付的报告（HTML / Excel / 横向对比）。
+- **兼容现有生态**：cURL 一键导入，Postman 集合、Apifox 导出、OpenAPI 3.0 / Swagger 2.0 都能进来，项目也可导出为 JSON 归档，迁移成本低。
+
+### 能力边界
+
+- 压测是**单机轻量引擎**，适合容量摸底与发版前验证，不追求 JMeter 级别的协议覆盖与分布式压测。
+- 当前**纯本地**：无团队协作、无云端 Mock、无定时巡检（均在路线图中）。
+- 传输协议只覆盖 HTTP / HTTPS，WebSocket 与 gRPC 尚未支持。
+
+### 什么时候选它
+
+| 你的场景 | 更合适的选择 |
+| --- | --- |
+| 团队协作、云端文档、Mock Server、多人共享工作区 | Apifox / Postman |
+| 分布式压测、gRPC / WebSocket / MQTT 压测、依赖 JMeter 插件生态 | JMeter |
+| 内网或隔离网、数据不能出本机、想在一个应用里完成调试 + 回归 + 压测 + 零散小工具 | **AstroMan** |
+| 想用自然语言让 AI 代劳建接口、跑回归、发压测 | **AstroMan** |
+| 只偶尔转个 JSON、算个哈希 | 在线工具箱够用；需要离线或天天用再看 AstroMan |
+
+### 目标用户
+
+| 用户角色                | 核心诉求                                                       |
+| ----------------------- | -------------------------------------------------------------- |
+| 后端开发工程师          | 日常构造请求、联调接口、脚本签名、查看响应、快速回归           |
+| 测试工程师              | 用例集管理、断言、数据驱动批量回归、压测摸底与报告交付         |
+| 架构师 / 技术负责人     | 容量压测摸底、SLA 判定、多份报告横向对比（链路编排在路线图中） |
+| 运维 / SRE              | 本机排障、发版前接口验证、内网离线使用（定时巡检在路线图中）   |
+| 开源爱好者 / 独立开发者 | 免费、无账号、无云依赖、数据本地保存                           |
+
+### 适配架构
+
+- **单体应用**：单机调试、本地服务联调、上线前压测摸底。
+- **微服务架构**：多环境切换、按集合组织跨服务接口、单服务容量摸底（链路编排与依赖拓扑规划中）。
+- **内网 / 隔离环境**：标准包、内置 WebView2 的离线包与便携版，无需联网授权即可使用。
+- **DevOps 流程**：桌面端或 `astroman-cli` 执行同一套测试场景，产出 HTML / JSON / JUnit，直接接入 GitHub Actions / Jenkins 门禁。
+
 ## 核心能力
 
 - **请求调试**：GET / POST / PUT / DELETE / PATCH / HEAD / OPTIONS，Params、Headers、Cookie、Auth、Form-Data、Binary、GraphQL、JSON 注释与语法着色
 - **环境与变量**：多环境切换、`{{变量}}` 替换、时间 / 随机内置变量、环境脚本生成运行时变量
 - **脚本与加密**：同步 JS 沙箱，前后置脚本、断言、`vars` / `env` / `cipher` / `rsa`，覆盖 MD5 / HMAC / AES / DES / 3DES / RSA
 - **批量运行**：集合级 Runner，迭代、间隔、CSV / JSON 数据驱动，脚本与断言全部生效
-- **本地压测**：固定并发 / 阶梯加压、RPS 限速、自动停止、SLA 验收、实时曲线、JSON / HTML / Excel 报告与横向对比
+- **自动化测试**：可保存的测试套件与用例（HTTP / Python / 压测），声明式断言、Python 前后置钩子、数据驱动、失败重试、运行历史与 HTML / JSON / JUnit 报告；套件包可在机器间导入导出
+- **本地压测**：固定并发 / 阶梯加压、RPS 限速、自动停止、SLA 验收、实时曲线、统一口径的 QPS 指标组（平均 / 峰值 / 90% 分布 / 单并发 / 目标达成率）、JSON / HTML / Excel 报告与横向对比；套件内压测用例支持 SLA 与基线回归门禁
 - **导入导出**：cURL、Postman / Apifox、OpenAPI 3.0 / Swagger 2.0 导入；项目 JSON、OpenAPI 导出
-- **离线工具箱**：9 大分类 75 个工具，全部本地计算
-- **航仔 AI Agent**：三协议模型接入、61 个业务工具 + `tool_search`、写操作确认、上下文预算与摘要、复盘时间线
+- **离线工具箱**：9 大分类 92 个工具，全部本地计算，支持收藏与最近使用
+- **航仔 AI Agent**：三协议模型接入、73 个业务工具 + `tool_search`（共 74 个）、写操作确认、上下文预算与摘要、复盘时间线
+- **外观**：21 套配色主题（14 浅 / 7 深，含低饱和「陶土红」）、可拖到窗口任意位置的宇航员挂件、64px 窄侧栏与命令面板
 - **本地优先**：SQLite 存储、无账号、无云依赖；数据目录可自定义与迁移
 - **跨平台**：Windows 10/11（x64 / x86）与 macOS 10.15+（Intel / Apple Silicon）
 
@@ -47,7 +126,7 @@ AstroMan 是一款**本地优先**的 HTTP API 研发工具箱：接口调试、
 
 - 下载入口：[GitHub Releases](https://github.com/Wayward-GOU/AstroMan/releases)
 - 系统下限、Gatekeeper / SmartScreen 放行、安装器报错处理：[docs/compatibility.md](docs/compatibility.md)
-- macOS 一键安装：`bash install-macos.sh v1.0.7`（Release 附件自带）
+- macOS 一键安装：`bash install-macos.sh v1.0.8`（Release 附件自带）
 
 ## 快速开始
 
@@ -56,7 +135,7 @@ AstroMan 是一款**本地优先**的 HTTP API 研发工具箱：接口调试、
 3. 新建请求，填方法 / URL / Params / Headers / Body，点发送
 4. 需要签名或密文时，在请求的「脚本」页写前置 / 后置脚本
 5. 需要回归时用「批量运行」，需要容量摸底时用「压测」
-6. 右侧机器人打开「航仔」，配置模型服务后可用自然语言操作软件
+6. 点击右侧的宇航员挂件「航仔」（可按住拖到任意位置，单击进入），配置模型服务后可用自然语言操作软件
 
 完整步骤：[快速开始](docs/quick-start.md) · 变量与脚本：[脚本 API](docs/script-api.md)
 
@@ -121,7 +200,8 @@ AstroMan/
 | [系统兼容性](docs/compatibility.md) | Windows / macOS 下限、安装包差异、放行方式 |
 | [脚本 API](docs/script-api.md) | 前后置脚本对象、内置变量、加密示例 |
 | [压测与报告](docs/load-testing.md) | 压测配置、指标、SLA、报告导出与对比 |
-| [离线工具箱](docs/toolbox.md) | 9 大类 75 个工具清单 |
+| [自动化测试](docs/automated-testing.md) | 测试场景、Python 钩子、压测门禁、套件包与 CLI / CI |
+| [离线工具箱](docs/toolbox.md) | 9 大类 92 个工具清单 |
 | [航仔 AI Agent](docs/ai-agent.md) | 模型接入、工具、安全、预算与会话 |
 | [开发与打包](docs/development.md) | 环境要求、开发启动、安装包构建、代码约定 |
 | [常见问题](docs/faq.md) | 安装、构建、数据恢复、AI 与脚本 FAQ |
@@ -130,20 +210,21 @@ AstroMan/
 
 ## 路线图
 
-已交付 M1–M7：请求调试、环境变量、历史、压测与报告、AI Agent、导入导出、品牌升级与双安装包。
+已交付 M1–M8：请求调试、环境变量、历史、压测与报告、AI Agent、导入导出、品牌升级与双安装包、自动化测试与 CLI / CI。
 
-规划中：链路编排 Flow、定时巡检与告警、CLI / CI、WebSocket、分布式压测、团队同步、Linux 桌面端。完整说明见 [路线图](docs/roadmap.md)。
+规划中：链路编排 Flow、定时巡检与告警、混合多接口压测、WebSocket、分布式压测、团队同步、Linux 桌面端。完整说明见 [路线图](docs/roadmap.md)。
 
 ## 参与贡献
 
 - 提交前请先看 [开发与打包](docs/development.md)
+- 提交前本地过一遍与 CI 同源的门禁：`npm run test`、`npm run build`、`cargo fmt --check --all`、`cargo clippy --all-targets -- -D warnings`、`cargo test --lib`；覆盖率门槛见 [测试与质量门禁](docs/development.md#测试与质量门禁)
 - 新增 IPC 命令必须注册到 `src-tauri/src/lib.rs` 的 `generate_handler!`
-- UI 变更请遵循现有设计令牌与 Ant Design Vue 组件规范
+- UI 变更请遵循现有设计令牌与 Ant Design Vue 组件规范（颜色只用 `--fm-*`，主题在 `src/stores/theme.ts`）
 - Issue / PR 请附复现步骤、系统版本与截图
 
 ## License
 
-当前仓库尚未添加 `LICENSE` 文件，正式开源发布前将补充（倾向 MIT）。在此之前，请勿将代码用于未授权的商业分发。
+[MIT](LICENSE) © AstroMan
 
 ---
 

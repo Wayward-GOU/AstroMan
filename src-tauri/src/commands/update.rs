@@ -1,4 +1,4 @@
-﻿use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 
 const RELEASE_API: &str = "https://api.github.com/repos/Wayward-GOU/AstroMan/releases/latest";
 const USER_AGENT: &str = "AstroMan-Desktop";
@@ -240,6 +240,14 @@ pub fn open_external(target: String) -> Result<(), String> {
                 .args(["/C", "start", "", &target])
                 .spawn()
                 .map_err(|e| format!("打开链接失败：{e}"))?;
+        } else if std::path::Path::new(&target).is_file()
+            && !target.to_ascii_lowercase().ends_with(".exe")
+        {
+            // 报告 HTML / PDF 等普通文件交给系统默认程序
+            std::process::Command::new("cmd")
+                .args(["/C", "start", "", &target])
+                .spawn()
+                .map_err(|e| format!("打开文件失败：{e}"))?;
         } else {
             std::process::Command::new(&target)
                 .spawn()
@@ -249,7 +257,11 @@ pub fn open_external(target: String) -> Result<(), String> {
     }
     #[cfg(not(windows))]
     {
-        let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        let opener = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
         std::process::Command::new(opener)
             .arg(&target)
             .spawn()

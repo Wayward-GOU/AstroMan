@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { isDangerousTool, toolLabel, validateToolArgs } from '@/utils/aiTools'
+import { isDangerousTool, testCaseKindLabel, toolLabel, validateToolArgs } from '@/utils/aiTools'
 
 const props = defineProps<{
   tool: string
@@ -28,7 +28,8 @@ const labelMap: Record<string, string> = {
   durationSec: '时长（秒）',
   rampUpSec: '爬坡（秒）',
   thinkTimeMs: '思考时间（毫秒）',
-  targetRps: '目标 RPS',
+  targetRps: '目标 QPS',
+  recordDetail: '明细记录（full/sample/off/auto）',
   rounds: '轮数',
   limit: '条数上限',
   page: '页码',
@@ -47,27 +48,60 @@ const labelMap: Record<string, string> = {
   slaP95: 'P95 阈值（毫秒）',
   slaP99: 'P99 阈值（毫秒）',
   slaErrorRate: '错误率阈值（%）',
-  slaMinRps: '最低 RPS',
+  slaMinRps: '最低 QPS',
   success: '仅看成功请求',
   requestIds: '请求 ID 列表',
+  suiteId: '测试套件',
+  runId: '运行记录',
+  datasetId: '数据集',
+  kind: '类型',
+  tags: '标签',
+  config: '套件配置',
+  dependsOn: '依赖用例',
+  failFast: '失败即停',
+  vars: '临时变量',
+  secrets: '临时密钥',
+  formats: '报告格式',
+  setupScript: '前置脚本',
+  teardownScript: '后置脚本',
+  mainScript: '主脚本',
 }
 
-function display(value: unknown): string {
-  if (value === null || value === undefined) return '—'
+/** 预览值：短参数直接展示，长参数（如整条 cURL、大 Body）完整保留并单独滚动 */
+interface PreviewValue {
+  text: string
+  /** 超长内容：用可滚动的代码块完整展示，不做截断 */
+  long: boolean
+  /** 字符数，用于告诉用户「这里就是全文」 */
+  size: number
+}
+
+function display(value: unknown): PreviewValue {
+  if (value === null || value === undefined) return { text: '—', long: false, size: 0 }
+  // 布尔参数写成「是 / 否」，避免整张表里混着 true / false 的机器值
+  if (typeof value === 'boolean') return { text: value ? '是' : '否', long: false, size: 0 }
   if (typeof value === 'string') {
     const text = value.trim()
-    if (!text) return '（空）'
-    return text.length > 400 ? `${text.slice(0, 400)}…（共 ${text.length} 字符）` : text
+    if (!text) return { text: '（空）', long: false, size: 0 }
+    const long = text.length > 400 || text.includes('\n')
+    return { text, long, size: text.length }
   }
   if (typeof value === 'object') {
     try {
-      const text = JSON.stringify(value)
-      return text.length > 400 ? `${text.slice(0, 400)}…` : text
+      const text = JSON.stringify(value, null, 2)
+      return { text, long: text.length > 400, size: text.length }
     } catch {
-      return String(value)
+      return { text: String(value), long: false, size: 0 }
     }
   }
-  return String(value)
+  return { text: String(value), long: false, size: 0 }
+}
+
+/** 参数名的中文标签；`id` 在测试域要指明是套件还是用例 */
+function rowLabel(key: string): string {
+  if (key === 'id' && props.tool.startsWith('test_suite')) return '测试套件'
+  if (key === 'id' && props.tool.startsWith('test_case')) return '测试用例'
+  return labelMap[key] ?? key
 }
 
 const rows = computed(() =>
@@ -75,8 +109,9 @@ const rows = computed(() =>
     .filter(([, value]) => value !== undefined && value !== null && value !== '')
     .map(([key, value]) => ({
       key,
-      label: labelMap[key] ?? key,
-      value: display(value),
+      label: rowLabel(key),
+      // 用例类型是机器值（request / python / stress），卡上按中文名展示
+      value: display(key === 'kind' ? testCaseKindLabel(value) || value : value),
     })),
 )
 
@@ -90,7 +125,17 @@ const targets = computed(() => {
   push(args.collectionId, '集合')
   push(args.requestId, '接口')
   push(args.envId, '环境')
-  push(args.id, '对象')
+  push(args.suiteId, '测试套件')
+  push(args.runId, '运行记录')
+  // test_* 的删除 / 修改只传 id，按工具前缀说清它是套件还是用例
+  push(
+    args.id,
+    props.tool.startsWith('test_suite')
+      ? '测试套件'
+      : props.tool.startsWith('test_case')
+        ? '测试用例'
+        : '对象',
+  )
   if (typeof args.path === 'string' && args.path.trim()) list.push(`文件 ${args.path}`)
   return list.length ? [...new Set(list)] : ['本机数据']
 })
@@ -147,14 +192,23 @@ const precheck = computed(() => {
     <section class="row">
       <div class="label">参数</div>
       <div class="value">
-        <table v-if="rows.length" class="params">
-          <tbody>
-            <tr v-for="row in rows" :key="row.key">
-              <th>{{ row.label }}</th>
-              <td>{{ row.value }}</td>
-            </tr>
-          </tbody>
-        </table>
+        <div v-if="rows.length" class="params">
+          <div
+            v-for="row in rows"
+            :key="row.key"
+            class="param-row"
+            :class="{ stacked: row.value.long }"
+          >
+            <div class="param-key">{{ row.label }}</div>
+            <div class="param-val">
+              <template v-if="row.value.long">
+                <div class="long-meta">{{ row.value.size }} 字符 · 全文如下（可滚动查看）</div>
+                <pre class="long-value">{{ row.value.text }}</pre>
+              </template>
+              <template v-else>{{ row.value.text }}</template>
+            </div>
+          </div>
+        </div>
         <span v-else class="muted">无额外参数</span>
       </div>
     </section>
@@ -233,7 +287,7 @@ const precheck = computed(() => {
   border: 1px solid var(--fm-border, #e6e8eb);
   border-radius: 6px;
   overflow: hidden;
-  display: table;
+  display: block;
 }
 
 .plan {
@@ -250,30 +304,61 @@ const precheck = computed(() => {
   word-break: break-all;
 }
 
-.params th,
-.params td {
+.param-row {
+  display: flex;
+  gap: 10px;
   padding: 4px 8px;
-  vertical-align: top;
-  text-align: left;
-  font-weight: 400;
   border-bottom: 1px solid var(--fm-border, #e6e8eb);
 }
 
-.params tr:last-child th,
-.params tr:last-child td {
+.param-row:last-child {
   border-bottom: none;
 }
 
-.params th {
-  width: 30%;
-  color: var(--fm-muted, #8a8f99);
-  white-space: nowrap;
+/* 长参数改成上下排布，让代码块占满整行宽度，读起来更像原文 */
+.param-row.stacked {
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 8px;
 }
 
-.params td {
+.param-key {
+  flex: 0 0 30%;
+  color: var(--fm-muted, #8a8f99);
+  white-space: nowrap;
+  font-size: 11.5px;
+}
+
+.param-val {
+  flex: 1;
+  min-width: 0;
   font-family: 'JetBrains Mono', Consolas, monospace;
   font-size: 11.5px;
   word-break: break-all;
+}
+
+/* 长参数（整条 cURL、大 Body）：完整展示，超长时在块内滚动，不做截断 */
+.long-meta {
+  margin-bottom: 3px;
+  font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
+  font-size: 10.5px;
+  color: var(--fm-muted, #8a8f99);
+}
+
+.long-value {
+  max-height: 200px;
+  overflow: auto;
+  margin: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--fm-border, #e6e8eb);
+  border-radius: 6px;
+  background: var(--fm-surface, #fff);
+  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  word-break: break-all;
+  overscroll-behavior: contain;
 }
 
 .risk,

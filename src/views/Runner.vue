@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { message } from 'ant-design-vue'
+import { message, Modal } from 'ant-design-vue'
 import { open, save } from '@tauri-apps/plugin-dialog'
 import {
   CaretRightOutlined,
@@ -22,11 +22,11 @@ import { formatDateTime } from '@/utils/datetime'
 import {
   clearRuntimeVars,
   renderRuntimeVars,
-  runEnvScript,
-  runPostScript,
-  runPreScript,
+  listRuntimeVars,
+  setRuntimeVars,
   type ScriptRequest,
 } from '@/utils/scriptRunner'
+import { runScriptJob } from '@/utils/scriptHost'
 import type { HttpRequestDetail, HttpResult, RequestSearchHit } from '@/types/models'
 
 const router = useRouter()
@@ -115,6 +115,81 @@ const selectedRequests = computed(() =>
     .map((id) => candidates.value.find((item) => item.id === id))
     .filter((item): item is RequestSearchHit => !!item),
 )
+
+/* ---------- 另存为测试套件（迁移 M1） ---------- */
+const suiteSave = reactive({ open: false, saving: false, name: '' })
+
+function openSuiteSave() {
+  if (!selectedRequests.value.length) {
+    message.warning('先勾选要保存的接口')
+    return
+  }
+  const project = store.projects.find((item) => item.id === projectId.value)
+  suiteSave.name = `${project?.name ?? '批量运行'} 冒烟套件`
+  suiteSave.open = true
+}
+
+async function saveAsSuite() {
+  if (!projectId.value || !suiteSave.name.trim()) {
+    message.warning('请填写套件名称')
+    return
+  }
+  suiteSave.saving = true
+  try {
+    const suiteId = await api.testSuiteSave({
+      projectId: projectId.value,
+      name: suiteSave.name.trim(),
+      envId: envId.value ?? undefined,
+    })
+    // 数据文件内联进套件，跨机器打开仍可用；读取失败不阻塞套件创建
+    let datasetId: number | undefined
+    if (dataRows.value.length && dataPath.value) {
+      try {
+        const content = await api.fileReadText(dataPath.value)
+        datasetId = await api.testDatasetSave({
+          suiteId,
+          name: dataPath.value.split(/[\\/]/).pop() || '数据集',
+          format: dataPath.value.toLowerCase().endsWith('.json') ? 'json' : 'csv',
+          content,
+        })
+      } catch {
+        datasetId = undefined
+      }
+    }
+    let order = 0
+    for (const item of selectedRequests.value) {
+      const detail = await api.requestGet(item.id)
+      await api.testCaseSave({
+        suiteId,
+        name: item.name,
+        kind: 'request',
+        requestId: item.id,
+        datasetId,
+        sortOrder: order++,
+        tags: 'migrated',
+        assertionsJson: detail.assertions?.trim() || undefined,
+      })
+    }
+    suiteSave.open = false
+    // 预检：把 JS 钩子 / 环境脚本 / 未执行断言字段等跳过项明确告知
+    const report = await api.testPreflight(suiteId, envId.value ?? undefined).catch(() => null)
+    const warnings = report?.items.filter((item) => item.level === 'warning') ?? []
+    const hint = warnings.length
+      ? `预检提示 ${warnings.length} 项：\n${warnings
+          .slice(0, 5)
+          .map((item) => `${item.caseName ? item.caseName + '：' : ''}${item.message}`)
+          .join('\n')}`
+      : '预检通过。接口自带的 JS 前置 / 后置与环境脚本不会在套件中执行，如需迁移请改写为 Python 钩子。'
+    Modal.info({
+      title: '测试套件已创建',
+      content: `${suiteSave.name.trim()} · ${selectedRequests.value.length} 个用例\n${hint}`,
+      okText: '去测试场景',
+      onOk: () => router.push('/automation'),
+    })
+  } finally {
+    suiteSave.saving = false
+  }
+}
 
 const envVars = computed<Record<string, string>>(() => {
   const env = store.environments.find((item) => item.id === envId.value)
@@ -359,19 +434,33 @@ async function runOne(requestId: number, round: number, row: DataRow | null) {
   let outgoing = toScriptRequest(detail)
 
   if (envScript.value.trim()) {
-    const envResult = runEnvScript(envScript.value, outgoing, envVars.value)
+    const envResult = await runScriptJob({
+      phase: 'env',
+      code: envScript.value,
+      request: outgoing,
+      env: envVars.value,
+      vars: listRuntimeVars(),
+    })
     if (envResult.error) {
       pushFailure(detail, round, `环境脚本执行失败：${envResult.error}`)
       return
     }
+    setRuntimeVars(envResult.vars)
     outgoing = envResult.request
   }
   if (detail.preScript?.trim()) {
-    const preResult = runPreScript(detail.preScript, outgoing, envVars.value)
+    const preResult = await runScriptJob({
+      phase: 'pre',
+      code: detail.preScript,
+      request: outgoing,
+      env: envVars.value,
+      vars: listRuntimeVars(),
+    })
     if (preResult.error) {
       pushFailure(detail, round, `前置脚本执行失败：${preResult.error}`)
       return
     }
+    setRuntimeVars(preResult.vars)
     outgoing = preResult.request
   }
 
@@ -424,7 +513,15 @@ async function runOne(requestId: number, round: number, row: DataRow | null) {
   }
 
   if (detail.postScript?.trim() && !result.error) {
-    const postResult = runPostScript(detail.postScript, outgoing, result, envVars.value)
+    const postResult = await runScriptJob({
+      phase: 'post',
+      code: detail.postScript,
+      request: outgoing,
+      response: result,
+      env: envVars.value,
+      vars: listRuntimeVars(),
+    })
+    if (!postResult.error) setRuntimeVars(postResult.vars)
     item.assertions = postResult.assertions
     item.passed = postResult.assertions.filter((a) => a.passed).length
     item.failed = postResult.assertions.filter((a) => !a.passed).length
@@ -505,7 +602,7 @@ function openRequest(id: number) {
         <template #icon><AiSparkIcon /></template>
         AI 分析结果
       </a-button>
-      <a-button :disabled="running" @click="router.push('/history')">查看请求历史</a-button>
+      <a-button :disabled="running" @click="router.push('/history')">查看历史记录</a-button>
     </PageHeader>
 
     <div class="layout">
@@ -562,6 +659,9 @@ function openRequest(id: number) {
           <a-button v-else danger @click="stop">
             <template #icon><StopOutlined /></template>
             停止
+          </a-button>
+          <a-button :disabled="running || !selected.length" @click="openSuiteSave">
+            另存为测试套件
           </a-button>
           <span v-if="running" class="progress mono">{{ currentIndex }} / {{ totalTasks }}</span>
         </div>
@@ -693,6 +793,24 @@ function openRequest(id: number) {
         </a-table-column>
       </a-table>
     </div>
+
+    <a-modal
+      v-model:open="suiteSave.open"
+      title="另存为测试套件"
+      :confirm-loading="suiteSave.saving"
+      ok-text="创建套件"
+      cancel-text="取消"
+      @ok="saveAsSuite"
+    >
+      <div class="suite-save-form">
+        <span class="label">套件名称</span>
+        <a-input v-model:value="suiteSave.name" placeholder="例如：订单回归冒烟" />
+        <div class="hint">
+          将把当前勾选的 {{ selected.length }} 个接口按现有顺序写成 HTTP 用例，并内联当前数据文件。
+          接口自带的 JS 前置 / 后置与环境脚本在套件中不会执行，需要时请改写为 Python 钩子。
+        </div>
+      </div>
+    </a-modal>
   </div>
 </template>
 
@@ -701,6 +819,23 @@ function openRequest(id: number) {
   display: flex;
   flex-direction: column;
   gap: 14px;
+}
+
+.suite-save-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.suite-save-form .label {
+  font-size: 12px;
+  color: var(--fm-muted);
+}
+
+.suite-save-form .hint {
+  font-size: 11px;
+  line-height: 1.7;
+  color: var(--fm-muted);
 }
 
 .layout {

@@ -191,10 +191,21 @@ fn read_environments(conn: &Connection, project_id: i64) -> Result<Vec<ExportEnv
             .map_err(err)?;
         let variables = var_stmt
             .query_map(params![env_id], |row| {
+                let is_secret = row.get::<_, Option<i64>>(2)?.unwrap_or(0) == 1;
+                let stored: Option<String> = row.get(1)?;
+                // 导出是「换机搬迁」语义，密钥必须还原成明文，否则导入方解不开；
+                // 这也意味着项目包本身要当敏感文件保管（设置页有提示）
+                let value = if is_secret {
+                    stored
+                        .as_deref()
+                        .map(|v| crate::secret::decrypt(crate::secret::AAD_ENV, v))
+                } else {
+                    stored
+                };
                 Ok(ExportVariable {
                     key: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                    value: row.get(1)?,
-                    is_secret: row.get::<_, Option<i64>>(2)?.unwrap_or(0) == 1,
+                    value,
+                    is_secret,
                     sort_order: row.get::<_, Option<i64>>(3)?.unwrap_or(0),
                 })
             })
@@ -251,7 +262,7 @@ pub fn project_export(
         .map_err(err)?;
 
     // 让父集合先出现，子集合按 sort_order 归组
-    collection_rows.sort_by_key(|(id, parent, _, sort)| (parent.unwrap_or(0), sort.clone(), *id));
+    collection_rows.sort_by_key(|(id, parent, _, sort)| (parent.unwrap_or(0), *sort, *id));
 
     let bundle = ExportBundle {
         format: FORMAT.to_string(),
@@ -300,7 +311,13 @@ fn insert_collection(
     tx.execute(
         "INSERT INTO collections (project_id, parent_id, name, sort_order, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-        params![project_id, parent_id, collection.name, collection.sort_order, now],
+        params![
+            project_id,
+            parent_id,
+            collection.name,
+            collection.sort_order,
+            now
+        ],
     )
     .map_err(err)?;
     let collection_id = tx.last_insert_rowid();
@@ -353,7 +370,11 @@ pub fn project_import(state: State<'_, AppState>, path: String) -> Result<Projec
     let mut conn = state.pool.get().map_err(err)?;
     let now = now_ms();
     let raw_name = bundle.project.name.trim();
-    let base_name = if raw_name.is_empty() { "导入项目" } else { raw_name };
+    let base_name = if raw_name.is_empty() {
+        "导入项目"
+    } else {
+        raw_name
+    };
     let name = unique_project_name(&conn, base_name);
 
     let tx = conn.transaction().map_err(err)?;
@@ -396,13 +417,20 @@ pub fn project_import(state: State<'_, AppState>, path: String) -> Result<Projec
         let env_id = tx.last_insert_rowid();
 
         for variable in &environment.variables {
+            // 导入的敏感值重新加密入库（项目包内是明文，落库必须是密文）
+            let stored = match (&variable.value, variable.is_secret) {
+                (Some(value), true) if !value.is_empty() => {
+                    crate::secret::encrypt(crate::secret::AAD_ENV, value)?
+                }
+                (value, _) => value.clone().unwrap_or_default(),
+            };
             tx.execute(
                 "INSERT INTO env_variables (env_id, \"key\", value, is_secret, sort_order)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     env_id,
                     variable.key,
-                    variable.value,
+                    stored,
                     variable.is_secret as i64,
                     variable.sort_order
                 ],
@@ -459,7 +487,10 @@ fn openapi_body(body_type: &str, body: &str) -> Option<(&'static str, Value)> {
         "form" | "multipart" => {
             let mut props = Map::new();
             if let Ok(fields) = serde_json::from_str::<Vec<KeyValueItem>>(raw) {
-                for field in fields.iter().filter(|f| f.enabled && !f.key.trim().is_empty()) {
+                for field in fields
+                    .iter()
+                    .filter(|f| f.enabled && !f.key.trim().is_empty())
+                {
                     props.insert(field.key.trim().to_string(), json!({ "type": "string" }));
                 }
             }
@@ -482,6 +513,8 @@ fn openapi_body(body_type: &str, body: &str) -> Option<(&'static str, Value)> {
     })
 }
 
+// 对应 OpenAPI 一个 operation 的各个字段，本身就是扁平的
+#[allow(clippy::too_many_arguments)]
 fn openapi_operation(
     name: &str,
     method: &str,
@@ -493,7 +526,10 @@ fn openapi_operation(
     tag: &str,
 ) -> (String, Value) {
     let mut parameters: Vec<Value> = Vec::new();
-    for item in params.iter().filter(|i| i.enabled && !i.key.trim().is_empty()) {
+    for item in params
+        .iter()
+        .filter(|i| i.enabled && !i.key.trim().is_empty())
+    {
         parameters.push(json!({
             "name": item.key.trim(),
             "in": "query",
@@ -509,7 +545,10 @@ fn openapi_operation(
         "content-length",
         "accept-encoding",
     ];
-    for item in headers.iter().filter(|i| i.enabled && !i.key.trim().is_empty()) {
+    for item in headers
+        .iter()
+        .filter(|i| i.enabled && !i.key.trim().is_empty())
+    {
         let key = item.key.trim().to_lowercase();
         if SKIP.contains(&key.as_str()) {
             continue;
@@ -827,7 +866,10 @@ pub fn openapi_import(
     let base_url = if let Some(url) = spec.pointer("/servers/0/url").map(|v| value_str(Some(v))) {
         url
     } else {
-        let host = spec.get("host").map(|v| value_str(Some(v))).unwrap_or_default();
+        let host = spec
+            .get("host")
+            .map(|v| value_str(Some(v)))
+            .unwrap_or_default();
         let base = spec
             .get("basePath")
             .map(|v| value_str(Some(v)))
@@ -850,16 +892,22 @@ pub fn openapi_import(
 
     let project_id = if let Some(id) = project_id {
         let exists: i64 = tx
-            .query_row("SELECT COUNT(*) FROM projects WHERE id = ?1", params![id], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM projects WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
             .map_err(err)?;
         if exists == 0 {
             return Err("目标项目不存在".to_string());
         }
         id
     } else {
-        let base_name = if title.trim().is_empty() { "OpenAPI 导入" } else { title.trim() };
+        let base_name = if title.trim().is_empty() {
+            "OpenAPI 导入"
+        } else {
+            title.trim()
+        };
         let name = unique_project_name(&tx, base_name);
         tx.execute(
             "INSERT INTO projects (name, description, color, sort_order, created_at, updated_at)
@@ -871,25 +919,26 @@ pub fn openapi_import(
     };
 
     let project_name: String = tx
-        .query_row("SELECT name FROM projects WHERE id = ?1", params![project_id], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT name FROM projects WHERE id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )
         .map_err(err)?;
 
     // 先按 tag 分组，再按路径顺序写入集合
     let methods = ["get", "post", "put", "patch", "delete", "head", "options"];
-    let mut groups: Vec<(
+    // 一行待写入的接口：(name, method, url, body_type, query, headers, body)
+    type PendingRequest = (
         String,
-        Vec<(
-            String,
-            String,
-            String,
-            String,
-            Vec<KeyValueItem>,
-            Vec<KeyValueItem>,
-            String,
-        )>,
-    )> = Vec::new();
+        String,
+        String,
+        String,
+        Vec<KeyValueItem>,
+        Vec<KeyValueItem>,
+        String,
+    );
+    let mut groups: Vec<(String, Vec<PendingRequest>)> = Vec::new();
 
     for (raw_path, item) in paths {
         let Some(operations) = item.as_object() else {
@@ -917,10 +966,7 @@ pub fn openapi_import(
 
             let mut query_params = Vec::new();
             let mut header_params = Vec::new();
-            let parameter_sets = [
-                item.get("parameters"),
-                operation.get("parameters"),
-            ];
+            let parameter_sets = [item.get("parameters"), operation.get("parameters")];
             for set in parameter_sets.into_iter().flatten() {
                 let Some(list) = set.as_array() else { continue };
                 for param in list {
@@ -974,8 +1020,8 @@ pub fn openapi_import(
         }
     }
 
-    let mut collection_order = 0_i64;
-    for (group_name, requests) in groups {
+    for (collection_order, (group_name, requests)) in groups.into_iter().enumerate() {
+        let collection_order = collection_order as i64;
         tx.execute(
             "INSERT INTO collections (project_id, parent_id, name, sort_order, created_at, updated_at)
              VALUES (?1, NULL, ?2, ?3, ?4, ?4)",
@@ -983,7 +1029,6 @@ pub fn openapi_import(
         )
         .map_err(err)?;
         let collection_id = tx.last_insert_rowid();
-        collection_order += 1;
 
         for (index, request) in requests.into_iter().enumerate() {
             let (name, method, url, body_type, query, headers, body) = request;

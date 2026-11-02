@@ -1,16 +1,26 @@
 use crate::models::{EnvVariable, Environment};
+use crate::secret::{self, AAD_ENV};
 use crate::state::AppState;
 use crate::util::{err, now_ms};
 use rusqlite::{params, Connection, Row};
 use tauri::State;
 
 fn map_variable(row: &Row<'_>) -> rusqlite::Result<EnvVariable> {
+    let raw = row.get::<_, Option<String>>(2)?.unwrap_or_default();
+    let is_secret = row.get::<_, i64>(3)? != 0;
+    // 敏感值只回显掩码：前端永远拿不到明文，发送请求时在 Rust 内部解密（4.2）
+    let value = if is_secret && !raw.is_empty() {
+        secret::MASK.to_string()
+    } else {
+        raw.clone()
+    };
     Ok(EnvVariable {
         id: Some(row.get(0)?),
         key: row.get(1)?,
-        value: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-        is_secret: row.get::<_, i64>(3)? != 0,
+        value,
+        is_secret,
         sort_order: row.get(4)?,
+        has_value: !raw.is_empty(),
     })
 }
 
@@ -111,11 +121,7 @@ pub fn env_script_save(state: State<'_, AppState>, id: i64, script: String) -> R
 }
 
 #[tauri::command]
-pub fn env_activate(
-    state: State<'_, AppState>,
-    project_id: i64,
-    id: i64,
-) -> Result<(), String> {
+pub fn env_activate(state: State<'_, AppState>, project_id: i64, id: i64) -> Result<(), String> {
     let conn = state.pool.get().map_err(err)?;
 
     let owner: i64 = conn
@@ -177,6 +183,23 @@ pub fn env_delete(state: State<'_, AppState>, id: i64) -> Result<(), String> {
     Ok(())
 }
 
+/// 读取指定环境的**非敏感**变量值，供界面做变量渲染预览（如压测目标 URL 回显）
+///
+/// 敏感变量（`is_secret = 1`）一律不返回明文 —— 预览只服务展示，
+/// 真正发请求时仍由 `load_vars` 在后端解密。
+#[tauri::command]
+pub fn env_plain_vars(
+    state: State<'_, AppState>,
+    env_id: i64,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let conn = state.pool.get().map_err(err)?;
+    let (vars, secrets) = crate::commands::http::load_vars_with_secrets(&conn, env_id)?;
+    Ok(vars
+        .into_iter()
+        .filter(|(key, _)| !secrets.contains(key))
+        .collect())
+}
+
 #[tauri::command]
 pub fn env_var_save(
     state: State<'_, AppState>,
@@ -186,8 +209,32 @@ pub fn env_var_save(
     let mut conn = state.pool.get().map_err(err)?;
     let tx = conn.transaction().map_err(err)?;
 
-    tx.execute("DELETE FROM env_variables WHERE env_id = ?1", params![env_id])
-        .map_err(err)?;
+    // 先把已有的敏感值读出来：前端回显的是掩码，原样提交回来时必须沿用旧密文，
+    // 否则用户只改一个普通变量就会把同环境的密钥全部清空（很难发现的破坏性 bug）
+    let mut existing: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    {
+        let mut stmt = tx
+            .prepare("SELECT \"key\", value FROM env_variables WHERE env_id = ?1 AND is_secret = 1")
+            .map_err(err)?;
+        let rows = stmt
+            .query_map(params![env_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                ))
+            })
+            .map_err(err)?;
+        for item in rows {
+            let (key, value) = item.map_err(err)?;
+            existing.insert(key, value);
+        }
+    }
+
+    tx.execute(
+        "DELETE FROM env_variables WHERE env_id = ?1",
+        params![env_id],
+    )
+    .map_err(err)?;
 
     {
         let mut stmt = tx
@@ -202,10 +249,23 @@ pub fn env_var_save(
             if key.is_empty() {
                 continue;
             }
+            let stored = if item.is_secret {
+                let unchanged = item.value == secret::MASK
+                    || (item.value.is_empty() && existing.contains_key(key));
+                if unchanged {
+                    existing.get(key).cloned().unwrap_or_default()
+                } else if item.value.is_empty() {
+                    String::new()
+                } else {
+                    secret::encrypt(AAD_ENV, &item.value)?
+                }
+            } else {
+                item.value.clone()
+            };
             stmt.execute(params![
                 env_id,
                 key,
-                item.value,
+                stored,
                 if item.is_secret { 1 } else { 0 },
                 index as i64
             ])

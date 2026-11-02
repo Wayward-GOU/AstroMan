@@ -3,8 +3,8 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::time::Instant;
 use sysinfo::{
-    CpuRefreshKind, Disks, MemoryRefreshKind, Networks, ProcessRefreshKind, ProcessesToUpdate,
-    RefreshKind, System,
+    CpuRefreshKind, Disks, MemoryRefreshKind, Networks, Pid, ProcessRefreshKind, ProcessesToUpdate,
+    RefreshKind, System, UpdateKind,
 };
 use tauri::State;
 
@@ -125,6 +125,10 @@ pub struct ProcessInfo {
     pub name: String,
     pub cpu: f32,
     pub memory: u64,
+    /// 占物理内存的百分比（0–100）
+    pub memory_percent: f32,
+    /// 可执行文件路径，受限权限下可能为空
+    pub exe: String,
 }
 
 pub struct Monitor {
@@ -195,7 +199,10 @@ impl Monitor {
 
         let cpus = self.sys.cpus();
         let cores: Vec<f32> = cpus.iter().map(|cpu| cpu.cpu_usage()).collect();
-        let brand = cpus.first().map(|cpu| cpu.brand().to_string()).unwrap_or_default();
+        let brand = cpus
+            .first()
+            .map(|cpu| cpu.brand().to_string())
+            .unwrap_or_default();
         let vendor = cpus
             .first()
             .map(|cpu| cpu.vendor_id().to_string())
@@ -207,10 +214,8 @@ impl Monitor {
             let usage = disk.usage();
             let key = disk.name().to_string_lossy().to_string();
             let (prev_read, prev_write) = self.prev_disk.get(&key).copied().unwrap_or((0, 0));
-            self.prev_disk.insert(
-                key,
-                (usage.total_read_bytes, usage.total_written_bytes),
-            );
+            self.prev_disk
+                .insert(key, (usage.total_read_bytes, usage.total_written_bytes));
             let total = disk.total_space();
             let available = disk.available_space();
             disks.push(DiskInfo {
@@ -224,16 +229,14 @@ impl Monitor {
                 } else {
                     0.0
                 },
-                read_per_sec: ((usage.total_read_bytes.saturating_sub(prev_read)) as f64
-                    / elapsed) as u64,
-                write_per_sec: ((usage
-                    .total_written_bytes
-                    .saturating_sub(prev_write)) as f64
+                read_per_sec: ((usage.total_read_bytes.saturating_sub(prev_read)) as f64 / elapsed)
+                    as u64,
+                write_per_sec: ((usage.total_written_bytes.saturating_sub(prev_write)) as f64
                     / elapsed) as u64,
                 removable: disk.is_removable(),
             });
         }
-        disks.sort_by(|a, b| b.total.cmp(&a.total));
+        disks.sort_by_key(|disk| std::cmp::Reverse(disk.total));
 
         let mut networks = Vec::new();
         let adapters = crate::netinfo::adapters();
@@ -241,8 +244,7 @@ impl Monitor {
             let total_rx = net.total_received();
             let total_tx = net.total_transmitted();
             let (prev_rx, prev_tx) = self.prev_net.get(name).copied().unwrap_or((0, 0));
-            self.prev_net
-                .insert(name.clone(), (total_rx, total_tx));
+            self.prev_net.insert(name.clone(), (total_rx, total_tx));
             let mac = format_mac(&net.mac_address().0);
             let matched = adapters
                 .iter()
@@ -324,38 +326,147 @@ impl Monitor {
         }
     }
 
-    fn top_processes(&mut self, limit: usize, by_memory: bool) -> Vec<ProcessInfo> {
+    fn top_processes(&mut self, limit: Option<usize>, by_memory: bool) -> Vec<ProcessInfo> {
+        self.sys.refresh_memory();
         self.sys.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
-            ProcessRefreshKind::nothing().with_cpu().with_memory(),
+            ProcessRefreshKind::nothing()
+                .with_cpu()
+                .with_memory()
+                .with_exe(UpdateKind::OnlyIfNotSet),
         );
 
+        let total_memory = self.sys.total_memory();
         let mut list: Vec<ProcessInfo> = self
             .sys
             .processes()
             .iter()
-            .map(|(pid, process)| ProcessInfo {
-                pid: pid.as_u32(),
-                name: process.name().to_string_lossy().to_string(),
-                cpu: process.cpu_usage(),
-                memory: process.memory(),
+            .map(|(pid, process)| {
+                let memory = process.memory();
+                ProcessInfo {
+                    pid: pid.as_u32(),
+                    name: process.name().to_string_lossy().to_string(),
+                    cpu: process.cpu_usage(),
+                    memory,
+                    memory_percent: if total_memory > 0 {
+                        ((memory as f64 / total_memory as f64) * 100.0) as f32
+                    } else {
+                        0.0
+                    },
+                    exe: process
+                        .exe()
+                        .map(|path| path.to_string_lossy().to_string())
+                        .unwrap_or_default(),
+                }
             })
             .collect();
 
         if by_memory {
-            list.sort_by(|a, b| b.memory.cmp(&a.memory));
+            list.sort_by(|a, b| b.memory.cmp(&a.memory).then(b.cpu.total_cmp(&a.cpu)));
         } else {
-            list.sort_by(|a, b| {
-                b.cpu
-                    .partial_cmp(&a.cpu)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then(b.memory.cmp(&a.memory))
-            });
+            list.sort_by(|a, b| b.cpu.total_cmp(&a.cpu).then(b.memory.cmp(&a.memory)));
         }
-        list.truncate(limit.clamp(1, 100));
+        if let Some(limit) = limit {
+            list.truncate(limit.clamp(1, 500));
+        }
         list
     }
+
+    fn kill_process(&mut self, pid: u32, expected_name: Option<&str>) -> Result<(), String> {
+        if pid == std::process::id() {
+            return Err("不能结束 AstroMan 自身进程".to_string());
+        }
+
+        let target = Pid::from_u32(pid);
+        self.sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[target]),
+            true,
+            ProcessRefreshKind::nothing()
+                .with_memory()
+                .with_exe(UpdateKind::OnlyIfNotSet),
+        );
+        let process = self
+            .sys
+            .process(target)
+            .ok_or_else(|| format!("进程 {pid} 不存在或已退出"))?;
+        let name = process.name().to_string_lossy().to_string();
+
+        // 列表到点击之间进程可能退出、PID 可能被复用：名称对不上就拒绝，避免误杀
+        if let Some(expected) = expected_name.filter(|value| !value.is_empty()) {
+            if !name.eq_ignore_ascii_case(expected) {
+                return Err(format!(
+                    "进程 {pid} 已退出或 PID 已被其他进程占用，请刷新后重试"
+                ));
+            }
+        }
+
+        let display = if name.is_empty() {
+            format!("PID {pid}")
+        } else {
+            format!("{name}（PID {pid}）")
+        };
+
+        if is_protected_process(&name, pid) {
+            return Err(format!("{display} 是系统关键进程，已阻止结束操作"));
+        }
+
+        if process.kill() {
+            log::info!("已结束进程 {display}");
+            Ok(())
+        } else {
+            Err(format!(
+                "结束 {display} 失败，可能需要管理员权限或进程已受保护"
+            ))
+        }
+    }
+}
+
+/// 系统关键进程：结束它们会直接导致蓝屏 / 系统崩溃，直接拒绝
+fn is_protected_process(name: &str, pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        if pid <= 4 {
+            return true;
+        }
+        let lower = name.to_ascii_lowercase();
+        const CORE: &[&str] = &[
+            "system",
+            "registry",
+            "smss.exe",
+            "csrss.exe",
+            "wininit.exe",
+            "winlogon.exe",
+            "services.exe",
+            "lsass.exe",
+            "fontdrvhost.exe",
+            "memory compression",
+            "secure system",
+        ];
+        if CORE.iter().any(|item| lower == *item) {
+            return true;
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if pid <= 1 {
+            return true;
+        }
+        if name.eq_ignore_ascii_case("launchd") || name.eq_ignore_ascii_case("kernel_task") {
+            return true;
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if pid <= 1 {
+            return true;
+        }
+        if matches!(name, "systemd" | "init" | "kthreadd") {
+            return true;
+        }
+    }
+    let _ = (name, pid);
+    false
 }
 
 fn collect_ips(adapters: &[crate::netinfo::AdapterIp]) -> Vec<LocalIp> {
@@ -421,6 +532,7 @@ pub fn winstats_snapshot(state: State<'_, WinStatsState>) -> SystemSnapshot {
     monitor.snapshot()
 }
 
+/// 进程列表：`limit` 为 0 或缺省时返回全部进程
 #[tauri::command]
 pub fn winstats_processes(
     state: State<'_, WinStatsState>,
@@ -428,7 +540,21 @@ pub fn winstats_processes(
     by_memory: Option<bool>,
 ) -> Vec<ProcessInfo> {
     let mut monitor = state.inner.lock();
-    monitor.top_processes(limit.unwrap_or(12), by_memory.unwrap_or(false))
+    let limit = limit.unwrap_or(0);
+    monitor.top_processes(
+        if limit == 0 { None } else { Some(limit) },
+        by_memory.unwrap_or(false),
+    )
+}
+
+#[tauri::command]
+pub fn winstats_process_kill(
+    state: State<'_, WinStatsState>,
+    pid: u32,
+    name: Option<String>,
+) -> Result<(), String> {
+    let mut monitor = state.inner.lock();
+    monitor.kill_process(pid, name.as_deref())
 }
 
 fn battery_info() -> Option<BatteryInfo> {
@@ -653,5 +779,104 @@ mod gpu {
             }
             String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
         }
+    }
+}
+
+#[cfg(test)]
+mod process_tests {
+    use super::{is_protected_process, Monitor};
+
+    #[test]
+    fn protects_system_critical_processes() {
+        #[cfg(windows)]
+        {
+            assert!(is_protected_process("System", 4));
+            assert!(is_protected_process("csrss.exe", 500));
+            assert!(is_protected_process("LSASS.EXE", 900));
+            assert!(!is_protected_process("chrome.exe", 500));
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            assert!(is_protected_process("systemd", 1));
+            assert!(!is_protected_process("chrome", 500));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert!(is_protected_process("launchd", 1));
+            assert!(!is_protected_process("Google Chrome", 500));
+        }
+    }
+
+    #[test]
+    fn process_list_contains_current_process_and_honours_limit() {
+        let mut monitor = Monitor::new();
+        let all = monitor.top_processes(None, false);
+        assert!(all.len() > 1, "应至少枚举到当前进程与系统进程");
+
+        let me = std::process::id();
+        let current = all
+            .iter()
+            .find(|item| item.pid == me)
+            .expect("进程列表应包含当前进程");
+        assert!(current.memory > 0, "当前进程内存占用应大于 0");
+        assert!(
+            (0.0..=100.0).contains(&current.memory_percent),
+            "内存占比应在 0–100 之间"
+        );
+
+        let limited = monitor.top_processes(Some(3), true);
+        assert!(limited.len() <= 3);
+        assert!(limited
+            .windows(2)
+            .all(|pair| pair[0].memory >= pair[1].memory));
+    }
+
+    #[test]
+    fn kills_spawned_child_process() {
+        let mut child = {
+            #[cfg(windows)]
+            {
+                std::process::Command::new("ping")
+                    .args(["-n", "60", "127.0.0.1"])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect("spawn ping")
+            }
+            #[cfg(not(windows))]
+            {
+                std::process::Command::new("sleep")
+                    .arg("60")
+                    .spawn()
+                    .expect("spawn sleep")
+            }
+        };
+        let pid = child.id();
+
+        let mut monitor = Monitor::new();
+        let mut name = None;
+        for _ in 0..20 {
+            if let Some(item) = monitor
+                .top_processes(None, false)
+                .into_iter()
+                .find(|item| item.pid == pid)
+            {
+                name = Some(item.name);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let Some(name) = name else {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("未能枚举到子进程 {pid}");
+        };
+
+        if let Err(error) = monitor.kill_process(pid, Some(&name)) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("结束子进程失败：{error}");
+        }
+        child.wait().expect("子进程结束");
     }
 }

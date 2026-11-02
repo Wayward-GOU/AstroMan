@@ -498,7 +498,7 @@ async fn run_load(
 ### 4.4 报告与导出
 
 **报告详情页内容**：
-- 概览卡片：总请求、成功率、平均/最大 RT、P95/P99、最大 QPS、最大并发
+- 概览卡片：总请求、成功率、平均 / 峰值 / 90% 分布 / 单并发 QPS、平均延迟、P95 / P99、APDEX（QPS 指标组由 `qpsOverview()` 统一口径，页面与 HTML / Excel 导出同源）
 - 曲线：QPS、RT、并发、错误数随时间变化（来自 `report_samples`，可回放）
 - 错误明细表：类型、消息、状态码、响应片段
 - 请求信息快照：当时用的 URL / Headers / Body（敏感字段打码）
@@ -559,7 +559,8 @@ async fn run_load(
 | 模型目录 | 10 家服务商的 `presetModels` 按官方文档校准（DeepSeek 仅 `deepseek-chat` / `deepseek-reasoner`）；模型下拉改用 `a-auto-complete` 原生展开，未识别服务商时兜底全量列表，仍可手填；编辑服务商回填已保存 Key |
 | 报错 | Rust `humanize_api_error` / `humanize_network_error` 把 401/402/403/404/429/5xx、模型不支持、DNS/超时/证书问题统一转中文 |
 | 页面内 AI | `stores/aiAssist.ts` + `components/AiAssistDrawer.vue` + `utils/aiScenarios.ts`，覆盖工作台洞察、项目体检、接口分析（解释响应 / 生成断言 / 生成后置脚本 / 优化定义）、环境体检、压测计划、批量运行分析、历史诊断、报告解读 8 个入口，均为只读建议且不调工具 |
-| 入口 | 右侧屏幕垂直居中的悬浮机器人；`/ai/usage` 用量统计页；设置页「AI 辅助（航仔）」卡片与首页使用说明第 07 步均提供入口 |
+| 入口 | 右侧屏幕垂直居中的**宇航员挂件**（透明底贴图 `src/assets/buddy.png`，显示 72×121）：可按住拖到窗口任意位置并记住坐标，单击（位移 < 4px）进入航仔，`/ai` 页自动隐藏；`/ai/usage` 用量统计页；设置页「AI 辅助（航仔）」卡片与首页使用说明第 07 步均提供入口 |
+| 外观 | 航仔形象按设计稿出图后抠透明底（四边泛洪 + 边缘羽化 + 轻度锐化），不再用手绘 SVG；配套 `AstroBuddyIcon.vue` 为 1em 线框版，用于侧栏 / 空状态 / AI 抽屉。配色扩到 21 套主题（14 浅 / 7 深），每套覆盖 35 个 `--fm-*` 颜色与阴影变量（HTTP 方法色与圆角沿用 `main.css`），新增主题只需在 `stores/theme.ts` 加一个定义 |
 
 #### 能力清单
 

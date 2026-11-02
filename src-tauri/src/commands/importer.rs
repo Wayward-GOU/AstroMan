@@ -52,33 +52,34 @@ pub fn api_import(
     let tx = conn.transaction().map_err(err)?;
 
     let project = match project_id {
-        Some(id) => {
-            let project = tx
-                .query_row(
-                    "SELECT id, name, description, color, sort_order, created_at, updated_at
+        Some(id) => tx
+            .query_row(
+                "SELECT id, name, description, color, sort_order, created_at, updated_at
                      FROM projects WHERE id = ?1",
-                    params![id],
-                    |row| {
-                        Ok(Project {
-                            id: row.get(0)?,
-                            name: row.get(1)?,
-                            description: row.get(2)?,
-                            color: row.get(3)?,
-                            sort_order: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
-                            created_at: row.get(5)?,
-                            updated_at: row.get(6)?,
-                        })
-                    },
-                )
-                .map_err(|e| match e {
-                    rusqlite::Error::QueryReturnedNoRows => "目标项目不存在".to_string(),
-                    other => err(other),
-                })?;
-            project
-        }
+                params![id],
+                |row| {
+                    Ok(Project {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        description: row.get(2)?,
+                        color: row.get(3)?,
+                        sort_order: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                        created_at: row.get(5)?,
+                        updated_at: row.get(6)?,
+                    })
+                },
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => "目标项目不存在".to_string(),
+                other => err(other),
+            })?,
         None => {
             let base = parsed.name.trim();
-            let base = if base.is_empty() { "导入项目" } else { base };
+            let base = if base.is_empty() {
+                "导入项目"
+            } else {
+                base
+            };
             let name = unique_project_name(&tx, base);
             tx.execute(
                 "INSERT INTO projects (name, description, color, sort_order, created_at, updated_at)
@@ -194,7 +195,9 @@ fn parse_postman(root: &Value) -> Result<ParsedImport, String> {
         if let Some(children) = item.get("item").and_then(|v| v.as_array()) {
             collections.push(build_postman_folder(&item_name, children));
         } else if let Some(request) = item.get("request") {
-            loose.requests.push(parse_postman_request(&item_name, request));
+            loose
+                .requests
+                .push(parse_postman_request(&item_name, request));
         }
     }
     if !loose.requests.is_empty() {
@@ -220,9 +223,13 @@ fn build_postman_folder(name: &str, items: &[Value]) -> ParsedCollection {
     for item in items {
         let item_name = optional_text(item.get("name")).unwrap_or_else(|| "未命名".to_string());
         if let Some(children) = item.get("item").and_then(|v| v.as_array()) {
-            folder.children.push(build_postman_folder(&item_name, children));
+            folder
+                .children
+                .push(build_postman_folder(&item_name, children));
         } else if let Some(request) = item.get("request") {
-            folder.requests.push(parse_postman_request(&item_name, request));
+            folder
+                .requests
+                .push(parse_postman_request(&item_name, request));
         }
     }
     folder
@@ -285,7 +292,9 @@ fn parse_postman_request(name: &str, request: &Value) -> ParsedRequest {
 fn parse_postman_url(value: &Value) -> (String, Vec<KeyValueItem>) {
     let raw = match value {
         Value::String(text) => text.clone(),
-        Value::Object(_) => optional_text(value.get("raw")).unwrap_or_else(|| build_postman_url(value)),
+        Value::Object(_) => {
+            optional_text(value.get("raw")).unwrap_or_else(|| build_postman_url(value))
+        }
         _ => String::new(),
     };
 
@@ -383,10 +392,7 @@ fn parse_postman_body(body: &Value) -> (String, String) {
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let is_json = language.eq_ignore_ascii_case("json") || looks_like_json(&raw);
-            (
-                if is_json { "json" } else { "text" }.to_string(),
-                raw,
-            )
+            (if is_json { "json" } else { "text" }.to_string(), raw)
         }
         "urlencoded" | "formdata" => {
             let field = if mode == "urlencoded" {
@@ -466,7 +472,9 @@ fn parse_openapi(root: &Value) -> Result<ParsedImport, String> {
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
-        for method in ["get", "post", "put", "patch", "delete", "head", "options", "trace"] {
+        for method in [
+            "get", "post", "put", "patch", "delete", "head", "options", "trace",
+        ] {
             let Some(operation) = item.get(method) else {
                 continue;
             };
@@ -581,9 +589,7 @@ fn parse_openapi_operation(
             "cookie" if !key.is_empty() => {
                 cookies.push(format!("{key}={}", param_value(root, parameter)))
             }
-            "formData" if !key.is_empty() => {
-                form_fields.push((key, param_value(root, parameter)))
-            }
+            "formData" if !key.is_empty() => form_fields.push((key, param_value(root, parameter))),
             "body" if !is_v3 => {
                 let schema = resolve_schema(root, parameter.get("schema").unwrap_or(&Value::Null));
                 body = body_from_schema(root, schema);

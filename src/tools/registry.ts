@@ -55,6 +55,23 @@ import { crc16, crc32, dateCalc, luhnCheck, pxRem, randomPassword, randomString,
 import { signJwt } from './crypto'
 import { cronInfo, snowflakeInfo } from './devtools'
 import { urlInfo } from './network'
+import { queryJsonPath } from './jsonpath'
+import { jsonDiff } from './jsondiff'
+import { inferJsonSchema } from './schema'
+import { otpInfo } from './otp'
+import { verifyJwt } from './jwtverify'
+import {
+  ascii85Decode,
+  ascii85Encode,
+  base58Decode,
+  base58Encode,
+  quotedPrintableDecode,
+  quotedPrintableEncode,
+} from './encoding'
+import { maskText } from './mask'
+import { checkDocument, DATA_KINDS, generateData } from './datagen'
+import { generateIds } from './idgen'
+import { httpMessageInfo, parseUserAgent } from './netparse'
 import type { CaseStyle, ExtractKind, LineOp } from './transforms'
 
 export const TOOL_CATEGORIES: ToolCategory[] = [
@@ -1720,6 +1737,444 @@ export const TOOLS: ToolDef[] = [
     component: () => import('@/components/tools/ReferenceTables.vue'),
     props: { kind: 'regex' },
   },
+
+  /* ---------------- v1.0.8 新增：JSON 增强 ---------------- */
+  {
+    id: 'jsonpath',
+    name: 'JSONPath 查询',
+    category: 'json',
+    desc: '用 $.data.list[*].name、$..id 等表达式提取字段，输出命中路径与合并结果，可直接用于断言取值',
+    keywords: ['jsonpath', 'json', '提取', '查询', '取值', '断言', '通配', '递归'],
+    aliases: ['jp', 'json路径', 'json提取'],
+    simple: {
+      inputLabel: 'JSON 内容',
+      outputLabel: '匹配结果',
+      actionLabel: '查询',
+      sample: `{
+  "code": 0,
+  "data": {
+    "total": 2,
+    "list": [
+      { "id": 1, "name": "张三", "tags": ["vip", "new"] },
+      { "id": 2, "name": "李四", "tags": ["trial"] }
+    ]
+  }
+}`,
+      options: [
+        { key: 'path', label: 'JSONPath', type: 'input', default: '$.data.list[*].name', width: 260 },
+      ],
+      run: (input, options) => queryJsonPath(input, opt(options, 'path', '$')),
+    },
+  },
+  {
+    id: 'json-diff',
+    name: 'JSON 结构化对比',
+    category: 'json',
+    desc: '按字段路径列出新增、删除与修改，适合对比两次接口响应的差异',
+    keywords: ['json', 'diff', '对比', '差异', '比较', '回归'],
+    aliases: ['json对比', 'jsondiff', '响应对比'],
+    simple: {
+      inputLabel: '两段 JSON（用单独一行 --- 分隔）',
+      outputLabel: '差异结果',
+      actionLabel: '对比',
+      sample: `{
+  "id": 1,
+  "name": "张三",
+  "roles": ["admin"],
+  "profile": { "city": "杭州", "age": 28 }
+}
+---
+{
+  "id": 1,
+  "name": "张三丰",
+  "roles": ["admin", "owner"],
+  "profile": { "city": "杭州" }
+}`,
+      run: (input) => jsonDiff(input),
+    },
+  },
+  {
+    id: 'json-schema',
+    name: 'JSON 生成 Schema',
+    category: 'json',
+    desc: '由样例推断 JSON Schema（draft-07），自动识别 date-time / email / uuid / uri 格式',
+    keywords: ['json', 'schema', 'jsonschema', '契约', '校验', '推断'],
+    aliases: ['schema', 'json模式'],
+    simple: {
+      inputLabel: 'JSON 样例',
+      outputLabel: 'JSON Schema',
+      actionLabel: '生成 Schema',
+      sample: `{
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "name": "张三",
+  "email": "dev@example.com",
+  "createdAt": "2026-10-30T10:00:00Z",
+  "score": 92.5,
+  "active": true,
+  "tags": ["vip", "new"]
+}`,
+      options: [{ key: 'title', label: '标题', type: 'input', default: 'InferredSchema', width: 180 }],
+      run: (input, options) => inferJsonSchema(input, { title: opt(options, 'title', 'InferredSchema') }),
+    },
+  },
+
+  /* ---------------- v1.0.8 新增：加密编码 ---------------- */
+  {
+    id: 'totp',
+    name: 'TOTP / HOTP 动态口令',
+    category: 'crypto',
+    desc: '输入 Base32 密钥生成本地动态验证码，输出上下周期与 otpauth 链接，用于双因子登录联调',
+    keywords: ['totp', 'hotp', 'otp', '验证码', '动态口令', '二次验证', '2fa', 'google authenticator'],
+    aliases: ['两步验证', '动态码', 'otp'],
+    simple: {
+      inputLabel: 'Base32 密钥',
+      inputPlaceholder: 'JBSWY3DPEHPK3PXP',
+      outputLabel: '验证码信息',
+      actionLabel: '生成验证码',
+      sample: 'JBSWY3DPEHPK3PXP',
+      options: [
+        {
+          key: 'mode',
+          label: '类型',
+          type: 'select',
+          default: 'totp',
+          width: 130,
+          options: [
+            { label: 'TOTP（时间）', value: 'totp' },
+            { label: 'HOTP（计数器）', value: 'hotp' },
+          ],
+        },
+        {
+          key: 'algorithm',
+          label: '算法',
+          type: 'select',
+          default: 'SHA-1',
+          width: 120,
+          options: [
+            { label: 'SHA-1', value: 'SHA-1' },
+            { label: 'SHA-256', value: 'SHA-256' },
+            { label: 'SHA-512', value: 'SHA-512' },
+          ],
+        },
+        { key: 'digits', label: '位数', type: 'number', default: 6, width: 80 },
+        { key: 'period', label: '周期(秒)', type: 'number', default: 30, width: 90 },
+      ],
+      run: (input, options) =>
+        otpInfo(input, {
+          mode: opt(options, 'mode', 'totp') as 'totp' | 'hotp',
+          algorithm: opt(options, 'algorithm', 'SHA-1') as 'SHA-1' | 'SHA-256' | 'SHA-512',
+          digits: Number(options.digits ?? 6),
+          period: Number(options.period ?? 30),
+        }),
+    },
+  },
+  {
+    id: 'jwt-verify',
+    name: 'JWT 验签',
+    category: 'crypto',
+    desc: '校验 HS / RS / PS / ES 系列签名，解析 exp / nbf 状态，公钥支持 PEM 与 JWK',
+    keywords: ['jwt', '验签', 'verify', 'rs256', 'hs256', 'token', '公钥', 'jwk'],
+    aliases: ['token验签', 'jwt校验'],
+    simple: {
+      inputLabel: 'JWT（可带 Bearer 前缀）',
+      outputLabel: '校验结果',
+      actionLabel: '验签',
+      sample: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMDAxIiwibmFtZSI6IuW8oOS4iSIsImlhdCI6MTcwMDAwMDAwMCwiZXhwIjoxOTAwMDAwMDAwfQ.invalid-signature',
+      options: [
+        {
+          key: 'key',
+          label: '密钥 / 公钥',
+          type: 'input',
+          default: 'your-256-bit-secret',
+          width: 280,
+          placeholder: 'HS 填共享密钥；RS/ES 填 PEM 或 JWK',
+        },
+      ],
+      run: (input, options) => verifyJwt(input, opt(options, 'key')),
+    },
+  },
+  {
+    id: 'base58',
+    name: 'Base58 编解码',
+    category: 'crypto',
+    desc: '比特币字母表（不含 0 O I l），区块链地址与短链 ID 常用',
+    keywords: ['base58', '编码', '解码', 'btc', '比特币', '地址'],
+    aliases: ['b58'],
+    simple: {
+      inputLabel: '原始内容 / Base58',
+      outputLabel: '转换结果',
+      actionLabel: '转换',
+      sample: 'AstroMan',
+      options: [
+        {
+          key: 'mode',
+          label: '方向',
+          type: 'select',
+          default: 'encode',
+          options: [
+            { label: '编码', value: 'encode' },
+            { label: '解码', value: 'decode' },
+          ],
+        },
+      ],
+      run: (input, options) =>
+        opt(options, 'mode', 'encode') === 'encode'
+          ? base58Encode(requireText(input))
+          : base58Decode(requireText(input)),
+    },
+  },
+  {
+    id: 'ascii85',
+    name: 'Ascii85 / Base85 编解码',
+    category: 'crypto',
+    desc: 'Adobe PDF、PostScript 常用编码，支持 <~ ~> 定界符与 z 缩写',
+    keywords: ['ascii85', 'base85', 'a85', 'pdf', '编码', '解码'],
+    aliases: ['b85'],
+    simple: {
+      inputLabel: '原始内容 / Ascii85',
+      outputLabel: '转换结果',
+      actionLabel: '转换',
+      sample: 'AstroMan',
+      options: [
+        {
+          key: 'mode',
+          label: '方向',
+          type: 'select',
+          default: 'encode',
+          options: [
+            { label: '编码', value: 'encode' },
+            { label: '解码', value: 'decode' },
+          ],
+        },
+        { key: 'delimiters', label: '包含 <~ ~>', type: 'switch', default: true },
+      ],
+      run: (input, options) => {
+        if (opt(options, 'mode', 'encode') === 'decode') return ascii85Decode(requireText(input))
+        return ascii85Encode(requireText(input), options.delimiters !== false)
+      },
+    },
+  },
+  {
+    id: 'quoted-printable',
+    name: 'Quoted-Printable 编解码',
+    category: 'crypto',
+    desc: '邮件原文（RFC 2045）常见编码，支持软换行与 =XX 转义还原',
+    keywords: ['quoted-printable', 'qp', 'mime', '邮件', '编码', '解码', 'eml'],
+    aliases: ['qp', '邮件编码'],
+    simple: {
+      inputLabel: '原文 / Quoted-Printable',
+      outputLabel: '转换结果',
+      actionLabel: '转换',
+      sample: '你好，AstroMan =E5=B7=A5=E5=85=B7=E7=AE=B1',
+      options: [
+        {
+          key: 'mode',
+          label: '方向',
+          type: 'select',
+          default: 'decode',
+          options: [
+            { label: '解码', value: 'decode' },
+            { label: '编码', value: 'encode' },
+          ],
+        },
+      ],
+      run: (input, options) =>
+        opt(options, 'mode', 'decode') === 'decode'
+          ? quotedPrintableDecode(requireText(input))
+          : quotedPrintableEncode(requireText(input)),
+    },
+  },
+  {
+    id: 'file-hash',
+    name: '文件哈希校验',
+    category: 'crypto',
+    desc: '拖入文件本地计算 MD5 / SHA-1 / SHA-256 / SHA-512 / CRC32，用于下载与发布产物核对',
+    keywords: ['文件', '哈希', 'md5', 'sha256', 'checksum', '校验', '下载'],
+    aliases: ['文件校验', 'checksum'],
+    component: () => import('@/components/tools/FileHashTool.vue'),
+  },
+  {
+    id: 'image-base64',
+    name: '图片 Base64',
+    category: 'crypto',
+    desc: '图片与 Data URL 双向转换，支持预览、复制 Data URL 或纯 Base64',
+    keywords: ['图片', 'image', 'base64', 'dataurl', '编码', '预览', '头像'],
+    aliases: ['img2base64', 'base64图片'],
+    component: () => import('@/components/tools/ImageBase64Tool.vue'),
+  },
+
+  /* ---------------- v1.0.8 新增：文本与格式化 ---------------- */
+  {
+    id: 'mask',
+    name: '文本脱敏',
+    category: 'text',
+    desc: '批量打码手机号、身份证、邮箱、银行卡、IP 与姓名，贴日志或工单前先过一遍',
+    keywords: ['脱敏', '打码', 'mask', '隐私', '手机号', '身份证', '日志'],
+    aliases: ['打码', '隐私处理'],
+    simple: {
+      inputLabel: '原始文本',
+      outputLabel: '脱敏结果',
+      actionLabel: '脱敏',
+      sample:
+        '用户 张三（姓名：张三），手机 13800138000，身份证 110101199003071234，' +
+        '邮箱 zhangsan@example.com，银行卡 6222021234567890123，来源 IP 203.12.34.56。',
+      options: [
+        {
+          key: 'rule',
+          label: '规则',
+          type: 'select',
+          default: 'auto',
+          width: 150,
+          options: [
+            { label: '自动识别全部', value: 'auto' },
+            { label: '仅手机号', value: 'phone' },
+            { label: '仅身份证', value: 'idcard' },
+            { label: '仅邮箱', value: 'email' },
+            { label: '仅银行卡', value: 'bankcard' },
+            { label: '仅 IP', value: 'ip' },
+            { label: '仅姓名', value: 'name' },
+          ],
+        },
+      ],
+      run: (input, options) => maskText(input, opt(options, 'rule', 'auto') as 'auto'),
+    },
+  },
+  {
+    id: 'markdown-preview',
+    name: 'Markdown 预览',
+    category: 'format',
+    desc: '实时渲染 Markdown（表格、代码块、任务列表），可查看并复制生成的 HTML',
+    keywords: ['markdown', 'md', '预览', '渲染', 'html', '文档'],
+    aliases: ['md预览', 'markdown转html'],
+    component: () => import('@/components/tools/MarkdownTool.vue'),
+  },
+
+  /* ---------------- v1.0.8 新增：开发辅助 ---------------- */
+  {
+    id: 'datagen',
+    name: '测试数据生成',
+    category: 'dev',
+    desc: '生成姓名、手机号、身份证、银行卡、统一社会信用代码、地址等造数，校验位真实有效，可导出 CSV / JSON / SQL',
+    keywords: ['造数', '测试数据', '假数据', 'mock', '身份证', '银行卡', '统一社会信用代码', 'csv'],
+    aliases: ['fake', 'mock数据', '造数据'],
+    simple: {
+      inputLabel: '',
+      outputLabel: '生成结果',
+      actionLabel: '生成数据',
+      options: [
+        { key: 'kind', label: '类型', type: 'select', default: 'mixed', width: 170, options: DATA_KINDS },
+        { key: 'count', label: '数量', type: 'number', default: 5, width: 80 },
+        {
+          key: 'format',
+          label: '格式',
+          type: 'select',
+          default: 'text',
+          width: 120,
+          options: [
+            { label: '文本', value: 'text' },
+            { label: 'CSV', value: 'csv' },
+            { label: 'JSON', value: 'json' },
+            { label: 'SQL', value: 'sql' },
+          ],
+        },
+      ],
+      run: (_input, options) =>
+        generateData(
+          opt(options, 'kind', 'mixed') as 'mixed',
+          Number(options.count ?? 5),
+          opt(options, 'format', 'text') as 'text',
+        ),
+    },
+  },
+  {
+    id: 'doc-check',
+    name: '证件 / 卡号校验',
+    category: 'dev',
+    desc: '校验身份证校验位与出生日期、统一社会信用代码、银行卡 Luhn 与手机号格式',
+    keywords: ['身份证', '校验', '统一社会信用代码', '银行卡', 'luhn', '手机号', 'uscc'],
+    aliases: ['身份证校验', '银行卡校验', '信用代码'],
+    simple: {
+      inputLabel: '待校验内容（多个用空格或换行分隔）',
+      outputLabel: '校验结果',
+      actionLabel: '校验',
+      sample: '110101199003071234\n91330106MA2CD1XY7N\n6222021234567890123\n13800138000',
+      run: (input) => checkDocument(input),
+    },
+  },
+  {
+    id: 'ulid',
+    name: 'ULID / NanoID 生成',
+    category: 'dev',
+    desc: '生成字典序即时间序的 ULID，以及 URL 安全的 NanoID，可批量输出',
+    keywords: ['ulid', 'nanoid', 'id', '随机', '唯一', '有序'],
+    aliases: ['短id', 'id生成'],
+    simple: {
+      inputLabel: '',
+      outputLabel: '生成结果',
+      actionLabel: '生成',
+      options: [
+        {
+          key: 'kind',
+          label: '类型',
+          type: 'select',
+          default: 'ulid',
+          width: 140,
+          options: [
+            { label: 'ULID', value: 'ulid' },
+            { label: 'NanoID', value: 'nanoid' },
+            { label: '两者都要', value: 'both' },
+          ],
+        },
+        { key: 'count', label: '数量', type: 'number', default: 5, width: 80 },
+        { key: 'length', label: 'NanoID 长度', type: 'number', default: 21, width: 110 },
+      ],
+      run: (_input, options) =>
+        generateIds(
+          opt(options, 'kind', 'ulid') as 'ulid',
+          Number(options.count ?? 5),
+          Number(options.length ?? 21),
+        ),
+    },
+  },
+
+  /* ---------------- v1.0.8 新增：网络解析 ---------------- */
+  {
+    id: 'ua-parse',
+    name: 'User-Agent 解析',
+    category: 'network',
+    desc: '识别浏览器、系统、设备、渲染引擎与 CPU 架构，含微信 / 钉钉 / 支付宝等国内客户端',
+    keywords: ['user-agent', 'ua', '浏览器', '设备', '解析', '爬虫'],
+    aliases: ['ua解析', 'useragent'],
+    simple: {
+      inputLabel: 'User-Agent',
+      outputLabel: '解析结果',
+      actionLabel: '解析',
+      sample:
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0',
+      run: (input) => parseUserAgent(input),
+    },
+  },
+  {
+    id: 'http-parse',
+    name: 'HTTP 原始报文解析',
+    category: 'network',
+    desc: '粘贴抓包或日志里的原始请求 / 响应，拆出起始行、全部请求头、查询参数与 Body',
+    keywords: ['http', '报文', '抓包', '请求头', '响应头', '解析', 'raw'],
+    aliases: ['报文解析', 'raw http'],
+    simple: {
+      inputLabel: '原始 HTTP 报文',
+      outputLabel: '解析结果',
+      actionLabel: '解析',
+      sample: `POST /api/v1/users?from=web HTTP/1.1
+Host: api.example.com
+Content-Type: application/json
+Authorization: Bearer token
+Content-Length: 27
+
+{"name": "张三", "age": 28}`,
+      run: (input) => httpMessageInfo(input),
+    },
+  },
 ]
 
 export const TOOL_MAP = new Map(TOOLS.map((tool) => [tool.id, tool]))
@@ -1732,6 +2187,7 @@ export function searchTools(keyword: string): ToolDef[] {
       tool.name,
       tool.desc,
       ...(tool.keywords ?? []),
+      ...(tool.aliases ?? []),
       TOOL_CATEGORIES.find((category) => category.id === tool.category)?.name ?? '',
     ]
       .join(' ')

@@ -1,13 +1,14 @@
 # 离线工具箱
 
-AstroMan 内置 75 个离线工具，参考 tool.aiapaas.com 的目录式布局，支持关键词全局搜索与懒加载。全部在本地计算，不上传任何内容。
+AstroMan 内置 92 个离线工具，参考 IT-Tools / DevToys 的目录式布局，支持关键词与别名全局搜索、收藏与最近使用，工具按需懒加载。全部在本机计算，不上传任何内容。
 
-- JSON 工具（18）：JSON 格式化 / 压缩 / 校验 / 转义（树形与文本双视图、行号与字符统计、报错行列定位）、JSON → Java / C# / Go / TypeScript 实体类、SQL CREATE TABLE → Java 实体类、JSON ↔ YAML / XML / CSV / GET 查询参数、JSON → SQL（逐条 / 批量 INSERT，标识符与字符串自动转义）、JSON → Markdown 表格、JSON ↔ JSON Lines（转换出错定位行号）
-- 格式化转换（1）：HTML / XML / CSS / JavaScript / Java / C# / Go / PHP / C / SQL 代码美化与压缩（可调缩进，JS 注释与正则字面量安全）
-- 加密编码（15）：MD5 / SHA-1 / SHA-256 / SHA-512 / HMAC 哈希、AES-256-CBC 加解密、JWT 解码（过期状态与声明解析）与 JWT 签发（HS256 / HS512，自动写入 iat / exp）、Base64 / Base64URL、Base32、十六进制编解码（大小写与 0x 前缀）、字符串转义还原、URL 编解码、Unicode 转义、HTML 实体、ASCII 码转换、RC4、Gzip 压缩、CRC32 / CRC16 / Luhn 校验
-- 文本处理（13）：命名风格转换（10 种）、文本统计、行去重、批量替换、文本反转、全角半角互转、人民币金额大写、摩尔斯电码、文本对比（行级 LCS 差异高亮）、内容提取（邮箱 / URL / IPv4 / 手机号 / 数字 / UUID / 中文）、行处理（清理 / 去重 / 排序 / 反转 / 行号 / 合并）、MAC 地址格式化与随机生成、文本一键处理（清空 / 撤销 / 重做 / 复制、随机密码、去空行空格、大小写、去重取重、排序、SQL IN（按换行或逗号拆分，所有值自动加单引号，输出 `IN(...);`）、or / 逗号 / 自定义符号连接、列转行、表格转 Markdown 或 HTML、自动与指定符号转置、多表连接、格式化 JSON、MyBatis 日志提取 SQL）
+- **常用入口**：工具卡片右上角星标收藏（最多 20 个），打开过的工具自动进入"最近使用"（最多 10 个），搜索支持别名（如 `jp`、`打码`、`b85`、`ua解析`）
+- JSON 工具（21）：JSON 格式化 / 压缩 / 校验 / 转义（树形与文本双视图、行号与字符统计、报错行列定位）、JSON → Java / C# / Go / TypeScript 实体类、SQL CREATE TABLE → Java 实体类、JSON ↔ YAML / XML / CSV / GET 查询参数、JSON → SQL（逐条 / 批量 INSERT，标识符与字符串自动转义）、JSON → Markdown 表格、JSON ↔ JSON Lines（转换出错定位行号）、**JSONPath 查询**（`$.a.b[0]`、`$..name`、`$.list[*]`，输出命中路径与合并结果）、**JSON 结构化对比**（两段 JSON 用 `---` 分隔，按路径列出增删改）、**JSON 生成 Schema**（draft-07，自动识别 date-time / email / uuid / uri）
+- 格式化转换（2）：HTML / XML / CSS / JavaScript / Java / C# / Go / PHP / C / SQL 代码美化与压缩（可调缩进，JS 注释与正则字面量安全）、**Markdown 预览**（实时渲染表格 / 代码块 / 任务列表，可查看并复制 HTML，关闭原始 HTML 防注入）
+- 加密编码（22）：MD5 / SHA-1 / SHA-256 / SHA-512 / HMAC 哈希、AES-256-CBC 加解密、JWT 解码（过期状态与声明解析）与 JWT 签发（HS256 / HS512，自动写入 iat / exp）、**JWT 验签**（HS / RS / PS / ES 全系列，公钥支持 PEM 与 JWK，校验 exp / nbf）、**TOTP / HOTP 动态口令**（Base32 密钥、SHA-1/256/512、上下周期与 otpauth 链接）、Base64 / Base64URL、Base32、**Base58**、**Ascii85 / Base85**、十六进制编解码（大小写与 0x 前缀）、**Quoted-Printable**（邮件原文 RFC 2045）、字符串转义还原、URL 编解码、Unicode 转义、HTML 实体、ASCII 码转换、RC4、Gzip 压缩、CRC32 / CRC16 / Luhn 校验、**文件哈希校验**（拖入文件流式计算 MD5 / SHA-1 / SHA-256 / SHA-512 / CRC32）、**图片 Base64**（图片 ↔ Data URL 双向，带预览）
+- 文本处理（14）：命名风格转换（10 种）、文本统计、行去重、批量替换、文本反转、全角半角互转、人民币金额大写、摩尔斯电码、文本对比（行级 LCS 差异高亮）、内容提取（邮箱 / URL / IPv4 / 手机号 / 数字 / UUID / 中文）、行处理（清理 / 去重 / 排序 / 反转 / 行号 / 合并）、MAC 地址格式化与随机生成、**文本脱敏**（手机号 / 身份证 / 邮箱 / 银行卡 / IP / 姓名，贴日志工单前先过一遍）、文本一键处理（清空 / 撤销 / 重做 / 复制、随机密码、去空行空格、大小写、去重取重、排序、SQL IN（按换行或逗号拆分，所有值自动加单引号，输出 `IN(...);`）、or / 逗号 / 自定义符号连接、列转行、表格转 Markdown 或 HTML、自动与指定符号转置、多表连接、格式化 JSON、MyBatis 日志提取 SQL）
 - 计算换算（10）：进制转换（2/8/10/16/32/36）、单位换算（长度/重量/面积/体积/速度/数据/时间/温度）、颜色转换（HEX/RGB/HSL/HSV/CMYK + WCAG 对比度）、时间戳互转、日期计算（相差天数 / 工作日 / 日期加减）、px 与 rem 换算、密码生成、UUID v4、随机字符串、键盘按键码
-- 开发辅助（4）：MyBatis 动态 SQL 填充（if / where / set / trim / foreach / choose / bind，支持 `#{}` 与 `${}` 渲染、占位符模式、参数清单）与 MyBatis 日志回填（解析 `Preparing` / `Parameters` / `Total`，按类型还原字面量 SQL，支持多语句切换与 Mapper 来源信息）、正则表达式测试（分组、命名分组、高亮预览）、Cron 表达式解析（字段含义 + 未来执行时间）、雪花 ID 解析（时间 / 数据中心 / 工作节点 / 序列号）
-- 网络工具（5）：IP 查询（支持本机公网 IP 与任意指定 IP 的归属地、运营商、经纬度）、IPv4 子网计算（掩码/广播/可用范围/主机数/分类）、IP 与整数互转、URL 解析（协议 / 主机 / 端口 / 路径 / 查询参数）、常用端口速查
+- 开发辅助（7）：MyBatis 动态 SQL 填充（if / where / set / trim / foreach / choose / bind，支持 `#{}` 与 `${}` 渲染、占位符模式、参数清单）与 MyBatis 日志回填（解析 `Preparing` / `Parameters` / `Total`，按类型还原字面量 SQL，支持多语句切换与 Mapper 来源信息）、正则表达式测试（分组、命名分组、高亮预览）、Cron 表达式解析（字段含义 + 未来执行时间）、雪花 ID 解析（时间 / 数据中心 / 工作节点 / 序列号）、**测试数据生成**（姓名 / 手机号 / 身份证 / 银行卡 / 统一社会信用代码 / 地址 / 公司，校验位真实有效，可导出文本 / CSV / JSON / SQL）、**证件与卡号校验**（身份证校验位与出生日期、USCC、银行卡 Luhn、手机号，自动识别类型）、**ULID / NanoID**（字典序即时间序，可批量）
+- 网络工具（7）：IP 查询（支持本机公网 IP 与任意指定 IP 的归属地、运营商、经纬度）、IPv4 子网计算（掩码/广播/可用范围/主机数/分类）、IP 与整数互转、URL 解析（协议 / 主机 / 端口 / 路径 / 查询参数）、**User-Agent 解析**（浏览器含微信 / 企微 / 钉钉 / 支付宝 / curl / Postman，系统、设备、引擎、架构）、**HTTP 原始报文解析**（区分请求 / 响应，拆起始行、查询参数、全部头与 Body，提示缺 Host / Content-Length）、常用端口速查
 - 二维码（2）：二维码生成（文本/网址、WiFi、名片、电话、短信、邮件、定位七类内容，可调尺寸、留白、容错级别、前景背景色、码点与定位点样式、Logo，导出 PNG/SVG）、二维码识别（上传或拖入图片，本机解析内容并识别 WiFi、名片、邮件、链接等类型）
 - 查询手册（7）：ASCII 码表、HTTP 状态码、MIME 类型、常用请求头、Git 命令速查、Docker 命令速查、正则语法速查

@@ -2,6 +2,30 @@ use chrono::{Local, SecondsFormat};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// 单测用的临时目录
+///
+/// 优先放在工程的 `target/test-tmp` 下：部分沙箱环境会禁止写系统临时目录，
+/// SQLite 会以 `attempt to write a readonly database` 报错，把测试带到坑里。
+#[cfg(test)]
+pub fn test_dir(tag: &str) -> std::path::PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let name = format!("{tag}-{}-{stamp}", std::process::id());
+    let local = std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join("target")
+        .join("test-tmp")
+        .join(&name);
+    if std::fs::create_dir_all(&local).is_ok() {
+        return local;
+    }
+    let fallback = std::env::temp_dir().join(name);
+    let _ = std::fs::create_dir_all(&fallback);
+    fallback
+}
+
 pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -55,7 +79,9 @@ pub fn strip_json_comments(input: &str) -> String {
                 }
                 '*' => {
                     index += 2;
-                    while index + 1 < chars.len() && !(chars[index] == '*' && chars[index + 1] == '/') {
+                    while index + 1 < chars.len()
+                        && !(chars[index] == '*' && chars[index + 1] == '/')
+                    {
                         index += 1;
                     }
                     index = (index + 2).min(chars.len());
@@ -75,6 +101,16 @@ pub fn strip_json_comments(input: &str) -> String {
 ///
 /// 内置变量支持 `{{timestamp}}` 与 Postman 风格的 `{{$timestamp}}` 两种写法。
 pub fn render(input: &str, vars: &HashMap<String, String>) -> String {
+    let mut secrets = Vec::new();
+    render_tracked(input, vars, &mut secrets)
+}
+
+/// 渲染并收集本次实际用到的敏感值（供日志 / 报告脱敏）
+pub fn render_tracked(
+    input: &str,
+    vars: &HashMap<String, String>,
+    used_secrets: &mut Vec<String>,
+) -> String {
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
 
@@ -85,14 +121,31 @@ pub fn render(input: &str, vars: &HashMap<String, String>) -> String {
         let end = start + 2 + end_rel;
         out.push_str(&rest[..start]);
         let expr = rest[start + 2..end].trim();
-        out.push_str(&resolve_expr(expr, vars));
+        out.push_str(&resolve_expr(expr, vars, used_secrets));
         rest = &rest[end + 2..];
     }
     out.push_str(rest);
     out
 }
 
-fn resolve_expr(expr: &str, vars: &HashMap<String, String>) -> String {
+fn resolve_expr(
+    expr: &str,
+    vars: &HashMap<String, String>,
+    used_secrets: &mut Vec<String>,
+) -> String {
+    // {{secret:NAME}}：与普通变量取值一致，但会进入脱敏清单
+    if let Some(secret_expr) = expr.strip_prefix("secret:") {
+        let secret_expr = secret_expr.trim();
+        let name = secret_expr.strip_prefix('$').unwrap_or(secret_expr);
+        if let Some(value) = vars.get(secret_expr).or_else(|| vars.get(name)) {
+            if !value.is_empty() {
+                used_secrets.push(value.clone());
+            }
+            return value.clone();
+        }
+        return format!("{{{{secret:{secret_expr}}}}}");
+    }
+
     let name = expr.strip_prefix('$').unwrap_or(expr);
 
     // 自定义变量优先，避免同名环境变量被内置变量覆盖
@@ -199,10 +252,105 @@ fn resolve_function(name: &str) -> Option<String> {
     None
 }
 
+/// 把 JSON 对象摊平成 `a.b.c` 形式的字符串变量，供 `{{a.b.c}}` 渲染
+///
+/// 顶层键同时保留原始 JSON 文本，`{{user}}` 仍可拿到完整对象。
+pub fn flatten_json(prefix: &str, value: &serde_json::Value, out: &mut HashMap<String, String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if !prefix.is_empty() {
+                out.insert(prefix.to_string(), value.to_string());
+            }
+            for (key, child) in map {
+                let path = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                flatten_json(&path, child, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            if !prefix.is_empty() {
+                out.insert(prefix.to_string(), value.to_string());
+            }
+            for (index, child) in items.iter().enumerate() {
+                let path = if prefix.is_empty() {
+                    index.to_string()
+                } else {
+                    format!("{prefix}.{index}")
+                };
+                flatten_json(&path, child, out);
+            }
+        }
+        serde_json::Value::String(text) => {
+            out.insert(prefix.to_string(), text.clone());
+        }
+        serde_json::Value::Null => {
+            out.insert(prefix.to_string(), String::new());
+        }
+        other => {
+            out.insert(prefix.to_string(), other.to_string());
+        }
+    }
+}
+
+/// 日志 / 报告脱敏：把敏感值替换成掩码，空值不处理避免全量替换
+pub fn mask_values(text: &str, secrets: &[String]) -> String {
+    let mut out = text.to_string();
+    for secret in secrets {
+        if secret.len() >= 3 {
+            out = out.replace(secret.as_str(), "******");
+        }
+    }
+    out
+}
+
 fn call_args<'a>(expr: &'a str, name: &str) -> Option<&'a str> {
     expr.strip_prefix(name)?
         .strip_prefix('(')?
         .strip_suffix(')')
+}
+
+/// 收集模板中的变量名（`{{name}}` / `{{$name}}`），用于运行前预检
+pub fn collect_placeholders(input: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rest = input;
+    while let Some(start) = rest.find("{{") {
+        let Some(end_rel) = rest[start + 2..].find("}}") else {
+            break;
+        };
+        let expr = rest[start + 2..start + 2 + end_rel].trim();
+        let name = expr.strip_prefix('$').unwrap_or(expr);
+        if !name.is_empty() {
+            names.push(name.to_string());
+        }
+        rest = &rest[start + 2 + end_rel + 2..];
+    }
+    names
+}
+
+/// 是否为内置变量或函数型占位符（这些不需要用户提供）
+pub fn is_builtin_placeholder(name: &str) -> bool {
+    if name.starts_with("secret:") || name.contains('(') {
+        return true;
+    }
+    resolve_time(name).is_some()
+        || matches!(
+            name,
+            "uuid"
+                | "guid"
+                | "uuidNoDash"
+                | "guidNoDash"
+                | "uuidSimple"
+                | "randomBool"
+                | "randomHex"
+                | "randomEmail"
+                | "randomPhone"
+                | "randomIPv4"
+                | "randomInt"
+                | "randomString"
+        )
 }
 
 fn int_args(inner: &str) -> Option<Vec<i64>> {
@@ -331,7 +479,7 @@ mod tests {
         let floats = render("{{randomFloat(1,2,3)}}", &map);
         let parsed: f64 = floats.parse().unwrap();
         assert!((1.0..=2.0).contains(&parsed));
-        assert_eq!(floats.split('.').last().unwrap().len(), 3);
+        assert_eq!(floats.split('.').next_back().unwrap().len(), 3);
     }
 
     #[test]
@@ -343,8 +491,60 @@ mod tests {
     }
 
     #[test]
+    fn render_supports_nested_paths_via_flatten() {
+        let mut map = HashMap::new();
+        let data = serde_json::json!({
+            "user": {"id": 7, "name": "astro", "tags": ["a", "b"]},
+            "empty": null
+        });
+        flatten_json("", &data, &mut map);
+        assert_eq!(render("{{user.id}}/{{user.name}}", &map), "7/astro");
+        assert_eq!(render("{{user.tags.1}}", &map), "b");
+        assert_eq!(render("{{empty}}", &map), "");
+        assert!(render("{{user}}", &map).contains("\"id\":7"));
+    }
+
+    #[test]
+    fn render_secret_prefix_collects_values() {
+        let map = vars(&[("token", "s3cr3t-value")]);
+        let mut used = Vec::new();
+        assert_eq!(
+            render_tracked("Bearer {{secret:token}}", &map, &mut used),
+            "Bearer s3cr3t-value"
+        );
+        assert_eq!(used, vec!["s3cr3t-value".to_string()]);
+        assert_eq!(mask_values("Bearer s3cr3t-value", &used), "Bearer ******");
+        // 未定义的 secret 保留占位，方便发现拼写错误
+        let mut none = Vec::new();
+        assert_eq!(
+            render_tracked("{{secret:nope}}", &map, &mut none),
+            "{{secret:nope}}"
+        );
+    }
+
+    #[test]
     fn random_int_handles_degenerate_range() {
         assert_eq!(random_int(3, 3), 3);
         assert_eq!(random_int(5, 2), 5);
+    }
+
+    #[test]
+    fn collect_placeholders_handles_builtin_and_secret_forms() {
+        let names =
+            collect_placeholders("{{ host }}/{{$uuid}}?t={{secret:TOKEN}}&x={{randomInt(1,3)}}");
+        assert_eq!(
+            names,
+            vec![
+                "host".to_string(),
+                "uuid".to_string(),
+                "secret:TOKEN".to_string(),
+                "randomInt(1,3)".to_string()
+            ]
+        );
+        assert!(is_builtin_placeholder("uuid"));
+        assert!(is_builtin_placeholder("timestamp"));
+        assert!(is_builtin_placeholder("secret:TOKEN"));
+        assert!(is_builtin_placeholder("randomInt(1,3)"));
+        assert!(!is_builtin_placeholder("host"));
     }
 }

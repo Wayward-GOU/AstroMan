@@ -96,9 +96,7 @@ pub fn dashboard_metrics(state: State<'_, AppState>) -> Result<DashboardMetrics,
 
     let days: Vec<DailyPoint> = (0..14)
         .map(|i| {
-            let key = (start + Duration::days(i))
-                .format("%Y-%m-%d")
-                .to_string();
+            let key = (start + Duration::days(i)).format("%Y-%m-%d").to_string();
             let (total, success, avg_rt) = by_day.get(&key).copied().unwrap_or((0, 0, 0.0));
             DailyPoint {
                 date: key,

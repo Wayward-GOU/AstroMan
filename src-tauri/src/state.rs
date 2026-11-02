@@ -35,11 +35,17 @@ pub struct AppSettings {
     /// 客户端证书（PKCS#12 格式，.pfx / .p12）
     pub cert_path: String,
     pub cert_password: String,
+    /// Python 解释器路径，空表示自动探测
+    pub python_path: String,
+    /// 是否允许执行本地 Python 脚本（首次使用需显式授权）
+    pub python_enabled: bool,
 }
 
 struct HttpClients {
     normal: reqwest::Client,
     insecure: reqwest::Client,
+    /// 建连探针：用来判断本次请求是「新建连接」还是「复用连接」
+    probe: std::sync::Arc<crate::net_probe::ConnectorProbe>,
 }
 
 pub struct AppState {
@@ -61,6 +67,12 @@ pub struct AppState {
     pub stress_cancel: Arc<AtomicBool>,
     /// AI 在途请求的取消标记：requestId → 取消位
     pub ai_cancels: Arc<parking_lot::Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    /// 套件运行的取消标记：runId → 取消位（按运行隔离，不用全局单例）
+    pub test_cancels: Arc<parking_lot::Mutex<HashMap<i64, Arc<AtomicBool>>>>,
+    /// 在途 HTTP 请求的取消标记：requestId → 取消位（4.6 取消能力）
+    pub http_cancels: Arc<parking_lot::Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    /// 重任务互斥锁：备份 / VACUUM / integrity_check 与压测互斥（4.0.2）
+    pub heavy_ops: Arc<parking_lot::Mutex<()>>,
 }
 
 impl AppState {
@@ -85,6 +97,17 @@ impl AppState {
         let config_file = config_dir.join("storage.json");
 
         let custom_dir = read_storage_config(&config_file);
+        // 上次排队中的恢复：必须在任何连接建立之前完成文件替换
+        let restore_target = custom_dir
+            .clone()
+            .unwrap_or_else(|| default_data_dir.clone());
+        if crate::backup::has_pending_restore(&config_file) {
+            match crate::backup::apply_pending_restore(&config_file, &restore_target) {
+                Ok(Some(path)) => log::info!("启动时完成备份恢复：{path}"),
+                Ok(None) => {}
+                Err(error) => log::error!("恢复备份失败：{error}"),
+            }
+        }
         let (data_dir, pool, is_custom) = match custom_dir {
             Some(dir) if dir != default_data_dir => match open_pool(&dir) {
                 Ok(pool) => (dir, pool, true),
@@ -95,11 +118,28 @@ impl AppState {
                         "自定义数据目录不可用（{error}），本次回退到默认目录：{}",
                         default_data_dir.display()
                     );
-                    (default_data_dir.clone(), open_pool(&default_data_dir)?, false)
+                    (
+                        default_data_dir.clone(),
+                        open_pool(&default_data_dir)?,
+                        false,
+                    )
                 }
             },
-            _ => (default_data_dir.clone(), open_pool(&default_data_dir)?, false),
+            _ => (
+                default_data_dir.clone(),
+                open_pool(&default_data_dir)?,
+                false,
+            ),
         };
+
+        // 清理上次崩溃残留的无主报告 / 工作目录（文档 7.6）
+        if let Ok(conn) = pool.get() {
+            crate::report_builder::cleanup_orphans(&conn, &data_dir);
+        }
+
+        // 主密钥：钥匙串 / 口令 / 文件，并顺手把历史明文加密（4.2）
+        let secrets = crate::secret::SecretStore::bootstrap(&data_dir, &pool)?;
+        crate::secret::install(secrets);
 
         let db_path = data_dir.join(DB_FILE);
         let settings_file = config_dir.join("settings.json");
@@ -119,6 +159,51 @@ impl AppState {
             stress_running: Arc::new(AtomicBool::new(false)),
             stress_cancel: Arc::new(AtomicBool::new(false)),
             ai_cancels: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            test_cancels: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            http_cancels: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            heavy_ops: Arc::new(parking_lot::Mutex::new(())),
+        })
+    }
+
+    /// 无窗口初始化：CLI 与测试用，数据目录 / 配置目录由调用方给出
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn headless(
+        data_dir: std::path::PathBuf,
+        config_dir: std::path::PathBuf,
+    ) -> Result<Self, String> {
+        let db_path = data_dir.join(DB_FILE);
+        Self::headless_at(data_dir, config_dir, db_path)
+    }
+
+    /// 无窗口初始化并指定数据库文件路径（CLI `--db`）
+    pub fn headless_at(
+        data_dir: std::path::PathBuf,
+        config_dir: std::path::PathBuf,
+        db_path: std::path::PathBuf,
+    ) -> Result<Self, String> {
+        std::fs::create_dir_all(&config_dir).map_err(|e| format!("创建配置目录失败：{e}"))?;
+        let pool = open_pool_path(&db_path)?;
+        let settings_file = config_dir.join("settings.json");
+        let settings = read_settings(&settings_file);
+        let clients = build_clients(&settings)?;
+        let secrets = crate::secret::SecretStore::bootstrap(&data_dir, &pool)?;
+        crate::secret::install(secrets);
+        Ok(Self {
+            pool,
+            db_path,
+            default_data_dir: data_dir.clone(),
+            data_dir,
+            config_file: config_dir.join("storage.json"),
+            is_custom: false,
+            settings_file,
+            settings: parking_lot::RwLock::new(settings),
+            clients: parking_lot::RwLock::new(clients),
+            stress_running: Arc::new(AtomicBool::new(false)),
+            stress_cancel: Arc::new(AtomicBool::new(false)),
+            ai_cancels: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            test_cancels: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            http_cancels: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            heavy_ops: Arc::new(parking_lot::Mutex::new(())),
         })
     }
 
@@ -132,16 +217,72 @@ impl AppState {
         }
     }
 
+    /// 建连探针（普通请求计时用）
+    pub fn connector_probe(&self) -> std::sync::Arc<crate::net_probe::ConnectorProbe> {
+        self.clients.read().probe.clone()
+    }
+
+    /// 按请求覆盖生成一次性客户端：协议偏好、连接超时、是否跟随重定向
+    ///
+    /// 只在用户显式改了协议或超时时调用——一次性客户端会丢掉连接池，
+    /// 换来的好处是「改动只影响这次请求」，符合 4.6「按请求网络覆盖」的语义。
+    pub fn client_for_request(
+        &self,
+        insecure: bool,
+        http1_only: bool,
+        connect_timeout_ms: Option<u64>,
+        follow_redirects: bool,
+    ) -> Result<
+        (
+            reqwest::Client,
+            std::sync::Arc<crate::net_probe::ConnectorProbe>,
+        ),
+        String,
+    > {
+        let probe = crate::net_probe::ConnectorProbe::new();
+        let client = build_client_full(
+            &self.settings.read(),
+            insecure,
+            connect_timeout_ms.unwrap_or(10_000),
+            follow_redirects,
+            None,
+            Some(probe.clone()),
+            http1_only,
+        )?;
+        Ok((client, probe))
+    }
+
     pub fn settings(&self) -> AppSettings {
         self.settings.read().clone()
+    }
+
+    /// 构建带自定义连接参数的客户端（压测等场景），代理与证书配置沿用应用设置
+    ///
+    /// `pool_max_idle` 为空时沿用默认的空闲连接上限；压测需按峰值并发放开，
+    /// 普通请求保持默认值，避免无谓的 fd 与内存占用。
+    pub fn client_with_options(
+        &self,
+        insecure: bool,
+        connect_timeout_ms: u64,
+        follow_redirects: bool,
+        pool_max_idle: Option<usize>,
+    ) -> Result<reqwest::Client, String> {
+        build_client_full(
+            &self.settings.read(),
+            insecure,
+            connect_timeout_ms,
+            follow_redirects,
+            pool_max_idle,
+            None,
+            false,
+        )
     }
 
     /// 应用新的网络设置：先重建客户端，成功后再落盘，避免配置与运行态不一致
     pub fn update_settings(&self, next: AppSettings) -> Result<AppSettings, String> {
         let clients = build_clients(&next)?;
         let text = serde_json::to_string_pretty(&next).map_err(crate::util::err)?;
-        std::fs::write(&self.settings_file, text)
-            .map_err(|e| format!("保存网络设置失败：{e}"))?;
+        std::fs::write(&self.settings_file, text).map_err(|e| format!("保存网络设置失败：{e}"))?;
         *self.clients.write() = clients;
         *self.settings.write() = next.clone();
         Ok(next)
@@ -167,6 +308,52 @@ impl AppState {
     /// 请求结束后释放登记，避免长期占用
     pub fn ai_release(&self, id: &str) {
         self.ai_cancels.lock().remove(id);
+    }
+
+    /// 登记一个在途 HTTP 请求，返回取消位（4.6）
+    pub fn http_register(&self, id: &str) -> Arc<AtomicBool> {
+        let flag = Arc::new(AtomicBool::new(false));
+        self.http_cancels
+            .lock()
+            .insert(id.to_string(), flag.clone());
+        flag
+    }
+
+    /// 请求停止某个在途 HTTP 请求，返回是否命中
+    pub fn http_cancel(&self, id: &str) -> bool {
+        match self.http_cancels.lock().get(id) {
+            Some(flag) => {
+                flag.store(true, Ordering::SeqCst);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn http_release(&self, id: &str) {
+        self.http_cancels.lock().remove(id);
+    }
+
+    /// 登记一次套件运行的取消标记
+    pub fn test_register(&self, run_id: i64) -> Arc<AtomicBool> {
+        let flag = Arc::new(AtomicBool::new(false));
+        self.test_cancels.lock().insert(run_id, flag.clone());
+        flag
+    }
+
+    /// 请求停止某次套件运行，返回是否命中
+    pub fn test_cancel_run(&self, run_id: i64) -> bool {
+        match self.test_cancels.lock().get(&run_id) {
+            Some(flag) => {
+                flag.store(true, Ordering::SeqCst);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn test_release(&self, run_id: i64) {
+        self.test_cancels.lock().remove(&run_id);
     }
 }
 
@@ -225,7 +412,9 @@ fn migrate_legacy_config(legacy_dir: &Path, target_dir: &Path) {
         if !from.is_file() || from.extension().and_then(|v| v.to_str()) != Some("json") {
             continue;
         }
-        let Some(name) = from.file_name() else { continue };
+        let Some(name) = from.file_name() else {
+            continue;
+        };
         let to = target_dir.join(name);
         if to.exists() {
             continue;
@@ -286,8 +475,53 @@ fn open_pool(data_dir: &Path) -> Result<DbPool, String> {
         .max_size(8)
         .build(manager)
         .map_err(crate::util::err)?;
+    // 结构升级前先留一份快照（失败即中止，避免升级到一半无法回退）
+    let db_dir = db_path
+        .parent()
+        .map(|dir| dir.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    crate::backup::snapshot_before_migrate(&pool, &db_dir)?;
     crate::db::init(&pool)?;
     Ok(pool)
+}
+
+/// 直接按数据库文件路径建池（CLI `--db` 可能与数据目录内的默认文件名不同）
+fn open_pool_path(db_path: &Path) -> Result<DbPool, String> {
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent).map_err(crate::util::err)?;
+    }
+    let manager = SqliteConnectionManager::file(db_path).with_init(|conn| {
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA foreign_keys = ON;
+             PRAGMA busy_timeout = 5000;",
+        )
+    });
+    let pool = Pool::builder()
+        .max_size(8)
+        .build(manager)
+        .map_err(crate::util::err)?;
+    let db_dir = db_path
+        .parent()
+        .map(|dir| dir.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    crate::backup::snapshot_before_migrate(&pool, &db_dir)?;
+    crate::db::init(&pool)?;
+    Ok(pool)
+}
+
+/// 解析本次启动会使用的数据目录（日志初始化需要它，早于 AppState 构建）
+pub fn resolve_data_dir(app: &tauri::AppHandle) -> PathBuf {
+    let base = app.path().data_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let default_dir = base.join("AstroMan");
+    let config_dir = app
+        .path()
+        .app_config_dir()
+        .unwrap_or_else(|_| default_dir.clone());
+    match read_storage_config(&config_dir.join("storage.json")) {
+        Some(dir) if dir != default_dir && dir.exists() => dir,
+        _ => default_dir,
+    }
 }
 
 /// 读取已保存的自定义数据目录
@@ -308,26 +542,80 @@ fn read_settings(path: &Path) -> AppSettings {
 }
 
 fn build_clients(settings: &AppSettings) -> Result<HttpClients, String> {
+    let probe = crate::net_probe::ConnectorProbe::new();
     Ok(HttpClients {
-        normal: build_client_with(settings, false)?,
-        insecure: build_client_with(settings, true)?,
+        normal: build_client_full(
+            settings,
+            false,
+            10_000,
+            true,
+            None,
+            Some(probe.clone()),
+            false,
+        )?,
+        insecure: build_client_full(
+            settings,
+            true,
+            10_000,
+            true,
+            None,
+            Some(probe.clone()),
+            false,
+        )?,
+        probe,
     })
 }
 
-fn build_client_with(settings: &AppSettings, insecure: bool) -> Result<reqwest::Client, String> {
+/// 按自定义连接参数构建客户端
+///
+/// 压测等场景需要单独覆盖连接超时与重定向策略，但仍沿用应用的代理与客户端
+/// 证书配置，保证与手工请求走同一条网络链路。
+#[allow(clippy::too_many_arguments)]
+fn build_client_full(
+    settings: &AppSettings,
+    insecure: bool,
+    connect_timeout_ms: u64,
+    follow_redirects: bool,
+    pool_max_idle: Option<usize>,
+    probe: Option<std::sync::Arc<crate::net_probe::ConnectorProbe>>,
+    http1_only: bool,
+) -> Result<reqwest::Client, String> {
+    /// 默认空闲连接上限，与历史行为保持一致
+    const DEFAULT_POOL_MAX_IDLE: usize = 32;
     let mut builder = reqwest::Client::builder()
         .user_agent(concat!("AstroMan/", env!("CARGO_PKG_VERSION")))
-        .connect_timeout(Duration::from_secs(10))
-        .pool_max_idle_per_host(32)
-        .danger_accept_invalid_certs(insecure);
+        .connect_timeout(Duration::from_millis(
+            connect_timeout_ms.clamp(500, 120_000),
+        ))
+        .pool_max_idle_per_host(
+            pool_max_idle
+                .unwrap_or(DEFAULT_POOL_MAX_IDLE)
+                .clamp(1, 4096),
+        )
+        .danger_accept_invalid_certs(insecure)
+        .redirect(if follow_redirects {
+            reqwest::redirect::Policy::limited(10)
+        } else {
+            reqwest::redirect::Policy::none()
+        });
+
+    if http1_only {
+        builder = builder.http1_only();
+    }
+    if let Some(probe) = probe {
+        builder = builder.connector_layer(crate::net_probe::ProbeLayer::new(probe));
+    }
 
     if settings.proxy_enabled {
         let proxy_url = settings.proxy_url.trim();
         if proxy_url.is_empty() {
             return Err("已开启代理，但代理地址为空".to_string());
         }
-        let proxy = reqwest::Proxy::all(proxy_url)
-            .map_err(|e| format!("代理地址无法解析（示例：http://127.0.0.1:7890 或 socks5h://127.0.0.1:1080）：{e}"))?;
+        let proxy = reqwest::Proxy::all(proxy_url).map_err(|e| {
+            format!(
+                "代理地址无法解析（示例：http://127.0.0.1:7890 或 socks5h://127.0.0.1:1080）：{e}"
+            )
+        })?;
         builder = builder.proxy(proxy);
     }
 
@@ -369,8 +657,14 @@ mod tests {
         migrate_legacy_dir(&legacy, &target, "fbinhttp.db");
 
         assert_eq!(std::fs::read(target.join("astroman.db")).unwrap(), b"main");
-        assert_eq!(std::fs::read(target.join("astroman.db-wal")).unwrap(), b"wal");
-        assert_eq!(std::fs::read(target.join("astroman.db-shm")).unwrap(), b"shm");
+        assert_eq!(
+            std::fs::read(target.join("astroman.db-wal")).unwrap(),
+            b"wal"
+        );
+        assert_eq!(
+            std::fs::read(target.join("astroman.db-shm")).unwrap(),
+            b"shm"
+        );
         // 目标已存在时不覆盖
         std::fs::write(legacy.join("fbinhttp.db"), b"new").unwrap();
         migrate_legacy_dir(&legacy, &target, "fbinhttp.db");
@@ -387,7 +681,10 @@ mod tests {
         std::fs::write(legacy.join("storage.json"), "old").unwrap();
         std::fs::write(legacy.join("settings.json"), "old-settings").unwrap();
         migrate_legacy_config(&legacy, &target);
-        assert_eq!(std::fs::read_to_string(target.join("storage.json")).unwrap(), "old");
+        assert_eq!(
+            std::fs::read_to_string(target.join("storage.json")).unwrap(),
+            "old"
+        );
         assert_eq!(
             std::fs::read_to_string(target.join("settings.json")).unwrap(),
             "old-settings"

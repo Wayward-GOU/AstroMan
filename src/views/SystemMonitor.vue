@@ -25,6 +25,12 @@ const loading = ref(true)
 const paused = ref(false)
 const intervalSec = ref(3)
 const processSort = ref<'cpu' | 'memory'>('cpu')
+const processSearch = ref('')
+const highOnly = ref(false)
+
+// 高占用判定：CPU ≥ 50% 或内存 ≥ 物理内存的 10%
+const HIGH_CPU = 50
+const HIGH_MEM_PERCENT = 10
 
 const cpuHistory = ref<number[]>([])
 const memHistory = ref<number[]>([])
@@ -38,13 +44,13 @@ let timer: number | null = null
 let errorNotified = false
 
 const COLORS = {
-  cpu: '#3d6b8f',
+  cpu: '#4d6bfe',
   mem: '#7a8fa6',
-  gpu: '#b07d33',
-  down: '#3d6b8f',
+  gpu: '#d97706',
+  down: '#4d6bfe',
   up: '#4f8a76',
-  read: '#b07d33',
-  write: '#b0524d',
+  read: '#d97706',
+  write: '#dc2626',
 }
 
 function pushHistory(list: number[], value: number) {
@@ -80,9 +86,48 @@ function diskTotal(snap: MonitorSnapshot) {
 
 async function loadProcesses() {
   try {
-    processes.value = await api.winstatsProcesses(12, processSort.value === 'memory')
+    processes.value = await api.winstatsProcesses(0, processSort.value === 'memory')
   } catch {
     /* 进程扫描失败不影响主面板 */
+  }
+}
+
+function isHighUsage(item: MonitorProcess) {
+  return item.cpu >= HIGH_CPU || item.memoryPercent >= HIGH_MEM_PERCENT
+}
+
+const highUsageCount = computed(() => processes.value.filter(isHighUsage).length)
+
+const filteredProcesses = computed(() => {
+  const keyword = processSearch.value.trim().toLowerCase()
+  return processes.value.filter((item) => {
+    if (highOnly.value && !isHighUsage(item)) return false
+    if (!keyword) return true
+    return (
+      item.name.toLowerCase().includes(keyword) ||
+      String(item.pid).includes(keyword) ||
+      item.exe.toLowerCase().includes(keyword)
+    )
+  })
+})
+
+const processSummary = computed(() => {
+  const order = processSort.value === 'cpu' ? '按 CPU 占用排序' : '按内存占用排序'
+  const filtered =
+    filteredProcesses.value.length === processes.value.length
+      ? ''
+      : ` · 当前筛选 ${filteredProcesses.value.length} 个`
+  return `共 ${processes.value.length} 个进程 · ${highUsageCount.value} 个高占用${filtered} · ${order}`
+})
+
+async function killProcess(item: MonitorProcess) {
+  try {
+    await api.winstatsProcessKill(item.pid, item.name)
+    message.success(`已结束 ${item.name || '进程'}（PID ${item.pid}）`)
+  } catch (e) {
+    message.error(String(e))
+  } finally {
+    await loadProcesses()
   }
 }
 
@@ -317,10 +362,6 @@ const overview = computed(() => {
   return cards
 })
 
-const processesLabel = computed(() =>
-  processSort.value === 'cpu' ? '按 CPU 占用排序' : '按内存占用排序',
-)
-
 function barTone(percent: number) {
   if (percent >= 85) return 'bad'
   if (percent >= 60) return 'warn'
@@ -359,7 +400,7 @@ function fmtUptime(seconds: number) {
     <PageHeader
       eyebrow="System Monitor"
       title="系统监视"
-      subtitle="参考 winstats 的本机资源面板：CPU 每核心占用、内存、GPU、磁盘、网络与本机 IP"
+      subtitle="参考 winstats 的本机资源面板：CPU 每核心占用、内存、GPU、磁盘、网络与本机 IP；进程监视可按 CPU / 内存排查并结束高占用进程"
     >
       <a-select v-model:value="intervalSec" size="small" style="width: 96px" @change="changeInterval">
         <a-select-option :value="3">3 秒</a-select-option>
@@ -647,45 +688,94 @@ function fmtUptime(seconds: number) {
         </div>
 
         <div class="fm-card panel process-panel">
-          <div class="panel-head">
-            <div>
-              <div class="panel-title">进程占用 Top 12</div>
-              <div class="panel-sub">{{ processesLabel }}</div>
+          <div class="panel-head process-head">
+            <div class="process-title">
+              <div class="panel-title">进程监视</div>
+              <div class="panel-sub">{{ processSummary }}</div>
             </div>
-            <a-segmented
-              :value="processSort"
-              :options="[
-                { label: 'CPU', value: 'cpu' },
-                { label: '内存', value: 'memory' },
-              ]"
-              size="small"
-              @change="changeSort"
-            />
+            <div class="process-tools">
+              <a-input
+                v-model:value="processSearch"
+                size="small"
+                allow-clear
+                placeholder="搜索进程 / PID / 路径"
+                class="proc-search"
+              />
+              <a-checkbox v-model:checked="highOnly" class="high-check">只看高占用</a-checkbox>
+              <a-segmented
+                :value="processSort"
+                :options="[
+                  { label: 'CPU', value: 'cpu' },
+                  { label: '内存', value: 'memory' },
+                ]"
+                size="small"
+                @change="changeSort"
+              />
+            </div>
           </div>
-          <div class="data-table">
+          <div class="data-table process-table">
             <table>
               <thead>
                 <tr>
                   <th class="col-name">进程</th>
                   <th class="col-pid">PID</th>
-                  <th>CPU</th>
-                  <th>内存</th>
+                  <th class="col-cpu">CPU</th>
+                  <th class="col-mem">内存</th>
+                  <th class="col-act">操作</th>
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="item in processes" :key="item.pid">
-                  <td class="col-name cell-name" :title="item.name">{{ item.name }}</td>
+                <tr
+                  v-for="item in filteredProcesses"
+                  :key="item.pid"
+                  :class="{ 'row-hot': isHighUsage(item) }"
+                >
+                  <td class="col-name cell-name" :title="item.exe || item.name">
+                    <div class="proc-line">
+                      <span class="proc-name">{{ item.name || '未知进程' }}</span>
+                      <span v-if="isHighUsage(item)" class="hot-tag">高占用</span>
+                    </div>
+                    <span v-if="item.exe" class="proc-exe">{{ item.exe }}</span>
+                  </td>
                   <td class="col-pid mono">{{ item.pid }}</td>
-                  <td class="mono">{{ item.cpu.toFixed(1) }}%</td>
-                  <td class="mono">{{ fmtBytes(item.memory) }}</td>
+                  <td class="col-cpu">
+                    <div class="cpu-cell">
+                      <span class="mono cpu-num">{{ item.cpu.toFixed(1) }}%</span>
+                      <span class="mini-track">
+                        <span
+                          class="mini-bar"
+                          :class="barTone(item.cpu)"
+                          :style="{ width: `${Math.min(100, Math.max(0, item.cpu))}%` }"
+                        />
+                      </span>
+                    </div>
+                  </td>
+                  <td class="col-mem mono">
+                    {{ fmtBytes(item.memory) }}
+                    <i class="mem-pct">{{ item.memoryPercent.toFixed(1) }}%</i>
+                  </td>
+                  <td class="col-act">
+                    <a-popconfirm
+                      :title="`结束 ${item.name || '该进程'}（PID ${item.pid}）？未保存的数据可能丢失`"
+                      ok-text="结束进程"
+                      cancel-text="取消"
+                      ok-type="danger"
+                      placement="topRight"
+                      @confirm="killProcess(item)"
+                    >
+                      <a-button type="text" size="small" danger class="kill-btn">结束</a-button>
+                    </a-popconfirm>
+                  </td>
                 </tr>
               </tbody>
             </table>
-            <div v-if="!processes.length" class="empty-text">暂无进程数据</div>
+            <div v-if="!filteredProcesses.length" class="empty-text">
+              {{ processes.length ? '没有匹配的进程' : '暂无进程数据' }}
+            </div>
           </div>
         </div>
 
-        <div class="fm-card panel">
+        <div class="fm-card panel info-panel">
           <div class="panel-head">
             <div>
               <div class="panel-title">系统信息</div>
@@ -1282,22 +1372,203 @@ function fmtUptime(seconds: number) {
 }
 
 .col-name {
-  text-align: left;
   width: 46%;
+  text-align: left;
+}
+
+.data-table td.col-name {
+  text-align: left;
 }
 
 .cell-name {
-  max-width: 0;
   overflow: hidden;
-  text-overflow: ellipsis;
   color: var(--fm-text);
 }
 
 .col-pid {
-  width: 76px;
+  width: 84px;
+}
+
+/* ---------- 进程监视 ---------- */
+.process-head {
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.process-title {
+  min-width: 220px;
+}
+
+.process-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+}
+
+.proc-search {
+  width: 200px;
+}
+
+.high-check {
+  font-size: 11px;
+  color: var(--fm-text-2);
+  white-space: nowrap;
+}
+
+.process-table {
+  max-height: 480px;
+  overflow: auto;
+}
+
+.process-table table {
+  min-width: 760px;
+  table-layout: fixed;
+}
+
+.process-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  padding-top: 8px;
+  padding-bottom: 8px;
+}
+
+.process-table td {
+  vertical-align: middle;
+  padding-top: 7px;
+  padding-bottom: 7px;
+}
+
+.process-table th.col-pid,
+.process-table td.col-pid {
+  text-align: right;
+}
+
+.process-table th.col-name,
+.process-table td.col-name {
+  padding-left: 14px;
+}
+
+.process-table th.col-act,
+.process-table td.col-act {
+  padding-right: 14px;
+}
+
+.col-cpu {
+  width: 168px;
+}
+
+.col-mem {
+  width: 158px;
+}
+
+.data-table .col-act {
+  width: 88px;
+  text-align: center;
+}
+
+.col-act .ant-btn {
+  height: 24px;
+  padding: 0 6px;
+  font-size: 11px;
+}
+
+.proc-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.cell-name .proc-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+  color: var(--fm-text);
+}
+
+.cell-name .proc-exe {
+  display: block;
+  max-width: 100%;
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 9.5px;
+  color: var(--fm-muted);
+}
+
+.hot-tag {
+  flex-shrink: 0;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: var(--fm-danger-soft);
+  color: var(--fm-danger);
+  font-size: 9px;
+  font-weight: 500;
+}
+
+.cpu-cell {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.cpu-num {
+  min-width: 46px;
+  text-align: right;
+  color: var(--fm-text-2);
+}
+
+.mini-track {
+  flex: 0 0 56px;
+  height: 5px;
+  border-radius: 999px;
+  background: var(--fm-surface-alt);
+  overflow: hidden;
+}
+
+.mini-bar {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--fm-success);
+  transition: width 0.35s ease;
+}
+
+.mini-bar.warn {
+  background: var(--fm-warning);
+}
+
+.mini-bar.bad {
+  background: var(--fm-danger);
+}
+
+.mem-pct {
+  margin-left: 4px;
+  font-style: normal;
+  font-size: 9px;
+  color: var(--fm-muted);
+}
+
+.process-table tbody tr.row-hot td:first-child {
+  box-shadow: inset 3px 0 0 var(--fm-danger);
+}
+
+.process-table tbody tr.row-hot .proc-name {
+  color: var(--fm-danger);
 }
 
 /* ---------- 系统信息 ---------- */
+.info-panel {
+  margin-top: 16px;
+}
+
 .info-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -1346,13 +1617,18 @@ function fmtUptime(seconds: number) {
   text-align: center;
 }
 
-@media (max-width: 1280px) {
+@media (min-width: 1081px) and (max-width: 1440px) {
   .charts {
-    grid-template-columns: 1fr;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .charts .chart-card:last-child {
+    grid-column: 1 / -1;
   }
 }
 
 @media (max-width: 1080px) {
+  .charts,
   .panel-grid {
     grid-template-columns: 1fr;
   }

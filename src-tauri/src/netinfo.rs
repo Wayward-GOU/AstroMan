@@ -95,8 +95,7 @@ unsafe fn windows_adapters() -> Vec<AdapterIp> {
         while !unicast.is_null() {
             let entry = &*unicast;
             let sockaddr = entry.Address.lpSockaddr as *const SOCKADDR;
-            if let Some((text, is_v4)) =
-                sockaddr_to_string(sockaddr, entry.Address.iSockaddrLength)
+            if let Some((text, is_v4)) = sockaddr_to_string(sockaddr, entry.Address.iSockaddrLength)
             {
                 let bucket = if is_v4 { &mut ipv4 } else { &mut ipv6 };
                 if !bucket.contains(&text) {
@@ -136,13 +135,16 @@ unsafe fn windows_adapters() -> Vec<AdapterIp> {
 }
 
 #[cfg(windows)]
-unsafe fn sockaddr_to_string(addr: *const windows_sys::Win32::Networking::WinSock::SOCKADDR, len: i32) -> Option<(String, bool)> {
+unsafe fn sockaddr_to_string(
+    addr: *const windows_sys::Win32::Networking::WinSock::SOCKADDR,
+    len: i32,
+) -> Option<(String, bool)> {
     use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
 
     if addr.is_null() || len < 8 {
         return None;
     }
-    let family = (*addr).sa_family as u16;
+    let family = (*addr).sa_family;
     let bytes = std::slice::from_raw_parts(addr as *const u8, len as usize);
 
     if family == AF_INET && bytes.len() >= 8 {

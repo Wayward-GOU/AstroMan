@@ -1,11 +1,11 @@
 # AstroMan 自动化测试方案（v1.0.8）
 
 > 文档性质：基于现有「批量运行（测试场景）」与「压测」能力的自动化测试技术方案
-> 基线版本：v1.0.7（AI-Agent 内核补齐）
+> 代码基线：AstroMan v1.0.7（原项目名 FbinHttp，自 v1.0.7 起更名为 AstroMan，仓库路径 `D:\Software\ProjectFiles\AstroMan`）
 > 目标版本：v1.0.8
 > 本期主题：**可保存的测试场景 + Python 脚本执行 + 可门禁的报告 + CLI/CI + AI 协同 + 工具箱记事本**
 > 关键决策：Python 采用「子进程 + JSON 文件协议」；报告产出 HTML / JSON / JUnit XML；提供 CLI 与退出码；AI 参与场景生成与失败归因
-> 编写日期：2026-10-29
+> 编写日期：2026-10-29（2026-10-30 按 v1.0.7 实际代码校对并评审修订，见修订记录「代码校对一」「评审修订」）
 > 维护要求：任务状态变化时更新第 12 节；发布前核对第 15 节
 
 ---
@@ -16,28 +16,29 @@
 
 | 能力 | 现状 | 位置 |
 |---|---|---|
-| 批量运行（事实上的测试场景） | 多选接口、按轮次或 CSV/JSON 数据行串行执行，支持环境脚本、接口前置 / 后置 JS 脚本、`test()/assert()` 断言 | [Runner.vue](file:///d:/Software/ProjectFiles/FbinHttp/src/views/Runner.vue#L301-L435) |
-| JS 脚本运行时 | `request / response / vars / env / console / rsa / cipher / test / assert` | [scriptRunner.ts](file:///d:/Software/ProjectFiles/FbinHttp/src/utils/scriptRunner.ts#L244-L365) |
-| 压测 | 固定并发 / 阶梯阶段、预热、思考时间、限速 targetRps、超时、SLA 目标字段 | [stress.rs](file:///d:/Software/ProjectFiles/FbinHttp/src-tauri/src/commands/stress.rs#L704-L769) |
-| 压测报告 | 请求数、成功/错误、P50~P99.9、均值、标准差、TTFB、APDEX、QPS、错误率、每秒采样、错误明细、逐请求明细 | [schema.sql](file:///d:/Software/ProjectFiles/FbinHttp/src-tauri/src/db/schema.sql#L83-L173) |
-| 报告导出 | 打包为 `astroman.report` JSON | [report.rs](file:///d:/Software/ProjectFiles/FbinHttp/src-tauri/src/commands/report.rs#L145-L200) |
-| 请求执行底座 | `send_http_request`：环境变量渲染、鉴权、Cookie 回写、超时、响应截断 | [http.rs](file:///d:/Software/ProjectFiles/FbinHttp/src-tauri/src/commands/http.rs#L16-L230) |
+| 批量运行（事实上的测试场景） | 多选接口、按轮次或 CSV/JSON 数据行串行执行，支持环境脚本、接口前置 / 后置 JS 脚本、`test()/assert()` 断言 | [Runner.vue](file:///d:/Software/ProjectFiles/AstroMan/src/views/Runner.vue#L301-L455) |
+| JS 脚本运行时 | `request / response / vars / env / console / rsa / cipher / test / assert` | [scriptRunner.ts](file:///d:/Software/ProjectFiles/AstroMan/src/utils/scriptRunner.ts#L245-L365) |
+| 压测 | 固定并发 / 阶梯阶段、预热、思考时间、限速 targetRps、超时、SLA 目标字段 | [stress.rs](file:///d:/Software/ProjectFiles/AstroMan/src-tauri/src/commands/stress.rs#L705-L1130) |
+| 压测报告 | 请求数、成功/错误、P50~P99.9、均值、标准差、TTFB、APDEX、QPS、错误率、每秒采样、错误明细、逐请求明细 | [schema.sql](file:///d:/Software/ProjectFiles/AstroMan/src-tauri/src/db/schema.sql#L84-L174) |
+| 报告导出 | 打包为 `astroman.report` JSON；HTML / Excel 由前端生成后经 `report_write_file` 落盘 | [report.rs](file:///d:/Software/ProjectFiles/AstroMan/src-tauri/src/commands/report.rs#L174-L201)、[reportExport.ts](file:///d:/Software/ProjectFiles/AstroMan/src/utils/reportExport.ts#L624) |
+| 请求执行底座 | `send_http_request` / `execute`：环境变量渲染、鉴权、Cookie 回写、超时、5MB 响应截断，并写入 `request_history` 与 `request_runs` | [http.rs](file:///d:/Software/ProjectFiles/AstroMan/src-tauri/src/commands/http.rs#L25-L272) |
 
 ### 0.2 现在缺什么
 
 | 编号 | 缺口 | 影响 |
 |---|---|---|
 | D-01 | 测试场景不可保存、不可复用 | 每次回归都要重新勾接口、填参数，无法沉淀资产 |
-| D-02 | 执行结果只在内存，关闭页面即丢失 | 无法回溯、无法做趋势、无法审计 |
+| D-02 | 用例级执行结果只在内存（仅每次请求写了 `request_history` / `request_runs` 快照） | 断言、通过/失败、用例维度无法回溯，无法做趋势与审计 |
 | D-03 | 不能执行 Python | 复杂签名、造数、数据库校验、文件处理都做不了 |
 | D-04 | 无功能测试报告 | 只有界面上的临时列表，不能交付、不能归档 |
 | D-05 | 无命令行 / 无 CI 入口 / 无退出码 | 无法接入 Jenkins、GitHub Actions，无法做质量门禁 |
 | D-06 | 批量执行纯串行、无重试、无跳过、无失败策略 | 大套件慢；偶发失败要整轮重跑 |
-| D-07 | JS 脚本无隔离、无超时，跑在主线程 | `while(true)` 会卡死界面；也无法在无 UI 的 CLI 中运行 |
-| D-08 | 压测 SLA 只存配置，不产出通过/失败结论 | 压测完仍要人工判断是否达标 |
+| D-07 | JS 脚本（接口前置/后置 + 环境脚本）无隔离、无超时，跑在主线程 | `while(true)` 会卡死界面；也无法在无 UI 的 CLI 中运行 |
+| D-08 | 压测 SLA 只在前端报告页做展示性判定，不落库、不参与门禁 | UI 能看「是否达标」，但 CI 无法据此拦截；判定口径在 TS 中，CLI 不可复用 |
 | D-09 | 压测仅支持单接口，无混合场景 | 真实业务链路压测缺失 |
 | D-10 | 测试与压测割裂 | 压测前冒烟、压测后数据校验都要手工串联 |
 | D-11 | 没有事项登记与提醒 | 待补的测试、临时结论只能记在外部工具，调试中容易丢事 |
+| D-12 | 执行记录无来源标记，且套件运行会挤占单接口历史 | `request_history`（全局 10 万条）与 `request_runs`（每接口 200 条）对任何调用都无条件写入；大套件一次回归就会冲掉手工调试快照、刷满历史页 |
 
 ### 0.3 v1.0.8 做五件主线 + 一件附加
 
@@ -61,11 +62,11 @@
 | 选择方式 | 在项目 / 集合树中勾选接口，可调整顺序 | 选择结果不持久化 |
 | 执行轮次 | 固定轮次 `iterations`，或数据文件行数 | 无套件概念，无分步编排 |
 | 数据驱动 | CSV（自实现解析，支持引号转义）或 JSON 对象数组，占位符 `{{字段}}` | 仅按行替换字符串，无类型、无嵌套 |
-| 脚本 | 全局环境脚本 + 每个接口自带前置 / 后置 JS | 仅 JS，无超时，跑在 UI 线程 |
-| 断言 | `test('名称', () => { ... })`、`assert(条件, 消息)` | 结果不落库；无统一断言类型 |
+| 脚本 | 全局环境脚本 + 每个接口自带前置 / 后置 JS | 仅 JS，无超时，跑在 UI 线程；环境脚本同样只在浏览器侧执行 |
+| 断言 | `test('名称', () => { ... })`、`assert(条件, 消息)` | 结果不落库；无统一断言类型；`requests.assertions` 字段虽已存在但从未被执行 |
 | 执行 | 前端串行 `await`，轮次间可设延迟 | 无并发、无重试、无跳过、无 fail-fast |
 | 上限 | 计划任务数 > 5000 直接拒绝 | 单次超时固定 30 秒 |
-| 结果 | 内存数组：状态、耗时、大小、断言通过/失败、错误 | 关闭即丢，无报告、无历史 |
+| 结果 | 内存数组：状态、耗时、大小、断言通过/失败、错误；每次请求仍会写 `request_history` 与 `request_runs` | 断言结果关闭即丢；历史/快照无来源标记，套件运行会挤占手工调试记录 |
 | 中断 | `stopFlag` 在当前请求结束后生效 | 无法中断正在进行的请求 |
 
 ### 1.2 现有「压测场景」
@@ -75,31 +76,39 @@
 | 计划模型 | `test_plans`：并发、时长、预热、思考时间、超时、参数配置、config_json | 只绑定单个 `request_id` |
 | 模式 | 固定并发；阶梯阶段 `stages[]` | 无混合接口、无按比例流量 |
 | 限速 | `targetRps` 全局令牌桶 | — |
-| SLA | `config.sla` 含 P95 / P99 / 错误率 / 最小 RPS | 只存储与展示，报告不判定 |
+| 鉴权 / Cookie | 无（`StressConfig` 没有 `auth` / `cookieEnabled`）；只能把 token 手写进 Header 或环境变量 | 登录态接口无法直接压；运行期变量传不进去 |
+| 客户端 | `stress_start` 自建 `reqwest::Client` | 不读设置页的代理与客户端证书，与手工请求行为不一致 |
+| SLA | `config.sla` 含 P95 / P99 / 错误率 / 最小 RPS；报告页前端逐项判定 | 判定不落库、不参与门禁、CLI 不可用 |
 | 执行 | Rust tokio 多 worker + 爬坡 + 阶段调度 | — |
 | 实时 | `stress:progress` / `stress:done` 事件推送 | 无统一测试事件总线 |
-| 报告 | 汇总指标 + 每秒采样 + 错误明细 + 逐请求明细 | 无 HTML，无 JUnit，无法作为门禁 |
+| 报告 | 汇总指标 + 每秒采样 + 错误明细 + 逐请求明细；HTML / Excel 由前端模板生成 | 无 JUnit，无法作为门禁；HTML 模板在 TS 中，CLI 无法复用 |
 | 导出 | `.astroman.report` JSON | 面向本工具，CI 不可读 |
 | 关系 | 与批量运行完全独立 | 无法「先功能冒烟、再压测、再校验」 |
+| 实例 | `stress_running` 为应用级单例 | 套件并发、CLI 与桌面端同时运行会互斥 |
 
 ### 1.3 可直接复用的资产
 
-1. `send_http_request`：环境渲染、鉴权、Cookie、超时、响应截断、运行记录；
+1. `send_http_request` / `execute`：环境渲染、鉴权、Cookie、超时、5MB 响应截断、运行记录；`execute` 已按「手动发送与 AI 执行共用」设计，可直接被套件引擎调用（见 6.7 的落库开关）；
 2. `request_runs`：单接口最近 200 条快照，可作调试依据；
-3. `test_reports` / `report_samples` / `report_errors` / `report_requests`：压测指标与明细；
+3. `test_reports` / `report_samples` / `report_errors` / `report_requests`：压测指标与明细，复用 `save_report` 落库；
 4. `scriptRunner` 的语义设计（`vars/env/console/test/assert`）：Python 侧保持同名概念，降低迁移成本；
-5. AI 工具框架：`ToolSpec + SCHEMAS + WRITE_TOOLS + 确认卡`（v1.0.7），AI 工具直接挂载；
-6. `maskSensitive()`：日志与报告脱敏复用。
+5. AI 工具框架：前端 `ToolSpec + SCHEMAS + WRITE_TOOLS + CORE_TOOL_NAMES + 确认卡`（v1.0.7），AI 工具直接挂载；AI 执行请求统一走 `ai_execute → http::execute`；
+6. 脱敏：前端 `maskSensitive()`（[aiTools.ts](file:///d:/Software/ProjectFiles/AstroMan/src/utils/aiTools.ts#L499)）与 Rust `mask_key()`（ai.rs）。注意 Rust 侧没有通用脱敏函数，报告/日志脱敏需新写或复用 `mask_key`；
+7. `env_variables.is_secret`：数据库中已有密钥标记（schema.sql），前端已按它隐藏明文；Rust `load_vars` 目前忽略该标记，套件报告需补读取；
+8. SQLite `WAL + foreign_keys + busy_timeout=5000` 已配置（state.rs `open_pool`），CLI 与桌面端可并发读写；
+9. 数据目录可自定义（设置页 `storage_set`），新表与报告目录必须跟随 `state.data_dir`，不能写死 `<appdata>`。
 
 ### 1.4 现有能力的定位调整
 
 | 现有能力 | v1.0.8 定位 |
 |---|---|
 | 批量运行页 `Runner.vue` | 保留为「快速手测 / JS 脚本调试」，不删除、不改行为 |
-| JS 前置 / 后置脚本 | 保留在交互式运行中；套件引擎 v1.0.8 只执行 Python 钩子 |
+| JS 前置 / 后置脚本、环境脚本 | 保留在交互式运行中；套件引擎 v1.0.8 只执行 Python 钩子，所有 JS 入口统一按 4.8 处理 |
 | 压测页 `StressTest.vue` | 保留手工压测；新增「压测用例」入口复用同一引擎 |
 | 压测报告 JSON 导出 | 保留；新增统一报告入口同时输出 HTML / JUnit |
-| `request_runs` | 保留；套件运行另建 `test_runs`，互不干扰 |
+| `request_runs` / `request_history` | 保留；新增「来源」标记（manual / batch / suite / cli），历史页默认只显示手工与批量，套件写入可关闭 |
+| AI 工具 `run_batch`（前端串行执行） | 保留手测语义；v1.0.8 后 AI 的「跑套件」一律走 `test_run_start`，不再扩展 `run_batch`，避免出现第三条执行路径 |
+| 压测报告页的 SLA 判定（前端 computed） | 迁移为 Rust 单点判定，前端改为读运行结果，避免 UI 与 CLI 两套口径 |
 
 ### 1.5 从现有场景迁移
 
@@ -115,7 +124,7 @@
 
 | 现有 JS | 迁移目标 |
 |---|---|
-| `test('名称', () => { ... })` | `assertions[]` 或 `fbin_runtime.assert_true(...)` |
+| `test('名称', () => { ... })` | `assertions[]` 或 `astroman_runtime.assert_true(...)` |
 | `assert(cond, '消息')` | `assert_true(cond, '消息', '断言名')` |
 | `vars.set('k', v)` | `result.variables = {'k': v}` |
 | `vars.get('k')` | `ctx['variables']['k']` |
@@ -129,9 +138,11 @@
 **迁移约束**：
 
 1. `Runner.vue` 的现有行为、结果结构、JS 语义一律不改；
-2. 被套件引用的接口若自带 JS 前置 / 后置脚本，套件引擎默认**跳过不执行**，并在运行前检查中给出警告（详见 4.8）；
+2. 被套件引用的接口若自带 JS 前置 / 后置脚本，**或所属环境带 JS 环境脚本**，套件引擎默认**跳过不执行**，并在运行前检查中给出警告（详见 4.8）；
 3. 迁移只生成草稿，必须用户确认后才写入套件；
-4. 迁移不复制运行历史，历史仍通过 `request_runs` 查询。
+4. 迁移不复制运行历史，历史仍通过 `request_runs` 查询；
+5. `requests.assertions` 字段目前只存不执行（执行器只跑 `postScript`）。M2 迁移前必须先确定该字段的格式并纳入执行，或明确弃用并清空，避免用户误以为已生效；
+6. 迁移 M1「另存为套件」只带入接口、顺序、轮次、数据集；JS 断言一律转成草稿待确认，不做静默等价替换。
 
 ---
 
@@ -223,6 +234,14 @@ flowchart LR
 | SLA 门禁 | 套件中 `stress` 用例按 `sla` 判定；超标即该用例 failed |
 | 基线回归 | `stress` 用例可指定 `baselineReportId`，P95 超过基线 1.2 倍即 failed |
 
+**前置条件（v1.0.8 必须先补，否则上述链路跑不通）**：
+
+1. **鉴权**：现有 `StressConfig` 没有 `auth`，压测请求只能手写 Header。`stress` 用例若绑定接口，必须从 `requests.auth` 构造并注入（或扩展 `StressConfig.auth` 复用 `execute` 的鉴权逻辑）；
+2. **运行期变量**：`stress_start` 目前只加载环境变量，登录用例产出的 `{{token}}` 无法传入。需给 `StressConfig` 增加 `vars`（运行期变量快照）并参与渲染；
+3. **Cookie**：压测完全不读 `cookies` 表，会话型接口需先补 `cookieEnabled` 支持；
+4. **客户端一致性**：压测自建 `reqwest::Client`，不读代理与客户端证书；套件压测必须与手工请求使用同一套连接配置，否则「手工通过、压测失败」无法解释；
+5. **单实例**：`stress_running` 是应用级单例。套件内多个 `stress` 用例必须串行；CLI 与桌面端同时运行需明确互斥与提示。
+
 ### 2.5 关键设计决策（ADR）
 
 | 编号 | 决策 | 备选方案 | 选择理由 | 代价 |
@@ -234,6 +253,9 @@ flowchart LR
 | A-05 | 新建 `test_*` 表，不复用 `request_runs` | 扩展 `request_runs` | 套件运行需要用例、断言、附件、报告维度，单接口快照模型不够 | 表更多，需要保留与清理策略 |
 | A-06 | 每次运行产出 HTML + JSON + JUnit | 只做 HTML；只做 JSON | 人要看得懂，机器要能解析，CI 要能展示 | 生成器维护三套输出映射 |
 | A-07 | 压测作为 `stress` 用例复用现有引擎 | 新建独立压测执行器 | 复用并发、爬坡、指标、报告；SLA 判定只加一层 | 受现有单接口压测模型限制，混合场景仍缺 |
+| A-08 | 引擎与 Tauri 解耦（progress 用回调/trait，`AppState` 支持 headless 初始化，取消按 runId） | CLI 直接链接现引擎；CLI 内起一个隐藏 Tauri App | 现有 `stress_start` 依赖 `AppHandle`、`AppState::new(&AppHandle)`、全局单例，CLI 无法复用；解耦后 UI 与 CLI 才能真正共用 | 需要改现有压测签名与事件发送方式，属于跨模块重构 |
+| A-09 | 报告生成收敛到 Rust 单点 | 前端继续生成 HTML（现状）；两端各生成 | CLI 无前端也能出报告；避免 HTML 模板双维护 | 需要把现有 `reportExport.ts` 的模板迁移/重写为 Rust 模板 |
+| A-10 | 执行记录（`request_history` / `request_runs`）增加来源标记 | 套件运行不写；或另建一套表 | 保留手工调试价值，同时避免大套件冲掉快照；历史页可按来源过滤 | 存量表需补列与索引；写入方要传入来源 |
 
 > 决策变更需同步更新本节，并在第 12 节任务中体现影响范围。
 
@@ -273,9 +295,9 @@ flowchart LR
 | F-14 | 参数边界 | 空值、超长、负数、0、Unicode、Emoji、超长数组 | 4xx 且错误码正确；不出现 5xx | 批量生成边界值 | 数据驱动 | P0 |
 | F-15 | 错误码与错误结构 | 构造 400/401/403/404/409/422/429/500 | `code/message/traceId` 结构稳定 | 校验错误 Schema | Python | P0 |
 | F-16 | 超时与重试 | 构造慢接口 / 断开连接 | 按 `timeoutMs` 失败；重试次数符合配置 | 启动本地慢服务 | Python | P1 |
-| F-17 | 大响应与截断 | 请求大 JSON / 大文件 | 截断标记正确、关键字段仍可读 | 流式统计大小 | 响应截断 | P2 |
+| F-17 | 大响应与截断 | 请求大 JSON / 大文件 | 截断标记正确、关键字段仍可读（现有上限 5MB） | 流式统计大小 | 响应截断 | P2 |
 | F-18 | 编码与压缩 | gzip / deflate / chunked / UTF-8 / GBK | 解码正确、无乱码 | 编码转换 | 请求执行 | P2 |
-| F-19 | 并发一致性 | 并发扣减库存 / 余额（如 20 并发） | 最终值正确、无超卖、无脏数据 | `threading` + `requests` 并发 | Python | P1 |
+| F-19 | 并发一致性 | 并发扣减库存 / 余额（如 20 并发） | 最终值正确、无超卖、无脏数据 | `threading` + `astroman_runtime.http`（urllib，免依赖；用 `requests` 需自装） | Python | P1 |
 | F-20 | 数据库校验 | 请求后直连 SQLite/MySQL/Redis 校验落库 | 行存在、字段值正确、无残留 | `sqlite3/pymysql/redis` | Python | P1 |
 | F-21 | 异步回调 / 消息 | 发起任务 → 轮询状态 / 消费消息 | 在时限内变为成功、消息内容正确 | 轮询、消费 MQ | Python | P1 |
 | F-22 | 批量造数 | 生成 1000 条用户 / 订单数据 | 全部创建成功、可清理 | `Faker`、批量请求 | Python | P1 |
@@ -331,10 +353,12 @@ flowchart LR
 
 #### 场景 E：压测门禁（P-02 + P-07）
 
+> 前提：2.4 的压测前置条件（auth / Cookie / 运行期变量 / 客户端一致性）已完成；否则带鉴权的接口只能手写 Header。
+
 | 顺序 | 用例类型 | 内容 | 判定 |
 |---|---|---|---|
 | 1 | request | 冒烟：目标接口 200 | failed 则中止套件（fail-fast） |
-| 2 | stress | 载入计划 `order-create`，20 VU / 120s | P95、P99、错误率、RPS 全部达标 |
+| 2 | stress | 内联压测配置（非 planId，CI 无计划库），20 VU / 120s | P95、P99、错误率、RPS 全部达标 |
 | 3 | request | 压测后查询统计接口 | 订单数增量 = 成功请求数 ± 容差 |
 | 4 | python | 清理压测数据 | 无残留 |
 
@@ -352,7 +376,7 @@ sequenceDiagram
   participant FS as 临时目录
   participant P as Python 进程
   R->>FS: 写入 context.json
-  R->>P: spawn(python, script, env: FBIN_CONTEXT/FBIN_RESULT/FBIN_WORKDIR)
+  R->>P: spawn(python, script, env: ASTROMAN_CONTEXT/ASTROMAN_RESULT/ASTROMAN_WORKDIR)
   P->>FS: 读取 context.json
   P->>P: 执行业务逻辑（HTTP/DB/文件/签名）
   P->>FS: 写入 result.json（+ 附件）
@@ -360,7 +384,7 @@ sequenceDiagram
   R->>R: 校验 result.json，合并变量与断言
 ```
 
-- 每个用例独立进程，独立工作目录：`<appdata>/test-runs/<runId>/<caseId>/`。
+- 每个用例独立进程，独立工作目录：`<data_dir>/test-runs/<runId>/<caseId>/`（跟随自定义数据目录）。
 - 失败判定顺序：进程启动失败 → 退出码非 0 → `result.json` 缺失/非法 → `ok=false` → 断言失败。
 - `stdout` / `stderr` 全部按日志采集，单路上限 1MB，超出截断并标记。
 
@@ -373,6 +397,12 @@ sequenceDiagram
 | `case_post.py` | HTTP 返回后、声明式断言后 | — | 是 | 是 | 是 | 该用例 failed |
 | `case_main.py` | 独立 Python 用例 | 自行发送请求 | — | 是 | 是 | 该用例 failed/error |
 | `suite_teardown.py` | 套件结束，无论成败 | — | — | 是 | 是 | 记入独立结果，不回滚已通过用例 |
+
+**请求覆盖边界（与现有 `execute` 对齐）**：
+
+- `case_pre` 只能覆盖 `method / url / headers / params / body`；**不能改结构化 auth**（Bearer/Basic/API Key 由 `SendRequestPayload.auth` 注入）。需要刷新 token 时，在 pre 里写入 `Authorization` 头即可——`execute` 会因「已有 Authorization」而跳过 auth 注入（http.rs 的既有行为），这正是 F-06 可用的机制；
+- pre 的修改在渲染前合并，`{{var}}` 仍按 6.2 统一渲染；
+- 附件路径必须落在 `workDir` 内，越界直接判 error。
 
 ### 4.3 协议契约
 
@@ -412,7 +442,7 @@ sequenceDiagram
 # case_post.py —— 校验业务码并提取订单号
 import json, os
 
-with open(os.environ["FBIN_CONTEXT"], "r", encoding="utf-8") as f:
+with open(os.environ["ASTROMAN_CONTEXT"], "r", encoding="utf-8") as f:
     ctx = json.load(f)
 
 resp = ctx["response"]
@@ -432,13 +462,13 @@ result = {
     "logs": [{"level": "info", "message": f"orderId={order_id}"}],
 }
 
-with open(os.environ["FBIN_RESULT"], "w", encoding="utf-8") as f:
+with open(os.environ["ASTROMAN_RESULT"], "w", encoding="utf-8") as f:
     json.dump(result, f, ensure_ascii=False)
 ```
 
 #### 辅助模块
 
-内置 `fbin_runtime.py`（随安装包放在 `resources/python/`，通过 `PYTHONPATH` 注入）提供：
+内置 `astroman_runtime.py`（随安装包放在 `resources/python/`，通过 `PYTHONPATH` 注入）提供：
 
 | 函数 | 用途 |
 |---|---|
@@ -458,7 +488,7 @@ with open(os.environ["FBIN_RESULT"], "w", encoding="utf-8") as f:
 ```python
 import base64, hashlib, hmac, json, os, time
 
-ctx = json.load(open(os.environ["FBIN_CONTEXT"], encoding="utf-8"))
+ctx = json.load(open(os.environ["ASTROMAN_CONTEXT"], encoding="utf-8"))
 body = ctx["request"]["body"]
 secret = ctx["environment"]["vars"]["API_SECRET"].encode()
 
@@ -470,7 +500,7 @@ ctx["request"]["headers"].update({
     "X-Signature": sign,
 })
 json.dump({"ok": True, "request": ctx["request"]},
-          open(os.environ["FBIN_RESULT"], "w", encoding="utf-8"))
+          open(os.environ["ASTROMAN_RESULT"], "w", encoding="utf-8"))
 ```
 
 #### 4.4.2 数据库校验（main）
@@ -478,7 +508,7 @@ json.dump({"ok": True, "request": ctx["request"]},
 ```python
 import os, sqlite3, json
 
-ctx = json.load(open(os.environ["FBIN_CONTEXT"], encoding="utf-8"))
+ctx = json.load(open(os.environ["ASTROMAN_CONTEXT"], encoding="utf-8"))
 order_id = ctx["variables"]["orderId"]
 
 conn = sqlite3.connect(os.environ["TEST_DB_PATH"])
@@ -492,7 +522,7 @@ assertions = [
      "message": f"实际 {row[0] if row else 'NULL'}"},
 ]
 json.dump({"ok": True, "assertions": assertions},
-          open(os.environ["FBIN_RESULT"], "w", encoding="utf-8"))
+          open(os.environ["ASTROMAN_RESULT"], "w", encoding="utf-8"))
 ```
 
 #### 4.4.3 批量造数（main）
@@ -505,14 +535,14 @@ rows = [{
     "phone": f"138{random.randint(0, 99999999):08d}",
 } for i in range(1000)]
 
-out = os.path.join(os.environ["FBIN_WORKDIR"], "users.json")
+out = os.path.join(os.environ["ASTROMAN_WORKDIR"], "users.json")
 json.dump(rows, open(out, "w", encoding="utf-8"), ensure_ascii=False)
 
 json.dump({
     "ok": True,
     "logs": [{"level": "info", "message": f"生成 {len(rows)} 条用户数据"}],
     "attachments": [{"name": "users.json", "path": out}],
-}, open(os.environ["FBIN_RESULT"], "w", encoding="utf-8"))
+}, open(os.environ["ASTROMAN_RESULT"], "w", encoding="utf-8"))
 ```
 
 #### 4.4.4 JSON Schema 契约校验（post）
@@ -521,7 +551,7 @@ json.dump({
 import json, os
 from jsonschema import validate, ValidationError
 
-ctx = json.load(open(os.environ["FBIN_CONTEXT"], encoding="utf-8"))
+ctx = json.load(open(os.environ["ASTROMAN_CONTEXT"], encoding="utf-8"))
 schema = {
     "type": "object",
     "required": ["code", "data"],
@@ -540,7 +570,7 @@ except ValidationError as e:
 json.dump({
     "ok": True,
     "assertions": [{"name": "响应符合 Schema", "passed": passed, "message": message}],
-}, open(os.environ["FBIN_RESULT"], "w", encoding="utf-8"))
+}, open(os.environ["ASTROMAN_RESULT"], "w", encoding="utf-8"))
 ```
 
 ### 4.5 运行时管理
@@ -563,8 +593,8 @@ json.dump({
 1. **显式开启**：首次使用 Python 需阅读风险提示并勾选「允许执行本地 Python 脚本」。
 2. **任意代码风险**：脚本以当前用户权限运行，可访问文件、网络、数据库；报告中固定展示风险标识。
 3. **工作目录隔离**：`workDir` 为每次运行独立目录；附件路径必须落在其内，越界拒绝。
-4. **环境变量白名单**：只传合并后的业务变量与 `FBIN_*`，不继承完整系统环境（避免泄露全局密钥）。
-5. **日志脱敏**：日志与报告写入前复用 `maskSensitive()`，对 token/password/secret/cookie/Authorization 打码。
+4. **环境变量白名单**：只传合并后的业务变量与 `ASTROMAN_*`，不继承完整系统环境（避免泄露全局密钥）；但必须保留最小系统变量 `SystemRoot`、`TEMP`、`TMP`、`PATH`、`USERPROFILE`，否则 Windows 下 Python 子进程与 `py` launcher 可能无法启动。
+5. **日志脱敏**：Rust 侧新增统一 `mask_sensitive()`（可参考 `ai.rs` 的 `mask_key`），对 token/password/secret/cookie/Authorization 打码；`env_variables.is_secret=1` 的变量值一律按密钥处理。前端已有同规则函数，报告生成前必须经过一次。
 6. **审计**：`test_run_cases` 记录脚本哈希、解释器路径与版本；`ai_tool_logs` 记录 AI 触发的运行。
 7. **不自动执行**：AI 生成脚本、修改脚本、启动运行，全部需要显式确认。
 8. **生产环境防呆**：环境名含 `prod` / `生产` 时，运行前二次确认并默认禁用写操作类用例。
@@ -580,20 +610,25 @@ json.dump({
 | v1.0.8 策略 | 保留不动 | 新增，作为套件唯一脚本形态 |
 | 迁移 | 提供 AI「JS 钩子转 Python」建议，不自动改 | — |
 
-### 4.8 引用请求自带 JS 钩子的处理
+### 4.8 无头执行时所有 JS 入口的处理
 
-套件用例仍引用 `requests` 表，而接口可能自带 `pre_script` / `post_script`（JS）。执行内核在 Rust，无法运行浏览器 JS，规则必须明确：
+执行内核在 Rust，无法运行浏览器 JS。JS 入口不止接口钩子，v1.0.8 必须一次性覆盖全部三类，否则会出现「报告全绿、实际没带签名 / 没校验」：
+
+| JS 入口 | 位置 | 规则 |
+|---|---|---|
+| 接口前置 / 后置脚本 | `requests.pre_script` / `post_script` | 默认**不执行**，只执行用例级 Python 钩子与声明式断言 |
+| 环境脚本 | `environments.script` | 默认**不执行**；多数签名 / 加解密写在这里，影响面比接口钩子更大 |
+| 接口声明式断言（字段已存在但未执行） | `requests.assertions` | 套件不读取；需在 M2 迁移时先定义格式或明确弃用 |
 
 | 场景 | 规则 |
 |---|---|
-| 引用请求含 JS 钩子 | 默认**不执行**，只执行用例级 Python 钩子与声明式断言 |
-| 运行前检查 | `test validate` 与 UI 预检列出「该用例引用了含 JS 钩子的接口」，标记 warning |
+| 运行前检查 | `test validate` 与 UI 预检逐条列出「该用例引用了含 JS 钩子的接口 / 环境带 JS 脚本 / 接口有未执行的 assertion 字段」，标记 warning |
 | 严格模式 | `config_json.strictScripts=true` 时，warning 升级为 error，禁止运行，避免误判通过 |
-| 结果标注 | 报告与 `test_run_cases.logs` 写入「已跳过 N 个 JS 钩子」，防止用户误以为已执行 |
-| 迁移 | 提供「转换 JS 钩子为 Python」入口，转换后写入用例级 `pre_script/post_script` |
+| 结果标注 | 报告与 `test_run_cases.logs` 写入「已跳过 N 个 JS 钩子 / 1 个环境脚本」，防止用户误以为已执行 |
+| 迁移 | 提供「转换 JS 为 Python」入口，转换后写入用例级 `pre_script/post_script` 或 `suite_setup` |
 | 长期 | v1.0.9 嵌入 JS 引擎后取消该限制 |
 
-> 该规则是 v1.0.8 最容易造成「看起来通过、实际没校验」的地方，必须在预检、报告、文档三处同时提示。
+> 该规则是 v1.0.8 最容易造成「看起来通过、实际没校验」的地方，必须在预检、报告、文档（含 `docs/script-api.md`）三处同时提示。
 
 ---
 
@@ -613,7 +648,7 @@ erDiagram
   test_runs ||--o{ test_run_cases : contains
   test_run_cases ||--o{ test_run_assertions : has
   test_run_cases ||--o{ test_artifacts : produces
-  test_reports ||--o{ test_run_cases : links
+  test_run_cases }o--|| test_reports : report_id
 ```
 
 ### 5.2 表设计
@@ -628,7 +663,7 @@ CREATE TABLE IF NOT EXISTS test_suites (
     env_id          INTEGER REFERENCES environments(id) ON DELETE SET NULL,
     tags            TEXT,                 -- 逗号分隔：smoke,order,regression
     python_path     TEXT,                 -- 可覆盖全局解释器
-    config_json     TEXT,                 -- failFast/maxWorkers/defaultTimeoutMs/retries/parallelRows/cookieMode/strictScripts/suiteTimeoutSec
+    config_json     TEXT,                 -- schemaVersion + failFast/maxWorkers/defaultTimeoutMs/retries/parallelRows/cookieMode/strictScripts/suiteTimeoutSec/vars
     setup_script    TEXT,                 -- suite_setup.py 源码
     teardown_script TEXT,                 -- suite_teardown.py 源码
     created_at      INTEGER NOT NULL,
@@ -642,7 +677,7 @@ CREATE TABLE IF NOT EXISTS test_cases (
     name             TEXT NOT NULL,
     kind             TEXT NOT NULL DEFAULT 'request', -- request | python | stress
     request_id       INTEGER REFERENCES requests(id) ON DELETE SET NULL,
-    plan_id          INTEGER REFERENCES test_plans(id) ON DELETE SET NULL,
+    plan_id          INTEGER REFERENCES test_plans(id) ON DELETE SET NULL, -- 可选：仅用于 UI 关联，运行以内联快照为准
     dataset_id       INTEGER REFERENCES test_datasets(id) ON DELETE SET NULL,
     depends_on       TEXT,                -- 逗号分隔的用例 ID，前置依赖
     sort_order       INTEGER DEFAULT 0,
@@ -657,7 +692,7 @@ CREATE TABLE IF NOT EXISTS test_cases (
     pre_script       TEXT,                -- case_pre.py
     post_script      TEXT,                -- case_post.py
     main_script      TEXT,                -- case_main.py（kind=python）
-    stress_json      TEXT,                -- { planId, slaOverride, baselineReportId, waitTimeoutSec }
+    stress_json      TEXT,                -- 内联 StressConfig 快照 + { slaOverride, baselineReportId, waitTimeoutSec }；不依赖 planId
     created_at       INTEGER NOT NULL,
     updated_at       INTEGER NOT NULL DEFAULT 0
 );
@@ -668,8 +703,10 @@ CREATE TABLE IF NOT EXISTS test_datasets (
     suite_id    INTEGER NOT NULL REFERENCES test_suites(id) ON DELETE CASCADE,
     name        TEXT NOT NULL,
     format      TEXT NOT NULL DEFAULT 'csv', -- csv | json
-    path        TEXT NOT NULL,
+    path        TEXT,                        -- 相对 data_dir；内联时为空
+    content     TEXT,                        -- 内联内容（≤2MB 时优先使用）
     row_count   INTEGER DEFAULT 0,
+    sha256      TEXT,
     created_at  INTEGER NOT NULL
 );
 
@@ -678,6 +715,7 @@ CREATE TABLE IF NOT EXISTS test_runs (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     suite_id     INTEGER NOT NULL REFERENCES test_suites(id) ON DELETE CASCADE,
     env_id       INTEGER,
+    env_name     TEXT,                     -- 环境名快照：环境被删后报告仍可读
     trigger      TEXT NOT NULL DEFAULT 'ui', -- ui | cli | ai
     status       TEXT NOT NULL DEFAULT 'queued', -- queued|running|passed|failed|cancelled|error
     total        INTEGER DEFAULT 0,
@@ -690,7 +728,7 @@ CREATE TABLE IF NOT EXISTS test_runs (
     summary_json TEXT,                     -- 分环境/分标签统计、SLA 结果
     app_version  TEXT,
     python_version TEXT,
-    report_dir   TEXT,
+    report_dir   TEXT,                     -- 相对 data_dir 的路径，避免自定义目录后失效
     started_at   INTEGER,
     finished_at  INTEGER,
     created_at   INTEGER NOT NULL
@@ -700,7 +738,7 @@ CREATE TABLE IF NOT EXISTS test_runs (
 CREATE TABLE IF NOT EXISTS test_run_cases (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id            INTEGER NOT NULL REFERENCES test_runs(id) ON DELETE CASCADE,
-    case_id           INTEGER,
+    case_id           INTEGER,              -- 仅追溯用，不设外键：用例删除后历史仍保留
     name              TEXT NOT NULL,
     kind              TEXT NOT NULL,
     status            TEXT NOT NULL,       -- passed|failed|skipped|error
@@ -708,12 +746,12 @@ CREATE TABLE IF NOT EXISTS test_run_cases (
     duration_ms       INTEGER DEFAULT 0,   -- 用例总耗时（含钩子与重试）
     http_duration_ms  INTEGER DEFAULT 0,   -- 单次 HTTP 耗时
     python_duration_ms INTEGER DEFAULT 0,  -- 钩子累计耗时
-    request_snapshot  TEXT,
-    response_snapshot TEXT,
+    request_snapshot  TEXT,                -- 上限 256KB，超出截断并标记
+    response_snapshot TEXT,                -- 上限 1MB，超出截断并标记
     assertions_total  INTEGER DEFAULT 0,
     assertions_failed INTEGER DEFAULT 0,
     error             TEXT,
-    logs              TEXT,
+    logs              TEXT,                -- 只存摘要（≤64KB），全文进 logs/<caseId>.log
     python_version    TEXT,
     script_hash       TEXT,
     report_id         INTEGER,             -- kind=stress 时关联 test_reports
@@ -752,6 +790,19 @@ CREATE INDEX IF NOT EXISTS idx_artifacts_run ON test_artifacts(run_id);
 
 与压测表的关系：`test_run_cases.report_id → test_reports.id`，不修改现有压测表结构；SLA 判定结果写入 `test_run_cases.error / summary_json`。
 
+**存量表增量（写进 `migrate()`，只做 ALTER）**：
+
+```sql
+ALTER TABLE request_history ADD COLUMN origin TEXT NOT NULL DEFAULT 'manual'; -- manual|batch|suite|cli
+ALTER TABLE request_runs    ADD COLUMN origin TEXT NOT NULL DEFAULT 'manual';
+CREATE INDEX IF NOT EXISTS idx_history_origin ON request_history(origin, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_runs_origin ON request_runs(origin, created_at DESC);
+```
+
+- `origin` 用于历史页默认过滤与单接口快照保护（见 6.7）；老数据默认 `manual`，升级不改写；
+- 纯新建表（`test_*`、`notes`）直接写进 `schema.sql` 即可——`db::init` 每次启动都会执行 `schema.sql`（`CREATE TABLE IF NOT EXISTS`），无需在 `migrate()` 重复 DDL；
+- 新增 `PRAGMA user_version` 记录库版本，供 CLI 判断「版本不兼容」（退出码 5）与后续迁移。
+
 ### 5.3 保留策略
 
 | 数据 | 保留 | 清理方式 |
@@ -759,7 +810,14 @@ CREATE INDEX IF NOT EXISTS idx_artifacts_run ON test_artifacts(run_id);
 | `test_runs` / `test_run_cases` / 断言 | 最近 200 次/套件 | 启动时清理，可在设置中调整 |
 | HTML / JSON / JUnit 报告 | 最近 50 次/套件 | 随运行清理 |
 | 附件 | 随运行 | 单次上限 100MB |
+| Python 工作目录 `test-runs/<runId>/` | 随运行（成功即可删，失败保留 7 天） | 清理任务按 runId 目录整树删除，并回收无主目录 |
 | 压测明细 | 沿用现有策略 | 不变 |
+
+清理约束：
+
+1. 先删库记录再删文件，删文件失败只记日志，不阻塞启动；
+2. 启动时扫描 `test-reports/` 与 `test-runs/`，删除库中已不存在的目录（处理崩溃残留）；
+3. 报告与工作目录一律位于 `state.data_dir` 下，使用相对路径入库，支持自定义数据目录与整体搬迁。
 
 ---
 
@@ -796,20 +854,20 @@ stateDiagram-v2
 | 2 | 用例静态变量 `variables_json` | 该用例 |
 | 3 | 数据集当前行 | 该行 |
 | 4 | 套件变量 `config_json.vars` | 本次运行 |
-| 5 | 环境变量 | 环境切换时 |
-| 6 | 全局默认 | 应用级 |
+| 5 | 环境变量（`env_variables`） | 环境切换时 |
 
-- 占位符统一 `{{name}}`；嵌套字段用 `{{data.user.id}}`（数据集行对象支持嵌套）。
-- 渲染范围：URL、Header 值、Query 值、Body 文本。
-- 变量未解析时保持原样并在日志给出 warn，避免静默错误。
-- 敏感变量名（含 token/secret/password/key）在报告与日志中打码。
+- 占位符统一 `{{name}}`；**嵌套字段 `{{data.user.id}}` 需要扩展渲染器**——现有 `util::render` 只做扁平 key + 内置时间变量，未命中保持 `{{x}}` 原样，且前端把数据集值统一 `String()` 拍平（嵌套对象会变 `[object Object]`）。套件侧需新增「按点路径解析」并保留原值类型；
+- 密钥占位符 `{{secret:NAME}}` 只从套件包 `secrets` / 注入文件读取，不参与普通变量；本机变量若标记 `is_secret=1`，同样按密钥处理（打码但不阻止渲染）；
+- 渲染范围：URL、Header 值、Query 值、Body 文本；不渲染 method 与 auth 结构的字段名；
+- 变量未解析时保持原样并在日志给出 warn，避免静默错误；
+- 敏感变量（`is_secret=1` 或名字含 token/secret/password/key）在报告与日志中打码；**快照落库前**还须用本次运行已解析的 secret 明文值做反向替换（值 → `***`），防止密钥随 `request_snapshot` / `response_snapshot` 明文持久化到 SQLite。
 
 ### 6.3 数据驱动
 
 | 项 | 方案 |
 |---|---|
 | 格式 | CSV（UTF-8，首行表头，支持引号转义）、JSON（对象数组） |
-| 行模型 | 每行一个 map；支持嵌套对象（JSON） |
+| 行模型 | 每行一个 map；JSON 允许嵌套，但需配合 T-05 的渲染扩展（`{{a.b.c}}`），否则按 T-05 之前的行为会拍平成 `[object Object]` |
 | 执行 | 默认每行一次；`parallelRows=true` 时按 `maxWorkers` 并行 |
 | 失败隔离 | 单行失败不影响其他行，最终按行汇总 |
 | 大数据 | 10000 行以内；超出提示拆分 |
@@ -822,6 +880,7 @@ stateDiagram-v2
   - 同一套件内存在变量依赖时，UI 标记「依赖」，强制串行；
   - 数据行并行与用例并行互斥，避免嵌套并发。
 - Python 用例并行时每进程独立 workDir，互不共享文件。
+- `kind=stress` 用例不参与并行调度，强制独占串行执行（`stress_running` 单例约束，见 2.4）。
 
 ### 6.5 失败策略
 
@@ -842,9 +901,10 @@ stateDiagram-v2
 
 ### 6.7 复用现有 HTTP 能力
 
-- 直接调用 `send_http_request`，自动获得环境渲染、鉴权（Bearer/Basic/API Key）、Cookie 读写、超时、响应截断。
-- 发送后仍写 `request_runs`，便于单接口调试复盘。
-- 套件运行额外写 `test_run_cases`，两者互不替代。
+- 直接调用 `http::execute`（`send_http_request` 与 `ai_execute` 已共用它），自动获得环境渲染、鉴权（Bearer/Basic/API Key）、Cookie 读写、超时、5MB 响应截断；
+- **必须给 `execute` 增加落库策略**：现在它对任何调用都无条件写 `request_history`（全局 10 万条上限）与 `request_runs`（每接口 200 条上限）。套件默认应只写 `test_run_cases`，`request_history` / `request_runs` 关闭或仅保留失败样本，否则一次 1000 用例回归会挤掉手工调试快照、刷满历史页；
+- 写入时带上 `origin`（manual / batch / suite / cli），历史页与单接口快照页默认按来源过滤；
+- 套件运行额外写 `test_run_cases`，与单接口快照互不替代。
 
 ### 6.8 计时口径与超时叠加
 
@@ -886,8 +946,10 @@ stateDiagram-v2
 | 风险 | 并发同账号互相覆盖 Cookie | 无跨 worker 污染，但会话不跨运行复用 |
 
 - 切换方式：`config_json.cookieMode`，或用例级 `tags: ["cookie:isolated"]` 覆盖；
-- 鉴权：Bearer / Basic / API Key 仍由 `send_http_request` 注入，密钥值来自环境变量，报告与日志统一走 `maskSensitive()`；
-- OAuth2：取 token 结果按 `(tokenUrl, clientId, scope)` 在**运行级**缓存，避免数据行重复换取；
+- **实现前提**：现有 `execute` 在内部直接调用 `cookie::cookies_for_url` / `store_response_cookies` 读写全局 `cookies` 表，没有注入点。`isolated` 模式需要把 Cookie 访问抽成参数（`cookie_mode` + 运行级内存罐），这是 6.9 的硬性改造项；
+- 鉴权：Bearer / Basic / API Key 仍由 `execute` 注入，密钥值来自环境变量，`is_secret=1` 的变量按密钥处理；
+- OAuth2：现有 `oauth2_token` 命令只支持 client_credentials 且不缓存；套件要按 `(tokenUrl, clientId, scope)` 做**运行级缓存**，避免数据行重复换取；
+- 压测在启动时按 `cookieEnabled` 读取一次本机 Cookie（不写回），认证由 `StressConfig.auth` 注入（Bearer / Basic / API Key），不再依赖手写 Header；`stress` 用例的会话行为需在报告中标注，避免误判；
 - 报告里不输出 `Set-Cookie` 与 `Authorization` 明文，只保留「已携带 / 已更新」标记。
 
 ### 6.10 setup/teardown 与依赖语义
@@ -912,13 +974,15 @@ stateDiagram-v2
 
 ### 7.1 一次运行产出
 
+一次运行产出（一律位于 `state.data_dir` 下，支持自定义数据目录；库内只存相对路径）：
+
 ```
-<appdata>/test-reports/<runId>/
+<data_dir>/test-reports/<runId>/
 ├─ report.html          # 自包含，无外部依赖
 ├─ report.json          # 机器可读全量结果
 ├─ junit.xml            # CI 消费
 ├─ summary.txt          # 控制台摘要
-├─ logs/<caseId>.log    # Python/stdout/stderr
+├─ logs/<caseId>.log    # Python/stdout/stderr（库内 logs 字段只存摘要）
 └─ files/               # 附件（截图、导出的数据、SQL 结果）
 ```
 
@@ -941,7 +1005,7 @@ stateDiagram-v2
     "id": 1024, "suite": "order-regression", "env": "test",
     "trigger": "cli", "status": "failed",
     "startedAt": 1793173957000, "durationMs": 48213,
-    "total": 12, "passed": 10, "failed": 2, "skipped": 0, "errors": 0
+    "total": 12, "passed": 10, "failed": 2, "skipped": 0, "errored": 0
   },
   "cases": [
     {
@@ -994,12 +1058,15 @@ stateDiagram-v2
 - 套件中的 `stress` 用例复用 `test_reports`，报告中嵌入核心指标；
 - HTML 报告提供「打开完整压测报告」跳转；
 - JUnit 中压测用例的失败原因为 SLA 项（如 `P95 612ms > 500ms`）；
-- 基线对比：与 `baselineReportId` 比较 P95 / P99 / RPS / 错误率，超阈值即失败。
+- 基线对比：与 `baselineReportId` 比较 P95 / P99 / RPS / 错误率，超阈值即失败；
+- **生成位置收敛**：现有压测 HTML / Excel 由前端 `reportExport.ts#buildReportHtml` 生成后经 `report_write_file` 落盘，CLI 无法复用。v1.0.8 以 Rust 报告生成器为准（A-09），前端报告页只做预览；迁移时以现有前端产物做信息结构与视觉风格对照（不做像素级逐点比对），避免样式回退；
+- **SLA 判定单点化**：现有判定在 `ReportDetail.vue` 的 computed 中，仅为展示。Rust 侧判定结果写入 `test_run_cases.error / summary_json` 后，前端改为读取，不再自行计算。
 
 ### 7.6 报告保留与清理
 
-- 每次运行一个目录；`test_artifacts` 建索引；
+- 每次运行一个目录；`test_artifacts` 建索引，路径存相对 `runId` 目录；
 - 默认保留 50 次/套件；超限删除最旧目录并同步删表；
+- 启动时清理无主目录（库中不存在的 runId 目录），处理崩溃残留；
 - 支持「导出报告包」：HTML + JSON + JUnit + 附件打 zip。
 
 ---
@@ -1008,7 +1075,7 @@ stateDiagram-v2
 
 ### 8.1 CLI 形态
 
-新增独立二进制 `astroman-cli`（复用 Tauri Rust 库，不启动窗口）：
+新增独立二进制 `astroman-cli`（复用 Rust 库，不启动窗口、不初始化 WebView）：
 
 ```bash
 astroman-cli test run \
@@ -1030,6 +1097,14 @@ astroman-cli test run \
 | `test validate` | 只校验配置、解释器、数据集、请求引用，不执行 |
 | `report export` | 将已有 run 导出为 HTML/JUnit |
 | `python check` | 检测解释器与依赖 |
+| `suite import` | 导入套件包（见 8.6） |
+
+**落地前提（现有代码的硬约束，任务表需对应）**：
+
+1. **引擎解耦**：`stress_start` 依赖 `AppHandle` 发事件、`AppState::new(&AppHandle)` 解析目录、`stress_running` 为全局单例。CLI 必须在无 Tauri App 的情况下初始化（A-08），否则只能启动一个隐藏窗口，违背无头目标；
+2. **数据目录解析**：读取 `%APPDATA%\com.astroman.app\storage.json` 的自定义 `data_dir`，否则用户改过目录后 CLI 会打开默认库；
+3. **打包**：`Cargo.toml` 增加 `[[bin]] astroman-cli`，`bundle.externalBin` 随安装包分发；CLI 需要控制台子系统（不能继承 `windows_subsystem = "windows"`）；macOS 需单独签名/公证；
+4. **资源**：`astroman_runtime.py` 与可选便携 Python 需通过 `bundle.resources` 打包，CLI 与桌面端共用同一解析逻辑。
 
 ### 8.2 参数
 
@@ -1038,13 +1113,15 @@ astroman-cli test run \
 | `--suite <name\|id>` | 必填 |
 | `--project <id>` | 套件重名时必填 |
 | `--env <name\|id>` | 覆盖套件默认环境 |
+| `--env-file <path>` | CI 注入 secrets 与变量（见 8.6） |
 | `--data <path>` | 覆盖套件数据集 |
 | `--tags / --exclude-tags` | 标签过滤 |
 | `--report <list>` | 产物类型，默认 `html,json,junit` |
 | `--out <dir>` | 产物目录 |
 | `--fail-fast` | 首个失败即停 |
 | `--workers <n>` | 覆盖并行度 |
-| `--db <path>` | 指定数据库（默认应用数据目录） |
+| `--db <path>` | 指定数据库；缺省时按 storage.json → 默认数据目录解析 |
+| `--allow-prod` | 允许对标记为生产的环境执行（默认拒绝） |
 | `--json` | 控制台输出机器可读摘要 |
 
 ### 8.3 退出码
@@ -1053,10 +1130,12 @@ astroman-cli test run \
 |---|---|
 | 0 | 全部通过（含 skipped） |
 | 1 | 存在断言失败 / SLA 未达标 |
-| 2 | 执行错误（Python 崩溃、超时、请求异常） |
-| 3 | 配置错误（套件不存在、解释器缺失、数据集非法） |
+| 2 | 执行错误（Python 崩溃、超时、请求异常、存在 error 用例） |
+| 3 | 配置错误（套件不存在、解释器缺失、数据集非法、缺 secret） |
 | 4 | 被取消 / 中断 |
-| 5 | 数据库被占用或版本不兼容 |
+| 5 | 数据库被占用或版本不兼容（`PRAGMA user_version` 高于当前程序） |
+
+优先级：**5 > 3 > 4 > 2 > 1 > 0**。启动前失败取 3/5；运行中被中断取 4；运行结束同时存在 error 与断言失败取 2；仅断言失败取 1。
 
 ### 8.4 CI 示例
 
@@ -1097,20 +1176,23 @@ stage('API 回归') {
 
 ### 8.5 无头运行约束
 
-- CLI 与桌面端共用 SQLite；WAL 模式下允许并发读写，但同一套件不建议同时运行。
+- CLI 与桌面端共用 SQLite；WAL + `busy_timeout=5000` 已配置（`open_pool`），允许并发读写，但同一套件不建议同时运行。
+- `stress_running` 为应用级单例：CLI 与桌面端同时发起压测必须互斥，返回明确错误而不是静默排队。
 - 运行使用独立 `runId`，不依赖 UI 状态。
-- 桌面端检测到新的 `test_runs` 时刷新列表（窗口获得焦点时拉取）。
-- 无 UI 时 Python 仍可运行（不依赖 webview）；JS 钩子不可用（见 4.7）。
+- 桌面端检测到新的 `test_runs` 时刷新列表（窗口获得焦点时拉取）；运行中窗口重开用 `test_run_current / test_run_list` 恢复，而不是依赖 lost runId。
+- 无 UI 时 Python 仍可运行（不依赖 webview）；JS 钩子与环境脚本不可用（见 4.8）。
+- **仓库现状**：`.github/workflows` 目前只有 tag 触发的 `release.yml`，没有测试流水线。v1.0.8 需新增 `ci.yml`（push / PR）：`npm run test`、`cargo test`、构建检查，再叠加下面的套件任务。
+- **CI 平台范围**：CLI 编译期仍链接 Tauri / WebKitGTK，Linux runner 需先安装系统依赖（如 `webkit2gtk-4.1`）才能构建与运行；官方 CI 模板仅验证 Windows（macOS 需签名 / 公证）。Linux 支持列入 v1.0.9 评估，不在本版承诺。
 
 ### 8.6 CI 数据准备与套件包
 
 CI 机器上通常没有项目库、接口定义与本地环境变量，因此需要「套件包」把运行所需的一切带走。
 
-**套件包格式**（`*.fbintest.json`，单文件，≤ 5MB）：
+**套件包格式**（`*.astromantest.json`，单文件，≤ 5MB）：
 
 ```json
 {
-  "schemaVersion": 1,
+  "schemaVersion": "1.0",
   "exportedAt": "2026-10-29T10:00:00+08:00",
   "appVersion": "1.0.8",
   "suite": {
@@ -1137,6 +1219,23 @@ CI 机器上通常没有项目库、接口定义与本地环境变量，因此�
       "dependsOn": [],
       "timeoutMs": 30000,
       "retries": 1
+    },
+    {
+      "name": "下单压测",
+      "kind": "stress",
+      "stress": {
+        "method": "POST",
+        "url": "{{env.baseUrl}}/api/orders",
+        "headers": [{ "key": "Authorization", "value": "Bearer {{token}}", "enabled": true }],
+        "bodyType": "json",
+        "body": "{\"amount\": 1}",
+        "auth": null,
+        "cookieEnabled": false,
+        "concurrent": 20,
+        "durationSec": 120,
+        "sla": { "p95Ms": 500, "p99Ms": 1000, "errorRate": 0.5, "minRps": 50 },
+        "baselineReportId": null
+      }
     }
   ],
   "datasets": [
@@ -1148,19 +1247,26 @@ CI 机器上通常没有项目库、接口定义与本地环境变量，因此�
 }
 ```
 
+**用例形态补充**：
+
+- `kind=stress` 的用例在套件包里**必须内联完整压测配置**（`StressConfig` 快照），不能只写 `planId`——CI 机器没有 `test_plans`；
+- `kind=python` 的用例内联 `mainScript`，不依赖目标机器的本地文件；
+- 压测用例的 `{{token}}` 来自前序用例运行期变量，这要求 2.4 的 `vars` 注入先完成。
+
 **脱敏与注入规则**：
 
 1. 导出时 `auth.token/password/clientSecret`、`Authorization`、`Cookie` 等一律替换为 `{{secret:NAME}}` 占位；
 2. 变量值**默认不导出**，只导出变量名与 profile；CI 通过 `--env-file ci.json` 或同名环境变量注入；
 3. 占位符在导入与运行前做预检，未注入的 secret 直接报 `MISSING_SECRET`，不允许以空值运行；
-4. 内联数据集优先，`path` 方式必须带 `sha256`，校验不一致拒绝导入；
+4. 数据集：**≤ 2000 行且 ≤ 2MB 时内联**；超出改为 `path + sha256`，并在导入时校验；套件包总量仍限 5MB，超限时导出直接报错并提示拆分套件；
 5. 脚本单文件 ≤ 256KB，超过改为附件引用并给出提示。
+6. **导入授权**：套件包含 Python 脚本（preScript / postScript / mainScript）等同于引入任意代码。导入时必须展示脚本清单并要求显式确认；未开启 4.6 的 Python 授权时直接拒绝导入，或导入后将全部脚本置为禁用并给出显著警告。
 
-**CLI 侧流程**：
+**CLI 侧流程**（与 8.1 命令表保持一致）：
 
 ```bash
-astroman-cli suite import order.fbintest.json --project "订单服务" --on-conflict rename
-astroman-cli run --suite "订单回归" --env-file ci.json --report-dir ./artifacts
+astroman-cli suite import order.astromantest.json --project "订单服务" --on-conflict rename
+astroman-cli test run --suite "订单回归" --env-file ci.json --out ./artifacts
 ```
 
 `--on-conflict` 支持 `skip | overwrite | rename`，默认 `rename`（追加时间后缀），保证 CI 重复执行不会互相覆盖。
@@ -1179,7 +1285,7 @@ astroman-cli run --suite "订单回归" --env-file ci.json --report-dir ./artifa
 | 生成 Python 脚本 | 接口定义 + 目标说明 | `case_pre/post/main` 代码 + 依赖说明 | diff 预览，确认后写入 |
 | 解释失败 | 运行结果 + 日志 + 响应片段 | 根因假设、修复建议、相关代码位置 | 只读分析，不改数据 |
 | 生成压测门禁 | 基线报告 + 业务目标 | SLA 建议（P95/P99/错误率/RPS） | 确认后写入 `stress_json` |
-| 转换 JS → Python | 现有 JS 钩子 | 等价 Python 草稿 | 不自动覆盖，用户确认 |
+| 转换 JS → Python | 现有接口钩子 / 环境脚本 | 等价 Python 草稿 | 不自动覆盖，用户确认 |
 
 ### 9.2 新增 AI 工具（12 个）
 
@@ -1197,6 +1303,14 @@ astroman-cli run --suite "订单回归" --env-file ci.json --report-dir ./artifa
 | `test_run_stop` | 执行 | 停止运行 |
 | `test_run_get` | 只读 | 运行详情 / 失败摘要 |
 | `test_report_export` | 写 | 导出报告包 |
+
+**实现约束（AI 工具层在前端 `src/utils/aiTools.ts`，不是 Rust 命令）**：
+
+1. 每个新工具必须同时登记 `SCHEMAS`（入参硬校验，未声明字段会被拒）、`WRITE_TOOLS`（写/执行类走确认卡）、`TOOL_LABELS`；
+2. `CORE_TOOL_NAMES` 决定哪些进提示词明文目录；一次新增 12 个工具会显著抬高提示词体积，建议只把 `test_run_start / test_run_get / test_suite_list` 进核心，其余走 `tool_search`（现有分层机制）；
+3. `toolTimeoutOf`：`test_run_start` 属于长任务，应像 `stress_start` 一样进 `NO_TIMEOUT_TOOLS`，不能套 60s；
+4. 运行类工具统一调 `test_run_start`，**不扩展已有的 `run_batch`**（前端串行执行，见 1.4），避免第三条执行路径；
+5. 工具返回值只回摘要 + `runId`，完整日志/响应由 `test_run_get` 按需取，避免上下文爆炸。
 
 ### 9.3 提示词与硬规则增量
 
@@ -1235,6 +1349,8 @@ astroman-cli run --suite "订单回归" --env-file ci.json --report-dir ./artifa
 3. `envInfo.isProd=true` 时风险等级至少 `high`，需手动勾选「我确认在生产环境执行」；
 4. 同一工具同参数的重复调用仍由指纹拦截（v1.0.7 规则），不因确认卡而放行。
 
+**与现有组件的差距**：`AiConfirmCard.vue` 目前只接收 `tool / args / description / overwrite / path / planText`，风险等级由工具名推导。上表 `changes / envInfo / dryRun / revertHint` 需要新增 props 与渲染分支；在扩展完成前，测试域工具只能沿用「参数表 + 计划文本」形态，达不到 9.5 的信息密度。
+
 ---
 
 ## 10. 界面与交互
@@ -1258,7 +1374,7 @@ flowchart LR
 | 用例排序 | 拖拽，显示依赖箭头；有变量依赖时标注 |
 | 脚本编辑 | 代码高亮、格式化、保存前语法检查（`python -m py_compile`） |
 | 断言编辑 | 表单化：类型、目标、期望值；高级模式直接编辑 JSON |
-| 运行前检查 | 解释器、数据集、请求引用、环境、生产环境警示 |
+| 运行前检查 | 解释器、数据集、请求引用、环境、生产环境警示；**JS 入口跳过清单**（接口钩子 / 环境脚本 / 未执行断言字段） |
 | 实时进度 | 事件推送：已完成/总数、当前用例、耗时、失败数 |
 | 停止 | 立即中断 HTTP/Python/压测，状态保留 |
 | 报告 | 失败置顶、断言差异、请求响应对照、附件下载 |
@@ -1275,9 +1391,9 @@ flowchart LR
 | 性能 | 1000 用例套件调度开销 < 5%；Python 冷启动 100~300ms；报告生成 1000 用例 < 2s |
 | 稳定 | Python 超时/崩溃不影响主进程；单用例失败不拖垮运行 |
 | 安全 | 任意代码显式授权、工作目录隔离、环境变量白名单、日志脱敏、审计留痕 |
-| 兼容 | Windows 10+ / macOS 12+ / Linux；Python 3.9+；无 Python 时功能优雅降级（仅声明式断言可用） |
+| 兼容 | Windows 10+ / macOS 10.15+（与 `tauri.conf.json` 一致）/ Linux；Python 3.9+；无 Python 时功能优雅降级（仅声明式断言可用） |
 | 可观测 | 事件：`test:run:start`、`test:case:start/end`、`test:run:done`；日志分级 |
-| 数据一致 | 运行结束一次性汇总写 `test_runs`；崩溃时按已落库用例恢复为 `error` |
+| 数据一致 | 运行开始即插入 `test_runs`（`status=running`），结束时更新汇总；崩溃后启动时扫描残留 `running`，按已落库用例恢复为 `error` |
 | 可移植 | 套件可导出 JSON（含脚本、断言、数据集引用），在另一台机器导入 |
 
 ### 11.2 成功指标（KPI）
@@ -1314,51 +1430,61 @@ flowchart LR
 
 | ID | 任务 | 缺口 | 优先级 | 复杂度 | 主要改动 | 验收标准 | 状态 |
 |---|---|---|---|---|---|---|---|
-| T-01 | 测试模型建表与迁移 | D-01 | P0 | M | `schema.sql`、`db/mod.rs` 新增 7 张表与索引 | 新库直接可用；v1.0.7 老库升级无报错 | 待开发 |
-| T-02 | 套件 / 用例 / 数据集 CRUD 命令 | D-01 | P0 | M | 新增 `commands/test_suite.rs`、`test_case.rs`；`lib.rs` 注册 | 增删改查可用；删除级联正确 | 待开发 |
-| T-03 | 套件执行引擎骨架 | D-01/D-06 | P0 | L | 新增 `test_runner.rs`：状态机、变量、顺序、事件 | 能跑纯 HTTP 套件；状态与事件正确 | 待开发 |
-| T-04 | 声明式断言引擎 | D-04 | P0 | M | `test_assert.rs`：status、响应时间、header、body、jsonPath、正则 | 6 类断言全部可判定；错误信息可读 | 待开发 |
-| T-05 | 数据集 CSV/JSON 解析 | D-01 | P0 | M | 后端解析、行模型、嵌套字段 | 与现有 CSV 语义兼容；1000 行可用 | 待开发 |
-| T-06 | 并发 / 重试 / 跳过 / 失败策略 | D-06 | P0 | M | 引擎调度与依赖标记 | 4 项策略均可配置并生效；非幂等不误重试 | 待开发 |
-| T-07 | 运行与用例结果落库 | D-02 | P0 | M | `test_runs` / `test_run_cases` / 断言 / 附件写入 | 关闭应用后结果仍在；统计准确 | 待开发 |
-| T-08 | Python 解释器探测与设置 | D-03 | P0 | M | 设置项、`python check`、版本校验 | Win/mac 均可探测；缺失时提示清晰 | 待开发 |
-| T-09 | Python 子进程执行器 | D-03 | P0 | L | 进程启动、context/result、超时、进程树、输出限制 | 正常/异常/超时/死循环 4 类用例均正确回收 | 待开发 |
-| T-10 | `fbin_runtime.py` 辅助模块 | D-03 | P1 | M | 随包资源、`PYTHONPATH` 注入、断言助手 | 示例脚本免额外依赖即可运行 | 待开发 |
-| T-11 | 套件 setup / teardown | D-03 | P1 | M | 引擎生命周期与失败记录 | teardown 始终执行；失败单独记录 | 待开发 |
-| T-12 | Python 安全与审计 | D-03 | P0 | M | 授权开关、工作目录、环境白名单、脱敏、审计 | 越界附件被拒；日志无明文密钥 | 待开发 |
-| T-13 | HTML 报告生成 | D-04 | P0 | L | 自包含模板 + 数据注入 | 1000 用例 < 2s；离线可打开；失败置顶 | 待开发 |
-| T-14 | JSON 报告与 schema | D-04 | P0 | S | 固定 schemaVersion | 可被外部脚本解析 | 待开发 |
-| T-15 | JUnit XML 生成 | D-05 | P0 | M | 状态映射、failure/error/skipped | Jenkins / Actions 可直接消费 | 待开发 |
-| T-16 | 附件与产物目录 | D-04 | P1 | M | workDir、大小限制、索引 | 附件可下载；超限拦截 | 待开发 |
-| T-17 | CLI 二进制与命令 | D-05 | P0 | L | 新增 `bin/astroman-cli.rs`；参数解析、无头执行 | 4 个命令可用；输出与退出码正确 | 待开发 |
-| T-18 | CI 模板与文档 | D-05 | P1 | S | GitHub Actions / Jenkins 示例 | 模板可直接跑通 | 待开发 |
-| T-19 | 压测用例与 SLA 判定 | D-08 | P0 | L | `kind=stress`、SLA 比较、基线对比 | 4 项 SLA 超标即 failed；基线回归生效 | 待开发 |
-| T-20 | 压测报告统一入口 | D-08/D-10 | P1 | M | 报告跳转、JUnit 映射 | 功能报告可查看压测详情 | 待开发 |
-| T-21 | AI 工具 12 个 | — | P1 | L | `aiTools.ts` 工具注册、写操作确认 | 生成/写入/运行/归因全链路可用 | 待开发 |
-| T-22 | AI 提示词增量 | — | P1 | S | 两份提示词与硬规则 | 生成前必确认；脚本约束生效 | 待开发 |
-| T-23 | 测试场景 UI | D-01 | P0 | L | 套件列表/编辑/运行配置 | 可完成建套件→配断言→运行→看报告 | 待开发 |
-| T-24 | 运行详情与报告 UI | D-02/D-04 | P0 | L | 实时进度、日志、停止、报告页 | 停止 < 2s 生效；报告可导出 | 待开发 |
-| T-25 | 套件导入导出 | D-01 | P2 | M | 套件 JSON 包 | 跨机器导入后可直接运行 | 待开发 |
-| T-26 | 文档与版本发布 | — | P0 | S | 本文档、README、版本号 1.0.8、安装包 | 三处版本一致；构建通过 | 待开发 |
-| T-27 | 现有场景迁移与「另存为套件」 | D-01 | P1 | M | `Runner.vue` 增加另存入口；JS 断言转声明式；预检告警 | 勾选接口可生成可用草稿；引用请求的 JS 钩子被标注为跳过 | 待开发 |
+| T-01 | 测试模型建表与迁移 | D-01 | P0 | M | `schema.sql` 新增 8 张表与索引；`db/mod.rs` `migrate()` 只补 `origin` 列与 `PRAGMA user_version` | 新库直接可用；v1.0.7 老库升级无报错；不重复 DDL | 已完成 |
+| T-02 | 套件 / 用例 / 数据集 CRUD 命令 | D-01 | P0 | M | 新增 `commands/test_suite.rs`、`test_case.rs`；`lib.rs` 注册 | 增删改查可用；删除级联正确 | 已完成 |
+| T-03 | 套件执行引擎骨架 | D-01/D-06 | P0 | L | 新增 `test_runner.rs`：状态机、变量、顺序、事件 | 能跑纯 HTTP 套件；状态与事件正确 | 已完成 |
+| T-04 | 声明式断言引擎 | D-04 | P0 | M | `test_assert.rs`：status、响应时间、header、body、jsonPath、正则 | 6 类断言全部可判定；错误信息可读 | 已完成 |
+| T-05 | 数据集 CSV/JSON 解析 + 渲染扩展 | D-01 | P0 | M | 后端解析、嵌套行模型；`util::render` 支持 `{{a.b.c}}` 与 `{{secret:NAME}}` | 与现有 CSV 语义兼容；1000 行可用；嵌套字段与 secret 可渲染 | 已完成 |
+| T-06 | 并发 / 重试 / 跳过 / 失败策略 | D-06 | P0 | M | 引擎调度与依赖标记 | 4 项策略均可配置并生效；非幂等不误重试 | 已完成 |
+| T-07 | 运行与用例结果落库 | D-02 | P0 | M | `test_runs` 开始即插 `running`；用例/断言/附件分项写入；快照与日志限长 | 崩溃后启动可恢复为 error；关闭应用后结果仍在；单次运行库增长可控 | 已完成 |
+| T-08 | Python 解释器探测与设置 | D-03 | P0 | M | 设置项、`python check`、版本校验 | Win/mac 均可探测；缺失时提示清晰 | 已完成 |
+| T-09 | Python 子进程执行器 | D-03 | P0 | L | 进程启动、context/result、超时、进程树、输出限制 | 正常/异常/超时/死循环 4 类用例均正确回收 | 已完成 |
+| T-10 | `astroman_runtime.py` 辅助模块 | D-03 | P1 | M | 随包资源、`PYTHONPATH` 注入、断言助手 | 示例脚本免额外依赖即可运行 | 已完成 |
+| T-11 | 套件 setup / teardown | D-03 | P1 | M | 引擎生命周期与失败记录 | teardown 始终执行；失败单独记录 | 已完成 |
+| T-12 | Python 安全与审计 | D-03 | P0 | M | 授权开关、工作目录、环境白名单、脱敏、审计 | 越界附件被拒；日志无明文密钥 | 已完成 |
+| T-13 | HTML 报告生成（Rust 单点） | D-04 | P0 | L | 迁移 `reportExport.ts` 模板到 Rust（模板选型优先轻量方案：字符串拼装或 tera，避免重依赖），自包含 + 数据注入；前端改为预览 | 1000 用例 < 2s；离线可打开；失败置顶；信息结构与风格与现有压测 HTML 一致（不做像素级对照） | 已完成 |
+| T-14 | JSON 报告与 schema | D-04 | P0 | S | 固定 schemaVersion | 可被外部脚本解析 | 已完成 |
+| T-15 | JUnit XML 生成 | D-05 | P0 | M | 状态映射、failure/error/skipped | Jenkins / Actions 可直接消费 | 已完成 |
+| T-16 | 附件与产物目录 | D-04 | P1 | M | workDir、大小限制、索引 | 附件可下载；超限拦截 | 已完成 |
+| T-17 | CLI 二进制与命令 | D-05 | P0 | L | `[[bin]] astroman-cli`；参数解析、无头执行、读 `storage.json` 数据目录 | 6 个命令可用；输出与退出码正确；自定义目录下能打开同一库 | 已完成 |
+| T-18 | CI 模板与文档 | D-05 | P1 | S | GitHub Actions / Jenkins 示例 | 模板可直接跑通 | 已完成 |
+| T-19 | 压测用例与 SLA 判定 | D-08 | P0 | L | `kind=stress`；SLA 判定下沉 Rust；基线对比；前端改读结果 | 4 项 SLA 超标即 failed；基线回归生效；UI 与 CLI 判定一致 | 已完成 |
+| T-20 | 压测报告统一入口 | D-08/D-10 | P1 | M | 报告跳转、JUnit 映射 | 功能报告可查看压测详情 | 已完成 |
+| T-21 | AI 工具 12 个 | — | P1 | L | `aiTools.ts` 注册（SCHEMAS / WRITE_TOOLS / LABELS / 超时 / 目录分层）；扩展 `AiConfirmCard` | 生成/写入/运行/归因全链路可用；长任务不误超时；确认卡含 dryRun 与变更明细 | 已完成 |
+| T-22 | AI 提示词增量 | — | P1 | S | 两份提示词与硬规则 | 生成前必确认；脚本约束生效 | 已完成 |
+| T-23 | 测试场景 UI | D-01 | P0 | L | 套件列表/编辑/运行配置 | 可完成建套件→配断言→运行→看报告 | 已完成 |
+| T-24 | 运行详情与报告 UI | D-02/D-04 | P0 | L | 实时进度、日志、停止、报告页 | 停止 < 2s 生效；报告可导出 | 已完成 |
+| T-25 | 套件导入导出 | D-01 | P2 | M | 套件 JSON 包 | 跨机器导入后可直接运行 | 已完成 |
+| T-26 | 文档与版本发布 | — | P0 | S | 本文档、README、版本号 1.0.8、安装包 | 三处版本一致；构建通过 | 已完成 |
+| T-27 | 现有场景迁移与「另存为套件」 | D-01 | P1 | M | `Runner.vue` 增加另存入口；JS 断言转声明式；预检告警（含环境脚本） | 勾选接口可生成可用草稿；接口 JS 钩子与环境脚本被标注为跳过 | 已完成 |
+| T-32 | 引擎与 Tauri 解耦（CLI 前置） | D-05 | P0 | L | 进度回调/trait 替代 `AppHandle`；`AppState` headless 初始化；取消按 runId | CLI 无窗口可执行；桌面端行为不变；压测事件仍能推送 | 已完成 |
+| T-33 | 执行记录来源标记与历史隔离 | D-12 | P0 | M | `request_history` / `request_runs` 加 `origin`；`execute` 增加落库策略；历史页默认过滤 | 1000 用例回归后手工快照不被挤掉；历史页可按来源筛选 | 已完成 |
+| T-34 | 压测鉴权 / Cookie / 运行期变量 | D-08/D-10 | P0 | M | `StressConfig` 增加 `auth`、`cookieEnabled`、`vars`；与手工请求共用连接配置 | 登录→压测链路可用；代理与客户端证书生效 | 已完成 |
+| T-35 | Cookie 隔离模式 | D-06 | P1 | M | 把 Cookie 读写从 `execute` 内部抽成可注入的 `cookie_mode` + 运行级内存罐 | `isolated` 不落库、不跨 worker 污染；`shared` 行为不变 | 已完成 |
+| T-36 | CLI 打包与分发 | D-05 | P1 | M | `bundle.externalBin`、Windows 控制台子系统、macOS 签名；`storage.json` 解析；win32（i686）与 offline 构建变体的 CLI 取舍（出 i686 版本或明确仅 x64） | 安装包内含 CLI；自定义数据目录可用；`--db` 覆盖正确；win32 / offline 包行为有明确结论 | 已完成 |
+| T-37 | 测试流水线 ci.yml | D-05 | P1 | S | push/PR 触发：`npm run test`、`cargo test`、构建检查；与 `release.yml` 分离 | PR 可见失败；发布 tag 不受影响 | 已完成 |
+| T-38 | Python runtime 资源打包 | D-03 | P1 | S | `bundle.resources` 打包 `astroman_runtime.py`；dev/prod 路径解析；便携 Python 与 win32 / offline 包的架构匹配 | 安装后示例脚本免额外依赖可运行；win32 / offline 安装包内资源齐全 | 已完成 |
+
+> 2026-10-30 收尾：T-19（压测用例 + SLA / 基线判定）、T-20（报告嵌入压测指标）、T-21/T-22（测试域 AI 工具与提示词）、T-25（套件包）、T-27（另存为套件）、T-36（CLI 分发）、T-37（CI 流水线）已完成；T-28~T-31 记事本按风险预案顺延到 v1.0.8 补丁版，不影响执行内核与报告主线。
+
+**批次归属（补充任务）**：T-32（解耦）必须在批次四之前完成，建议并入批次一；T-33（origin）、T-34（压测参数）、T-35（Cookie 隔离）并入批次一~二；T-36~T-38 并入批次四~六。T-28~T-31 为记事本任务（见 16.7），与主线无强依赖，可并行开发，不占用上述批次。
 
 ### 12.3 数据结构迁移
 
-写入 `db/mod.rs` 的 `migrate()`（沿用「已存在则忽略」策略）：
+分两处维护，避免同一份 DDL 写两遍：
+
+1. **新建表**：直接写 `schema.sql`（见 5.2 全量定义）。`db::init` 每次启动都会执行 `schema.sql`，`CREATE TABLE IF NOT EXISTS` 天然幂等，老库升级也会自动补表；
+2. **存量表增量**：只把无法用 `IF NOT EXISTS` 表达的语句放进 `db/mod.rs` 的 `migrate()`（沿用「已存在则忽略」策略）：
 
 ```sql
--- v1.0.8 新建表（见 5.2 全量定义）
--- 仅建表，不改动 v1.0.7 已有表结构
-CREATE TABLE IF NOT EXISTS test_suites (...);
-CREATE TABLE IF NOT EXISTS test_cases (...);
-CREATE TABLE IF NOT EXISTS test_datasets (...);
-CREATE TABLE IF NOT EXISTS test_runs (...);
-CREATE TABLE IF NOT EXISTS test_run_cases (...);
-CREATE TABLE IF NOT EXISTS test_run_assertions (...);
-CREATE TABLE IF NOT EXISTS test_artifacts (...);
+ALTER TABLE request_history ADD COLUMN origin TEXT NOT NULL DEFAULT 'manual';
+ALTER TABLE request_runs    ADD COLUMN origin TEXT NOT NULL DEFAULT 'manual';
+CREATE INDEX IF NOT EXISTS idx_history_origin ON request_history(origin, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_runs_origin ON request_runs(origin, created_at DESC);
+PRAGMA user_version = 1;  -- 记录库版本，供 CLI 判断兼容性
 ```
 
-同步更新 `schema.sql`，保证新库与升级库一致。
+3. `notes` 表并入同一次变更，不单独走升级路径（见 16.7）。
 
 ### 12.4 关键实现约束
 
@@ -1366,8 +1492,11 @@ CREATE TABLE IF NOT EXISTS test_artifacts (...);
 2. 不修改 `test_plans` / `test_reports` 结构，压测关联只加外键字段；
 3. Python 协议字段一旦发布按版本号兼容，新增字段只能可选；
 4. 报告生成失败不得影响运行结果落库；
-5. CLI 与 UI 使用同一引擎同一张表，禁止复制逻辑；
-6. 所有超时与停止必须走到进程树回收，防止孤儿 Python 进程。
+5. CLI 与 UI 使用同一引擎同一张表，禁止复制逻辑；AI 侧只保留 `test_run_start` 一个入口，不扩展 `run_batch`；
+6. 所有超时与停止必须走到进程树回收，防止孤儿 Python 进程；
+7. 新表与新目录一律基于 `state.data_dir`，库内只存相对路径；
+8. 纯新建表写 `schema.sql`，`migrate()` 只放 ALTER 与索引，禁止两处重复 DDL；
+9. 任何跳过 JS 入口（接口钩子 / 环境脚本 / 未执行断言字段）的情况，必须在预检、报告、日志三处同时暴露。
 
 ### 12.5 命令与事件契约
 
@@ -1382,9 +1511,10 @@ CREATE TABLE IF NOT EXISTS test_artifacts (...);
 | `test_suite_export` / `test_suite_import` | `id, path` / `path, onConflict` | `path` / `id` | 套件包（8.6） |
 | `test_dataset_list` / `test_dataset_import` | `suiteId` / `suiteId, path` | `Dataset[]` / `Dataset` | 数据集 |
 | `test_case_list` / `test_case_save` / `test_case_delete` | `suiteId` / `payload` / `id` | — | 用例 |
-| `test_preflight` | `suiteId, envId` | `PreflightReport` | 语法、变量、依赖环、缺 secret |
+| `test_preflight` | `suiteId, envId` | `PreflightReport` | 语法、变量、依赖环、缺 secret、JS 入口跳过清单（接口钩子 / 环境脚本 / request.assertions） |
 | `test_run_start` | `suiteId, envId?, overrides?` | `runId` | 启动运行 |
 | `test_run_stop` | `runId` | `()` | 停止并回收进程树 |
+| `test_run_current` | `suiteId?` | `RunDetail \| null` | 运行中窗口重开时恢复进度（不依赖事件回溯） |
 | `test_run_get` | `runId` | `RunDetail` | 汇总 + 用例 + 断言 |
 | `test_run_list` | `suiteId?, page, size` | `RunSummary[]` | 历史 |
 | `test_report_export` | `runId, format` | `path` | html / json / junit |
@@ -1402,7 +1532,7 @@ CREATE TABLE IF NOT EXISTS test_artifacts (...);
 
 契约约束：
 
-1. 事件只做增量刷新，断线或窗口重开时以 `test_run_get` 拉取为准（幂等，不依赖事件补发）；
+1. 事件只做增量刷新，断线或窗口重开时以 `test_run_current` / `test_run_get` 拉取为准（幂等，不依赖事件补发）；
 2. payload 只带展示字段，不塞完整响应体；大字段通过 `test_run_get` 按需取；
 3. 新增字段只能可选，旧前端忽略即可；`test:run:done` 的 `status` 与 `test_runs.status` 完全一致；
 4. CLI 复用同一引擎，不消费 Tauri 事件，改为轮询 `test_run_get` 或读取进度文件。
@@ -1428,7 +1558,14 @@ CREATE TABLE IF NOT EXISTS test_artifacts (...);
 | 超时叠加 | HTTP / 钩子 / 用例 / 套件 四层各自超时 | 先到者生效；剩余预算正确传递 |
 | 依赖语义 | 前置失败、跳过传递、行号配对、依赖环 | 下游 `skipped`；成环拒绝保存 |
 | 计时口径 | 含重试、含钩子、`stress` 用例 | `duration_ms` 不含排队，分项可加总核对 |
-| 套件包 | 导出→导入→运行；缺 secret；sha256 不符 | 导入即可运行；缺失与校验失败明确报错 |
+| 套件包 | 导出→导入→运行；缺 secret；sha256 不符；stress 内联 | 导入即可运行；缺失与校验失败明确报错 |
+| 历史隔离 | 1000 用例回归后检查 `request_history` / `request_runs` | 手工记录不被淘汰；可按 `origin` 过滤 |
+| JS 入口 | 接口钩子、环境脚本、`request.assertions` 三类 | 预检与报告均列出跳过项；`strictScripts` 时拒绝运行 |
+| 压测链路 | 登录取 token → 压测 → 校验 | 运行期变量可注入；auth / Cookie 与手工请求一致 |
+| 数据目录 | 切换到自定义数据目录后运行与查看历史 | 报告、工作目录、历史均可用（相对路径） |
+| 崩溃恢复 | 运行中强杀进程后重启 | 残留 `running` 自动转 `error`，已完成用例保留 |
+
+**测试落位约定**：渲染 / 断言 / 协议解析 / 变量优先级 → Rust `#[cfg(test)]` 单测（现有 util / state / ai 三处为参照）；AI 工具 schema 与确认卡 → vitest（现有 `src/utils/__tests__/` 4 个 spec）；退出码、进程回收、崩溃恢复、CI 消费 → 集成脚本（`scripts/`）+ 13.2 手工验收。
 
 ### 13.2 手工回归
 
@@ -1450,8 +1587,14 @@ CREATE TABLE IF NOT EXISTS test_artifacts (...);
 | R-14 | 套件导入导出 | 另一台机器导入可运行 |
 | R-15 | AI 生成套件 | 先出草案；确认后写库；拒绝不写入 |
 | R-16 | 无 Python 环境 | 仅声明式断言用例可运行；提示清晰 |
-| R-17 | 敏感信息 | 报告与日志无明文 token/password |
-| R-18 | 老库升级 | v1.0.7 数据库升级后功能正常 |
+| R-17 | 敏感信息 | 报告与日志无明文 token/password（含 `is_secret` 变量） |
+| R-18 | 老库升级 | v1.0.7 数据库升级后功能正常；`origin` 列默认 `manual` |
+| R-19 | 带鉴权与代理的压测 | 压测请求与手工请求结果一致；登录 token 可传入 |
+| R-20 | 环境脚本场景 | 套件预检提示环境脚本被跳过；报告有标注 |
+| R-21 | 退出码优先级 | 同时存在 error 与断言失败时返回 2；配置错误返回 3 |
+| R-22 | 自定义数据目录 | 切换目录后运行、历史、报告、附件均正常 |
+| R-23 | CLI 读取自定义目录 | 桌面端切换目录后，CLI 默认打开同一库 |
+| R-24 | 运行中强杀 | 重启后残留运行转为 error，UI 不卡在「运行中」 |
 
 ### 13.3 发布门禁
 
@@ -1463,9 +1606,10 @@ cargo test --manifest-path src-tauri/Cargo.toml
 npm run build:win
 ```
 
-- 三处版本号一致：`package.json` / `src-tauri/tauri.conf.json` / `src-tauri/Cargo.toml` → `1.0.8`。
-- 安装包冒烟：R-01 / R-02 / R-04 / R-09 / R-11。
+- 三处版本号一致：`package.json` / `src-tauri/tauri.conf.json` / `src-tauri/Cargo.toml` → `1.0.8`（`Cargo.lock` 随构建自动更新）。
+- 安装包冒烟：R-01 / R-02 / R-04 / R-09 / R-11 / R-19。
 - v1.0.7 数据库升级验证（R-18）。
+- 安装包内确认 CLI 与 `resources/python/astroman_runtime.py` 均已打入（T-36 / T-38）。
 
 ---
 
@@ -1479,8 +1623,11 @@ npm run build:win
 | Rust 引擎与前端 Runner 行为不一致 | 同一脚本两处结果不同 | 中 | 明确边界（JS 只在前端）、文档标注、对比用例 |
 | 报告体积过大 | 磁盘占用 | 低 | 保留 50 次、附件上限、清理策略 |
 | CLI 与桌面端并发写库 | 锁冲突 | 中 | WAL + 单写者建议 + 明确退出码 5 |
-| SLA 判定误伤 | 发版阻塞 | 中 | 支持阈值豁免 / 仅告警模式（warnOnly） |
+| SLA 判定误伤 | 发版阻塞 | 中 | 支持阈值豁免 / 仅告警模式（warnOnly）；判定单点下沉 Rust，避免 UI 与 CLI 不一致 |
 | AI 生成脚本质量不稳定 | 用例不可用 | 中 | 生成后必须通过 `python -m py_compile` 与 dry-run |
+| 引擎解耦重构影响现有压测 | 手工压测回归 | 中 | 先加适配层保留 `stress_*` 命令签名；事件与取消行为做对比用例 |
+| 套件回归冲掉调试快照 | 排查依据丢失 | 中 | `origin` 标记 + 套件默认不写单接口快照（T-33） |
+| v1.0.8 范围过大（38 项任务、多个 L 级） | 发布延期 / 半成品合入 | 高 | 严格按批次交付；记事本（T-28~T-31）与 AI 工具（T-21 / T-22）可随时切割到补丁版，不影响执行内核与报告主线 |
 
 **回滚**：新增表与新增文件为主，回退旧版本不影响既有功能；报告目录与 `test_*` 表可保留。Python 执行器可单独关闭（设置项），关闭后退化为声明式断言。
 
@@ -1489,7 +1636,7 @@ npm run build:win
 | 威胁 | 触发方式 | 缓解措施 | 残余风险 |
 |---|---|---|---|
 | 任意代码执行 | 用户或 AI 生成的脚本 | 默认关闭、首次运行显式授权、逐次审计、AI 生成需确认 | 用户主动执行恶意脚本，等同于本机权限 |
-| 环境变量泄露 | 脚本读取宿主环境 | 只注入白名单（`FBIN_*` + 用户显式声明的变量），不继承完整环境 | 脚本可读取工作目录内文件 |
+| 环境变量泄露 | 脚本读取宿主环境 | 只注入白名单（`ASTROMAN_*` + 用户显式声明的变量），不继承完整环境 | 脚本可读取工作目录内文件 |
 | 路径穿越 | 脚本写 `../../` 或绝对路径 | 工作目录 `canonicalize` 后做前缀校验，越界附件拒绝并记审计 | 同盘符下的软链接需额外校验 |
 | 符号链接逃逸 | 建软链指向系统目录 | 解析真实路径后再校验；Windows 拒绝 reparse point | 极小概率的竞态 |
 | 输出洪泛 | `print` 百万行卡死管道 | stdout / stderr 各 1MB 上限，超出截断并标记 `OUTPUT_TRUNCATED` | 截断后日志不完整 |
@@ -1505,19 +1652,20 @@ npm run build:win
 
 | 项 | 内容 | 状态 |
 |---|---|---|
-| 版本号 | `package.json` / `tauri.conf.json` / `Cargo.toml` → 1.0.8 | 待办 |
-| 数据库 | 8 张新表（测试域 7 + `notes`）+ 索引；老库升级脚本验证 | 待办 |
-| Python | 解释器探测、内置 runtime、默认关闭授权 | 待办 |
-| 报告 | HTML / JSON / JUnit 三份产物 | 待办 |
-| CLI | `astroman-cli` 四命令 + 退出码 | 待办 |
-| CI | GitHub Actions / Jenkins 模板 | 待办 |
-| 压测 | SLA 判定 + 基线回归 | 待办 |
-| AI | 12 个工具 + 记事本 4 个工具 + 提示词增量 | 待办 |
-| 记事本 | `notes` 表与命令、提醒调度、系统通知权限声明、托盘计数 | 待办 |
-| 文档 | 本文档 + README + 技术方案 | 待办 |
-| 测试 | 13.1 自动化 + 13.2 手工 + 16.8 记事本验收全部通过 | 待办 |
-| 构建 | 前端构建 / `cargo check` / Windows 安装包 | 待办 |
-| 发布说明 | 场景资产化、Python、报告、CLI、SLA 门禁、AI 协同、工具箱记事本 | 待办 |
+| 版本号 | `package.json` / `tauri.conf.json` / `Cargo.toml` → 1.0.8；`Cargo.lock` 同步 | 已完成 |
+| 数据库 | 测试域 7 张新表 + 索引；`origin` 列迁移；`PRAGMA user_version`；老库升级验证（`notes` 表随补丁版） | 已完成 |
+| 存量兼容 | `request_history` / `request_runs` 来源过滤；历史页与快照页 UI 适配 | 已完成 |
+| Python | 解释器探测、runtime 资源打包（`bundle.resources`）、默认关闭授权、设置页入口 | 已完成 |
+| 报告 | Rust 单点：HTML / JSON / JUnit 三份产物；前端改为预览 | 已完成 |
+| CLI | `astroman-cli`：命令 / 退出码 / `storage.json` 解析 / `bundle.externalBin` / 控制台子系统 / macOS 签名 | 已完成 |
+| CI | 新增 `ci.yml`（push/PR：vitest + cargo test + 构建）；GitHub Actions / Jenkins 套件模板 | 已完成 |
+| 压测 | `stress` 用例：auth / Cookie / 运行期变量 / 客户端一致性；SLA 判定单点 + 基线回归 | 已完成 |
+| AI | 12 个测试域工具（含 SCHEMAS / WRITE_TOOLS / 超时 / 目录分层）+ 提示词增量 + 确认卡预检（记事本 4 个工具随补丁版） | 已完成 |
+| 记事本 | `notes` 表与命令、提醒调度、`notification` 插件与能力声明、托盘计数 | 待办（补丁版） |
+| 文档 | 本文档 + README + `docs/features.md` + 新增 `docs/automated-testing.md` + CHANGELOG | 已完成 |
+| 测试 | 13.1 自动化单测（渲染 / 断言 / SLA / 压测链路）通过；13.2 手工与 16.8 记事本验收待执行 | 进行中 |
+| 构建 | 前端构建、`cargo check`、`cargo test`、CLI release 编译已完成；安装包与包内 CLI / runtime 检查待发布构建 | 进行中 |
+| 发布说明 | 场景资产化、Python、报告、CLI、SLA 门禁、AI 协同（记事本随补丁版） | 已完成 |
 
 ---
 
@@ -1540,7 +1688,7 @@ v1.0.8 除测试主线外，新增工具箱「记事本」：既能**登记事�
 **明确不做**（写进文档避免预期落空）：
 
 1. **不做云同步与多人共享**，数据只在本机 SQLite；
-2. **应用退出后不提醒**——提醒由应用内常驻调度器触发，最小化到托盘仍有效，完全退出即失效，界面必须明示；
+2. **完全退出应用后不提醒**——提醒由应用内常驻调度器触发。注意现有行为：点击窗口关闭按钮只是**隐藏到托盘**（`lib.rs` 的 `CloseRequested` 拦截），调度器仍在运行；只有从托盘菜单「退出 AstroMan」才会终止进程。界面文案必须区分「关闭窗口（到托盘，仍提醒）」与「托盘退出（不提醒）」；
 3. 不做日历视图、不做富文本编辑器、不做附件。
 
 ### 16.2 数据模型
@@ -1593,14 +1741,14 @@ flowchart LR
 | 规则 | 说明 |
 |---|---|
 | 调度器 | Rust 侧 `tokio::spawn` + `interval(Duration::from_secs(30))`，随应用启动，不依赖前端页面 |
-| 去重 | 命中即写 `notified_at`；同一记录不会重复弹 |
-| 限流 | 单次 tick 最多弹 3 条，其余合并为一条「还有 N 条待办到期」，避免休眠唤醒后刷屏 |
-| 睡醒补偿 | 系统休眠恢复时按 `remind_at` 升序补发，已过期超 24h 的只进列表不弹窗 |
+| 去重 | 命中**且实际弹出**的记录才写 `notified_at`；同一记录不会重复弹 |
+| 限流 | 单次 tick 最多弹 3 条，其余合并为一条「还有 N 条待办到期」；**只有被弹出/被合并提示覆盖的记录才写 `notified_at`**，未覆盖的留到下个 tick，避免永久丢失 |
+| 睡醒补偿 | 系统休眠恢复时按 `remind_at` 升序补发，已过期超 24h 的只进列表不弹窗（同样写 `notified_at`，避免下次重复判断） |
 | 稍后提醒 | `snooze_until` 存在时以它为准，触发后清空该字段并写 `notified_at` |
-| 重复提醒 | `daily/weekly/workday` 触发后推进 `remind_at` 到下一个周期；`workday` 遇周末顺延到周一 |
+| 重复提醒 | `daily/weekly/workday` 触发后推进 `remind_at` 到下一个周期，**同时清空 `notified_at`**（否则第二次永不触发）；`workday` 遇周末顺延到周一 |
 | 完成即停 | `status` 改为 `done/archived` 后不再参与调度 |
-| 通知通道 | 新增 `tauri-plugin-notification`，`capabilities/default.json` 增加 `notification:default`；无权限时降级为应用内提示条，并在设置页提示一次 |
-| 托盘 | 托盘菜单新增「记事本（N 条未完成）」，左键仍打开主窗口；托盘 tooltip 显示最近一条到期事项 |
+| 通知通道 | 新增 `tauri-plugin-notification`，`capabilities/default.json` 增加 `notification:default`（现有能力为 `core:default` / `core:webview:allow-set-webview-zoom` / `dialog:default`）；无权限时降级为应用内提示条，并在设置页提示一次；macOS 通知需打包签名后验证，dev 模式可能不弹 |
+| 托盘 | 托盘菜单新增「记事本（N 条未完成）」，左键仍打开主窗口；托盘 tooltip 显示最近一条到期事项。现有 `setup_tray` 只创建一次，动态改文案需保存 `MenuItem` 句柄（`app.tray_by_id` + `set_text`） |
 
 ### 16.4 与测试主线、AI 的衔接
 
@@ -1645,7 +1793,7 @@ AI 工具参数要点：
 
 | 风险 | 规避 |
 |---|---|
-| 用户误以为退出应用也能提醒 | 首次使用弹一次说明；设置页常驻一行「退出应用后不提醒」 |
+| 用户误以为「关窗口 / 退出」行为一致 | 首次使用弹一次说明；设置页常驻一行「关闭窗口＝到托盘，仍提醒；托盘退出＝不提醒」 |
 | 休眠唤醒后通知刷屏 | 单 tick 限 3 条 + 24h 过期不弹 |
 | 重复提醒算错（工作日/时区） | 用 `chrono::Local` 计算下一周期，单元测试覆盖跨月、周末、跨年 |
 | 通知权限被拒 | 降级应用内提示条，不阻塞功能 |
@@ -1674,7 +1822,8 @@ AI 工具参数要点：
 | 重复提醒 | 设为每日，改 `remind_at` 为过去 | 触发后自动推进到次日同一时刻 |
 | 已完成不提醒 | 到期前标记完成 | 到点无通知 |
 | 关联跳转 | 从失败用例记待办 | 笔记带 `ref_type=case`、可在用例详情看到 |
-| 应用退出 | 退出后到期 | **不弹通知**，再次启动时列表标红「已逾期」 |
+| 关闭窗口 | 点窗口关闭按钮后到期 | 应用隐藏到托盘，**仍会提醒**；文案明确说明 |
+| 托盘退出 | 托盘菜单退出后到期 | **不弹通知**，再次启动时列表标红「已逾期」 |
 | 休眠恢复 | 睡眠跨过 5 条到期 | 最多弹 3 条 + 合并提示，无刷屏 |
 | 权限拒绝 | 拒绝系统通知权限 | 降级提示条，功能不报错 |
 | 大数据 | 1000 条笔记 + 搜索 | 列表 < 500ms，搜索 < 300ms |
@@ -1703,35 +1852,51 @@ AI 工具参数要点：
 
 | 文件 | 作用 |
 |---|---|
-| [src/views/Runner.vue](file:///d:/Software/ProjectFiles/FbinHttp/src/views/Runner.vue) | 现有批量运行（测试场景雏形） |
-| [src/utils/scriptRunner.ts](file:///d:/Software/ProjectFiles/FbinHttp/src/utils/scriptRunner.ts) | 现有 JS 脚本运行时与断言 |
-| [src/views/StressTest.vue](file:///d:/Software/ProjectFiles/FbinHttp/src/views/StressTest.vue) | 压测配置、SLA 输入、实时进度 |
-| [src-tauri/src/commands/stress.rs](file:///d:/Software/ProjectFiles/FbinHttp/src-tauri/src/commands/stress.rs) | 压测引擎 |
-| [src-tauri/src/commands/report.rs](file:///d:/Software/ProjectFiles/FbinHttp/src-tauri/src/commands/report.rs) | 压测报告读写与导出 |
-| [src-tauri/src/commands/http.rs](file:///d:/Software/ProjectFiles/FbinHttp/src-tauri/src/commands/http.rs) | HTTP 执行底座 |
-| [src-tauri/src/commands/run.rs](file:///d:/Software/ProjectFiles/FbinHttp/src-tauri/src/commands/run.rs) | 单接口运行记录 |
-| [src-tauri/src/db/schema.sql](file:///d:/Software/ProjectFiles/FbinHttp/src-tauri/src/db/schema.sql) | 数据库结构 |
-| [src-tauri/src/db/mod.rs](file:///d:/Software/ProjectFiles/FbinHttp/src-tauri/src/db/mod.rs) | 建表与迁移 |
-| [src-tauri/src/lib.rs](file:///d:/Software/ProjectFiles/FbinHttp/src-tauri/src/lib.rs) | 命令注册 |
-| [src/utils/aiTools.ts](file:///d:/Software/ProjectFiles/FbinHttp/src/utils/aiTools.ts) | AI 工具注册 |
-| [src-tauri/src/prompts/hangzai_system_prompt.md](file:///d:/Software/ProjectFiles/FbinHttp/src-tauri/src/prompts/hangzai_system_prompt.md) | 系统提示词 |
-| [src-tauri/src/docx/agent_hard_rules.md](file:///d:/Software/ProjectFiles/FbinHttp/src-tauri/src/docx/agent_hard_rules.md) | Agent 硬规则 |
-| [src/views/Tools.vue](file:///d:/Software/ProjectFiles/FbinHttp/src/views/Tools.vue) | 工具箱页面（记事本挂载入口） |
-| [src/tools/registry.ts](file:///d:/Software/ProjectFiles/FbinHttp/src/tools/registry.ts) | 工具箱工具注册表与分类 |
-| [src/tools/types.ts](file:///d:/Software/ProjectFiles/FbinHttp/src/tools/types.ts) | 工具定义类型（`component` 懒加载） |
-| [src/router/index.ts](file:///d:/Software/ProjectFiles/FbinHttp/src/router/index.ts) | 路由表（`/tools`） |
-| [src-tauri/Cargo.toml](file:///d:/Software/ProjectFiles/FbinHttp/src-tauri/Cargo.toml) | Rust 依赖（需加 `tauri-plugin-notification`） |
-| [src-tauri/capabilities/default.json](file:///d:/Software/ProjectFiles/FbinHttp/src-tauri/capabilities/default.json) | 权限声明（需加 `notification:default`） |
+| [src/views/Runner.vue](file:///d:/Software/ProjectFiles/AstroMan/src/views/Runner.vue) | 现有批量运行（测试场景雏形） |
+| [src/utils/scriptRunner.ts](file:///d:/Software/ProjectFiles/AstroMan/src/utils/scriptRunner.ts) | 现有 JS 脚本运行时与断言 |
+| [src/views/StressTest.vue](file:///d:/Software/ProjectFiles/AstroMan/src/views/StressTest.vue) | 压测配置、SLA 输入、实时进度 |
+| [src-tauri/src/commands/stress.rs](file:///d:/Software/ProjectFiles/AstroMan/src-tauri/src/commands/stress.rs) | 压测引擎 |
+| [src-tauri/src/commands/report.rs](file:///d:/Software/ProjectFiles/AstroMan/src-tauri/src/commands/report.rs) | 压测报告读写与导出 |
+| [src-tauri/src/commands/http.rs](file:///d:/Software/ProjectFiles/AstroMan/src-tauri/src/commands/http.rs) | HTTP 执行底座 |
+| [src-tauri/src/commands/run.rs](file:///d:/Software/ProjectFiles/AstroMan/src-tauri/src/commands/run.rs) | 单接口运行记录 |
+| [src-tauri/src/db/schema.sql](file:///d:/Software/ProjectFiles/AstroMan/src-tauri/src/db/schema.sql) | 数据库结构 |
+| [src-tauri/src/db/mod.rs](file:///d:/Software/ProjectFiles/AstroMan/src-tauri/src/db/mod.rs) | 建表与迁移 |
+| [src-tauri/src/lib.rs](file:///d:/Software/ProjectFiles/AstroMan/src-tauri/src/lib.rs) | 命令注册 |
+| [src/utils/aiTools.ts](file:///d:/Software/ProjectFiles/AstroMan/src/utils/aiTools.ts) | AI 工具注册 |
+| [src-tauri/src/prompts/hangzai_system_prompt.md](file:///d:/Software/ProjectFiles/AstroMan/src-tauri/src/prompts/hangzai_system_prompt.md) | 系统提示词 |
+| [src-tauri/src/docx/agent_hard_rules.md](file:///d:/Software/ProjectFiles/AstroMan/src-tauri/src/docx/agent_hard_rules.md) | Agent 硬规则 |
+| [src/views/Tools.vue](file:///d:/Software/ProjectFiles/AstroMan/src/views/Tools.vue) | 工具箱页面（记事本挂载入口） |
+| [src/tools/registry.ts](file:///d:/Software/ProjectFiles/AstroMan/src/tools/registry.ts) | 工具箱工具注册表与分类 |
+| [src/tools/types.ts](file:///d:/Software/ProjectFiles/AstroMan/src/tools/types.ts) | 工具定义类型（`component` 懒加载） |
+| [src/router/index.ts](file:///d:/Software/ProjectFiles/AstroMan/src/router/index.ts) | 路由表（`/tools`） |
+| [src-tauri/Cargo.toml](file:///d:/Software/ProjectFiles/AstroMan/src-tauri/Cargo.toml) | Rust 依赖（需加 `tauri-plugin-notification`） |
+| [src-tauri/capabilities/default.json](file:///d:/Software/ProjectFiles/AstroMan/src-tauri/capabilities/default.json) | 权限声明（需加 `notification:default`） |
+| [src-tauri/src/state.rs](file:///d:/Software/ProjectFiles/AstroMan/src-tauri/src/state.rs) | `AppState` / 连接池（WAL、busy_timeout）/ 设置 / headless 改造点 |
+| [src-tauri/src/commands/history.rs](file:///d:/Software/ProjectFiles/AstroMan/src-tauri/src/commands/history.rs) | 历史查询（需增加 `origin` 过滤） |
+| [src-tauri/src/commands/request.rs](file:///d:/Software/ProjectFiles/AstroMan/src-tauri/src/commands/request.rs) | 接口读写（含未执行的 `assertions` 字段） |
+| [src/utils/reportExport.ts](file:///d:/Software/ProjectFiles/AstroMan/src/utils/reportExport.ts) | 现有压测 HTML / Excel 模板（需迁移到 Rust） |
+| [src/views/ReportDetail.vue](file:///d:/Software/ProjectFiles/AstroMan/src/views/ReportDetail.vue) | 现有 SLA 前端判定（需改为读运行结果） |
+| [src/components/EnvironmentDrawer.vue](file:///d:/Software/ProjectFiles/AstroMan/src/components/EnvironmentDrawer.vue) | 环境变量编辑（`isSecret` 标记来源） |
+| [src/components/AiConfirmCard.vue](file:///d:/Software/ProjectFiles/AstroMan/src/components/AiConfirmCard.vue) | AI 写操作确认卡（需扩展 dryRun / changes / envInfo） |
+| [docs/load-testing.md](file:///d:/Software/ProjectFiles/AstroMan/docs/load-testing.md) | 现有压测文档（需补套件压测与门禁） |
+| [docs/script-api.md](file:///d:/Software/ProjectFiles/AstroMan/docs/script-api.md) | 现有 JS 脚本 API（需标注无头不可用 + 新增 Python 协议） |
 
 ## 附录 B：Python 协议速查
 
 | 环境变量 | 含义 |
 |---|---|
-| `FBIN_CONTEXT` | context.json 绝对路径 |
-| `FBIN_RESULT` | result.json 绝对路径（脚本必须写入） |
-| `FBIN_WORKDIR` | 本次用例工作目录 |
-| `FBIN_RUN_ID` / `FBIN_CASE_ID` | 运行与用例标识 |
-| `FBIN_PHASE` | setup / pre / post / main / teardown |
+| `ASTROMAN_CONTEXT` | context.json 绝对路径 |
+| `ASTROMAN_RESULT` | result.json 绝对路径（脚本必须写入） |
+| `ASTROMAN_WORKDIR` | 本次用例工作目录 |
+| `ASTROMAN_RUN_ID` / `ASTROMAN_CASE_ID` | 运行与用例标识 |
+| `ASTROMAN_PHASE` | setup / pre / post / main / teardown |
+
+| 占位符 | 说明 | 现状 |
+|---|---|---|
+| `{{name}}` | 普通变量（环境 / 运行期 / 数据集行） | 已有（`util::render`） |
+| `{{$timestamp}}` / `{{timestampMs}}` | 内置时间变量 | 已有 |
+| `{{a.b.c}}` | 嵌套路径 | **需扩展**（现有只做扁平 key） |
+| `{{secret:NAME}}` | 套件包 / `--env-file` 注入的密钥 | **需新增**（不参与普通变量） |
 
 | 断言类型（声明式） | 示例 |
 |---|---|
@@ -1765,7 +1930,11 @@ AI 工具参数要点：
 | 2026-10-29 | 优化一 | 补 1.5 迁移路径（M1~M3 + JS→Python 映射）、2.5 ADR（A-01~A-07）、4.8 引用请求 JS 钩子规则 |
 | 2026-10-29 | 优化二 | 补 6.8 计时与超时叠加、6.9 Cookie 与鉴权隔离、6.10 setup/teardown 与依赖语义、8.6 套件包、9.5 确认卡字段、11.2 KPI、12.5 命令与事件契约、14.1 Python 威胁模型；修正场景 C 幂等表述；数据表补 `depends_on`/`dataset_id`/计时字段；任务表补 T-27 |
 | 2026-10-29 | 优化三 | 新增第 16 节「工具箱 · 记事本」（D-11、`notes` 表、提醒调度、通知插件、AI 4 工具、T-28~T-31、16.8 验收）；发布清单补第 8 张表与记事本项；附录 A 补工具箱相关文件 |
+| 2026-10-30 | 代码校对一 | 按 v1.0.7（AstroMan）实际代码全面校对：① 全量链接改为 AstroMan 并校正行号；② 修正现状描述（每次请求写 `request_history`/`request_runs`、SLA 仅前端判定、环境脚本也是 JS、`maskSensitive` 仅前端、`env_variables.is_secret` 已存在、`requests.assertions` 未执行、macOS 10.15）；③ 新增 D-12、A-08~A-10、2.4 压测前置条件、4.8 全 JS 入口规则、5.2 存量表 `origin` 增量与快照限长、6.7 落库策略、6.9 Cookie 注入前提、7.5 报告单点与 SLA 单点、8.1 CLI 落地前提、8.3 退出码优先级、8.5 CI 现状、8.6 stress 内联快照、9.2 工具层约束、9.5 确认卡差距、11.1 崩溃恢复、12.3 迁移拆分、12.4 约束、12.5 `test_run_current`、13.x 新验收项、14 风险、15 清单、16.1/16.3/16.8 提醒逻辑；④ 任务表补 T-32~T-38 并修订 T-01/T-05/T-07/T-13/T-17/T-19/T-21/T-27 |
+| 2026-10-30 | 评审修订 | ① 快照落库前 secret 反向替换脱敏（6.2）；② 套件包导入授权（8.6 第 6 条）；③ 协议与资源统一更名为 `ASTROMAN_*` / `astroman_runtime.py` / `*.astromantest.json`；④ T-36/T-38 补 win32 与 offline 构建变体，8.5 补 Linux CI 依赖说明；⑤ 6.4 明确 stress 用例独占串行；⑥ 13.1 补测试落位约定；⑦ 12.2 补 T-28~T-31 交叉引用；⑧ 修正 capabilities 现状、F-19 依赖口径、ER 图方向、套件包 schemaVersion 类型；⑨ T-13 验收放宽为结构/风格一致并补模板选型；⑩ 风险表补范围切割预案 |
+| 2026-10-30 | 收尾推进 | 完成 T-19（`kind=stress` 执行、SLA 与基线判定下沉 Rust、报告嵌入指标）、T-20（报告跳转与 JUnit 映射）、T-21/T-22（12 个测试域 AI 工具、目录分层、提示词与硬规则）、T-25（`*.astromantest.json` 导入导出）、T-27（批量运行「另存为测试套件」+ 预检提示）、T-36（`bundle.externalBin` 与 release/CI 打包步骤）、T-37（CI 状态）；新增 `docs/automated-testing.md`；T-28~T-31 记事本按风险预案顺延补丁版 |
+| 2026-10-30 | 开发推进 | 按 12.2 批次完成 T-01~T-18、T-32~T-35、T-38：新增 `test_runner.rs`/`test_assert.rs`/`test_dataset.rs`/`python_exec.rs`/`report_builder.rs`/`cli.rs` 与对应命令；报告支持 HTML/JSON(1.0)/JUnit/summary、附件索引与保留清理；新增 `astroman-cli`（test run/list/validate、report export、python check、suite import）与退出码 0~5；CI 增加 `ci.yml`；`astroman_runtime.py` 进入 bundle.resources 与便携包；版本号 1.0.8。剩余 T-19/T-20（压测与 SLA）、T-21/T-22（AI）、T-23~T-27（UI 与发布）、T-36（externalBin 分发）、T-28~T-31（记事本） |
 
 ---
 
-> 备注：本方案以 v1.0.7 代码为基线盘点；「现状」部分均可在对应文件中核对。开发按第 12 节批次推进，每完成一个任务更新状态，并在发布前跑完第 13 节门禁。
+> 备注：本方案以 AstroMan v1.0.7 代码为基线盘点；「现状」部分均可在附录 A 对应文件中核对（2026-10-30 已完成一次逐项校对）。开发按第 12 节批次推进，每完成一个任务更新状态，并在发布前跑完第 13 节门禁。

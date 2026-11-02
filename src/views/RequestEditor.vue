@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
 import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
 import { open, save as saveFile } from '@tauri-apps/plugin-dialog'
+import { convertFileSrc } from '@tauri-apps/api/core'
 import {
   ArrowLeftOutlined,
   ThunderboltOutlined,
@@ -11,6 +12,8 @@ import {
   DeleteOutlined,
   CloseOutlined,
   CopyOutlined,
+  CheckOutlined,
+  EditOutlined,
   CodeOutlined,
   PlusOutlined,
   DownOutlined,
@@ -28,6 +31,7 @@ import {
   requestPostScriptPrompt,
 } from '@/utils/aiScenarios'
 import { useProjectStore } from '@/stores/project'
+import { backOr, previousEntry } from '@/stores/navHistory'
 import { MAX_REQUEST_TABS, useTabsStore } from '@/stores/tabs'
 import { useErrorDialogStore } from '@/stores/errorDialog'
 import { formatDateTime } from '@/utils/datetime'
@@ -51,13 +55,12 @@ import {
   clearRuntimeVars,
   listRuntimeVars,
   renderRuntimeVars,
-  runEnvScript,
-  runPostScript,
-  runPreScript,
+  setRuntimeVars,
   type ScriptAssertion,
   type ScriptLog,
   type ScriptRequest,
 } from '@/utils/scriptRunner'
+import { runScriptJob } from '@/utils/scriptHost'
 import { POST_SCRIPT_EXAMPLES, PRE_SCRIPT_EXAMPLES } from '@/utils/scriptExamples'
 
 const route = useRoute()
@@ -109,6 +112,77 @@ const responseTab = ref('body')
 const insecure = ref(false)
 const envId = ref<number | null>(null)
 const envDrawerOpen = ref(false)
+
+/* ---------- 发送选项：协议 / 重定向 / 重试（v1.0.8） ----------
+   这几个是「发一次怎么发」的开关，不属于接口定义本身，所以存本地偏好而不是写库，
+   避免为它们做一次表结构迁移。 */
+const SEND_OPT_KEY = 'astroman.send.opts'
+
+interface SendOpts {
+  protocol: 'auto' | 'http1' | 'http2'
+  followRedirects: boolean
+  retryEnabled: boolean
+  retryMaxAttempts: number
+  retryAllowNonIdempotent: boolean
+}
+
+function loadSendOpts(): SendOpts {
+  const fallback: SendOpts = {
+    protocol: 'auto',
+    followRedirects: true,
+    retryEnabled: false,
+    retryMaxAttempts: 3,
+    retryAllowNonIdempotent: false,
+  }
+  try {
+    const raw = localStorage.getItem(SEND_OPT_KEY)
+    if (!raw) return fallback
+    const parsed = JSON.parse(raw) as Partial<SendOpts>
+    return {
+      protocol: parsed.protocol === 'http1' || parsed.protocol === 'http2' ? parsed.protocol : 'auto',
+      followRedirects: parsed.followRedirects !== false,
+      retryEnabled: parsed.retryEnabled === true,
+      retryMaxAttempts: Math.min(4, Math.max(1, Number(parsed.retryMaxAttempts) || 3)),
+      retryAllowNonIdempotent: parsed.retryAllowNonIdempotent === true,
+    }
+  } catch {
+    return fallback
+  }
+}
+
+const initialOpts = loadSendOpts()
+const protocol = ref<'auto' | 'http1' | 'http2'>(initialOpts.protocol)
+const followRedirects = ref(initialOpts.followRedirects)
+const retryEnabled = ref(initialOpts.retryEnabled)
+const retryMaxAttempts = ref(initialOpts.retryMaxAttempts)
+const retryAllowNonIdempotent = ref(initialOpts.retryAllowNonIdempotent)
+
+watch([protocol, followRedirects, retryEnabled, retryMaxAttempts, retryAllowNonIdempotent], () => {
+  try {
+    localStorage.setItem(
+      SEND_OPT_KEY,
+      JSON.stringify({
+        protocol: protocol.value,
+        followRedirects: followRedirects.value,
+        retryEnabled: retryEnabled.value,
+        retryMaxAttempts: retryMaxAttempts.value,
+        retryAllowNonIdempotent: retryAllowNonIdempotent.value,
+      }),
+    )
+  } catch {
+    /* 隐私模式下 localStorage 可能不可写，忽略 */
+  }
+})
+
+/** 在途请求标识：后端按它定位要取消的那一条 */
+const requestKey = ref('')
+/** 本次是否被用户主动停止（用于把「取消」和「报错」区分开） */
+const wasCancelled = ref(false)
+
+const IDEMPOTENT_METHODS = new Set(['GET', 'HEAD', 'OPTIONS', 'PUT', 'DELETE', 'TRACE'])
+const retryAvailable = computed(() => IDEMPOTENT_METHODS.has(form.value.method.toUpperCase()))
+/** 非幂等方法想重试必须显式勾选，否则后端会拒绝重试 */
+const retryNeedsConfirm = computed(() => retryEnabled.value && !retryAvailable.value)
 
 /* ---------- 环境变量抽屉 ---------- */
 /** 抽屉内新增 / 修改 / 删除环境后，同步项目环境列表，请求里用到的变量立即生效 */
@@ -671,7 +745,11 @@ function save(showToast = true): Promise<boolean> {
 
 async function goBack() {
   await flushSave()
-  router.push(`/project/${projectId.value}`)
+  // 优先回到真正来源页（例如从历史记录点进来就回历史记录）；
+  // 若上一页只是另一个请求标签页，则按原逻辑回项目
+  const prev = previousEntry.value
+  const fromHistory = prev && !prev.path.startsWith('/request/')
+  router.push(fromHistory ? backOr(`/project/${projectId.value}`) : `/project/${projectId.value}`)
 }
 
 async function switchTab(id: number) {
@@ -752,6 +830,9 @@ async function send() {
   }
   sending.value = true
   result.value = null
+  wasCancelled.value = false
+  // 每次发送一个新标识：重试/重定向都在同一标识下，取消时能一次打中
+  requestKey.value = `req-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
   resetScriptOutput()
   try {
     const envVars = activeEnvVars()
@@ -766,7 +847,13 @@ async function send() {
     let outgoing = request
     const envScript = store.environments.find((item) => item.id === envId.value)?.script?.trim()
     if (envScript) {
-      const envResult = runEnvScript(envScript, request, envVars)
+      const envResult = await runScriptJob({
+        phase: 'env',
+        code: envScript,
+        request,
+        env: envVars,
+        vars: listRuntimeVars(),
+      })
       scriptLogs.value.push(...envResult.logs)
       scriptMs.value += envResult.durationMs
       scriptError.value = envResult.error ?? ''
@@ -778,12 +865,19 @@ async function send() {
         })
         return
       }
+      setRuntimeVars(envResult.vars)
       outgoing = envResult.request
     }
 
     const preCode = form.value.preScript?.trim()
     if (preCode) {
-      const preResult = runPreScript(preCode, outgoing, envVars)
+      const preResult = await runScriptJob({
+        phase: 'pre',
+        code: preCode,
+        request: outgoing,
+        env: envVars,
+        vars: listRuntimeVars(),
+      })
       scriptLogs.value.push(...preResult.logs)
       scriptMs.value += preResult.durationMs
       scriptError.value = preResult.error ?? ''
@@ -795,6 +889,7 @@ async function send() {
         })
         return
       }
+      setRuntimeVars(preResult.vars)
       outgoing = preResult.request
     }
 
@@ -818,12 +913,25 @@ async function send() {
       timeoutMs: 30000,
       auth: form.value.auth ?? null,
       cookieEnabled: true,
+      // v1.0.8：让后端能定位到这条在途请求（「停止」按钮依赖它）
+      requestKey: requestKey.value,
+      protocol: protocol.value === 'auto' ? null : protocol.value,
+      followRedirects: followRedirects.value,
+      retry: {
+        enabled: retryEnabled.value,
+        maxAttempts: retryMaxAttempts.value,
+        allowNonIdempotent: retryAllowNonIdempotent.value,
+      },
     }
 
     result.value = await api.sendRequest(payload)
+    wasCancelled.value = result.value.cancelled === true
 
-    // 超时、DNS、TLS、连接被拒等执行期错误会放在 result.error，直接弹窗展示完整原因
-    if (result.value.error) {
+    // 用户主动停止：不是错误，用 info 提示即可，不弹错误框
+    if (wasCancelled.value) {
+      message.info('已停止本次请求')
+    } else if (result.value.error) {
+      // 超时、DNS、TLS、连接被拒等执行期错误会放在 result.error，直接弹窗展示完整原因
       errorDialog.show({
         title: '请求发送失败',
         error: result.value.error,
@@ -833,7 +941,15 @@ async function send() {
 
     const postCode = form.value.postScript?.trim()
     if (postCode) {
-      const postResult = runPostScript(postCode, outgoing, result.value, envVars)
+      const postResult = await runScriptJob({
+        phase: 'post',
+        code: postCode,
+        request: outgoing,
+        response: result.value,
+        env: envVars,
+        vars: listRuntimeVars(),
+      })
+      if (!postResult.error) setRuntimeVars(postResult.vars)
       scriptLogs.value.push(...postResult.logs)
       scriptAssertions.value = postResult.assertions
       scriptMs.value += postResult.durationMs
@@ -860,16 +976,241 @@ async function send() {
   await loadRuns()
 }
 
+/* ---------- v1.0.8：停止在途请求 ---------- */
+const cancelling = ref(false)
+
+async function cancelSend() {
+  if (!requestKey.value || cancelling.value) return
+  cancelling.value = true
+  try {
+    // 返回 false 说明请求刚好结束了，静默忽略即可
+    await api.httpCancel(requestKey.value)
+  } catch (e) {
+    errorDialog.show({ title: '停止请求失败', error: e, context: { 操作: 'http_cancel' } })
+  } finally {
+    cancelling.value = false
+  }
+}
+
+/* ---------- v1.0.8：耗时分解（瀑布图） ----------
+   口径：dns / connect 只在建连时有值；复用连接时 connectMs = 0 且 reusedConnection = true，
+   这不代表「连接极快」。代理场景下 connect 不含代理握手，必须标注。 */
+interface TimingRow {
+  key: string
+  label: string
+  ms: number
+  /** 在总时长里的起始位置百分比 */
+  offset: number
+  width: number
+  color: string
+  hint: string
+}
+
+const timings = computed(() => result.value?.timings ?? null)
+
+const timingRows = computed<TimingRow[]>(() => {
+  const t = timings.value
+  if (!t) return []
+  const total = Math.max(t.totalMs, 1)
+  const rows: TimingRow[] = []
+  let cursor = 0
+  const push = (key: string, label: string, ms: number, color: string, hint: string) => {
+    if (!(ms > 0)) return
+    rows.push({
+      key,
+      label,
+      ms,
+      offset: (cursor / total) * 100,
+      width: Math.max((ms / total) * 100, 0.5),
+      color,
+      hint,
+    })
+    cursor += ms
+  }
+  if (t.dnsMs && t.dnsMs > 0) push('dns', 'DNS 解析', t.dnsMs, '#8b5cf6', '域名解析耗时')
+  push(
+    'connect',
+    t.reusedConnection ? '连接（复用）' : 'TCP + TLS',
+    t.connectMs,
+    '#0ea5e9',
+    t.reusedConnection ? '复用了已有连接，未新建握手' : '含 TCP 与 TLS 握手',
+  )
+  push('ttfb', '等待首字节', t.ttfbMs, '#f59e0b', '从请求发出到收到响应首字节')
+  push('download', '正文下载', t.downloadMs, '#10b981', '读取响应体的耗时')
+  return rows
+})
+
+/** 计时口径说明：把「容易被误读」的地方显式写出来 */
+const timingNotes = computed<string[]>(() => {
+  const t = timings.value
+  if (!t) return []
+  const notes: string[] = []
+  if (t.reusedConnection) {
+    notes.push('本次复用了已有连接，连接耗时记为 0 —— 这表示「没有新建连接」，不是「连接很快」。')
+  }
+  if (t.proxy) {
+    notes.push('经过代理：连接耗时不含代理握手时间，实际网络时间会比这里显示的更长。')
+  }
+  if (!t.dnsMs) {
+    notes.push('未记录到 DNS 阶段：域名已被解析缓存，或请求直连 IP。')
+  }
+  return notes
+})
+
+/* ---------- v1.0.8：二进制响应 ---------- */
+const bodyKind = computed(() => result.value?.bodyKind ?? 'text')
+const isBinaryBody = computed(
+  () => bodyKind.value === 'binary' || bodyKind.value === 'stream',
+)
+const isImageBody = computed(() => {
+  const type = (result.value?.headers?.['content-type'] ?? '').toLowerCase()
+  return type.startsWith('image/')
+})
+const isPdfBody = computed(() => {
+  const type = (result.value?.headers?.['content-type'] ?? '').toLowerCase()
+  return type.includes('application/pdf')
+})
+
+/** 落盘响应的绝对路径：asset: 预览与「打开所在目录」都用它 */
+const bodyAbsPath = ref('')
+const bodyPreviewError = ref('')
+
+const bodyPreviewSrc = computed(() => {
+  const preview = result.value?.previewBase64
+  if (preview) {
+    const type = (result.value?.headers?.['content-type'] ?? 'image/png').split(';')[0]
+    return `data:${type};base64,${preview}`
+  }
+  if (bodyAbsPath.value) {
+    try {
+      return convertFileSrc(bodyAbsPath.value)
+    } catch {
+      return ''
+    }
+  }
+  return ''
+})
+
+watch(
+  () => result.value?.bodyFile,
+  async (relPath) => {
+    bodyAbsPath.value = ''
+    bodyPreviewError.value = ''
+    if (!relPath) return
+    try {
+      bodyAbsPath.value = await api.responseFilePath(relPath)
+    } catch (e) {
+      bodyPreviewError.value = String(e)
+    }
+  },
+  { immediate: true },
+)
+
+/** 二进制响应「另存为」：有落盘文件就走流式拷贝，没有就用 Base64 写盘 */
+async function saveBinaryBody() {
+  const current = result.value
+  if (!current) return
+  const suggested = guessFileName(current)
+  const target = await saveFile({ defaultPath: suggested })
+  if (!target) return
+  try {
+    if (current.bodyFile) {
+      const absolute = bodyAbsPath.value || (await api.responseFilePath(current.bodyFile))
+      await api.fileCopy(absolute, target)
+    } else if (current.previewBase64) {
+      await api.fileWriteBinary(target, current.previewBase64)
+    } else {
+      await api.fileWriteText(target, current.body)
+    }
+    message.success(`已保存到 ${target}`)
+  } catch (e) {
+    errorDialog.show({ title: '保存响应失败', error: e, context: { 操作: '另存响应体' } })
+  }
+}
+
+/** 从 Content-Disposition / URL 猜一个像样的文件名 */function guessFileName(current: HttpResult): string {
+  const disposition = current.headers?.['content-disposition'] ?? ''
+  const quoted = /filename\*?=(?:UTF-8''|")?([^";]+)/i.exec(disposition)
+  if (quoted?.[1]) {
+    try {
+      return decodeURIComponent(quoted[1].trim())
+    } catch {
+      return quoted[1].trim()
+    }
+  }
+  const type = (current.headers?.['content-type'] ?? '').toLowerCase()
+  const ext = type.includes('pdf')
+    ? 'pdf'
+    : type.includes('png')
+      ? 'png'
+      : type.includes('jpeg')
+        ? 'jpg'
+        : type.includes('gif')
+          ? 'gif'
+          : type.includes('webp')
+            ? 'webp'
+            : type.includes('zip')
+              ? 'zip'
+              : 'bin'
+  return `response-${current.status}-${Date.now()}.${ext}`
+}
+
+/** 打开响应文件所在目录（复用 storage_open，避免再引一个 opener 插件） */
+async function openBodyFolder() {
+  if (!bodyAbsPath.value) return
+  const sep = bodyAbsPath.value.includes('\\') ? '\\' : '/'
+  const dir = bodyAbsPath.value.slice(0, bodyAbsPath.value.lastIndexOf(sep))
+  try {
+    await api.storageOpen(dir)
+  } catch (e) {
+    errorDialog.show({ title: '打开目录失败', error: e, context: { 操作: 'storage_open' } })
+  }
+}
+
+async function copyBodyPath() {
+  if (!bodyAbsPath.value) return
+  try {
+    await navigator.clipboard.writeText(bodyAbsPath.value)
+    message.success('路径已复制')
+  } catch {
+    message.warning('复制失败，请手动选择路径')
+  }
+}
+
 const runs = ref<RequestRun[]>([])
 const runsOpen = ref(true)
 const runsLoading = ref(false)
 const expandedRunId = ref<number | null>(null)
+
+/* ---------- 运行历史：分页 20 条（整页共用一个滚动，不再单独限高） ---------- */
+const RUNS_PAGE_SIZE = 20
+const runsPage = ref(1)
+const runsPanelEl = ref<HTMLElement | null>(null)
+
+const runsTotalPages = computed(() => Math.max(1, Math.ceil(runs.value.length / RUNS_PAGE_SIZE)))
+
+const pagedRuns = computed(() => {
+  const start = (runsPage.value - 1) * RUNS_PAGE_SIZE
+  return runs.value.slice(start, start + RUNS_PAGE_SIZE)
+})
+
+function setRunsPage(page: number) {
+  const next = Math.min(Math.max(1, page), runsTotalPages.value)
+  if (next === runsPage.value) return
+  runsPage.value = next
+  expandedRunId.value = null
+  // 翻页后把列表顶部带回视野，避免停在上一页的滚动位置
+  nextTick(() => {
+    runsPanelEl.value?.scrollIntoView({ block: 'start', behavior: 'smooth' })
+  })
+}
 
 async function loadRuns() {
   if (!form.value.id) return
   runsLoading.value = true
   try {
     runs.value = await api.runList(form.value.id, 200)
+    runsPage.value = 1
   } catch (e) {
     message.error(String(e))
   } finally {
@@ -921,6 +1262,7 @@ function clearRuns() {
       await api.runClear(id)
       runs.value = []
       expandedRunId.value = null
+      runsPage.value = 1
       message.success('已清空')
     },
   })
@@ -957,7 +1299,14 @@ async function saveResponseBody() {
       ],
     })
     if (!path) return
-    await api.fileWriteText(path, result.value.body)
+    // 超过 2MB 的文本响应后端已经流式落盘，直接拷文件才能拿到完整内容
+    // （编辑器里的 body 只保留前 5MB，截断后另存会丢数据）
+    if (result.value.bodyFile) {
+      const absolute = bodyAbsPath.value || (await api.responseFilePath(result.value.bodyFile))
+      await api.fileCopy(absolute, path)
+    } else {
+      await api.fileWriteText(path, result.value.body)
+    }
     message.success('响应体已保存')
   } catch (e) {
     message.error(String(e))
@@ -1050,6 +1399,67 @@ const activeSnippet = computed(
   () => snippets.value.find((item) => item.key === snippetKey.value) ?? snippets.value[0],
 )
 
+/* 生成内容默认只读；进入编辑后改动按代码类型分别留存，复制取改动后的文本 */
+const codeEditing = ref(false)
+const codeEditText = ref('')
+const codeAreaRef = ref<HTMLTextAreaElement | null>(null)
+const editedCodes = reactive<Record<string, string>>({})
+
+const activeCode = computed(
+  () => editedCodes[snippetKey.value] ?? activeSnippet.value.code,
+)
+const isCodeEdited = computed(() => editedCodes[snippetKey.value] !== undefined)
+
+function startEditCode() {
+  codeEditText.value = activeCode.value
+  codeEditing.value = true
+  nextTick(() => {
+    fitCodeArea()
+    codeAreaRef.value?.focus()
+  })
+}
+
+function fitCodeArea() {
+  const el = codeAreaRef.value
+  if (!el) return
+  const max = Math.max(260, window.innerHeight - 300)
+  el.style.height = 'auto'
+  el.style.height = `${Math.min(Math.max(el.scrollHeight + 2, 240), max)}px`
+}
+
+function finishEditCode() {
+  // 与生成内容一致时不留残余草稿，避免误报「已修改」
+  if (codeEditText.value === activeSnippet.value.code) {
+    delete editedCodes[snippetKey.value]
+  } else {
+    editedCodes[snippetKey.value] = codeEditText.value
+  }
+  codeEditing.value = false
+}
+
+function resetCode() {
+  delete editedCodes[snippetKey.value]
+  codeEditText.value = activeSnippet.value.code
+}
+
+watch(codeEditText, (text) => {
+  if (!codeEditing.value) return
+  if (text === activeSnippet.value.code) delete editedCodes[snippetKey.value]
+  else editedCodes[snippetKey.value] = text
+  nextTick(fitCodeArea)
+})
+
+/* 编辑中切换语言：先落盘当前草稿，再载入目标语言的文本 */
+watch(snippetKey, () => {
+  codeEditText.value = activeCode.value
+  if (codeEditing.value) nextTick(fitCodeArea)
+})
+
+/* 关闭抽屉时退出编辑态，下次打开仍是默认的只读视图（草稿保留） */
+watch(codeOpen, (open) => {
+  if (!open) codeEditing.value = false
+})
+
 function openCode() {
   if (!form.value.url?.trim()) {
     message.warning('请先填写请求 URL')
@@ -1060,8 +1470,12 @@ function openCode() {
 
 async function copySnippet() {
   try {
-    await navigator.clipboard.writeText(activeSnippet.value.code)
-    message.success(`已复制 ${activeSnippet.value.label} 代码`)
+    await navigator.clipboard.writeText(activeCode.value)
+    message.success(
+      isCodeEdited.value
+        ? `已复制修改后的 ${activeSnippet.value.label} 代码`
+        : `已复制 ${activeSnippet.value.label} 代码`,
+    )
   } catch {
     message.error('复制失败')
   }
@@ -1080,7 +1494,8 @@ const responseHeaders = computed(() => {
 </script>
 
 <template>
-  <a-spin :spinning="loading">
+  <div class="editor-root">
+    <a-spin :spinning="loading">
     <div class="editor-page">
       <div class="topbar">
         <div class="left">
@@ -1092,7 +1507,12 @@ const responseHeaders = computed(() => {
           <span class="crumb">
             <span class="crumb-project">{{ projectName || '项目' }}</span>
             <span class="crumb-sep">/</span>
-            <a-input v-model:value="form.name" class="name-input" placeholder="请求名称" />
+            <a-input
+              v-model:value="form.name"
+              class="name-input"
+              placeholder="请求名称"
+              :title="form.name"
+            />
           </span>
           <span class="saved-hint" :class="`is-${autoState}`">
             <template v-if="autoState === 'saving'">保存中…</template>
@@ -1104,6 +1524,63 @@ const responseHeaders = computed(() => {
         </div>
         <div class="right">
           <a-checkbox v-model:checked="insecure" class="insecure">忽略证书校验</a-checkbox>
+          <a-popover trigger="click" placement="bottomRight" :overlay-style="{ width: '340px' }">
+            <template #content>
+              <div class="send-opt-panel">
+                <div class="send-opt-title">发送选项</div>
+                <div class="send-opt-row">
+                  <span class="send-opt-label">协议</span>
+                  <a-radio-group v-model:value="protocol" size="small">
+                    <a-radio-button value="auto">自动</a-radio-button>
+                    <a-radio-button value="http1">HTTP/1.1</a-radio-button>
+                    <a-radio-button value="http2">HTTP/2</a-radio-button>
+                  </a-radio-group>
+                </div>
+                <div class="send-opt-hint">
+                  自动按 ALPN 协商；选 HTTP/2 时明文 <code>http://</code> 会被拒绝（h2c 需要预置知识，暂不支持）。
+                </div>
+                <div class="send-opt-row">
+                  <span class="send-opt-label">重定向</span>
+                  <a-checkbox v-model:checked="followRedirects">
+                    跟随（最多 10 跳）
+                  </a-checkbox>
+                </div>
+                <div class="send-opt-row">
+                  <span class="send-opt-label">失败重试</span>
+                  <a-checkbox v-model:checked="retryEnabled">启用</a-checkbox>
+                </div>
+                <template v-if="retryEnabled">
+                  <div class="send-opt-row">
+                    <span class="send-opt-label">最多尝试</span>
+                    <a-input-number
+                      v-model:value="retryMaxAttempts"
+                      :min="1"
+                      :max="4"
+                      size="small"
+                      style="width: 90px"
+                    />
+                    <span class="send-opt-hint inline">次（含首次）</span>
+                  </div>
+                  <div class="send-opt-row">
+                    <a-checkbox v-model:checked="retryAllowNonIdempotent">
+                      允许对非幂等方法重试
+                    </a-checkbox>
+                  </div>
+                  <div v-if="retryNeedsConfirm && !retryAllowNonIdempotent" class="send-opt-warn">
+                    {{ form.method.toUpperCase() }} 不是幂等方法，未勾选时不会重试（避免重复下单/重复扣款）。
+                  </div>
+                  <div class="send-opt-hint">
+                    仅对 408 / 429 / 5xx 重试，退避 200 → 400 → 800 ms，服务端给 <code>Retry-After</code> 时按它等待（上限 10s）。
+                  </div>
+                </template>
+              </div>
+            </template>
+            <a-button size="small" class="send-opt-btn">
+              <template #icon><SettingOutlined /></template>
+              发送选项
+              <span v-if="protocol !== 'auto' || !followRedirects || retryEnabled" class="send-opt-dot" />
+            </a-button>
+          </a-popover>
           <a-button v-if="form.id" type="text" size="small" danger class="del-btn" @click="deleteRequest">
             <template #icon><DeleteOutlined /></template>
             删除
@@ -1225,8 +1702,13 @@ const responseHeaders = computed(() => {
             <template #icon><SendOutlined /></template>
             发送
           </a-button>
+          <a-tooltip v-if="sending" title="停止本次请求（连接、等待或下载阶段都可以中断）">
+            <a-button danger class="stop-btn" :loading="cancelling" @click="cancelSend">
+              停止
+            </a-button>
+          </a-tooltip>
         </div>
-        <span class="url-tip">Enter 发送 · 支持 {{ }} 变量</span>
+        <span class="url-tip">Enter 发送 · 支持环境变量</span>
       </div>
 
       <div class="panes">
@@ -1491,6 +1973,27 @@ const responseHeaders = computed(() => {
               <span class="meta mono">{{ result.durationMs }} ms</span>
               <span class="meta-divider" />
               <span class="meta mono">{{ fmtSize(result.sizeBytes) }}</span>
+              <a-tooltip v-if="result.httpVersion" :title="`实际协商协议：${result.httpVersion}`">
+                <span class="proto-pill mono">{{ result.httpVersion }}</span>
+              </a-tooltip>
+              <a-tooltip
+                v-if="result.cancelled"
+                title="本次请求被手动停止，数据可能不完整"
+              >
+                <span class="proto-pill warn mono">已停止</span>
+              </a-tooltip>
+              <a-tooltip
+                v-else-if="result.retries.length"
+                :title="`共发生 ${result.retries.length} 次重试`"
+              >
+                <span class="proto-pill retry mono">重试 ×{{ result.retries.length }}</span>
+              </a-tooltip>
+              <a-tooltip
+                v-if="result.redirects.length"
+                :title="`跟随了 ${result.redirects.length} 跳重定向`"
+              >
+                <span class="proto-pill mono">跳转 ×{{ result.redirects.length }}</span>
+              </a-tooltip>
             </template>
             <span
               v-if="scriptAssertions.length"
@@ -1502,12 +2005,20 @@ const responseHeaders = computed(() => {
             </span>
             <span class="res-spacer" />
             <template v-if="result && !result.error">
-              <a-radio-group v-model:value="bodyView" size="small" button-style="solid" class="view-toggle">
+              <a-radio-group
+                v-if="!isBinaryBody"
+                v-model:value="bodyView"
+                size="small"
+                button-style="solid"
+                class="view-toggle"
+              >
                 <a-radio-button value="pretty">Pretty</a-radio-button>
                 <a-radio-button value="raw">Raw</a-radio-button>
               </a-radio-group>
-              <a-button size="small" type="text" @click="copyBody">复制</a-button>
-              <a-button size="small" type="text" @click="saveResponseBody">另存为</a-button>
+              <a-button v-if="!isBinaryBody" size="small" type="text" @click="copyBody">复制</a-button>
+              <a-button size="small" type="text" @click="isBinaryBody ? saveBinaryBody() : saveResponseBody()">
+                另存为
+              </a-button>
               <a-button size="small" type="text" :disabled="!runs.length && !result.body" @click="openDiff">对比</a-button>
             </template>
           </div>
@@ -1522,12 +2033,60 @@ const responseHeaders = computed(() => {
             <a-tabs v-model:active-key="responseTab" size="small" class="tabs res-tabs">
               <a-tab-pane key="body">
                 <template #tab>
-                  Body <span class="tab-count">{{ prettyBody ? `${prettyBody.split('\n').length} 行` : '0' }}</span>
+                  Body
+                  <span class="tab-count">{{
+                    isBinaryBody
+                      ? fmtSize(result.bodyBytes || result.sizeBytes)
+                      : prettyBody
+                        ? `${prettyBody.split('\n').length} 行`
+                        : '0'
+                  }}</span>
                 </template>
-                <div v-if="result.truncated" class="truncate-hint">响应体超过 5MB，已截断显示</div>
-                <div class="res-body-wrap">
-                  <pre class="mono body-pre">{{ bodyView === 'pretty' ? prettyBody : result.body }}</pre>
+
+                <!-- 二进制 / 超大响应：已落盘，不塞进文本框 -->
+                <div v-if="isBinaryBody" class="binary-body">
+                  <div v-if="isImageBody && bodyPreviewSrc" class="binary-preview">
+                    <img :src="bodyPreviewSrc" :alt="`响应图片 ${result.status}`" />
+                  </div>
+                  <div v-else class="binary-icon">{{ isPdfBody ? 'PDF' : 'BIN' }}</div>
+                  <div class="binary-meta">
+                    <div class="binary-title">
+                      {{ isPdfBody ? 'PDF 文档' : isImageBody ? '图片' : '二进制响应' }}
+                      <span class="mono binary-size">{{ fmtSize(result.bodyBytes || result.sizeBytes) }}</span>
+                    </div>
+                    <div class="binary-desc">
+                      该响应不是文本内容（{{ bodyKind === 'binary' ? '二进制' : bodyKind }}），
+                      已完整保存到本机，不载入编辑器以避免卡死。点「另存为」导出到你需要的位置。
+                    </div>
+                    <div v-if="result.rawBytes && result.rawBytes !== result.bodyBytes" class="binary-desc">
+                      压缩传输：{{ fmtSize(result.rawBytes) }} → 解压后 {{ fmtSize(result.bodyBytes) }}
+                    </div>
+                    <div v-if="bodyAbsPath" class="binary-path mono" :title="bodyAbsPath">
+                      {{ bodyAbsPath }}
+                    </div>
+                    <div v-else-if="bodyPreviewError" class="binary-desc bad">
+                      {{ bodyPreviewError }}
+                    </div>
+                    <div class="binary-actions">
+                      <a-button size="small" type="primary" @click="saveBinaryBody">另存为</a-button>
+                      <a-button size="small" :disabled="!bodyAbsPath" @click="openBodyFolder">
+                        打开所在目录
+                      </a-button>
+                      <a-button size="small" @click="copyBodyPath">复制路径</a-button>
+                    </div>
+                  </div>
                 </div>
+
+                <template v-else>
+                  <div v-if="result.bodyFile" class="truncate-hint">
+                    完整响应（{{ fmtSize(result.bodyBytes || result.sizeBytes) }}）已落盘到本机，编辑器只加载前 5MB；
+                    点「另存为」导出的是完整文件。
+                  </div>
+                  <div v-else-if="result.truncated" class="truncate-hint">响应体超过 5MB，已截断显示</div>
+                  <div class="res-body-wrap">
+                    <pre class="mono body-pre">{{ bodyView === 'pretty' ? prettyBody : result.body }}</pre>
+                  </div>
+                </template>
               </a-tab-pane>
               <a-tab-pane key="headers">
                 <template #tab>
@@ -1538,6 +2097,77 @@ const responseHeaders = computed(() => {
                     <span class="mono hk">{{ h.key }}</span>
                     <span class="mono hv">{{ h.value }}</span>
                   </div>
+                  <div v-if="result.ignoredHeaders.length" class="ignored-headers">
+                    <div class="ignored-title">因 HTTP/2 被剔除的请求头</div>
+                    <div class="ignored-list mono">{{ result.ignoredHeaders.join('、') }}</div>
+                    <div class="ignored-hint">
+                      HTTP/2 禁止这些逐跳头（connection / keep-alive / transfer-encoding 等），
+                      发送时已自动忽略；如果你需要它们生效，把协议切到 HTTP/1.1。
+                    </div>
+                  </div>
+                </div>
+              </a-tab-pane>
+
+              <a-tab-pane key="timing">
+                <template #tab>
+                  计时
+                  <span class="tab-count">{{ Math.round(result.durationMs) }}ms</span>
+                </template>
+                <div class="timing-panel">
+                  <div v-if="!timings" class="empty-hint">
+                    本次请求没有采集到耗时分解（可能在使用直连或旧版本记录）。
+                  </div>
+                  <template v-else>
+                    <div class="timing-total">
+                      <span class="timing-total-label">总耗时</span>
+                      <span class="timing-total-value mono">{{ Math.round(timings.totalMs) }} ms</span>
+                    </div>
+                    <div class="waterfall">
+                      <div v-for="row in timingRows" :key="row.key" class="wf-row">
+                        <span class="wf-label">{{ row.label }}</span>
+                        <div class="wf-track">
+                          <div
+                            class="wf-bar"
+                            :style="{
+                              left: `${row.offset}%`,
+                              width: `${row.width}%`,
+                              background: row.color,
+                            }"
+                            :title="`${row.label}：${row.ms.toFixed(1)} ms（${row.hint}）`"
+                          />
+                        </div>
+                        <span class="wf-value mono">{{ row.ms.toFixed(1) }} ms</span>
+                      </div>
+                    </div>
+                    <div v-if="timingNotes.length" class="timing-notes">
+                      <div v-for="(note, index) in timingNotes" :key="index" class="timing-note">
+                        · {{ note }}
+                      </div>
+                    </div>
+
+                    <div v-if="result.redirects.length" class="timing-block">
+                      <div class="timing-block-title">重定向链（{{ result.redirects.length }} 跳）</div>
+                      <div v-for="(hop, index) in result.redirects" :key="index" class="hop-row">
+                        <span class="hop-index mono">{{ index + 1 }}</span>
+                        <span class="hop-status mono" :class="{ bad: hop.status >= 400 }">{{ hop.status }}</span>
+                        <span class="hop-host mono">{{ hop.host }}</span>
+                        <span class="hop-loc mono" :title="hop.location">{{ hop.location }}</span>
+                        <span class="hop-ms mono">{{ hop.durationMs.toFixed(1) }} ms</span>
+                      </div>
+                    </div>
+
+                    <div v-if="result.retries.length" class="timing-block">
+                      <div class="timing-block-title">重试记录（{{ result.retries.length }} 次）</div>
+                      <div v-for="(item, index) in result.retries" :key="index" class="hop-row">
+                        <span class="hop-index mono">#{{ item.attempt }}</span>
+                        <span class="hop-status mono" :class="{ bad: item.status >= 400 || !item.status }">
+                          {{ item.status || 'ERR' }}
+                        </span>
+                        <span class="hop-loc mono" :title="item.error || ''">{{ item.error || '按状态码重试' }}</span>
+                        <span class="hop-ms mono">等待 {{ item.delayMs }} ms</span>
+                      </div>
+                    </div>
+                  </template>
                 </div>
               </a-tab-pane>
               <a-tab-pane key="tests">
@@ -1604,7 +2234,7 @@ const responseHeaders = computed(() => {
         </div>
       </div>
 
-      <section class="runs-panel" :class="{ collapsed: !runsOpen }">
+      <section ref="runsPanelEl" class="runs-panel" :class="{ collapsed: !runsOpen }">
         <div class="runs-head">
           <button class="runs-toggle" @click="runsOpen = !runsOpen">
             <span class="run-caret" :class="{ open: runsOpen }">›</span>
@@ -1632,7 +2262,7 @@ const responseHeaders = computed(() => {
               <span>URL</span>
               <span />
             </div>
-            <template v-for="run in runs" :key="run.id">
+            <template v-for="run in pagedRuns" :key="run.id">
               <div
                 class="run-row"
                 :class="{ active: expandedRunId === run.id }"
@@ -1693,6 +2323,20 @@ const responseHeaders = computed(() => {
                 </div>
               </div>
             </template>
+
+            <div v-if="runs.length > RUNS_PAGE_SIZE" class="runs-pager">
+              <span class="runs-pager-info">
+                共 {{ runs.length }} 条 · 每页 {{ RUNS_PAGE_SIZE }} 条
+              </span>
+              <a-pagination
+                size="small"
+                :current="runsPage"
+                :page-size="RUNS_PAGE_SIZE"
+                :total="runs.length"
+                :show-size-changer="false"
+                @change="setRunsPage"
+              />
+            </div>
           </template>
         </div>
       </section>
@@ -1714,13 +2358,38 @@ const responseHeaders = computed(() => {
         </a-radio-button>
       </a-radio-group>
       <div class="code-actions">
-        <a-button size="small" type="primary" @click="copySnippet">
+        <a-button size="small" :type="codeEditing ? 'default' : 'primary'" @click="copySnippet">
           <template #icon><CopyOutlined /></template>
           复制
         </a-button>
+        <a-button v-if="!codeEditing" size="small" @click="startEditCode">
+          <template #icon><EditOutlined /></template>
+          编辑
+        </a-button>
+        <a-button v-else size="small" type="primary" @click="finishEditCode">
+          <template #icon><CheckOutlined /></template>
+          完成
+        </a-button>
+        <a-button v-if="isCodeEdited && !codeEditing" size="small" type="text" @click="resetCode">
+          恢复生成内容
+        </a-button>
+        <span
+          v-if="isCodeEdited"
+          class="code-edited-badge"
+          title="已手动修改，不再随当前请求自动更新；复制取当前文本"
+        >
+          已修改
+        </span>
         <span class="code-file mono">{{ form.name || 'request' }} · {{ activeSnippet.language }}</span>
       </div>
-      <pre class="code-block mono">{{ activeSnippet.code }}</pre>
+      <textarea
+        v-if="codeEditing"
+        ref="codeAreaRef"
+        v-model="codeEditText"
+        class="code-block code-textarea mono"
+        spellcheck="false"
+      ></textarea>
+      <pre v-else class="code-block mono">{{ activeCode }}</pre>
     </a-drawer>
 
     <a-modal
@@ -1813,11 +2482,23 @@ const responseHeaders = computed(() => {
       @changed="onEnvsChanged"
     />
   </a-spin>
+  </div>
 </template>
 
 <style scoped>
-.editor-page {
+/* 整页共用一个滚动：外层 .main 已经是 overflow:auto，
+   这里让页面至少一屏高、内容多则自然撑高，请求/响应区不再被压扁 */
+.editor-root {
   height: 100%;
+}
+
+.editor-root :deep(.ant-spin-nested-loading),
+.editor-root :deep(.ant-spin-container) {
+  height: 100%;
+}
+
+.editor-page {
+  min-height: 100%;
   display: flex;
   flex-direction: column;
 }
@@ -1825,11 +2506,6 @@ const responseHeaders = computed(() => {
 .ai-caret {
   font-size: 10px;
   margin-left: 4px;
-}
-
-:deep(.ant-spin-nested-loading),
-:deep(.ant-spin-container) {
-  height: 100%;
 }
 
 .topbar {
@@ -1847,6 +2523,16 @@ const responseHeaders = computed(() => {
   display: flex;
   align-items: center;
   gap: 10px;
+  min-width: 0;
+}
+
+.left {
+  flex: 1;
+  overflow: hidden;
+}
+
+.right {
+  flex-shrink: 0;
 }
 
 .tabs-bar {
@@ -1945,8 +2631,10 @@ const responseHeaders = computed(() => {
 
 .tab-name {
   flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .tab-close {
@@ -1994,11 +2682,13 @@ const responseHeaders = computed(() => {
 }
 
 .name-input {
-  width: 230px;
+  width: clamp(160px, 24vw, 380px);
+  min-width: 120px;
   font-weight: 600;
   border-color: transparent;
   background: transparent;
   font-size: 13px;
+  text-overflow: ellipsis;
 }
 
 .name-input:hover {
@@ -2090,29 +2780,48 @@ const responseHeaders = computed(() => {
 }
 
 .method-select {
-  width: 104px;
+  width: 96px;
   flex-shrink: 0;
   font-weight: 700;
 }
 
 .method-select :deep(.ant-select-selector) {
   box-shadow: none !important;
+  border-radius: 6px !important;
+  transition: background-color 0.14s ease;
+}
+
+/* 方法色底：让 URL 输入条左侧的方法一眼可辨（Postman / Apifox 的做法） */
+.method-select.m-GET :deep(.ant-select-selector) {
+  background: var(--fm-method-get-soft, var(--fm-success-soft));
+}
+.method-select.m-POST :deep(.ant-select-selector) {
+  background: var(--fm-method-post-soft, var(--fm-warning-soft));
+}
+.method-select.m-PUT :deep(.ant-select-selector) {
+  background: var(--fm-method-put-soft, var(--fm-primary-soft));
+}
+.method-select.m-PATCH :deep(.ant-select-selector) {
+  background: var(--fm-method-patch-soft, var(--fm-purple-soft));
+}
+.method-select.m-DELETE :deep(.ant-select-selector) {
+  background: var(--fm-method-delete-soft, var(--fm-danger-soft));
 }
 
 .method-select.m-GET :deep(.ant-select-selection-item) {
-  color: var(--fm-success);
+  color: var(--fm-method-get, var(--fm-success));
 }
 .method-select.m-POST :deep(.ant-select-selection-item) {
-  color: var(--fm-warning);
+  color: var(--fm-method-post, var(--fm-warning));
 }
 .method-select.m-PUT :deep(.ant-select-selection-item) {
-  color: var(--fm-primary);
+  color: var(--fm-method-put, var(--fm-primary));
 }
 .method-select.m-PATCH :deep(.ant-select-selection-item) {
-  color: var(--fm-purple);
+  color: var(--fm-method-patch, var(--fm-purple));
 }
 .method-select.m-DELETE :deep(.ant-select-selection-item) {
-  color: var(--fm-danger);
+  color: var(--fm-method-delete, var(--fm-danger));
 }
 
 .bar-divider {
@@ -2156,8 +2865,27 @@ const responseHeaders = computed(() => {
 .send-btn {
   height: 34px;
   flex-shrink: 0;
-  border-radius: 7px;
+  border-radius: 8px;
   font-weight: 600;
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--fm-primary) 80%, #ffffff) 0%,
+    var(--fm-primary) 100%
+  );
+  border: none;
+  box-shadow: 0 3px 10px color-mix(in srgb, var(--fm-primary) 32%, transparent);
+  transition: filter 0.16s ease, box-shadow 0.16s ease, transform 0.1s ease;
+}
+
+.send-btn:not(:disabled):hover {
+  filter: brightness(1.07);
+  box-shadow: 0 5px 16px color-mix(in srgb, var(--fm-primary) 42%, transparent);
+  transform: translateY(-1px);
+}
+
+.send-btn:not(:disabled):active {
+  transform: translateY(0);
+  filter: brightness(0.97);
 }
 
 .url-tip {
@@ -2167,7 +2895,9 @@ const responseHeaders = computed(() => {
 }
 
 .panes {
-  flex: 1;
+  flex: 1 1 auto;
+  /* 固定高度：请求 / 响应各自内部滚动，长 Body 不再把整页撑长 */
+  height: clamp(380px, 58vh, 660px);
   min-height: 0;
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
@@ -2865,25 +3595,24 @@ const responseHeaders = computed(() => {
 /* ---------- 运行历史 ---------- */
 .runs-panel {
   flex: 0 0 auto;
-  max-height: 32%;
   display: flex;
   flex-direction: column;
   background: var(--fm-surface);
-  border-top: 1px solid var(--fm-border);
-}
-
-.runs-panel.collapsed {
-  max-height: none;
 }
 
 .runs-head {
+  position: sticky;
+  top: 0;
+  z-index: 3;
   height: 34px;
+  flex-shrink: 0;
   padding: 0 14px;
   display: flex;
   align-items: center;
   gap: 12px;
   background: var(--fm-surface-alt);
   border-bottom: 1px solid var(--fm-border);
+  border-top: 1px solid var(--fm-border);
 }
 
 .runs-toggle {
@@ -2930,10 +3659,25 @@ const responseHeaders = computed(() => {
   color: var(--fm-danger);
 }
 
+/* 列表随页面滚动，不再有独立滚动条 */
 .runs-body {
   flex: 1;
-  min-height: 0;
-  overflow: auto;
+  padding-bottom: 6px;
+}
+
+.runs-pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--fm-border);
+  background: var(--fm-surface);
+}
+
+.runs-pager-info {
+  font-size: 11px;
+  color: var(--fm-muted);
 }
 
 .runs-empty {
@@ -2964,8 +3708,8 @@ const responseHeaders = computed(() => {
 
 .run-row-head {
   position: sticky;
-  top: 0;
-  z-index: 1;
+  top: 34px;
+  z-index: 2;
   background: var(--fm-surface);
   color: var(--fm-muted);
   font-size: 10px;
@@ -3095,16 +3839,15 @@ const responseHeaders = computed(() => {
   .panes {
     grid-template-columns: minmax(0, 1fr);
     grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
-    overflow: auto;
+    /* 单列时请求与响应上下叠放，各自固定一半高度、内部滚动 */
+    height: clamp(600px, 82vh, 940px);
+    min-height: 0;
+    overflow: hidden;
   }
 
   .req-pane,
   .res-pane {
-    min-height: 320px;
-  }
-
-  .runs-panel {
-    max-height: 50%;
+    min-height: 240px;
   }
 
   .run-row {
@@ -3212,13 +3955,30 @@ const responseHeaders = computed(() => {
 .code-actions {
   display: flex;
   align-items: center;
-  gap: 10px;
+  flex-wrap: wrap;
+  gap: 8px;
   margin-bottom: 10px;
 }
 
 .code-file {
+  margin-left: auto;
   font-size: 11px;
   color: var(--fm-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.code-edited-badge {
+  flex-shrink: 0;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  line-height: 16px;
+  color: var(--fm-warning, #d97706);
+  background: color-mix(in srgb, var(--fm-warning, #d97706) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--fm-warning, #d97706) 30%, transparent);
+  cursor: help;
 }
 
 .code-block {
@@ -3234,5 +3994,368 @@ const responseHeaders = computed(() => {
   color: var(--fm-text-2);
   max-height: calc(100vh - 280px);
   overflow: auto;
+}
+
+.code-textarea {
+  display: block;
+  width: 100%;
+  height: auto;
+  min-height: 240px;
+  max-height: calc(100vh - 300px);
+  resize: none;
+  outline: none;
+  tab-size: 2;
+  transition: border-color 0.16s ease, box-shadow 0.16s ease, background 0.16s ease;
+  background: var(--fm-surface);
+  border-style: dashed;
+}
+
+.code-textarea:focus {
+  border-color: var(--fm-primary);
+  border-style: solid;
+  background: var(--fm-surface);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--fm-primary) 16%, transparent);
+}
+
+/* ---------- v1.0.8：发送选项 / 停止按钮 / 协议徽标 ---------- */
+.send-opt-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  position: relative;
+}
+
+.send-opt-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--fm-primary);
+  margin-left: 2px;
+}
+
+.send-opt-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 2px;
+}
+
+.send-opt-title {
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.send-opt-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.send-opt-label {
+  font-size: 12px;
+  color: var(--fm-text-2);
+  min-width: 56px;
+}
+
+.send-opt-hint {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--fm-text-3);
+}
+
+.send-opt-hint.inline {
+  margin-left: 0;
+}
+
+.send-opt-hint code {
+  font-size: 11px;
+  padding: 0 3px;
+  border-radius: 3px;
+  background: var(--fm-surface-2, rgba(0, 0, 0, 0.05));
+}
+
+.send-opt-warn {
+  font-size: 11px;
+  line-height: 1.5;
+  color: #d97706;
+}
+
+.stop-btn {
+  margin-left: 6px;
+}
+
+.proto-pill {
+  margin-left: 6px;
+  padding: 0 6px;
+  height: 18px;
+  line-height: 18px;
+  font-size: 11px;
+  border-radius: 4px;
+  color: var(--fm-text-2);
+  background: var(--fm-surface-2, rgba(0, 0, 0, 0.05));
+  border: 1px solid var(--fm-border, rgba(0, 0, 0, 0.08));
+}
+
+.proto-pill.warn {
+  color: #d97706;
+  border-color: rgba(217, 119, 6, 0.4);
+  background: rgba(217, 119, 6, 0.1);
+}
+
+.proto-pill.retry {
+  color: #2563eb;
+  border-color: rgba(37, 99, 235, 0.35);
+  background: rgba(37, 99, 235, 0.08);
+}
+
+/* ---------- v1.0.8：二进制响应 ---------- */
+.binary-body {
+  display: flex;
+  gap: 18px;
+  align-items: flex-start;
+  padding: 18px 16px;
+}
+
+.binary-preview {
+  flex: 0 0 auto;
+  max-width: 46%;
+  border: 1px solid var(--fm-border, rgba(0, 0, 0, 0.08));
+  border-radius: 8px;
+  overflow: hidden;
+  background: repeating-conic-gradient(rgba(128, 128, 128, 0.12) 0% 25%, transparent 0% 50%) 50% / 16px 16px;
+}
+
+.binary-preview img {
+  display: block;
+  max-width: 100%;
+  max-height: 320px;
+  object-fit: contain;
+}
+
+.binary-icon {
+  flex: 0 0 auto;
+  width: 96px;
+  height: 96px;
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  letter-spacing: 1px;
+  color: var(--fm-text-3);
+  background: var(--fm-surface-2, rgba(0, 0, 0, 0.05));
+  border: 1px dashed var(--fm-border, rgba(0, 0, 0, 0.15));
+}
+
+.binary-meta {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.binary-title {
+  font-size: 14px;
+  font-weight: 600;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.binary-size {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--fm-text-3);
+}
+
+.binary-desc {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--fm-text-2);
+}
+
+.binary-desc.bad {
+  color: #dc2626;
+}
+
+.binary-path {
+  font-size: 11px;
+  color: var(--fm-text-3);
+  word-break: break-all;
+  padding: 6px 8px;
+  border-radius: 5px;
+  background: var(--fm-surface-2, rgba(0, 0, 0, 0.04));
+}
+
+.binary-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+/* ---------- v1.0.8：计时瀑布 ---------- */
+.timing-panel {
+  padding: 14px 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.timing-total {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.timing-total-label {
+  font-size: 12px;
+  color: var(--fm-text-3);
+}
+
+.timing-total-value {
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.waterfall {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.wf-row {
+  display: grid;
+  grid-template-columns: 96px 1fr 88px;
+  align-items: center;
+  gap: 10px;
+}
+
+.wf-label {
+  font-size: 12px;
+  color: var(--fm-text-2);
+  text-align: right;
+}
+
+.wf-track {
+  position: relative;
+  height: 16px;
+  border-radius: 4px;
+  background: var(--fm-surface-2, rgba(0, 0, 0, 0.05));
+  overflow: hidden;
+}
+
+.wf-bar {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  border-radius: 4px;
+  min-width: 2px;
+  transition: width 0.2s ease;
+}
+
+.wf-value {
+  font-size: 11px;
+  color: var(--fm-text-2);
+  text-align: right;
+}
+
+.timing-notes {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--fm-surface-2, rgba(0, 0, 0, 0.04));
+}
+
+.timing-note {
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--fm-text-3);
+}
+
+.timing-block {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border-top: 1px solid var(--fm-border, rgba(0, 0, 0, 0.07));
+  padding-top: 10px;
+}
+
+.timing-block-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fm-text-2);
+}
+
+.hop-row {
+  display: grid;
+  grid-template-columns: 28px 52px 140px 1fr 76px;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  padding: 3px 0;
+}
+
+.hop-index {
+  color: var(--fm-text-3);
+}
+
+.hop-status {
+  font-weight: 600;
+  color: #059669;
+}
+
+.hop-status.bad {
+  color: #dc2626;
+}
+
+.hop-host {
+  color: var(--fm-text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hop-loc {
+  color: var(--fm-text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hop-ms {
+  text-align: right;
+  color: var(--fm-text-2);
+}
+
+.ignored-headers {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: rgba(217, 119, 6, 0.08);
+  border: 1px solid rgba(217, 119, 6, 0.25);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ignored-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: #b45309;
+}
+
+.ignored-list {
+  font-size: 11px;
+  color: #b45309;
+  word-break: break-all;
+}
+
+.ignored-hint {
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--fm-text-3);
 }
 </style>

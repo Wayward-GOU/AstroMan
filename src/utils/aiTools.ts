@@ -44,6 +44,18 @@ import {
   runList,
   stressStart,
   stressStop,
+  testCaseDelete,
+  testCaseGet,
+  testCaseSave,
+  testPreflight,
+  testReportGenerate,
+  testRunGet,
+  testRunStart,
+  testRunStop,
+  testSuiteDelete,
+  testSuiteGet,
+  testSuiteList,
+  testSuiteSave,
   toolHash,
   toolHmac,
   workspaceStats,
@@ -66,6 +78,8 @@ import type {
   StressConfig,
   StressReport,
   StressStage,
+  TestCase,
+  TestCasePayload,
 } from '@/types/models'
 import { diffAsText, diffLines } from '@/tools/analysis'
 import { timestampInfo, uuidV4 } from '@/tools/calc'
@@ -414,6 +428,80 @@ const SCHEMAS: Record<string, Record<string, ArgRule>> = {
   toolbox_uuid: { count: { kind: 'number', min: 1, max: 20 } },
   /* ---------------- 阶段四：工具目录检索 ---------------- */
   tool_search: { keyword: { kind: 'string', required: true } },
+  /* ---------------- 自动化测试域 ---------------- */
+  test_suite_list: {
+    projectId: { kind: 'number' },
+    keyword: { kind: 'string' },
+    tag: { kind: 'string' },
+  },
+  test_suite_get: { id: { kind: 'number', required: true } },
+  test_suite_create: {
+    projectId: { kind: 'number', required: true },
+    name: { kind: 'string', required: true },
+    description: { kind: 'string' },
+    envId: { kind: 'number' },
+    tags: { kind: 'array', item: 'string' },
+    config: { kind: 'object' },
+    setupScript: { kind: 'string' },
+    teardownScript: { kind: 'string' },
+  },
+  test_suite_update: {
+    id: { kind: 'number', required: true },
+    name: { kind: 'string' },
+    description: { kind: 'string' },
+    envId: { kind: 'number' },
+    tags: { kind: 'array', item: 'string' },
+    config: { kind: 'object' },
+    setupScript: { kind: 'string' },
+    teardownScript: { kind: 'string' },
+  },
+  test_suite_delete: { id: { kind: 'number', required: true } },
+  test_case_create: {
+    suiteId: { kind: 'number', required: true },
+    name: { kind: 'string', required: true },
+    kind: { kind: 'string', required: true, enum: ['request', 'python', 'stress'] },
+    requestId: { kind: 'number' },
+    datasetId: { kind: 'number' },
+    dependsOn: { kind: 'array', item: 'string' },
+    assertions: { kind: 'array' },
+    variables: { kind: 'object' },
+    preScript: { kind: 'string' },
+    postScript: { kind: 'string' },
+    mainScript: { kind: 'string' },
+    stress: { kind: 'object' },
+    timeoutMs: { kind: 'number', min: 500, max: 600000 },
+    retries: { kind: 'number', min: 0, max: 3 },
+  },
+  test_case_update: {
+    id: { kind: 'number', required: true },
+    name: { kind: 'string' },
+    kind: { kind: 'string', enum: ['request', 'python', 'stress'] },
+    requestId: { kind: 'number' },
+    datasetId: { kind: 'number' },
+    dependsOn: { kind: 'array', item: 'string' },
+    assertions: { kind: 'array' },
+    variables: { kind: 'object' },
+    preScript: { kind: 'string' },
+    postScript: { kind: 'string' },
+    mainScript: { kind: 'string' },
+    stress: { kind: 'object' },
+    timeoutMs: { kind: 'number', min: 500, max: 600000 },
+    retries: { kind: 'number', min: 0, max: 3 },
+  },
+  test_case_delete: { id: { kind: 'number', required: true } },
+  test_run_start: {
+    suiteId: { kind: 'number', required: true },
+    envId: { kind: 'number' },
+    failFast: { kind: 'boolean' },
+    vars: { kind: 'object' },
+    secrets: { kind: 'object' },
+  },
+  test_run_stop: { runId: { kind: 'number', required: true } },
+  test_run_get: { runId: { kind: 'number', required: true } },
+  test_report_export: {
+    runId: { kind: 'number', required: true },
+    formats: { kind: 'array', item: 'string' },
+  },
 }
 
 function checkRule(key: string, value: unknown, rule: ArgRule): string | null {
@@ -601,6 +689,36 @@ const STRESS_MODE_LABELS: Record<string, string> = {
   stages: '分阶段加压',
   duration: '定时长',
   count: '定次数',
+}
+
+/**
+ * 自动化测试域的三个枚举。
+ * kind 是写入时的机器值（request / python / stress），所以只额外给中文标签、不改原值，
+ * 避免模型把「脚本用例」回填到 test_case_create 的 kind 上被 SCHEMAS 的 enum 拦下。
+ */
+const TEST_CASE_KIND_LABELS: Record<string, string> = {
+  request: '接口用例',
+  python: '脚本用例',
+  stress: '压测用例',
+}
+
+/** 运行状态：queued → running → passed / failed / error / cancelled；用例级别另有 skipped */
+const TEST_RUN_STATUS_LABELS: Record<string, string> = {
+  queued: '排队中',
+  running: '运行中',
+  passed: '通过',
+  failed: '失败',
+  error: '错误',
+  skipped: '跳过',
+  cancelled: '已取消',
+  stopped: '已停止',
+}
+
+const TEST_TRIGGER_LABELS: Record<string, string> = {
+  ui: '界面手动',
+  ai: '航仔发起',
+  cli: '命令行',
+  schedule: '定时计划',
 }
 
 const BODY_TYPE_LABELS: Record<string, string> = {
@@ -1174,6 +1292,95 @@ function detailPayload(
   }
 }
 
+/* ---------------- 自动化测试域辅助 ---------------- */
+
+function parseJsonText(text?: string | null): unknown {
+  const raw = text?.trim()
+  if (!raw) return undefined
+  try {
+    return JSON.parse(raw)
+  } catch {
+    return raw
+  }
+}
+
+function testTags(value: unknown): string | undefined {
+  if (!Array.isArray(value)) return undefined
+  const list = value.map((item) => str(item).trim()).filter(Boolean)
+  return list.length ? list.join(',') : undefined
+}
+
+function jsonField(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined
+  return typeof value === 'string' ? value : JSON.stringify(value)
+}
+
+function strMap(value: unknown): Record<string, string> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).map(([key, item]) => [key, str(item)]),
+  )
+}
+
+/** 组装 test_case_save 的入参；更新时以已有用例为底，只覆盖传入字段 */
+function testCasePayload(args: ToolArgs, suiteId: number, existing?: TestCase): TestCasePayload {
+  const payload: TestCasePayload = existing
+    ? {
+        id: existing.id,
+        suiteId,
+        name: existing.name,
+        kind: existing.kind,
+        requestId: existing.requestId,
+        datasetId: existing.datasetId,
+        dependsOn: existing.dependsOn,
+        sortOrder: existing.sortOrder,
+        enabled: existing.enabled,
+        timeoutMs: existing.timeoutMs,
+        retries: existing.retries,
+        retryOnFailure: existing.retryOnFailure,
+        continueOnFailure: existing.continueOnFailure,
+        tags: existing.tags,
+        variablesJson: existing.variablesJson,
+        assertionsJson: existing.assertionsJson,
+        preScript: existing.preScript,
+        postScript: existing.postScript,
+        mainScript: existing.mainScript,
+        stressJson: existing.stressJson,
+      }
+    : { suiteId, name: '', kind: 'request' }
+
+  if (args.name !== undefined) payload.name = str(args.name).trim()
+  if (args.kind !== undefined) payload.kind = str(args.kind).trim()
+  if (args.requestId !== undefined) payload.requestId = optionalNum(args.requestId)
+  if (args.datasetId !== undefined) payload.datasetId = optionalNum(args.datasetId)
+  if (args.dependsOn !== undefined) payload.dependsOn = testTags(args.dependsOn)
+  if (args.assertions !== undefined) payload.assertionsJson = jsonField(args.assertions)
+  if (args.variables !== undefined) payload.variablesJson = jsonField(args.variables)
+  if (args.preScript !== undefined) payload.preScript = str(args.preScript)
+  if (args.postScript !== undefined) payload.postScript = str(args.postScript)
+  if (args.mainScript !== undefined) payload.mainScript = str(args.mainScript)
+  if (args.stress !== undefined) payload.stressJson = jsonField(args.stress)
+  if (args.timeoutMs !== undefined) {
+    payload.timeoutMs = Math.round(optionalNum(args.timeoutMs) ?? 30000)
+  }
+  if (args.retries !== undefined) payload.retries = Math.round(optionalNum(args.retries) ?? 0)
+
+  if (!payload.name.trim()) throw new Error('用例名称不能为空')
+  if (!['request', 'python', 'stress'].includes(payload.kind)) {
+    throw new Error('kind 只支持 request / python / stress')
+  }
+  if (payload.kind === 'request' && !payload.requestId) {
+    throw new Error('HTTP 用例必须提供 requestId')
+  }
+  if (payload.kind === 'python' && !payload.mainScript?.trim()) {
+    throw new Error('Python 用例必须提供 mainScript')
+  }
+  if (payload.kind === 'stress' && !payload.stressJson?.trim()) {
+    throw new Error('压测用例必须提供 stress 配置快照')
+  }
+  return payload
+}
+
 const SPECS: ToolSpec[] = [
   {
     name: 'project_list',
@@ -1349,6 +1556,12 @@ const SPECS: ToolSpec[] = [
     handler: async (args) => {
       const curl = str(args.curl).trim()
       if (!curl) throw new Error('参数 curl 不能为空')
+      // 模型复述超长命令时可能在中间插省略号，这种命令导入必然缺参数，直接拦下
+      if (/…|（已截断）|\(truncated\)|\[truncated\]/i.test(curl) || /\.\.\.\s*$/.test(curl)) {
+        throw new Error(
+          'cURL 参数看起来被截断了（含有省略号）。请把完整命令重新发一次，或改用「接口调试 → 从 cURL 导入」对话框直接粘贴原文。',
+        )
+      }
       const parsed = await curlParse(curl)
       const collectionId = optionalNum(args.collectionId)
       if (collectionId === undefined) {
@@ -1801,6 +2014,253 @@ const SPECS: ToolSpec[] = [
     handler: async () => {
       await stressStop()
       return '已发送停止指令，稍后用 report_list 查看已生成的报告'
+    },
+  },
+  /* ---------------- 自动化测试域 ---------------- */
+  {
+    name: 'test_suite_list',
+    desc: '列出自动化测试套件（可按项目 / 关键词 / 标签过滤），返回套件 id、名称、用例数与默认环境',
+    args: '{ projectId?, keyword?, tag? }',
+    handler: async (args) => {
+      const projectId = optionalNum(args.projectId)
+      const list = await testSuiteList(
+        projectId,
+        str(args.keyword).trim() || undefined,
+        str(args.tag).trim() || undefined,
+      )
+      return list.map((item) => ({
+        id: item.id,
+        name: item.name,
+        projectId: item.projectId,
+        env: item.envName ?? '',
+        tags: item.tags ?? '',
+        cases: item.caseCount,
+      }))
+    },
+  },
+  {
+    name: 'test_suite_get',
+    desc: '读取测试套件详情：用例顺序、类型、断言、数据集与脚本摘要（完整脚本只回前 600 字）',
+    args: '{ id }',
+    handler: async (args) => {
+      const id = needNum(args.id, 'id')
+      const detail = await testSuiteGet(id)
+      return {
+        id,
+        name: detail.suite.name,
+        envId: detail.suite.envId ?? null,
+        tags: detail.suite.tags ?? '',
+        config: parseJsonText(detail.suite.configJson),
+        setupScript: clip(detail.suite.setupScript ?? '', 600),
+        teardownScript: clip(detail.suite.teardownScript ?? '', 600),
+        datasets: detail.datasets.map((item) => ({
+          id: item.id,
+          name: item.name,
+          format: item.format,
+          rows: item.rowCount,
+        })),
+        cases: detail.cases.map((item) => ({
+          id: item.id,
+          name: item.name,
+          kind: item.kind,
+          kindLabel: cnLabel(TEST_CASE_KIND_LABELS, item.kind, ''),
+          enabled: item.enabled,
+          requestId: item.requestId ?? null,
+          datasetId: item.datasetId ?? null,
+          dependsOn: item.dependsOn ?? '',
+          assertions: parseJsonText(item.assertionsJson),
+          stress: item.stressJson ? '已配置压测快照' : undefined,
+          preScript: clip(item.preScript ?? '', 200),
+          postScript: clip(item.postScript ?? '', 200),
+          mainScript: clip(item.mainScript ?? '', 600),
+        })),
+      }
+    },
+  },
+  {
+    name: 'test_suite_create',
+    desc: '新建测试套件（可在 config 中写 failFast / maxWorkers / cookieMode / vars 等套件配置）',
+    args: '{ projectId, name, description?, envId?, tags?: string[], config?: object, setupScript?, teardownScript? }',
+    handler: async (args) => {
+      const projectId = needNum(args.projectId, 'projectId')
+      const name = str(args.name).trim()
+      if (!name) throw new Error('参数 name 不能为空')
+      const id = await testSuiteSave({
+        projectId,
+        name,
+        description: str(args.description) || undefined,
+        envId: optionalNum(args.envId),
+        tags: testTags(args.tags),
+        configJson: jsonField(args.config),
+        setupScript: str(args.setupScript) || undefined,
+        teardownScript: str(args.teardownScript) || undefined,
+      })
+      return { id, name, 说明: '套件已创建，继续用 test_case_create 添加用例' }
+    },
+  },
+  {
+    name: 'test_suite_update',
+    desc: '修改测试套件配置 / 脚本 / 标签（只传需要改的字段）',
+    args: '{ id, name?, description?, envId?, tags?: string[], config?: object, setupScript?, teardownScript? }',
+    handler: async (args) => {
+      const id = needNum(args.id, 'id')
+      const existing = await testSuiteGet(id)
+      const suite = existing.suite
+      await testSuiteSave({
+        id,
+        projectId: suite.projectId,
+        name: args.name === undefined ? suite.name : str(args.name).trim(),
+        description: args.description === undefined ? suite.description : str(args.description),
+        envId: args.envId === undefined ? suite.envId : optionalNum(args.envId),
+        tags: args.tags === undefined ? suite.tags : testTags(args.tags),
+        pythonPath: suite.pythonPath,
+        configJson: args.config === undefined ? suite.configJson : jsonField(args.config),
+        setupScript:
+          args.setupScript === undefined ? suite.setupScript : str(args.setupScript),
+        teardownScript:
+          args.teardownScript === undefined ? suite.teardownScript : str(args.teardownScript),
+      })
+      return { id, name: args.name === undefined ? suite.name : str(args.name).trim(), 说明: '套件已更新' }
+    },
+  },
+  {
+    name: 'test_suite_delete',
+    desc: '删除测试套件及其用例、数据集与运行记录（危险操作，需用户确认）',
+    args: '{ id }',
+    danger: true,
+    handler: async (args) => {
+      const id = needNum(args.id, 'id')
+      await testSuiteDelete(id)
+      return `测试套件 #${id} 已删除`
+    },
+  },
+  {
+    name: 'test_case_create',
+    desc: '新增测试用例：request（绑定接口 + 断言）、python（mainScript）、stress（内联压测配置 + SLA）',
+    args: '{ suiteId, name, kind: request|python|stress, requestId?, datasetId?, dependsOn?: string[], assertions?: object[], variables?: object, preScript?, postScript?, mainScript?, stress?: object, timeoutMs?, retries? }',
+    handler: async (args) => {
+      const suiteId = needNum(args.suiteId, 'suiteId')
+      const payload = testCasePayload(args, suiteId)
+      const id = await testCaseSave(payload)
+      return { id, name: payload.name, 说明: `用例已加入套件 #${suiteId}` }
+    },
+  },
+  {
+    name: 'test_case_update',
+    desc: '修改测试用例（断言 / 脚本 / 压测配置 / 顺序等；只传需要改的字段）',
+    args: '{ id, name?, kind?, requestId?, datasetId?, dependsOn?: string[], assertions?: object[], variables?: object, preScript?, postScript?, mainScript?, stress?, timeoutMs?, retries? }',
+    handler: async (args) => {
+      const id = needNum(args.id, 'id')
+      const existing = await testCaseGet(id)
+      const payload = testCasePayload(args, existing.suiteId, existing)
+      await testCaseSave(payload)
+      return { id, name: payload.name, 说明: '用例已更新' }
+    },
+  },
+  {
+    name: 'test_case_delete',
+    desc: '删除测试用例（危险操作，需用户确认）',
+    args: '{ id }',
+    danger: true,
+    handler: async (args) => {
+      const id = needNum(args.id, 'id')
+      await testCaseDelete(id)
+      return `测试用例 #${id} 已删除`
+    },
+  },
+  {
+    name: 'test_run_start',
+    desc: '启动测试套件运行（先做预检；生产环境需用户确认）。立即返回 runId，用 test_run_get 查询结果',
+    args: '{ suiteId, envId?, failFast?, vars?: object, secrets?: object }',
+    danger: true,
+    handler: async (args) => {
+      const suiteId = needNum(args.suiteId, 'suiteId')
+      const envId = optionalNum(args.envId)
+      const preflight = await testPreflight(suiteId, envId ?? undefined)
+      const errors = preflight.items.filter((item) => item.level === 'error')
+      if (errors.length) {
+        throw new Error(
+          `预检未通过：${errors
+            .slice(0, 5)
+            .map((item) => `${item.caseName ? item.caseName + '：' : ''}${item.message}`)
+            .join('；')}`,
+        )
+      }
+      const runId = await testRunStart(
+        suiteId,
+        envId ?? undefined,
+        {
+          failFast: args.failFast === true,
+          vars: strMap(args.vars),
+          secrets: strMap(args.secrets),
+        },
+        'ai',
+      )
+      const warnings = preflight.items
+        .filter((item) => item.level === 'warning')
+        .slice(0, 5)
+        .map((item) => item.message)
+      return {
+        runId,
+        说明: `已启动套件「${preflight.suiteName}」的 ${preflight.enabledCases} 个用例${
+          warnings.length ? `；预检提示：${warnings.join('；')}` : ''
+        }`,
+      }
+    },
+  },
+  {
+    name: 'test_run_stop',
+    desc: '停止正在运行的测试套件（已完成的用例结果会保留）',
+    args: '{ runId }',
+    danger: true,
+    handler: async (args) => {
+      const runId = needNum(args.runId, 'runId')
+      await testRunStop(runId)
+      return `已发送停止指令，运行 #${runId} 会保留已完成结果`
+    },
+  },
+  {
+    name: 'test_run_get',
+    desc: '读取测试运行结果：汇总、失败用例、失败断言与错误；报告生成后用 test_report_export 导出',
+    args: '{ runId }',
+    handler: async (args) => {
+      const runId = needNum(args.runId, 'runId')
+      const detail = await testRunGet(runId)
+      const failures = detail.cases.filter((item) => item.status === 'failed' || item.status === 'error')
+      return {
+        id: detail.run.id,
+        status: cnLabel(TEST_RUN_STATUS_LABELS, detail.run.status, '未知'),
+        env: detail.run.envName ?? '',
+        trigger: cnLabel(TEST_TRIGGER_LABELS, detail.run.trigger, '未知'),
+        durationMs: detail.run.durationMs,
+        total: detail.run.total,
+        passed: detail.run.passed,
+        failed: detail.run.failed,
+        skipped: detail.run.skipped,
+        errored: detail.run.errored,
+        failures: failures.slice(0, 20).map((item) => ({
+          name: item.name,
+          kind: item.kind,
+          kindLabel: cnLabel(TEST_CASE_KIND_LABELS, item.kind, ''),
+          status: cnLabel(TEST_RUN_STATUS_LABELS, item.status, '未知'),
+          error: item.error ?? '',
+          assertions: detail.assertions
+            .filter((a) => a.runCaseId === item.id && !a.passed)
+            .map((a) => `${a.name}：${a.message ?? ''}`),
+        })),
+        omittedFailures: Math.max(0, failures.length - 20),
+      }
+    },
+  },
+  {
+    name: 'test_report_export',
+    desc: '为一次测试运行生成并导出报告（html / json / junit / summary）',
+    args: '{ runId, formats?: string[] }',
+    handler: async (args) => {
+      const runId = needNum(args.runId, 'runId')
+      const formats = Array.isArray(args.formats) ? args.formats.map((item) => str(item)) : undefined
+      const report = await testReportGenerate(runId, formats)
+      return { runId, dir: report.dir, files: report.files }
     },
   },
   {
@@ -2291,6 +2751,8 @@ const TOOL_KEYWORDS: Array<{ words: string[]; tools: string[] }> = [
   { words: ['导入', 'import'], tools: ['_import'] },
   { words: ['导出', 'export'], tools: ['_export'] },
   { words: ['计划', '压测'], tools: ['plan_', 'stress_'] },
+  { words: ['测试', '套件', '用例', '回归'], tools: ['test_'] },
+  { words: ['运行', '执行', '报告'], tools: ['test_run_', 'test_report_'] },
 ]
 
 const TOOL_MAP = new Map(SPECS.map((spec) => [spec.name, spec]))
@@ -2339,6 +2801,18 @@ export const TOOL_LABELS: Record<string, string> = {
   plan_save: '保存压测计划',
   stress_start: '启动压测',
   stress_stop: '停止压测',
+  test_suite_list: '读取测试套件',
+  test_suite_get: '读取套件详情',
+  test_suite_create: '新建测试套件',
+  test_suite_update: '修改测试套件',
+  test_suite_delete: '删除测试套件',
+  test_case_create: '新增测试用例',
+  test_case_update: '修改测试用例',
+  test_case_delete: '删除测试用例',
+  test_run_start: '启动套件运行',
+  test_run_stop: '停止套件运行',
+  test_run_get: '读取运行结果',
+  test_report_export: '导出测试报告',
   workspace_stats: '工作台统计',
   dashboard_metrics: '数据大屏指标',
   env_delete: '删除环境',
@@ -2393,6 +2867,15 @@ const WRITE_TOOLS = new Set([
   'plan_delete',
   'stress_start',
   'stress_stop',
+  'test_suite_create',
+  'test_suite_update',
+  'test_suite_delete',
+  'test_case_create',
+  'test_case_update',
+  'test_case_delete',
+  'test_run_start',
+  'test_run_stop',
+  'test_report_export',
   'run_batch',
   'history_export',
   'report_export',
@@ -2412,6 +2895,10 @@ export function isWriteTool(tool: string): boolean {
 export function toolLabel(tool: string): string {
   return TOOL_LABELS[tool] ?? tool
 }
+
+/** 测试用例类型的中文名；认不出就返回空串，由调用方决定退回原值还是标「未知」 */
+export const testCaseKindLabel = (kind: unknown): string =>
+  TEST_CASE_KIND_LABELS[str(kind).trim().toLowerCase()] ?? ''
 
 /**
  * 常用工具直接注入提示词；其余长尾工具只列名字，
@@ -2440,6 +2927,9 @@ const CORE_TOOL_NAMES = new Set([
   'plan_save',
   'stress_start',
   'stress_stop',
+  'test_suite_list',
+  'test_run_start',
+  'test_run_get',
   'workspace_stats',
   'tool_search',
 ])
@@ -2480,7 +2970,7 @@ const FILE_TOOLS = new Set([
   'openapi_import',
 ])
 /** 压测启停本身立即返回任务句柄，包超时反而会误判 */
-const NO_TIMEOUT_TOOLS = new Set(['stress_start', 'stress_stop'])
+const NO_TIMEOUT_TOOLS = new Set(['stress_start', 'stress_stop', 'test_run_start'])
 
 class ToolTimeoutError extends Error {}
 

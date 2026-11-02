@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
 import { save } from '@tauri-apps/plugin-dialog'
@@ -22,6 +22,7 @@ import { formatDateTime } from '@/utils/datetime'
 import * as api from '@/api'
 import type { ReportDetail, ReportRequestRecord, ReportRequestsPage } from '@/types/models'
 import { buildReportHtml, buildReportSheets } from '@/utils/reportExport'
+import { detectKnee, qpsOverview, scoreReport, selfCheck } from '@/utils/reportAnalytics'
 import { buildXlsx } from '@/utils/xlsx'
 
 const route = useRoute()
@@ -153,7 +154,7 @@ onMounted(async () => {
   } finally {
     loading.value = false
   }
-  loadRequests()
+  await loadRequests()
 })
 
 const report = computed(() => detail.value?.report ?? null)
@@ -179,25 +180,123 @@ const errorTypes = computed(() => detail.value?.errorTypes ?? [])
 const histogram = computed(() => detail.value?.histogram ?? [])
 const stages = computed(() => detail.value?.stages ?? [])
 const config = computed(() => detail.value?.config ?? null)
+const metrics = computed(() => config.value?.metrics ?? null)
+const bytesSent = computed(() => metrics.value?.bytesSent ?? 0)
+
+/** QPS 指标组：平均 / 峰值 / 90% 分布 / 单并发 / 目标达成率，页面与导出同一口径 */
+const qps = computed(() =>
+  detail.value
+    ? qpsOverview(detail.value, { rampUpSec: config.value?.rampUpSec ?? 0 })
+    : null,
+)
+const knee = computed(() => (detail.value ? detectKnee(detail.value) : null))
+const score = computed(() => (detail.value ? scoreReport(detail.value) : null))
+const checks = computed(() => (detail.value ? selfCheck(detail.value) : []))
+const checksPassed = computed(() => checks.value.every((item) => item.pass))
+
+const recordModeText = computed(() => {
+  const mode = metrics.value?.recordMode ?? config.value?.recordDetail
+  const map: Record<string, string> = {
+    full: '明细：完整',
+    sample: '明细：采样 1%',
+    off: '明细：已关闭',
+    auto: '明细：自动',
+  }
+  return mode ? map[mode] ?? mode : ''
+})
+
+const statsRows = computed(() => {
+  const current = report.value
+  if (!current) return []
+  const seconds = Math.max(1, durationSec.value)
+  return [
+    { label: '样本数', value: current.totalRequests.toLocaleString() },
+    { label: '错误率', value: `${current.errorRate.toFixed(2)}%` },
+    { label: '平均响应时间', value: `${fmtNum(current.avgRt)} ms` },
+    { label: '中位数 P50', value: `${fmtNum(current.p50Rt)} ms` },
+    { label: 'P90', value: `${fmtNum(current.p90Rt)} ms` },
+    { label: 'P95', value: `${fmtNum(current.p95Rt)} ms` },
+    { label: 'P99', value: `${fmtNum(current.p99Rt)} ms` },
+    { label: '标准差', value: `${fmtNum(current.stddevRt)} ms` },
+    { label: '平均 QPS', value: fmtNum(qps.value?.avg) },
+    { label: '峰值 QPS', value: fmtNum(qps.value?.max) },
+    { label: '90% 分布 QPS', value: fmtNum(qps.value?.ninety) },
+    { label: '单并发 QPS', value: fmtNum(qps.value?.perConcurrent, 2) },
+    ...(qps.value?.target
+      ? [
+          { label: '目标 QPS', value: fmtNum(qps.value.target) },
+          { label: '目标达成率', value: `${fmtNum(qps.value.attainment, 1)}%` },
+        ]
+      : []),
+    { label: '接收带宽', value: `${(current.bytesTotal / seconds / 1024).toFixed(1)} KB/s` },
+    { label: '发送带宽', value: `${(bytesSent.value / seconds / 1024).toFixed(1)} KB/s` },
+  ]
+})
+
+const scenarioDraft = ref('')
+const summaryDraft = ref('')
+const textSaving = ref(false)
+
+watch(
+  detail,
+  (value) => {
+    scenarioDraft.value = value?.scenarioText ?? ''
+    summaryDraft.value = value?.summaryText ?? ''
+  },
+  { immediate: true },
+)
+
+async function saveTexts() {
+  if (!report.value) return
+  textSaving.value = true
+  try {
+    await api.reportUpdateTexts(report.value.id, scenarioDraft.value, summaryDraft.value)
+    if (detail.value) {
+      detail.value.scenarioText = scenarioDraft.value
+      detail.value.summaryText = summaryDraft.value
+    }
+    message.success('已保存场景与总结')
+  } catch (e) {
+    message.error(String(e))
+  } finally {
+    textSaving.value = false
+  }
+}
+
+function clearDetails() {
+  if (!report.value) return
+  Modal.confirm({
+    title: '清理逐请求明细？',
+    content: '汇总、采样与错误类型统计会保留，仅删除逐条请求明细（不可恢复）。',
+    okText: '清理',
+    okType: 'danger',
+    cancelText: '取消',
+    async onOk() {
+      const removed = await api.reportClearDetails(report.value!.id)
+      message.success(`已清理 ${removed.toLocaleString()} 条明细`)
+      await loadRequests()
+    },
+  })
+}
 
 const chartLabels = computed(() => samples.value.map((s) => `${s.elapsedSec}s`))
 
 const qpsSeries = computed(() => [
-  { name: 'QPS', color: '#3d6b8f', values: samples.value.map((s) => s.qps) },
+  { name: 'QPS', color: '#4d6bfe', values: samples.value.map((s) => s.qps) },
   { name: '并发', color: '#7d8fa6', values: samples.value.map((s) => s.concurrent) },
 ])
 
 const latencySeries = computed(() => [
-  { name: '平均', color: '#3d6b8f', values: samples.value.map((s) => s.avgRt) },
+  { name: '平均', color: '#4d6bfe', values: samples.value.map((s) => s.avgRt) },
   { name: 'P50', color: '#6d8fa8', values: samples.value.map((s) => s.p50Rt) },
-  { name: 'P95', color: '#b07d33', values: samples.value.map((s) => s.p95Rt) },
-  { name: 'P99', color: '#b0524d', values: samples.value.map((s) => s.p99Rt) },
+  { name: 'P95', color: '#d97706', values: samples.value.map((s) => s.p95Rt) },
+  { name: 'P99', color: '#dc2626', values: samples.value.map((s) => s.p99Rt) },
 ])
 
 const errorSeries = computed(() => [
   {
     name: '错误率',
-    color: '#b0524d',
+    color: '#dc2626',
     values: samples.value.map((s) => {
       const total = s.successCount + s.errorCount
       return total > 0 ? (s.errorCount / total) * 100 : 0
@@ -299,7 +398,7 @@ const slaChecks = computed(() => {
   }
   if (sla.minRps) {
     rows.push({
-      label: '平均 RPS',
+      label: '平均 QPS',
       target: `≥ ${sla.minRps}`,
       actual: fmtNum(r.avgQps),
       pass: r.avgQps >= sla.minRps,
@@ -346,12 +445,14 @@ function codeTone(code: number) {
   return 'ok'
 }
 
-type ExportFormat = 'json' | 'html' | 'excel'
+type ExportFormat = 'json' | 'html' | 'excel' | 'csv-requests' | 'csv-errors'
 
 const EXPORT_META: Record<ExportFormat, { extension: string; filterName: string; label: string }> = {
   json: { extension: 'json', filterName: 'AstroMan 压测报告', label: 'JSON 归档' },
   html: { extension: 'html', filterName: 'HTML 报告', label: 'HTML 报告' },
   excel: { extension: 'xlsx', filterName: 'Excel 工作簿', label: 'Excel 表格' },
+  'csv-requests': { extension: 'csv', filterName: 'CSV 明细', label: '请求明细 CSV' },
+  'csv-errors': { extension: 'csv', filterName: 'CSV 明细', label: '错误明细 CSV' },
 }
 
 async function exportReport(format: ExportFormat) {
@@ -372,6 +473,12 @@ async function exportReport(format: ExportFormat) {
     const target = path.toLowerCase().endsWith(suffix) ? path : `${path}${suffix}`
     if (format === 'json') {
       await api.reportExport(current.id, target)
+    } else if (format === 'csv-requests' || format === 'csv-errors') {
+      // 后端逐行流式写盘，前端不经过内存
+      const kind = format === 'csv-requests' ? 'requests' : 'errors'
+      const rows = await api.reportExportDetailCsv(current.id, kind, target)
+      message.success(`已导出 ${meta.label}，共 ${rows.toLocaleString()} 行`)
+      return
     } else {
       const records = await api.reportRequests(current.id, 1, 50000, null)
       if (format === 'html') {
@@ -391,6 +498,10 @@ async function exportReport(format: ExportFormat) {
 }
 
 function onExportMenu(info: { key: string | number }) {
+  if (info.key === 'clear-details') {
+    clearDetails()
+    return
+  }
   exportReport(info.key as ExportFormat)
 }
 
@@ -405,7 +516,7 @@ function remove() {
     async onOk() {
       await api.reportDelete(report.value!.id)
       message.success('已删除')
-      router.push('/reports')
+      router.push('/stress')
     },
   })
 }
@@ -422,7 +533,7 @@ function remove() {
         <template #icon><AiSparkIcon /></template>
         AI 解读
       </a-button>
-      <a-button @click="router.push('/reports')">
+      <a-button @click="router.push('/stress')">
         <template #icon><ArrowLeftOutlined /></template>
         返回列表
       </a-button>
@@ -437,6 +548,11 @@ function remove() {
             <a-menu-item key="json">JSON 归档（完整数据）</a-menu-item>
             <a-menu-item key="html">HTML 报告（可视化）</a-menu-item>
             <a-menu-item key="excel">Excel 表格（多工作表）</a-menu-item>
+            <a-menu-divider />
+            <a-menu-item key="csv-requests">请求明细 CSV（全量流式导出）</a-menu-item>
+            <a-menu-item key="csv-errors">错误明细 CSV（全量流式导出）</a-menu-item>
+            <a-menu-divider />
+            <a-menu-item key="clear-details">清理逐请求明细</a-menu-item>
           </a-menu>
         </template>
       </a-dropdown>
@@ -464,8 +580,10 @@ function remove() {
               <span>耗时 {{ durationSec }} 秒</span>
               <span class="dot-sep">·</span>
               <span>峰值并发 {{ report.concurrency }}</span>
-              <span v-if="report.targetRps > 0" class="dot-sep">·</span>
-              <span v-if="report.targetRps > 0">目标 {{ fmtNum(report.targetRps, 0) }} RPS</span>
+              <span v-if="qps?.target" class="dot-sep">·</span>
+              <span v-if="qps?.target">目标 {{ fmtNum(qps.target, 0) }} QPS</span>
+              <span v-if="qps?.attainment != null" class="dot-sep">·</span>
+              <span v-if="qps?.attainment != null">达成 {{ fmtNum(qps.attainment, 0) }}%</span>
             </div>
             <div v-if="config?.url" class="target-line">
               <span class="method-chip">{{ config.method || 'GET' }}</span>
@@ -494,11 +612,19 @@ function remove() {
           </div>
           <div class="metric-card fm-card">
             <span class="m-label">平均 QPS</span>
-            <span class="m-value mono">{{ fmtNum(report.avgQps) }}</span>
+            <span class="m-value mono">{{ fmtNum(qps?.avg) }}</span>
           </div>
           <div class="metric-card fm-card">
             <span class="m-label">峰值 QPS</span>
-            <span class="m-value mono">{{ fmtNum(report.maxQps) }}</span>
+            <span class="m-value mono">{{ fmtNum(qps?.max) }}</span>
+          </div>
+          <div class="metric-card fm-card" title="每秒采样 QPS 的 P10：90% 的时间吞吐不低于该值，已剔除升压段与首末不完整秒">
+            <span class="m-label">90% 分布 QPS</span>
+            <span class="m-value mono">{{ fmtNum(qps?.ninety) }}</span>
+          </div>
+          <div class="metric-card fm-card" title="平均 QPS ÷ 并发数，用于对比不同并发档位下单连接的吞吐效率">
+            <span class="m-label">单并发 QPS</span>
+            <span class="m-value mono">{{ fmtNum(qps?.perConcurrent, 2) }}</span>
           </div>
           <div class="metric-card fm-card">
             <span class="m-label">平均延迟</span>
@@ -520,6 +646,36 @@ function remove() {
           </div>
         </div>
 
+        <div class="fm-card text-card">
+          <div class="card-head">
+            <div>
+              <div class="card-title">测试场景与报告总结</div>
+              <div class="card-sub">可编辑，保存后随报告归档，并同步进入 HTML 报告</div>
+            </div>
+            <a-button size="small" :loading="textSaving" @click="saveTexts">保存</a-button>
+          </div>
+          <div class="text-grid">
+            <div class="text-field">
+              <span class="text-label">测试场景</span>
+              <a-textarea
+                v-model:value="scenarioDraft"
+                :rows="3"
+                :maxlength="2000"
+                placeholder="本次压测的业务场景、目的、数据构造与前置条件…"
+              />
+            </div>
+            <div class="text-field">
+              <span class="text-label">报告总结</span>
+              <a-textarea
+                v-model:value="summaryDraft"
+                :rows="3"
+                :maxlength="3000"
+                placeholder="结论、瓶颈判断与后续优化建议…"
+              />
+            </div>
+          </div>
+        </div>
+
         <div v-if="slaChecks.length" class="fm-card sla-card">
           <div class="card-head">
             <div>
@@ -537,6 +693,71 @@ function remove() {
               <span class="sla-actual mono">{{ row.actual }}</span>
               <span class="sla-result" :class="row.pass ? 'ok' : 'bad'">{{ row.pass ? '达标' : '未达标' }}</span>
             </div>
+          </div>
+        </div>
+
+        <div class="two-col">
+          <div class="fm-card table-card">
+            <div class="card-head">
+              <div>
+                <div class="card-title">统计表</div>
+                <div class="card-sub">对齐 JMeter Statistics；90% QPS 已剔除升压段</div>
+              </div>
+              <span v-if="recordModeText" class="head-note">{{ recordModeText }}</span>
+            </div>
+            <div class="percentile-grid">
+              <div v-for="row in statsRows" :key="row.label" class="percentile-cell">
+                <span class="p-label">{{ row.label }}</span>
+                <span class="p-value mono">{{ row.value }}</span>
+              </div>
+            </div>
+            <div v-if="metrics" class="extra-row">
+              <div class="extra-item">
+                <span class="p-label">明细丢弃</span>
+                <span class="p-value mono">{{ (metrics.recordsDropped ?? 0).toLocaleString() }} 条</span>
+              </div>
+              <div class="extra-item">
+                <span class="p-label">错误丢弃</span>
+                <span class="p-value mono">{{ (metrics.errorsDropped ?? 0).toLocaleString() }} 条</span>
+              </div>
+              <div class="extra-item">
+                <span class="p-label">施压端峰值 CPU</span>
+                <span class="p-value mono">
+                  {{ metrics.cpuPeakCores ? `${metrics.cpuPeakCores.toFixed(1)} 核` : '未采集' }}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <div class="fm-card table-card">
+            <div class="card-head">
+              <div>
+                <div class="card-title">自动分析</div>
+                <div class="card-sub">拐点检测与四维体检，规则可解释</div>
+              </div>
+              <span class="head-note">
+                {{ score?.total != null ? `综合 ${score.total.toFixed(0)}（${score.grade}）` : '—' }}
+              </span>
+            </div>
+            <div v-if="knee" class="analysis-note">{{ knee.note }}</div>
+            <div v-if="score" class="score-list">
+              <div v-for="dim in score.dimensions" :key="dim.key" class="score-row">
+                <span class="score-label">{{ dim.label }}</span>
+                <div class="score-bar-wrap">
+                  <div class="score-bar" :style="{ width: `${dim.score ?? 0}%` }" />
+                </div>
+                <span class="score-value mono">{{ dim.score === null ? '—' : dim.score.toFixed(0) }}</span>
+                <span class="score-detail">{{ dim.detail }}</span>
+              </div>
+            </div>
+            <div class="checks">
+              <div v-for="item in checks" :key="item.key" class="check-row">
+                <span :class="item.pass ? 'check-ok' : 'check-bad'">{{ item.pass ? '✓' : '!' }}</span>
+                <span class="check-label">{{ item.label }}</span>
+                <span class="check-detail">{{ item.detail }}</span>
+              </div>
+            </div>
+            <div v-if="score" class="rule-note">{{ score.ruleNote }}</div>
           </div>
         </div>
 
@@ -786,7 +1007,7 @@ function remove() {
               <span class="c-value mono">{{ config.rampUpSec }} s</span>
             </div>
             <div class="config-item">
-              <span class="c-label">目标 RPS</span>
+              <span class="c-label">目标 QPS</span>
               <span class="c-value mono">{{ config.targetRps ? fmtNum(config.targetRps, 0) : '不限速' }}</span>
             </div>
             <div class="config-item">
@@ -1220,7 +1441,7 @@ function remove() {
 
 .metrics {
   display: grid;
-  grid-template-columns: repeat(8, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 10px;
   margin-top: 16px;
 }
@@ -2122,6 +2343,116 @@ function remove() {
   }
   .percentile-grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+/* ---------- 场景/总结、统计表、自动分析 ---------- */
+.text-card {
+  padding: 18px 20px;
+}
+.text-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-top: 8px;
+}
+.text-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.text-label {
+  font-size: 12px;
+  color: var(--fm-text-3, #7d8c8b);
+}
+.analysis-note {
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--fm-text-2, #4a5a59);
+  background: #f6f8f8;
+  border-left: 3px solid #2f6f62;
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-bottom: 12px;
+}
+.score-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.score-row {
+  display: grid;
+  grid-template-columns: 60px 1fr 32px;
+  grid-template-areas: 'label bar value' 'detail detail detail';
+  align-items: center;
+  gap: 4px 8px;
+  font-size: 12px;
+}
+.score-label {
+  grid-area: label;
+  color: var(--fm-text-2, #4a5a59);
+}
+.score-bar-wrap {
+  grid-area: bar;
+  height: 6px;
+  border-radius: 3px;
+  background: #eef1f2;
+  overflow: hidden;
+}
+.score-bar {
+  height: 100%;
+  background: #2f6f62;
+  border-radius: 3px;
+}
+.score-value {
+  grid-area: value;
+  text-align: right;
+  font-weight: 600;
+}
+.score-detail {
+  grid-area: detail;
+  font-size: 11px;
+  color: var(--fm-text-3, #7d8c8b);
+}
+.checks {
+  margin-top: 12px;
+  border-top: 1px dashed #e3e8ea;
+  padding-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.check-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12px;
+}
+.check-ok {
+  color: #2f8f5b;
+  font-weight: 700;
+}
+.check-bad {
+  color: #b7822f;
+  font-weight: 700;
+}
+.check-label {
+  color: var(--fm-text-2, #4a5a59);
+  white-space: nowrap;
+}
+.check-detail {
+  color: var(--fm-text-3, #7d8c8b);
+  font-size: 11px;
+}
+.rule-note {
+  margin-top: 10px;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--fm-text-3, #7d8c8b);
+}
+@media (max-width: 1180px) {
+  .text-grid {
+    grid-template-columns: 1fr;
   }
 }
 </style>

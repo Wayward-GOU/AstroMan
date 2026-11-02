@@ -261,3 +261,32 @@ function quoteJs(value: string): string {
 export function resolveCurlVars(text: string, variables?: EnvVariable[]): string {
   return resolveVariables(text, variables)
 }
+
+const CURL_HEAD_RE = /(^|[\s`>$])curl\s/i
+
+/**
+ * 从一段自由文本（用户粘贴的消息、代码块、附件）里摘出 cURL 命令原文。
+ *
+ * 用途：模型在工具参数里复述长 cURL 时可能被输出长度限制截断，
+ * 这时直接拿用户消息里的原文补全，保证导入的是完整命令。
+ * 优先取 ``` 代码块内的内容，没有代码块则从 curl 关键字一直取到文本末尾。
+ */
+export function extractCurlCommand(text: string): string | null {
+  if (!text) return null
+  const normalized = text.replace(/\r\n/g, '\n')
+
+  // 1. 代码块内的 curl 最可信
+  const fenceRe = /```[a-zA-Z0-9_-]*[ \t]*\n([\s\S]*?)```/g
+  let fence: RegExpExecArray | null
+  while ((fence = fenceRe.exec(normalized))) {
+    const block = fence[1] ?? ''
+    if (CURL_HEAD_RE.test(block)) return block.trim()
+  }
+
+  // 2. 正文里直接出现 curl：取到文本结尾
+  const match = CURL_HEAD_RE.exec(normalized)
+  if (!match) return null
+  const start = match.index + match[1].length
+  const body = normalized.slice(start).trim()
+  return body || null
+}

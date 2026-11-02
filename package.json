@@ -1,17 +1,19 @@
 {
   "name": "AstroMan",
   "private": true,
-  "version": "1.0.7",
+  "version": "1.0.8",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
-    "build:win": "tauri build --bundles nsis",
-    "build:win:offline": "tauri build --bundles nsis --config src-tauri/tauri.offline.conf.json",
-    "build:win32": "tauri build --target i686-pc-windows-msvc --bundles nsis",
-    "build:mac": "tauri build --target universal-apple-darwin --bundles dmg",
+    "build:win": "node scripts/prepare-cli.mjs && tauri build --bundles nsis",
+    "build:win:offline": "node scripts/prepare-cli.mjs && tauri build --bundles nsis --config src-tauri/tauri.offline.conf.json",
+    "build:win32": "node scripts/prepare-cli.mjs --target i686-pc-windows-msvc && tauri build --target i686-pc-windows-msvc --bundles nsis",
+    "build:mac": "node scripts/prepare-cli.mjs --target universal-apple-darwin && tauri build --target universal-apple-darwin --bundles dmg",
     "preview": "vite preview",
     "test": "vitest run",
+    "version:check": "node scripts/sync-version.mjs",
+    "version:set": "node scripts/sync-version.mjs",
     "tauri": "tauri"
   },
   "dependencies": {

@@ -35,10 +35,14 @@ export const useAiAssistStore = defineStore('aiAssist', () => {
   const providerId = ref<number | null>(null)
   const messages = ref<AssistMessage[]>([])
   const streaming = ref(false)
+  /** 已打开但还没开始分析：等用户确认，避免一进来就长时间等待 */
+  const pending = ref(false)
   const error = ref('')
 
   /** 页面上下文只进入模型，不铺在对话里 */
   let context = ''
+  /** 上下文规模，用于确认页提示耗时 */
+  const contextChars = ref(0)
 
   const currentProvider = computed(
     () => providers.value.find((item) => item.id === providerId.value) ?? null,
@@ -153,14 +157,29 @@ export const useAiAssistStore = defineStore('aiAssist', () => {
     }
   }
 
-  /** 打开抽屉并立即分析 */
-  async function show(options: { title: string; prompt: string; hint?: string }) {
+  /**
+   * 打开抽屉，默认停在「待确认」状态：把上下文准备好但不发请求，
+   * 由用户点「开始分析」后才真正调用模型。autoStart 仅供确实需要立即出结果的入口使用。
+   */
+  async function show(options: { title: string; prompt: string; hint?: string; autoStart?: boolean }) {
     title.value = options.title
     hint.value = options.hint ?? ''
     context = options.prompt
+    contextChars.value = options.prompt.length
     messages.value = []
     error.value = ''
+    pending.value = !options.autoStart
     open.value = true
+    await ensureProviders()
+    if (!pending.value) await run()
+  }
+
+  /** 用户确认开始分析；可带上他补充的一句话诉求 */
+  async function start(preface?: string) {
+    if (streaming.value) return
+    const text = preface?.trim()
+    if (text) messages.value.push({ role: 'user', content: text })
+    pending.value = false
     await run()
   }
 
@@ -168,6 +187,10 @@ export const useAiAssistStore = defineStore('aiAssist', () => {
   async function ask(text: string) {
     const content = text.trim()
     if (!content || streaming.value) return
+    if (pending.value) {
+      await start(content)
+      return
+    }
     messages.value.push({ role: 'user', content })
     await run()
   }
@@ -180,6 +203,8 @@ export const useAiAssistStore = defineStore('aiAssist', () => {
     messages.value = []
     error.value = ''
     context = ''
+    contextChars.value = 0
+    pending.value = false
   }
 
   return {
@@ -191,10 +216,13 @@ export const useAiAssistStore = defineStore('aiAssist', () => {
     currentProvider,
     messages,
     streaming,
+    pending,
+    contextChars,
     error,
     ready,
     canSend,
     show,
+    start,
     ask,
     close,
     reset,

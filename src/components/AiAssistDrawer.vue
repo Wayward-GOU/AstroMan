@@ -4,10 +4,11 @@ import { useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
 import {
   CopyOutlined,
-  RobotOutlined,
   SendOutlined,
   SettingOutlined,
+  ThunderboltOutlined,
 } from '@ant-design/icons-vue'
+import AstroBuddyIcon from '@/components/AstroBuddyIcon.vue'
 import { useAiAssistStore } from '@/stores/aiAssist'
 import { renderMarkdown } from '@/utils/markdown'
 
@@ -50,6 +51,17 @@ async function submit() {
   await store.ask(text)
 }
 
+/** 确认页的「开始分析」：不带额外说明直接开跑 */
+async function startNow() {
+  await store.start()
+}
+
+function formatSize(chars: number) {
+  if (chars < 1000) return `${chars} 字`
+  if (chars < 10000) return `${(chars / 1000).toFixed(1)} 千字`
+  return `${(chars / 10000).toFixed(1)} 万字`
+}
+
 function onEnter(event: KeyboardEvent) {
   if (event.shiftKey || event.isComposing) return
   event.preventDefault()
@@ -84,7 +96,7 @@ function goChat() {
   >
     <template #title>
       <div class="assist-title">
-        <span class="assist-bot"><RobotOutlined /></span>
+        <span class="assist-bot"><AstroBuddyIcon /></span>
         <div class="assist-title-text">
           <span class="assist-name">{{ store.title }}</span>
           <span class="assist-sub">航仔 · 基于当前页面数据分析</span>
@@ -128,9 +140,37 @@ function goChat() {
         <pre v-if="expanded" class="assist-hint-body">{{ store.hint }}</pre>
       </div>
 
-      <div v-if="!store.messages.length && !store.streaming" class="assist-empty">
-        <RobotOutlined class="assist-empty-icon" />
-        <p>正在准备分析上下文…</p>
+      <div v-if="store.pending" class="assist-start">
+        <div class="assist-start-icon"><AstroBuddyIcon /></div>
+        <div class="assist-start-title">开始分析？</div>
+        <p class="assist-start-text">
+          我先把当前页面的数据整理好了，还没发给模型。点「开始分析」才会真正调用模型并消耗额度，内容多时通常要等十几秒到一分钟。
+        </p>
+        <div class="assist-start-meta">
+          <span v-if="store.hint">{{ store.hint }}</span>
+          <span v-if="store.contextChars">上下文约 {{ formatSize(store.contextChars) }}</span>
+        </div>
+        <div class="assist-start-actions">
+          <a-button
+            type="primary"
+            :disabled="!store.ready"
+            :loading="store.streaming"
+            @click="startNow"
+          >
+            <template #icon><ThunderboltOutlined /></template>
+            开始分析
+          </a-button>
+          <a-button @click="store.close">先不看</a-button>
+        </div>
+        <p v-if="!store.ready" class="assist-start-warn">
+          还没有可用的模型服务，先到「航仔」配置后再来。
+        </p>
+        <p v-else class="assist-start-warn">也可以直接在下方输入你的问题，随分析一起发送。</p>
+      </div>
+
+      <div v-if="!store.messages.length && !store.streaming && !store.pending" class="assist-empty">
+        <AstroBuddyIcon class="assist-empty-icon" />
+        <p>分析已结束，可以继续追问。</p>
       </div>
 
       <div
@@ -154,7 +194,11 @@ function goChat() {
       <a-textarea
         v-model:value="input"
         :auto-size="{ minRows: 1, maxRows: 4 }"
-        placeholder="继续追问，例如：把断言脚本改成校验 code=0（Enter 发送，Shift + Enter 换行）"
+        :placeholder="
+          store.pending
+            ? '有话想先说？例如「只看失败的那几个接口」，留空也可以直接开始'
+            : '继续追问，例如：把断言脚本改成校验 code=0（Enter 发送，Shift + Enter 换行）'
+        "
         :disabled="store.streaming"
         @keydown.enter="onEnter"
       />
@@ -173,7 +217,7 @@ function goChat() {
           @click="submit"
         >
           <template #icon><SendOutlined /></template>
-          追问
+          {{ store.pending ? '带上问题开始' : '追问' }}
         </a-button>
       </div>
     </div>
@@ -194,8 +238,8 @@ function goChat() {
   width: 30px;
   height: 30px;
   border-radius: 9px;
-  background: var(--fm-accent-soft, #e8f0fe);
-  color: var(--fm-accent, #2b6cf6);
+  background: var(--fm-primary-soft, #eef1ff);
+  color: var(--fm-primary, #4d6bfe);
   flex: none;
 }
 
@@ -214,7 +258,7 @@ function goChat() {
 
 .assist-sub {
   font-size: 11px;
-  color: var(--fm-text-muted, #8a94a6);
+  color: var(--fm-muted, #6b7490);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -243,7 +287,7 @@ function goChat() {
   border-radius: 8px;
   padding: 8px 10px;
   font-size: 12px;
-  color: var(--fm-text-muted, #8a94a6);
+  color: var(--fm-muted, #6b7490);
 }
 
 .assist-hint-label {
@@ -265,10 +309,74 @@ function goChat() {
   color: var(--fm-text, #2b3445);
 }
 
+.assist-start {
+  margin: 8px 0 4px;
+  padding: 20px 18px 16px;
+  border-radius: 12px;
+  border: 1px solid var(--fm-border, #e6ebf3);
+  background: var(--fm-surface-alt, #f2f4f9);
+  text-align: center;
+}
+
+.assist-start-icon {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  margin: 0 auto 10px;
+  border-radius: 13px;
+  font-size: 21px;
+  color: var(--fm-primary, #4d6bfe);
+  background: var(--fm-primary-soft, #eef1ff);
+}
+
+.assist-start-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--fm-text, #2b3445);
+}
+
+.assist-start-text {
+  margin: 6px auto 12px;
+  max-width: 420px;
+  font-size: 12.5px;
+  line-height: 1.75;
+  color: var(--fm-muted, #6b7490);
+}
+
+.assist-start-meta {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+
+.assist-start-meta span {
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  color: var(--fm-text-2, #3a4256);
+  background: var(--fm-surface, #fff);
+  border: 1px solid var(--fm-border, #e6e9f2);
+}
+
+.assist-start-actions {
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+}
+
+.assist-start-warn {
+  margin: 12px 0 0;
+  font-size: 11.5px;
+  color: var(--fm-muted, #6b7490);
+}
+
 .assist-empty {
   margin: 40px auto;
   text-align: center;
-  color: var(--fm-text-muted, #8a94a6);
+  color: var(--fm-muted, #6b7490);
   font-size: 13px;
 }
 
@@ -310,12 +418,12 @@ function goChat() {
 }
 
 .assist-row.assistant .assist-bubble {
-  background: var(--fm-surface-2, #f5f7fb);
+  background: var(--fm-surface-alt, #f2f4f9);
   color: var(--fm-text, #2b3445);
 }
 
 .assist-row.user .assist-bubble {
-  background: var(--fm-accent, #2b6cf6);
+  background: var(--fm-primary, #4d6bfe);
   color: #fff;
   max-width: 84%;
   white-space: pre-wrap;
@@ -333,7 +441,7 @@ function goChat() {
 
 .assist-typing {
   font-size: 12px;
-  color: var(--fm-text-muted, #8a94a6);
+  color: var(--fm-muted, #6b7490);
   padding-left: 34px;
 }
 

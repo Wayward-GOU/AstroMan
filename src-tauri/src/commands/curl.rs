@@ -22,7 +22,7 @@ fn looks_like_json(value: &str) -> bool {
 
 fn base64_encode(input: &[u8]) -> String {
     const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = *chunk.get(1).unwrap_or(&0) as u32;
@@ -235,9 +235,7 @@ pub fn curl_parse(text: String) -> Result<CurlParsed, String> {
                             Some((k, v)) => pairs.push((k.to_string(), v.to_string())),
                             None => pairs.push((value.clone(), String::new())),
                         }
-                    } else if let Some(body) =
-                        collect_data(&value, &mut pairs, &mut warnings)
-                    {
+                    } else if let Some(body) = collect_data(&value, &mut pairs, &mut warnings) {
                         raw_body = Some(body);
                     }
                 }
@@ -254,7 +252,9 @@ pub fn curl_parse(text: String) -> Result<CurlParsed, String> {
                     match value.split_once('=') {
                         Some((k, v)) => {
                             if v.starts_with('@') || v.starts_with('<') {
-                                warnings.push(format!("已忽略文件字段 {k}（暂不支持 multipart 文件上传）"));
+                                warnings.push(format!(
+                                    "已忽略文件字段 {k}（暂不支持 multipart 文件上传）"
+                                ));
                             } else {
                                 pairs.push((k.to_string(), v.to_string()));
                             }
@@ -269,11 +269,32 @@ pub fn curl_parse(text: String) -> Result<CurlParsed, String> {
             "-b" | "--cookie" => cookie = iter.next(),
             "-A" | "--user-agent" => user_agent = iter.next(),
             "--url" => url = iter.next(),
-            "-f" | "--fail" | "--fail-with-body" | "-s" | "--silent" | "-S" | "--show-error"
-            | "-sS" | "-L" | "--location" | "-k" | "--insecure" | "-i" | "--include"
-            | "-v" | "--verbose" | "--compressed" | "--no-buffer" | "-N"
-            | "--http1.1" | "--http2" | "--raw" | "--path-as-is" | "--no-progress-meter"
-            | "--globoff" | "-g" => {}
+            "-f"
+            | "--fail"
+            | "--fail-with-body"
+            | "-s"
+            | "--silent"
+            | "-S"
+            | "--show-error"
+            | "-sS"
+            | "-L"
+            | "--location"
+            | "-k"
+            | "--insecure"
+            | "-i"
+            | "--include"
+            | "-v"
+            | "--verbose"
+            | "--compressed"
+            | "--no-buffer"
+            | "-N"
+            | "--http1.1"
+            | "--http2"
+            | "--raw"
+            | "--path-as-is"
+            | "--no-progress-meter"
+            | "--globoff"
+            | "-g" => {}
             other => {
                 if other.starts_with('-') {
                     warnings.push(format!("已忽略参数 {other}"));
@@ -365,10 +386,9 @@ pub fn curl_parse(text: String) -> Result<CurlParsed, String> {
         .find(|h| h.key.eq_ignore_ascii_case("content-type"))
         .map(|h| h.value.to_lowercase());
 
+    // -G 或没有 body 都按 GET 处理，两者走的是同一个分支
     let method = method.unwrap_or_else(|| {
-        if get_mode {
-            "GET".to_string()
-        } else if body.is_empty() {
+        if get_mode || body.is_empty() {
             "GET".to_string()
         } else {
             "POST".to_string()
@@ -379,7 +399,10 @@ pub fn curl_parse(text: String) -> Result<CurlParsed, String> {
         "none"
     } else if json_mode
         || looks_like_json(&body)
-        || content_type.as_deref().map(|v| v.contains("json")).unwrap_or(false)
+        || content_type
+            .as_deref()
+            .map(|v| v.contains("json"))
+            .unwrap_or(false)
     {
         "json"
     } else if form_mode

@@ -18,6 +18,7 @@ import {
 import AiSparkIcon from '@/components/AiSparkIcon.vue'
 import PageHeader from '@/components/PageHeader.vue'
 import LineChart from '@/components/LineChart.vue'
+import StressReportList from '@/components/StressReportList.vue'
 import { useProjectStore } from '@/stores/project'
 import { useAiAssistStore } from '@/stores/aiAssist'
 import { useErrorDialogStore } from '@/stores/errorDialog'
@@ -27,6 +28,8 @@ import type {
   Environment,
   HttpRequestDetail,
   PlanSummary,
+  RecordDetailMode,
+  ReportSample,
   RequestSearchHit,
   StressDone,
   StressProgress,
@@ -56,20 +59,45 @@ const activeProjectId = ref<number | null>(null)
 const modalEnvironments = ref<Environment[]>([])
 const modalEnvId = ref<number | null>(null)
 
+/** 当前选中环境的非敏感变量值，用于把 {{base_url}}/xxx 渲染成完整路径 */
+const plainVars = ref<Record<string, string>>({})
+
 const projectOptions = computed(() =>
   projectStore.projects.map((item) => ({ value: item.id, label: item.name })),
 )
 
+/** 名称里已经带了方法前缀（如「GET 查询参数」）就不再拼一遍 */
+function displayName(method: string, name: string): string {
+  return name.toUpperCase().startsWith(`${method} `.toUpperCase())
+    ? name
+    : `${method} ${name}`
+}
+
+/** 用当前选中环境的非敏感变量渲染 URL，得到完整路径；缺变量时保留模板原文 */
+function renderPreviewUrl(text: string): string {
+  if (!text || !text.includes('{{')) return text
+  return text.replace(/\{\{\s*([\w.-]+)\s*\}\}/g, (raw, key: string) =>
+    plainVars.value[key] ?? raw,
+  )
+}
+
 const requestSelectOptions = computed(() =>
   choices.value.map((item) => ({
     value: item.id,
-    label: `${item.method}  ${item.name}  ·  ${item.url}`,
+    /** 选中后选择框里显示「方法 + 名称」 */
+    label: displayName(item.method, item.name),
+    method: item.method,
+    name: item.name,
+    /** 下拉与目标卡片展示渲染后的完整路径 */
+    url: renderPreviewUrl(item.url),
   })),
 )
 
-const selectedChoice = computed(
-  () => choices.value.find((item) => item.id === targetRequestId.value) ?? null,
-)
+const selectedChoice = computed(() => {
+  const raw = choices.value.find((item) => item.id === targetRequestId.value)
+  if (!raw) return null
+  return { ...raw, url: renderPreviewUrl(raw.url) }
+})
 
 const currentProject = computed(
   () =>
@@ -156,6 +184,17 @@ watch(targetProjectId, async (id) => {
     message.error(String(e))
   } finally {
     choicesLoading.value = false
+  }
+})
+
+// 环境切换后拉取非敏感变量，供接口 URL 预览渲染（失败不影响选择流程）
+watch(modalEnvId, async (envId) => {
+  plainVars.value = {}
+  if (!envId) return
+  try {
+    plainVars.value = await api.envPlainVars(envId)
+  } catch {
+    /* 预览拿不到变量就保留模板原文，不值得弹错 */
   }
 })
 
@@ -277,8 +316,14 @@ async function startFromConfig() {
 }
 
 
+/** 并发上限，与后端 stress.rs 的 MAX_CONCURRENT 保持一致 */
+const MAX_CONCURRENT = 5000
+/** 超过该并发给出资源提示 */
+const HIGH_CONCURRENT_HINT = 1000
+
 const settings = reactive({
   mode: 'fixed' as 'fixed' | 'stages',
+  recordDetail: 'auto' as RecordDetailMode,
   concurrent: 20,
   durationSec: 30,
   rampUpSec: 5,
@@ -307,7 +352,7 @@ const stages = ref<StressStage[]>([
 function addStage() {
   const last = stages.value[stages.value.length - 1]
   stages.value.push({
-    concurrent: Math.min(500, (last?.concurrent ?? 0) + 20),
+    concurrent: Math.min(MAX_CONCURRENT, (last?.concurrent ?? 0) + 20),
     durationSec: last?.durationSec ?? 30,
   })
 }
@@ -323,12 +368,18 @@ const progress = ref<StressProgress | null>(null)
 const done = ref<StressDone | null>(null)
 const resultCard = ref<HTMLElement | null>(null)
 const unlisteners: UnlistenFn[] = []
+const reportList = ref<{ reload: () => Promise<void> } | null>(null)
 
 onMounted(async () => {
   try {
     unlisteners.push(
       await listen<StressProgress>('stress:progress', (event) => {
         progress.value = event.payload
+        // 后端只下发增量采样点，这里累积成完整序列供图表使用
+        if (event.payload.samples?.length) {
+          liveSamples.value.push(...event.payload.samples)
+        }
+        if (event.payload.notice) message.info(event.payload.notice)
       }),
     )
     unlisteners.push(
@@ -345,6 +396,7 @@ onMounted(async () => {
             context: stressContext('压测执行'),
           })
         }
+        void reportList.value?.reload()
         nextTick(() => resultCard.value?.scrollIntoView({ behavior: 'smooth', block: 'center' }))
       }),
     )
@@ -378,20 +430,21 @@ onBeforeUnmount(() => {
   }
 })
 
-const samples = computed(() => progress.value?.samples ?? [])
+const liveSamples = ref<ReportSample[]>([])
+const samples = computed(() => liveSamples.value)
 
 const qpsSeries = computed(() => [
   {
     name: 'QPS',
-    color: '#3d6b8f',
+    color: '#4d6bfe',
     values: samples.value.map((s) => s.qps),
   },
 ])
 
 const latencySeries = computed(() => [
-  { name: '平均', color: '#3d6b8f', values: samples.value.map((s) => s.avgRt) },
-  { name: 'P95', color: '#b07d33', values: samples.value.map((s) => s.p95Rt) },
-  { name: 'P99', color: '#b0524d', values: samples.value.map((s) => s.p99Rt) },
+  { name: '平均', color: '#4d6bfe', values: samples.value.map((s) => s.avgRt) },
+  { name: 'P95', color: '#d97706', values: samples.value.map((s) => s.p95Rt) },
+  { name: 'P99', color: '#dc2626', values: samples.value.map((s) => s.p99Rt) },
 ])
 
 const chartLabels = computed(() => samples.value.map((s) => `${s.elapsedSec}s`))
@@ -423,6 +476,17 @@ const stageLabel = computed(() => {
 })
 
 const statusCodes = computed(() => progress.value?.statusCodes ?? [])
+
+const RECORD_MODE_TEXT: Record<string, string> = {
+  full: '明细：完整',
+  sample: '明细：采样 1%',
+  off: '明细：已关闭',
+}
+const recordModeText = computed(() => {
+  const mode = progress.value?.recordMode
+  if (!mode) return ''
+  return RECORD_MODE_TEXT[mode] ?? `明细：${mode}`
+})
 const statusCodeTotal = computed(() =>
   statusCodes.value.reduce((sum, item) => sum + item.count, 0),
 )
@@ -446,6 +510,16 @@ const currentRps = computed(() => {
   return 0
 })
 
+/** 至今平均 QPS = 已完成请求数 ÷ 已运行秒数，避免首秒抖动放大瞬时值 */
+const avgQps = computed(() => {
+  const seconds = progress.value?.elapsedSec ?? done.value?.elapsedSec ?? 0
+  const total = progress.value?.total ?? done.value?.total ?? 0
+  return seconds > 0 ? total / seconds : 0
+})
+
+/** 本次压测的采样峰值 QPS */
+const peakQps = computed(() => samples.value.reduce((max, item) => Math.max(max, item.qps), 0))
+
 function fmt(v: number | undefined | null, digits = 1) {
   if (v === undefined || v === null || Number.isNaN(v)) return '-'
   return v >= 1000 ? v.toFixed(0) : v.toFixed(digits)
@@ -463,8 +537,8 @@ async function start() {
       message.warning('至少需要一个加压阶段')
       return
     }
-    if (stages.value.some((item) => item.concurrent < 1 || item.concurrent > 500)) {
-      message.warning('阶段并发数需在 1 到 500 之间')
+    if (stages.value.some((item) => item.concurrent < 1 || item.concurrent > MAX_CONCURRENT)) {
+      message.warning(`阶段并发数需在 1 到 ${MAX_CONCURRENT} 之间`)
       return
     }
     if (stages.value.some((item) => item.durationSec < 1)) {
@@ -472,8 +546,8 @@ async function start() {
       return
     }
   } else {
-    if (settings.concurrent < 1 || settings.concurrent > 500) {
-      message.warning('并发数需在 1 到 500 之间')
+    if (settings.concurrent < 1 || settings.concurrent > MAX_CONCURRENT) {
+      message.warning(`并发数需在 1 到 ${MAX_CONCURRENT} 之间`)
       return
     }
     if (settings.rampUpSec >= settings.durationSec) {
@@ -486,6 +560,7 @@ async function start() {
   done.value = null
   stopping.value = false
   running.value = true
+  liveSamples.value = []
 
   try {
     await api.stressStart({
@@ -510,6 +585,7 @@ async function start() {
       thinkTimeMs: settings.thinkTimeMs,
       stages: settings.mode === 'stages' ? stages.value.map((item) => ({ ...item })) : [],
       targetRps: settings.targetRps > 0 ? settings.targetRps : null,
+      recordDetail: settings.recordDetail,
       sla: settings.slaEnabled
         ? {
             p95Ms: settings.slaP95 > 0 ? settings.slaP95 : null,
@@ -570,10 +646,6 @@ function backToRequest() {
         <template #icon><ArrowLeftOutlined /></template>
         返回请求
       </a-button>
-      <a-button @click="router.push('/reports')">
-        <template #icon><FileTextOutlined /></template>
-        压测报告
-      </a-button>
     </PageHeader>
 
     <a-spin :spinning="loading">
@@ -629,11 +701,27 @@ function backToRequest() {
               </div>
             </div>
 
+            <div class="field">
+              <div class="label">明细记录</div>
+              <a-select v-model:value="settings.recordDetail" :disabled="running" style="width: 100%">
+                <a-select-option value="auto">自动（按 QPS 降档，推荐）</a-select-option>
+                <a-select-option value="full">完整记录（排查问题）</a-select-option>
+                <a-select-option value="sample">1% 采样</a-select-option>
+                <a-select-option value="off">关闭（冲量跑分）</a-select-option>
+              </a-select>
+              <div class="hint">
+                自动模式下预估 QPS ≥ 2000 降为采样、≥ 5000 关闭明细；聚合指标始终完整
+              </div>
+            </div>
+
             <template v-if="settings.mode === 'fixed'">
               <div class="field">
                 <div class="label">并发数</div>
-                <a-input-number v-model:value="settings.concurrent" :min="1" :max="500" style="width: 100%" />
+                <a-input-number v-model:value="settings.concurrent" :min="1" :max="MAX_CONCURRENT" style="width: 100%" />
                 <div class="hint">同一时刻同时执行的请求数量，建议从 10～30 起步</div>
+                <div v-if="settings.concurrent > HIGH_CONCURRENT_HINT" class="hint" style="color:#b7822f">
+                  高并发将占用较多 CPU/内存，建议 8 核以上机器，并确认本机端口与文件句柄限制
+                </div>
               </div>
 
               <div class="field-row">
@@ -666,7 +754,7 @@ function backToRequest() {
                     <a-input-number
                       v-model:value="stage.concurrent"
                       :min="1"
-                      :max="500"
+                      :max="MAX_CONCURRENT"
                       size="small"
                       :disabled="running"
                     />
@@ -706,7 +794,7 @@ function backToRequest() {
             </div>
 
             <div class="field">
-              <div class="label">目标 RPS 限速</div>
+              <div class="label">目标 QPS 限速</div>
               <a-input-number v-model:value="settings.targetRps" :min="0" :max="100000" :step="10" style="width: 100%" />
               <div class="hint">0 表示不限速；设置后每秒最多发出该数量的请求</div>
             </div>
@@ -741,7 +829,7 @@ function backToRequest() {
                   <a-input-number v-model:value="settings.slaErrorRate" :min="0" :max="100" :step="0.5" size="small" style="width: 100%" />
                 </div>
                 <div class="field">
-                  <div class="label">平均 RPS ≥</div>
+                  <div class="label">平均 QPS ≥</div>
                   <a-input-number v-model:value="settings.slaMinRps" :min="0" :max="100000" size="small" style="width: 100%" />
                 </div>
               </div>
@@ -779,13 +867,14 @@ function backToRequest() {
                 </span>
                 <span v-if="running" class="status-elapsed mono">{{ elapsed }}s / {{ totalSeconds }}s</span>
                 <span v-if="running && stageLabel" class="status-stage">{{ stageLabel }}</span>
+                <span v-if="running && recordModeText" class="status-stage">{{ recordModeText }}</span>
               </div>
               <span class="status-name">{{ request.name }}</span>
             </div>
             <a-progress
               :percent="running || done ? percent : 0"
               :show-info="false"
-              :stroke-color="running ? '#3d6b8f' : done ? '#3f7f5f' : '#cbd5e1'"
+              :stroke-color="running ? '#4d6bfe' : done ? '#16a34a' : '#cbd5e1'"
               size="small"
             />
             <div class="stats">
@@ -794,8 +883,12 @@ function backToRequest() {
                 <span class="stat-value mono">{{ progress?.total ?? done?.total ?? 0 }}</span>
               </div>
               <div class="stat">
-                <span class="stat-label">当前 RPS</span>
+                <span class="stat-label">当前 QPS</span>
                 <span class="stat-value mono">{{ fmt(currentRps) }}</span>
+              </div>
+              <div class="stat">
+                <span class="stat-label">平均 QPS</span>
+                <span class="stat-value mono">{{ fmt(avgQps) }}</span>
               </div>
               <div class="stat">
                 <span class="stat-label">平均延迟</span>
@@ -828,7 +921,7 @@ function backToRequest() {
           <div class="fm-card chart-card">
             <div class="chart-head">
               <span class="chart-title">吞吐量 QPS</span>
-              <span class="chart-sub">按秒统计</span>
+              <span class="chart-sub">按秒统计 · 峰值 {{ fmt(peakQps) }} QPS</span>
             </div>
             <LineChart :series="qpsSeries" :labels="chartLabels" unit="" />
           </div>
@@ -875,6 +968,17 @@ function backToRequest() {
       </div>
     </a-spin>
 
+    <div class="reports-section">
+      <div class="reports-head">
+        <div>
+          <div class="reports-title">压测报告记录</div>
+          <div class="reports-sub">最近 200 份，点击「查看详情」查看逐请求明细</div>
+        </div>
+        <a-button size="small" @click="reportList?.reload()">刷新</a-button>
+      </div>
+      <StressReportList ref="reportList" />
+    </div>
+
     <a-modal
       v-model:open="configOpen"
       title="新建压测"
@@ -895,7 +999,6 @@ function backToRequest() {
           <div class="plan-row">
             <a-select
               :value="activePlanId"
-              size="large"
               allow-clear
               placeholder="载入已保存的压测计划"
               class="plan-select"
@@ -904,17 +1007,15 @@ function backToRequest() {
             />
             <a-input
               v-model:value="planName"
-              size="large"
               class="plan-name"
               placeholder="计划名称（留空自动命名）"
             />
-            <a-button size="large" :loading="planSaving" :disabled="!targetProjectId" @click="savePlan">
+            <a-button :loading="planSaving" :disabled="!targetProjectId" @click="savePlan">
               <template #icon><SaveOutlined /></template>
               保存计划
             </a-button>
             <a-button
               v-if="activePlanId"
-              size="large"
               danger
               type="text"
               @click="removePlan"
@@ -937,17 +1038,15 @@ function backToRequest() {
                 v-model:value="targetProjectId"
                 :options="projectOptions"
                 placeholder="选择项目"
-                size="large"
                 show-search
                 option-filter-prop="label"
                 popup-class-name="stress-select-dropdown"
               />
             </div>
-            <div class="field">
+            <div class="field field-env">
               <div class="label">环境变量</div>
               <a-select
                 v-model:value="modalEnvId"
-                size="large"
                 allow-clear
                 placeholder="不使用环境变量"
                 popup-class-name="stress-select-dropdown"
@@ -957,31 +1056,48 @@ function backToRequest() {
                 </a-select-option>
               </a-select>
             </div>
-          </div>
-          <div class="field">
-            <div class="label">
-              接口
-              <span class="label-hint">选中后自动带入 Headers、Params、Body 与变量</span>
+            <div class="field field-request">
+              <div class="label">
+                接口
+                <span class="label-hint">选中后自动带入 Headers、Params、Body 与变量</span>
+              </div>
+              <a-select
+                v-model:value="targetRequestId"
+                :loading="choicesLoading"
+                placeholder="选择要压测的接口"
+                show-search
+                option-filter-prop="label"
+                option-label-prop="label"
+                popup-class-name="stress-select-dropdown stress-req-dropdown"
+                :not-found-content="choicesLoading ? '加载中…' : '该项目下暂无接口'"
+              >
+                <a-select-option
+                  v-for="item in requestSelectOptions"
+                  :key="item.value"
+                  :value="item.value"
+                  :label="item.label"
+                >
+                  <div class="req-option">
+                    <span class="req-option-main">
+                      <span class="method-tag method-mini" :class="`method-${item.method}`">{{ item.method }}</span>
+                      <span class="req-option-name">{{ item.name }}</span>
+                    </span>
+                    <span class="req-option-url mono">{{ item.url }}</span>
+                  </div>
+                </a-select-option>
+              </a-select>
             </div>
-            <a-select
-              v-model:value="targetRequestId"
-              :options="requestSelectOptions"
-              :loading="choicesLoading"
-              placeholder="选择要压测的接口"
-              size="large"
-              show-search
-              option-filter-prop="label"
-              popup-class-name="stress-select-dropdown"
-              :not-found-content="choicesLoading ? '加载中…' : '该项目下暂无接口'"
-            />
           </div>
-          <div v-if="selectedChoice" class="target-preview">
-            <div class="target-preview-top">
+          <div v-if="selectedChoice" class="target-card">
+            <div class="target-card-head">
+              <span class="target-card-badge">已选目标</span>
               <span class="method-tag" :class="`method-${selectedChoice.method}`">{{ selectedChoice.method }}</span>
-              <span class="target-preview-name">{{ selectedChoice.name }}</span>
-              <span class="target-preview-collection">{{ selectedChoice.collectionName }}</span>
+              <span class="target-card-name" :title="selectedChoice.name">{{ selectedChoice.name }}</span>
+              <span class="target-card-collection" :title="selectedChoice.collectionName">
+                {{ selectedChoice.collectionName }}
+              </span>
             </div>
-            <div class="target-url mono">{{ selectedChoice.url }}</div>
+            <div class="target-card-url mono" :title="selectedChoice.url">{{ selectedChoice.url }}</div>
           </div>
           <div v-else-if="currentProject" class="hint">
             {{ currentProject.name }} · 共 {{ choices.length }} 个接口
@@ -1025,8 +1141,7 @@ function backToRequest() {
                       <a-input-number
                         v-model:value="settings.concurrent"
                         :min="1"
-                        :max="500"
-                        size="large"
+                        :max="MAX_CONCURRENT"
                         style="width: 100%"
                       />
                       <div class="hint">建议从 10～30 起步，观察错误率后再提高</div>
@@ -1037,7 +1152,6 @@ function backToRequest() {
                         v-model:value="settings.durationSec"
                         :min="1"
                         :max="3600"
-                        size="large"
                         style="width: 100%"
                       />
                     </div>
@@ -1048,7 +1162,6 @@ function backToRequest() {
                       v-model:value="settings.rampUpSec"
                       :min="0"
                       :max="600"
-                      size="large"
                       style="width: 100%"
                     />
                     <div class="hint">并发从 0 逐步升到目标值的时间，需小于持续时间</div>
@@ -1070,7 +1183,7 @@ function backToRequest() {
                       </div>
                       <div v-for="(stage, index) in stages" :key="index" class="stage-row">
                         <span class="stage-index">{{ index + 1 }}</span>
-                        <a-input-number v-model:value="stage.concurrent" :min="1" :max="500" />
+                        <a-input-number v-model:value="stage.concurrent" :min="1" :max="MAX_CONCURRENT" />
                         <a-input-number v-model:value="stage.durationSec" :min="1" :max="3600" />
                         <a-button size="small" type="text" danger :disabled="stages.length <= 1" @click="removeStage(index)">
                           移除
@@ -1078,6 +1191,9 @@ function backToRequest() {
                       </div>
                     </div>
                     <div class="hint">共 {{ totalSeconds }} 秒，峰值并发 {{ peakConcurrent }}</div>
+                    <div v-if="peakConcurrent > HIGH_CONCURRENT_HINT" class="hint" style="color:#b7822f">
+                      高并发将占用较多 CPU/内存，建议 8 核以上机器，并确认本机端口与文件句柄限制
+                    </div>
                   </div>
                 </template>
               </div>
@@ -1098,7 +1214,6 @@ function backToRequest() {
                       :min="500"
                       :max="120000"
                       :step="1000"
-                      size="large"
                       style="width: 100%"
                     />
                   </div>
@@ -1109,7 +1224,6 @@ function backToRequest() {
                       :min="500"
                       :max="120000"
                       :step="1000"
-                      size="large"
                       style="width: 100%"
                     />
                   </div>
@@ -1136,19 +1250,17 @@ function backToRequest() {
                       :min="0"
                       :max="60000"
                       :step="100"
-                      size="large"
                       style="width: 100%"
                     />
                     <div class="hint">每个线程两次请求之间的固定间隔</div>
                   </div>
                   <div class="field">
-                    <div class="label">目标 RPS 限速</div>
+                    <div class="label">目标 QPS 限速</div>
                     <a-input-number
                       v-model:value="settings.targetRps"
                       :min="0"
                       :max="100000"
                       :step="10"
-                      size="large"
                       style="width: 100%"
                     />
                     <div class="hint">0 表示不限速；每秒最多发出该数量的请求</div>
@@ -1175,7 +1287,6 @@ function backToRequest() {
                       :min="0.1"
                       :max="100"
                       :step="0.5"
-                      size="large"
                       style="width: 100%"
                     />
                   </div>
@@ -1186,7 +1297,6 @@ function backToRequest() {
                       :min="1"
                       :max="1000000"
                       :step="100"
-                      size="large"
                       style="width: 100%"
                     />
                     <div class="hint">达到该请求数后才开始判定，避免起步阶段误停</div>
@@ -1208,11 +1318,11 @@ function backToRequest() {
                 <div v-if="settings.slaEnabled" class="sla-grid">
                   <div class="field">
                     <div class="label">P95 ≤（ms）</div>
-                    <a-input-number v-model:value="settings.slaP95" :min="0" :max="120000" size="large" style="width: 100%" />
+                    <a-input-number v-model:value="settings.slaP95" :min="0" :max="120000" style="width: 100%" />
                   </div>
                   <div class="field">
                     <div class="label">P99 ≤（ms）</div>
-                    <a-input-number v-model:value="settings.slaP99" :min="0" :max="120000" size="large" style="width: 100%" />
+                    <a-input-number v-model:value="settings.slaP99" :min="0" :max="120000" style="width: 100%" />
                   </div>
                   <div class="field">
                     <div class="label">错误率 ≤（%）</div>
@@ -1221,13 +1331,12 @@ function backToRequest() {
                       :min="0"
                       :max="100"
                       :step="0.5"
-                      size="large"
                       style="width: 100%"
                     />
                   </div>
                   <div class="field">
-                    <div class="label">平均 RPS ≥</div>
-                    <a-input-number v-model:value="settings.slaMinRps" :min="0" :max="100000" size="large" style="width: 100%" />
+                    <div class="label">平均 QPS ≥</div>
+                    <a-input-number v-model:value="settings.slaMinRps" :min="0" :max="100000" style="width: 100%" />
                   </div>
                 </div>
                 <div v-if="settings.slaEnabled" class="hint">报告生成时会逐项判定并给出是否达标</div>
@@ -1256,6 +1365,27 @@ function backToRequest() {
 </template>
 
 <style scoped>
+.reports-section {
+  margin-top: 22px;
+  padding-top: 4px;
+}
+.reports-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 6px;
+}
+.reports-title {
+  font-size: 14px;
+  font-weight: 600;
+}
+.reports-sub {
+  font-size: 11px;
+  color: var(--fm-muted);
+  margin-top: 2px;
+}
+
 .layout {
   display: grid;
   grid-template-columns: 330px minmax(0, 1fr);
@@ -1565,7 +1695,7 @@ function backToRequest() {
 
 .stats {
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
   gap: 10px;
   margin-top: 16px;
 }
@@ -1728,15 +1858,15 @@ function backToRequest() {
 .modal-body {
   display: flex;
   flex-direction: column;
-  gap: 20px;
-  max-height: 74vh;
+  gap: 14px;
+  max-height: 76vh;
   overflow-y: auto;
-  padding: 4px 8px 4px 2px;
+  padding: 2px 8px 2px 2px;
 }
 
 .modal-body .label {
-  margin-bottom: 7px;
-  font-size: 12.5px;
+  margin-bottom: 5px;
+  font-size: 12px;
   font-weight: 500;
   color: var(--fm-text-2);
 }
@@ -1753,26 +1883,27 @@ function backToRequest() {
   color: var(--fm-muted);
 }
 
-.modal-body :deep(.ant-select-lg .ant-select-selector) {
-  min-height: 44px;
-  padding: 6px 14px;
-  font-size: 13.5px;
+/* 弹窗内控件统一 32px 高度与 13px 字号，避免默认尺寸下各控件高度参差 */
+.modal-body :deep(.ant-select-single .ant-select-selector) {
+  min-height: 32px;
+  padding: 1px 11px;
+  font-size: 13px;
   align-items: center;
 }
 
-.modal-body :deep(.ant-input-number-lg) {
-  min-height: 44px;
-  font-size: 13.5px;
+.modal-body :deep(.ant-input-number) {
+  font-size: 13px;
 }
 
-.modal-body :deep(.ant-input-number-lg .ant-input-number-input) {
-  height: 42px;
+.modal-body :deep(.ant-input) {
+  padding: 4px 11px;
+  font-size: 13px;
 }
 
 .modal-section {
   display: flex;
   flex-direction: column;
-  gap: 13px;
+  gap: 10px;
 }
 
 .section-title {
@@ -1792,9 +1923,9 @@ function backToRequest() {
 }
 
 .step {
-  width: 20px;
-  height: 20px;
-  border-radius: 7px;
+  width: 18px;
+  height: 18px;
+  border-radius: 6px;
   background: var(--fm-primary-soft);
   color: var(--fm-primary);
   font-size: 11px;
@@ -1805,8 +1936,23 @@ function backToRequest() {
 
 .target-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 14px;
+  grid-template-columns: 3fr 2fr 5fr;
+  gap: 20px;
+  align-items: end;
+}
+
+/* 接口列的提示文字较长，允许换行不被截断 */
+.target-grid .label {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 8px;
+  min-height: 19px;
+  margin-bottom: 7px;
+}
+
+.target-grid .label-hint {
+  margin-left: 0;
 }
 
 .plan-row {
@@ -1827,13 +1973,18 @@ function backToRequest() {
 }
 
 .plan-section {
-  padding-bottom: 18px;
+  padding-bottom: 12px;
   border-bottom: 1px dashed var(--fm-border);
 }
 
 .target-grid .field,
 .modal-section > .field {
   min-width: 0;
+}
+
+/* 三个控件必须撑满各自的栅格列，否则会收缩成内容宽度，30/20/50 的比例看不出来 */
+.target-grid .field :deep(.ant-select) {
+  width: 100%;
 }
 
 :global(.stress-select-dropdown) {
@@ -1852,32 +2003,114 @@ function backToRequest() {
   line-height: 1.5;
 }
 
-.target-preview {
-  padding: 13px 15px;
-  border: 1px solid var(--fm-border);
-  border-radius: 10px;
-  background: var(--fm-surface-alt);
+/* 下拉里的接口条目：第一行 方法 + 名称，第二行 URL 小字 */
+:global(.stress-req-dropdown) {
+  min-width: 560px;
+  max-width: 680px;
 }
 
-.target-preview-top {
+:global(.stress-req-dropdown .ant-select-item) {
+  padding: 7px 12px;
+}
+
+:global(.stress-req-dropdown .ant-select-item-option-content) {
+  padding: 0;
+}
+
+.req-option {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 2px 0;
+  min-width: 0;
+}
+
+.req-option-main {
   display: flex;
   align-items: center;
   gap: 8px;
+  min-width: 0;
 }
 
-.target-preview-name {
-  font-size: 12.5px;
+.method-mini {
+  min-width: 44px;
+  height: 18px;
+  font-size: 9.5px;
+  flex-shrink: 0;
+}
+
+.req-option-name {
+  font-size: 13px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.req-option-url {
+  font-size: 10.5px;
+  line-height: 1.4;
+  color: var(--fm-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 选中后的目标卡片：让「选了什么」一眼可见 */
+.target-card {
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--fm-primary) 32%, var(--fm-border));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--fm-primary) 5%, var(--fm-surface-alt));
+}
+
+.target-card-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+
+.target-card-badge {
+  flex-shrink: 0;
+  padding: 1px 7px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--fm-primary) 14%, transparent);
+  color: var(--fm-primary);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+}
+
+.target-card-name {
+  font-size: 13.5px;
   font-weight: 600;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.target-preview-collection {
+.target-card-collection {
   margin-left: auto;
   flex-shrink: 0;
-  font-size: 10px;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10.5px;
   color: var(--fm-muted);
+}
+
+.target-card-url {
+  margin-top: 7px;
+  padding: 6px 9px;
+  border-radius: 7px;
+  border: 1px solid var(--fm-border);
+  background: var(--fm-surface);
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--fm-text-2);
+  word-break: break-all;
 }
 
 .modal-fields {
@@ -1898,7 +2131,7 @@ function backToRequest() {
   display: flex;
   align-items: baseline;
   gap: 9px;
-  padding: 10px 15px;
+  padding: 8px 13px;
   border-bottom: 1px solid var(--fm-border);
   background: var(--fm-surface-alt);
 }

@@ -12,6 +12,9 @@ const MAX_RUNS: i64 = 200;
 const MAX_STORED_BODY: usize = 256 * 1024;
 
 /// 发送请求后写入一条运行快照（由 http 命令内部调用）
+///
+/// 参数就是一次请求的完整快照，拆开传反而更容易漏字段。
+#[allow(clippy::too_many_arguments)]
 pub fn record_run(
     pool: &DbPool,
     payload: &SendRequestPayload,
@@ -20,6 +23,7 @@ pub fn record_run(
     headers: &[(String, String)],
     body: &str,
     result: &HttpResult,
+    origin: &str,
 ) -> Result<(), String> {
     let conn = pool.get().map_err(err)?;
 
@@ -48,8 +52,8 @@ pub fn record_run(
         "INSERT INTO request_runs
             (request_id, method, url, headers, params, body_type, body,
              response_status, response_status_text, response_headers, response_body,
-             duration_ms, size_bytes, error, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+             duration_ms, size_bytes, error, created_at, origin)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         params![
             request_id,
             payload.method.to_uppercase(),
@@ -66,6 +70,7 @@ pub fn record_run(
             result.size_bytes as i64,
             result.error,
             now_ms(),
+            origin,
         ],
     )
     .map_err(err)?;
@@ -99,20 +104,25 @@ pub fn run_list(
     state: State<'_, AppState>,
     request_id: i64,
     limit: Option<u32>,
+    origin: Option<String>,
 ) -> Result<Vec<RequestRun>, String> {
     let limit = limit.unwrap_or(MAX_RUNS as u32).clamp(1, MAX_RUNS as u32) as i64;
+    let origin = origin
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
     let conn = state.pool.get().map_err(err)?;
     let mut stmt = conn
         .prepare(
             "SELECT id, request_id, method, url, headers, params, body_type, body,
                     response_status, response_status_text, response_headers, response_body,
-                    duration_ms, size_bytes, error, created_at
+                    duration_ms, size_bytes, error, origin, created_at
              FROM request_runs WHERE request_id = ?1
+               AND (?3 IS NULL OR origin = ?3)
              ORDER BY id DESC LIMIT ?2",
         )
         .map_err(err)?;
     let rows = stmt
-        .query_map(params![request_id, limit], |row| {
+        .query_map(params![request_id, limit, origin], |row| {
             Ok(RequestRun {
                 id: row.get(0)?,
                 request_id: row.get(1)?,
@@ -129,7 +139,8 @@ pub fn run_list(
                 duration_ms: row.get(12)?,
                 size_bytes: row.get(13)?,
                 error: row.get(14)?,
-                created_at: row.get(15)?,
+                origin: row.get(15).unwrap_or_default(),
+                created_at: row.get(16)?,
             })
         })
         .map_err(err)?;

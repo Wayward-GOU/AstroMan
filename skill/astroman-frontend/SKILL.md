@@ -12,9 +12,9 @@ description: AstroMan 前端开发规范（Vue 3 + Ant Design Vue + Pinia + 设�
 
 - 所有颜色/圆角/阴影只用 `main.css` 里的 `--fm-*` 变量，**不要写死 hex**
 - 主要 token：`--fm-primary` / `-dark` / `-soft`、`--fm-success|warning|danger|purple`（各有 `-soft`）、`--fm-bg`、`--fm-surface`、`--fm-surface-alt`、`--fm-border` / `-strong`、`--fm-text` / `-2` / `--fm-muted`、`--fm-radius-sm|`radius`|lg`、`--fm-shadow-sm|`shadow`|lg`、侧边栏一组 `--fm-sidebar-*`、代码区 `--fm-code-bg` / `--fm-gutter-bg`
-- 代码/JSON 专用色（8 套主题都定义了同一批）：`--fm-json-key`（字段名）、`--fm-json-string`（字符串）、`--fm-json-number`（数字）、`--fm-json-bool`（布尔与 `{{变量}}`）、`--fm-json-punct`（括号、逗号、冒号）；不要在组件里为暗色主题单独写死颜色
-- 主题：`stores/theme.ts` 定义 `ThemeId = 'ocean' | 'graphite' | 'forest' | 'midnight' | 'amber' | 'teal' | 'rose' | 'dusk'`（8 套，含 2 套深色），每套用同名变量覆盖；新增主题只加一个 `ThemeDefinition` 并追加到 `themes` 数组，设置页会自动渲染，不要在组件里判断主题名
-- 深色主题靠 `data-theme`（`midnight` / `dusk`）+ `applyTheme()` 统一换变量，需要针对深色单独调整时用 `html[data-theme='midnight']` / `html[data-theme='dusk']` 选择器
+- 代码/JSON 专用色（每套主题都定义了同一批）：`--fm-json-key`（字段名）、`--fm-json-string`（字符串）、`--fm-json-number`（数字）、`--fm-json-bool`（布尔与 `{{变量}}`）、`--fm-json-punct`（括号、逗号、冒号）；不要在组件里为暗色主题单独写死颜色
+- 主题：`stores/theme.ts` 定义 `ThemeId`（**21 套**，14 浅 / 7 深），每套 `ThemeDefinition` 用同一批 35 个 `--fm-*` 颜色 / 阴影变量覆盖（HTTP 方法色与圆角沿用 `main.css`）；深色的 7 套是 `midnight` / `dusk` / `indigo` / `plum` / `pine` / `slate` / `aurora`。新增主题只加一个定义并追加到 `themes` 数组（顺序即设置页顺序），不要在组件里判断主题名
+- 深色主题靠 `data-theme` + `applyTheme()` 统一换变量，需要针对性微调时用 `html[data-theme='<id>']` 选择器；颜色对比度与新增主题的完整流程见 skill `astroman-appearance`
 
 ## 页面骨架
 
@@ -43,11 +43,27 @@ description: AstroMan 前端开发规范（Vue 3 + Ant Design Vue + Pinia + 设�
 - 输入法组合期间（`compositionstart` / `compositionend`）临时去掉 overlay 类，否则中文拼音与候选字不可见
 - 注释只用于编辑态：发送前由 Rust 的 `util::strip_json_comments` 剥离（见 `astroman-backend`），前端不负责删注释
 
-## 首页数据大屏
+## 工作台与数据大屏
 
-`Dashboard.vue` 里的图表**不依赖图表库**：柱高/宽度用峰值归一后的百分比，堆叠用 `column-reverse`，颜色只用 `--fm-*`（成功/警告/危险），空数据必须走 `.dash-empty` 文案而不是空坐标轴。数据来自 `api.dashboardMetrics()`，页面用 `Promise.allSettled` 拉取，失败时保留空态、不阻断其他区块。
+v1.0.8 起大屏不在首页：`views/Dashboard.vue` 只剩总览 KPI、快捷入口、测试场景 / 批量运行介绍、产品介绍、引导与 FAQ；图表全部在 `components/DashboardMetrics.vue`，由 `views/History.vue`（历史记录）挂载。
 
-新增/调整图表的完整约定见 skill `astroman-dashboard`。
+- 图表**不依赖图表库**：柱高/宽度用峰值归一后的百分比，颜色只用 `--fm-*`（成功/警告/危险），空数据必须走 `.dash-empty` 文案而不是空坐标轴
+- 两个页面都用 `Promise.allSettled` 拉数据，失败时保留空态、不阻断其他区块
+- 新增/调整图表的完整约定（SQL 口径、补零、断点）见 skill `astroman-dashboard`
+
+## 工具箱（`src/tools`）
+
+92 个离线工具由 `src/tools/registry.ts` 的 `TOOLS` 数组声明，9 个分类来自 `TOOL_CATEGORIES`；页面是 `views/Tools.vue`，纯函数工具套 `components/tools/ToolWorkbench.vue`，复杂工具用独立组件懒加载。
+
+- 工具的计算逻辑写在 `src/tools/<域>.ts`（`transforms` / `converters` / `crypto` / `encoding` / `netparse` / `datagen` …），**不要写进 `.vue`**，否则没法进 vitest
+- 新增工具、字段契约与搜索别名规则见 skill `astroman-toolbox`
+
+## 自动化测试页（`views/Automation.vue`）
+
+套件列表 → 用例 / 运行记录 / 数据集 / 设置四个页签；运行前先调 `test_preflight` 展示阻断项，运行中拉进度、结束后跳报告。用例编辑器按 `kind`（`request` / `python` / `stress`）切换表单，压测用例可直接从压测计划导入。
+
+- 写操作与起跑前都要二次确认；`test_run_start` 返回 `runId` 后轮询 `test_run_get`，不要阻塞等待整个套件跑完
+- 数据模型、产物与 CLI 口径见 skill `astroman-automation`
 
 ## 页面内 AI 入口（AiAssist）
 
@@ -59,6 +75,16 @@ description: AstroMan 前端开发规范（Vue 3 + Ant Design Vue + Pinia + 设�
 4. 需要异步取数据再分析时，先 `await` 拿到数据再 `void aiAssist.show(...)`，失败用 `message.error`
 
 约定：页面内 AI 是**只读建议**，`stores/aiAssist.ts` 的 `SYSTEM_PROMPT` 已禁止调用工具，所以不会触发写操作；抽屉的流式渲染由 store 统一处理，页面不要自己再写一份。上下文不再固定截 12k：store 按 `contextBudgetOf(model)` 分配，页面快照最多 70%，大报告用 `clipMiddle()` 保留头尾。
+
+## 航仔挂件（`components/AstroBuddy.vue`）
+
+`App.vue` 里全局挂载一次：`<AstroBuddy v-if="!route.path.startsWith('/ai')" @open="go('/ai')" />`，`/ai` 页自动隐藏。
+
+- 形象用设计稿贴图 `src/assets/buddy.png`（288×483 透明底），显示 72×121；不要改回手绘 SVG，也不要在外面加白底卡片
+- 拖拽走 Pointer Events + `setPointerCapture`：位移 ≤ 4px 仍算点击，否则拖拽；坐标存 `astroman.buddy.pos`，`clampPos`（`EDGE = 10`）保证拖不出窗口
+- 甩动倾斜通过 CSS 变量 `--buddy-tilt` 传给 `.buddy-body`，**不要在外层元素写 `transform`**，否则会和浮动动画抢同一属性
+- 小尺寸图标（侧栏 / 空状态 / AI 抽屉）用 `AstroBuddyIcon.vue`：`viewBox 0 0 24 24`、1em 线框，面罩用 `<mask>` 实心填充后挖掉双眼；`<svg>` 必须显式 `width/height: 1em`，否则 flex 容器里高度会塌成 0
+- 动画都要在 `prefers-reduced-motion` 下关闭；细节与截图核验流程见 skill `astroman-appearance`
 
 ## 状态管理
 
@@ -95,6 +121,7 @@ description: AstroMan 前端开发规范（Vue 3 + Ant Design Vue + Pinia + 设�
 ## 导出与文件
 
 - 报告导出：`utils/reportExport.ts`（JSON 归档 / 可打印 HTML / 多工作表 Excel），写文件走 `report_write_file`
+- 压测报告 QPS 口径：唯一入口是 `utils/reportAnalytics.ts` 的 `qpsOverview(detail, { rampUpSec })`，产出平均 / 峰值 / 最低 / 90% 分布 / 单并发 / 目标 QPS 与达成率；`ReportDetail.vue` 与 HTML / Excel 导出都调它。**不要在模板或导出函数里另算一遍**，否则同一个报告会出现两套数字。90% 分布 = 每秒采样 QPS 的 P10，最低 QPS 与它共用 `stableQpsValues()` 的稳态窗口（剔除升压段与末点），达成率与 SLA `minRps` 同口径用平均 QPS
 - Excel 生成：`utils/xlsx.ts`（无第三方依赖，手写 OOXML）
 - 其他工具：`utils/curl.ts`（cURL 解析/生成）、`utils/diff.ts`（响应对比）、`utils/mybatis.ts`、`utils/datetime.ts`
 
@@ -103,6 +130,6 @@ description: AstroMan 前端开发规范（Vue 3 + Ant Design Vue + Pinia + 设�
 1. **TDZ 白屏**：`App.vue` 中 `navs` 等常量必须声明在被 `watch`/`computed` 引用之前，否则 `setup()` 抛 `Cannot access 'navs' before initialization`，整页白屏且无报错遮罩
 2. 浏览器里跑 `npm run dev` 时没有 Tauri IPC，`invoke` 报错属正常，验证功能必须 `npm run tauri dev`
 3. 类型别手写：模型改动先看 `types/models.ts`，与 Rust 的 `models.rs` 保持一致
-4. 图标/品牌资源：界面 logo 与侧栏标志统一用 `public/logo.png`，由 `AppLogo.vue` 输出 `<img>`（`size` 控制尺寸，圆角靠 CSS 裁）；`src-tauri/icons` 只保留打包/托盘这一套，不要再往 `src/assets` 放重复 logo
+4. 图标/品牌资源：界面 logo 与侧栏标志统一用 `public/logo.png`，由 `AppLogo.vue` 输出 `<img>`（`size` 控制尺寸，圆角靠 CSS 裁）；`src-tauri/icons` 只保留打包/托盘这一套；`src/assets` 只放航仔贴图 `buddy.png`（走 vite 资源管线，构建后带 hash），不要再往里放 logo 副本
 5. **`v-html` + scoped 样式**：`v-html` 生成的节点不带 `data-v-*`，`.tok-key { ... }` 这类选择器编译成 `.tok-key[data-v-x]` 会全部失效（现象：高亮层有 DOM 但完全没有颜色）。必须写成 `.highlight :deep(.tok-key)`；同理，任何 `v-html` 内容样式都要走 `:deep()`
 6. **安装版看不到前端改动**：`tauri build` 会把 `dist/` 打进二进制，只改源码或只跑 `npm run build` 不会影响已安装的 exe；开发期用 `npm run tauri dev`（Vite 热更新），验证发布效果要重新打安装包

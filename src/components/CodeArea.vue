@@ -279,7 +279,7 @@ defineExpose({
 
 .code-area:focus-within {
   border-color: var(--fm-primary);
-  box-shadow: 0 0 0 3px rgba(61, 107, 143, 0.1);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--fm-primary) 13%, transparent);
 }
 
 .code-area.fill {

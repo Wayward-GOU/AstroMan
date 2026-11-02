@@ -6,12 +6,13 @@ import type { Dayjs } from 'dayjs'
 import { ClockCircleOutlined, DeleteOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons-vue'
 import AiSparkIcon from '@/components/AiSparkIcon.vue'
 import PageHeader from '@/components/PageHeader.vue'
+import DashboardMetrics from '@/components/DashboardMetrics.vue'
 import { useAiAssistStore } from '@/stores/aiAssist'
 import { useTabsStore } from '@/stores/tabs'
 import { formatDateTime } from '@/utils/datetime'
 import { historyDiagnosePrompt } from '@/utils/aiScenarios'
 import * as api from '@/api'
-import type { CleanupResult, HistoryItem, HistoryStats } from '@/types/models'
+import type { CleanupResult, HistoryItem, HistoryStats, RequestTimings } from '@/types/models'
 
 const router = useRouter()
 const tabs = useTabsStore()
@@ -79,7 +80,7 @@ function aiAnalyze() {
     return
   }
   void aiAssist.show({
-    title: '请求历史分析',
+    title: '历史记录分析',
     prompt: historyDiagnosePrompt(rows.value, stats.value),
     hint: `当前筛选结果 ${rows.value.length} 条，失败 ${summary.value.failed} 条，平均耗时 ${summary.value.avg.toFixed(0)}ms`,
   })
@@ -139,7 +140,7 @@ const previewText = computed(() => {
   if (previewLoading.value) return '正在统计…'
   if (!preview.value) return ''
   const parts: string[] = []
-  if (cleanupScope.value.includes('history')) parts.push(`请求历史 ${preview.value.history} 条`)
+  if (cleanupScope.value.includes('history')) parts.push(`历史记录 ${preview.value.history} 条`)
   if (cleanupScope.value.includes('runs')) parts.push(`接口运行记录 ${preview.value.runs} 条`)
   if (!parts.length) return '请至少选择一项清理内容'
   return `将删除 ${parts.join('、')}`
@@ -193,7 +194,7 @@ async function runCleanup() {
       vacuum: cleanupVacuum.value,
     })
     const parts: string[] = []
-    if (cleanupScope.value.includes('history')) parts.push(`请求历史 ${result.history} 条`)
+    if (cleanupScope.value.includes('history')) parts.push(`历史记录 ${result.history} 条`)
     if (cleanupScope.value.includes('runs')) parts.push(`接口运行记录 ${result.runs} 条`)
     message.success(`已清理 ${parts.join('、')}`)
     cleanupOpen.value = false
@@ -225,15 +226,58 @@ const columns = [
   { title: 'URL', dataIndex: 'url', key: 'url', ellipsis: true },
   { title: '状态码', dataIndex: 'statusCode', key: 'statusCode', width: 88 },
   { title: '耗时', dataIndex: 'durationMs', key: 'durationMs', width: 96 },
+  { title: '计时', key: 'timing', width: 76 },
 ]
+
+/* ---------- v1.0.8：历史回看耗时分解 ----------
+   记录里存的是 JSON 字符串，解析失败就当没有（旧数据 / 被裁剪过）。 */
+function parseTimings(item: HistoryItem): RequestTimings | null {
+  if (!item.timingsJson) return null
+  try {
+    const parsed = JSON.parse(item.timingsJson) as RequestTimings
+    if (!parsed || typeof parsed.totalMs !== 'number') return null
+    return parsed
+  } catch {
+    return null
+  }
+}
+
+/** 把耗时拆成瀑布条：dns → connect → ttfb → download */
+function timingBars(item: HistoryItem) {
+  const t = parseTimings(item)
+  if (!t) return []
+  const total = Math.max(t.totalMs, 1)
+  const bars: Array<{ key: string; label: string; ms: number; left: number; width: number; color: string }> = []
+  let cursor = 0
+  const push = (key: string, label: string, ms: number, color: string) => {
+    if (!(ms > 0)) return
+    bars.push({ key, label, ms, left: (cursor / total) * 100, width: Math.max((ms / total) * 100, 1), color })
+    cursor += ms
+  }
+  if (t.dnsMs && t.dnsMs > 0) push('dns', 'DNS', t.dnsMs, '#8b5cf6')
+  push('connect', t.reusedConnection ? '连接(复用)' : 'TCP+TLS', t.connectMs, '#0ea5e9')
+  push('ttfb', '首字节', t.ttfbMs, '#f59e0b')
+  push('download', '下载', t.downloadMs, '#10b981')
+  return bars
+}
+
+function timingCaption(item: HistoryItem): string {
+  const t = parseTimings(item)
+  if (!t) return ''
+  const parts = [`总 ${t.totalMs.toFixed(0)} ms`]
+  if (t.reusedConnection) parts.push('复用连接')
+  if (t.proxy) parts.push('经代理')
+  return parts.join(' · ')
+}
+
 </script>
 
 <template>
   <div class="page">
     <PageHeader
       eyebrow="History"
-      title="请求历史"
-      subtitle="本机保留最近 100000 条发送记录，默认展示最新 500 条，点击可跳回原接口；支持按时间范围清理"
+      title="历史记录"
+      subtitle="请求概览与最近 100000 条发送记录，默认展示最新 500 条，点击可跳回原接口；支持按时间范围清理"
     >
       <a-button :disabled="!rows.length" @click="aiAnalyze">
         <template #icon><AiSparkIcon /></template>
@@ -251,7 +295,7 @@ const columns = [
 
     <div class="summary">
       <div class="summary-item">
-        <span class="summary-label">请求历史总数</span>
+        <span class="summary-label">历史记录总数</span>
         <span class="summary-value mono">{{ summary.total }}</span>
       </div>
       <div class="summary-divider" />
@@ -275,6 +319,8 @@ const columns = [
         <span class="summary-value mono date">{{ fmtDay(stats?.oldestAt) }}</span>
       </div>
     </div>
+
+    <DashboardMetrics />
 
     <div class="toolbar">
       <a-input v-model:value="keyword" allow-clear placeholder="搜索接口名称、URL、方法或状态码" class="search">
@@ -332,6 +378,29 @@ const columns = [
             <template v-else-if="column.key === 'durationMs'">
               <span class="mono">{{ fmtMs((record as HistoryItem).durationMs) }}</span>
             </template>
+            <template v-else-if="column.key === 'timing'">
+              <a-popover v-if="parseTimings(record as HistoryItem)" placement="left">
+                <template #content>
+                  <div class="timing-pop">
+                    <div class="timing-pop-title mono">{{ timingCaption(record as HistoryItem) }}</div>
+                    <div class="timing-pop-bars">
+                      <div v-for="bar in timingBars(record as HistoryItem)" :key="bar.key" class="timing-pop-row">
+                        <span class="timing-pop-label">{{ bar.label }}</span>
+                        <div class="timing-pop-track">
+                          <div
+                            class="timing-pop-bar"
+                            :style="{ left: `${bar.left}%`, width: `${bar.width}%`, background: bar.color }"
+                          />
+                        </div>
+                        <span class="timing-pop-ms mono">{{ bar.ms.toFixed(1) }}</span>
+                      </div>
+                    </div>
+                  </div>
+                </template>
+                <a class="timing-link">分解</a>
+              </a-popover>
+              <span v-else class="timing-none">—</span>
+            </template>
           </template>
         </a-table>
 
@@ -356,7 +425,7 @@ const columns = [
       @ok="runCleanup"
     >
       <div class="cleanup-tip">
-        只清理本机保存的请求历史与接口运行记录，项目、集合、接口、环境变量与压测报告不受影响。
+        只清理本机保存的历史记录与接口运行记录，项目、集合、接口、环境变量与压测报告不受影响。
       </div>
 
       <div class="cleanup-field">
@@ -382,7 +451,7 @@ const columns = [
       <div class="cleanup-field">
         <div class="cleanup-label">清理内容</div>
         <a-checkbox-group v-model:value="cleanupScope">
-          <a-checkbox value="history">请求历史</a-checkbox>
+          <a-checkbox value="history">历史记录</a-checkbox>
           <a-checkbox value="runs">接口运行记录</a-checkbox>
         </a-checkbox-group>
       </div>
@@ -574,5 +643,69 @@ const columns = [
   font-size: 11.5px;
   color: var(--fm-muted);
   margin-top: 6px;
+}
+
+/* ---------- v1.0.8：历史回看耗时分解 ---------- */
+.timing-link {
+  font-size: 12px;
+  color: var(--fm-primary, #1677ff);
+  cursor: pointer;
+}
+
+.timing-none {
+  font-size: 12px;
+  color: var(--fm-text-3, #999);
+}
+
+.timing-pop {
+  min-width: 240px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.timing-pop-title {
+  font-size: 11px;
+  color: var(--fm-text-3, #999);
+}
+
+.timing-pop-bars {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.timing-pop-row {
+  display: grid;
+  grid-template-columns: 62px 1fr 46px;
+  align-items: center;
+  gap: 6px;
+}
+
+.timing-pop-label {
+  font-size: 11px;
+  color: var(--fm-text-2, #666);
+  text-align: right;
+}
+
+.timing-pop-track {
+  position: relative;
+  height: 10px;
+  border-radius: 3px;
+  background: rgba(128, 128, 128, 0.14);
+  overflow: hidden;
+}
+
+.timing-pop-bar {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  border-radius: 3px;
+}
+
+.timing-pop-ms {
+  font-size: 10px;
+  color: var(--fm-text-3, #999);
+  text-align: right;
 }
 </style>

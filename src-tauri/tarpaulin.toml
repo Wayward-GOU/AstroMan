@@ -1,0 +1,26 @@
+# cargo-tarpaulin 覆盖率门禁配置（CI 与本地共用）
+#
+# 用法（在 src-tauri 目录下）：
+#   cargo tarpaulin --config tarpaulin.toml                # 按 fail-under 判定，超线即非零退出
+#   cargo tarpaulin --config tarpaulin.toml --engine llvm  # Windows 本地只能走 LLVM 后端
+#   报告产物：target/coverage/tarpaulin-report.html、cobertura.xml
+#
+# 只统计 lib 测试：桌面端 UI 装配（窗口 / 托盘 / 菜单）依赖真实 WebView 运行时，
+# 无头环境无法初始化，把 main.rs 与 bin 排除在外，避免分母里长期挂着不可测代码。
+#
+# 阈值策略：v1.0.8 先落一个下限，作用是拦住「删测试 / 砍覆盖」的倒退，不在首版追求高位。
+# CI 首次跑完后按 tarpaulin-report.html 的真实值校准，再按版本分批抬向 60%
+# （目标见《本地能力补强技术方案》覆盖率门槛：全量行覆盖 ≥ 60%）。
+# 改门槛只改这一处，CI 直接读本文件。
+
+[coverage]
+run-types = ["Lib"]
+fail-under = 25
+exclude-files = [
+  "src/main.rs",
+  "src/bin/*",
+]
+
+[report]
+out = ["Xml", "Html", "Stdout"]
+output-dir = "target/coverage"

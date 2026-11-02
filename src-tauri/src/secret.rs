@@ -40,6 +40,10 @@ const KEY_LEN: usize = 32;
 /// v1.0.8 之前所有安装共用不带后缀的这一个条目：任何一份新库（开发实例、测试库）
 /// 首次启动都会把正在使用的密钥覆盖掉，因此改为按数据目录派生
 const KEYRING_TARGET: &str = "AstroMan/master-key";
+/// 凭据管理器里的「用户名」，只有 Windows 的 `CredWriteW` 需要填；
+/// macOS / Linux 走的是 `#[cfg(not(windows))]` 的空实现，所以这里跟着一起条件编译，
+/// 否则非 Windows 构建会报 `constant is never used`
+#[cfg(windows)]
 const KEYRING_USER: &str = "master-key";
 const KEY_CHECK_AAD: &str = "app_meta:key_check";
 const KEY_CHECK_TEXT: &str = "astroman-master-key-check";

@@ -5,6 +5,8 @@ const props = defineProps<{
   modelValue: KeyValueItem[]
   keyPlaceholder?: string
   valuePlaceholder?: string
+  /** 是否显示启用勾选框（Form 表格没有启用状态，可关闭） */
+  showCheck?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -36,13 +38,14 @@ function removeRow(index: number) {
 <template>
   <div class="kv-editor">
     <div v-if="modelValue.length" class="kv-head">
-      <span class="col-check" />
+      <span v-if="showCheck !== false" class="col-check" />
       <span class="col-key">Key</span>
       <span class="col-value">Value</span>
       <span class="col-op" />
     </div>
     <div v-for="(item, index) in modelValue" :key="index" class="kv-row">
       <a-checkbox
+        v-if="showCheck !== false"
         class="col-check"
         :checked="item.enabled"
         @change="onCheck(index, $event)"

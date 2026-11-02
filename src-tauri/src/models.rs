@@ -122,6 +122,9 @@ pub struct HttpRequestDetail {
     pub body_type: String,
     #[serde(default)]
     pub body: String,
+    /// 各 Body 类型的草稿（JSON：{"json":"...","form":"...","raw":"..."}）
+    #[serde(default)]
+    pub body_meta: String,
     #[serde(default)]
     pub pre_script: String,
     #[serde(default)]

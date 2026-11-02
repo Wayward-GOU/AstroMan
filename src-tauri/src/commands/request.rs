@@ -37,6 +37,7 @@ fn map_detail(row: &Row<'_>) -> rusqlite::Result<HttpRequestDetail> {
             .get::<_, Option<String>>(7)?
             .unwrap_or_else(|| "none".into()),
         body: row.get::<_, Option<String>>(8)?.unwrap_or_default(),
+        body_meta: row.get::<_, Option<String>>(13)?.unwrap_or_default(),
         pre_script: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
         post_script: row.get::<_, Option<String>>(10)?.unwrap_or_default(),
         assertions: row.get::<_, Option<String>>(11)?.unwrap_or_default(),
@@ -49,7 +50,7 @@ fn map_detail(row: &Row<'_>) -> rusqlite::Result<HttpRequestDetail> {
 pub(crate) fn find_request(conn: &Connection, id: i64) -> Result<HttpRequestDetail, String> {
     conn.query_row(
         "SELECT id, collection_id, name, method, url, headers, params,
-                body_type, body, pre_script, post_script, assertions, auth
+                body_type, body, pre_script, post_script, assertions, auth, body_meta
          FROM requests WHERE id = ?1",
         params![id],
         map_detail,
@@ -182,8 +183,9 @@ pub fn request_save(
                 .execute(
                     "UPDATE requests SET name = ?1, method = ?2, url = ?3, headers = ?4,
                         params = ?5, body_type = ?6, body = ?7, pre_script = ?8,
-                        post_script = ?9, assertions = ?10, auth = ?11, updated_at = ?12
-                     WHERE id = ?13",
+                        post_script = ?9, assertions = ?10, auth = ?11, body_meta = ?12,
+                        updated_at = ?13
+                     WHERE id = ?14",
                     params![
                         name,
                         request.method,
@@ -196,6 +198,7 @@ pub fn request_save(
                         request.post_script,
                         request.assertions,
                         auth,
+                        request.body_meta,
                         now,
                         id
                     ],
@@ -209,9 +212,9 @@ pub fn request_save(
         None => {
             conn.execute(
                 "INSERT INTO requests
-                    (collection_id, name, method, url, headers, params, body_type, body,
+                    (collection_id, name, method, url, headers, params, body_type, body, body_meta,
                      pre_script, post_script, assertions, auth, sort_order, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0, ?13, ?13)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0, ?14, ?14)",
                 params![
                     request.collection_id,
                     name,
@@ -221,6 +224,7 @@ pub fn request_save(
                     query,
                     request.body_type,
                     request.body,
+                    request.body_meta,
                     request.pre_script,
                     request.post_script,
                     request.assertions,

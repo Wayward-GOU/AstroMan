@@ -79,6 +79,8 @@ export interface HttpRequestDetail {
   params: KeyValueItem[]
   bodyType: string
   body: string
+  /** 各 Body 类型的草稿（JSON 字符串），切换类型时保留内容 */
+  bodyMeta?: string
   preScript: string
   postScript: string
   assertions: string

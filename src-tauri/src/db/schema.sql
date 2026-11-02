@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS requests (
     params        TEXT,
     body_type     TEXT DEFAULT 'none',
     body          TEXT,
+    body_meta     TEXT,
     pre_script    TEXT,
     post_script   TEXT,
     assertions    TEXT,

@@ -240,8 +240,9 @@ body {
   transition: background-color 0.16s, border-color 0.16s, color 0.16s, box-shadow 0.2s;
 }
 
-/* 主按钮：轻微渐变 + 主题色光晕，更接近 Apifox / Postman 的现代按钮质感 */
-.ant-btn-primary.ant-btn-primary:not(:disabled) {
+/* 主按钮：轻微渐变 + 主题色光晕，更接近 Apifox / Postman 的现代按钮质感
+   ghost 按钮（type="primary" ghost）文字本身就是主题色，必须保持透明背景，否则会和渐变底色撞色 */
+.ant-btn-primary.ant-btn-primary:not(.ant-btn-background-ghost):not(:disabled) {
   background: linear-gradient(
     135deg,
     color-mix(in srgb, var(--fm-primary) 82%, #ffffff) 0%,
@@ -250,7 +251,7 @@ body {
   box-shadow: 0 2px 8px color-mix(in srgb, var(--fm-primary) 30%, transparent);
 }
 
-.ant-btn-primary.ant-btn-primary:not(:disabled):hover {
+.ant-btn-primary.ant-btn-primary:not(.ant-btn-background-ghost):not(:disabled):hover {
   background: linear-gradient(
     135deg,
     color-mix(in srgb, var(--fm-primary) 72%, #ffffff) 0%,
@@ -259,12 +260,12 @@ body {
   box-shadow: 0 4px 14px color-mix(in srgb, var(--fm-primary) 38%, transparent);
 }
 
-.ant-btn-primary.ant-btn-primary:not(:disabled):active {
+.ant-btn-primary.ant-btn-primary:not(.ant-btn-background-ghost):not(:disabled):active {
   background: var(--fm-primary-dark);
   box-shadow: 0 1px 4px color-mix(in srgb, var(--fm-primary) 30%, transparent);
 }
 
-.ant-btn-primary:disabled {
+.ant-btn-primary:not(.ant-btn-background-ghost):disabled {
   background: color-mix(in srgb, var(--fm-primary) 45%, transparent);
 }
 

@@ -6,7 +6,8 @@ mod seed;
 /// 数据库结构版本（PRAGMA user_version）
 ///
 /// 1 = v1.0.7；2 = v1.0.8（耗时分解、响应体类型、按请求网络配置、app_meta）
-pub const DB_VERSION: i64 = 2;
+/// 3 = 按 Body 类型保留草稿（requests.body_meta）
+pub const DB_VERSION: i64 = 3;
 
 /// 打开库时发现库版本高于本程序：说明用户降级了应用。
 /// 直接返回错误而不是继续写，避免旧代码用旧结构写坏新数据。
@@ -133,6 +134,8 @@ const COLUMN_MIGRATIONS: &[(&str, &str, &str)] = &[
     ("request_history", "body_kind", "TEXT"),
     ("request_history", "body_file", "TEXT"),
     ("requests", "net_json", "TEXT"),
+    // 各 Body 类型的草稿，切换类型时不丢失内容
+    ("requests", "body_meta", "TEXT"),
 ];
 
 fn column_exists(conn: &rusqlite::Connection, table: &str, column: &str) -> Result<bool, String> {

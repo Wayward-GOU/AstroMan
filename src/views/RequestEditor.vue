@@ -97,6 +97,7 @@ const form = ref<HttpRequestDetail>({
   params: [],
   bodyType: 'none',
   body: '',
+  bodyMeta: '',
   preScript: '',
   postScript: '',
   assertions: '',
@@ -385,6 +386,38 @@ async function fetchOauthToken() {
   }
 }
 
+/* ---------- Body 各类型草稿：切换类型时保留各自内容 ---------- */
+const bodyDrafts = ref<Record<string, string>>({})
+
+function parseBodyDrafts(raw?: string): Record<string, string> {
+  if (!raw) return {}
+  try {
+    const parsed = JSON.parse(raw)
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return Object.fromEntries(
+        Object.entries(parsed).filter(([, value]) => typeof value === 'string'),
+      ) as Record<string, string>
+    }
+  } catch {
+    // 旧数据可能是空字符串或非法 JSON，按没有草稿处理
+  }
+  return {}
+}
+
+function rememberBodyDraft(type: string, body: string) {
+  if (!type || type === 'none' || hydrating) return
+  if (bodyDrafts.value[type] === body) return
+  bodyDrafts.value = { ...bodyDrafts.value, [type]: body }
+  form.value.bodyMeta = JSON.stringify(bodyDrafts.value)
+}
+
+watch(
+  () => form.value.body,
+  (body) => {
+    rememberBodyDraft(form.value.bodyType, body ?? '')
+  },
+)
+
 /* ---------- multipart / binary / GraphQL ---------- */
 const multipartFields = computed<FormField[]>({
   get() {
@@ -435,6 +468,44 @@ async function pickBinaryFile() {
   const picked = await open({ multiple: false, directory: false })
   if (typeof picked === 'string') binaryPath.value = picked
 }
+
+/* ---------- urlencoded 表单（表格编辑，存储仍为 a=b&c=d） ---------- */
+function decodeFormPart(part: string): string {
+  try {
+    return decodeURIComponent(part.replace(/\+/g, ' '))
+  } catch {
+    return part
+  }
+}
+
+function encodeFormPart(part: string): string {
+  // {{变量}} 保持原样，避免被编码后无法在发送时替换
+  return part
+    .split(/(\{\{[^{}]*\}\})/)
+    .map((segment) => (/^\{\{[^{}]*\}\}$/.test(segment) ? segment : encodeURIComponent(segment)))
+    .join('')
+}
+
+const formFields = computed<KeyValueItem[]>({
+  get() {
+    if (form.value.bodyType !== 'form') return []
+    return (form.value.body || '')
+      .split('&')
+      .filter((chunk) => chunk.trim())
+      .map((chunk) => {
+        const index = chunk.indexOf('=')
+        const rawKey = index >= 0 ? chunk.slice(0, index) : chunk
+        const rawValue = index >= 0 ? chunk.slice(index + 1) : ''
+        return { key: decodeFormPart(rawKey), value: decodeFormPart(rawValue), enabled: true }
+      })
+  },
+  set(fields) {
+    form.value.body = fields
+      .filter((field) => field.key || field.value)
+      .map((field) => `${encodeFormPart(field.key)}=${encodeFormPart(field.value)}`)
+      .join('&')
+  },
+})
 
 const gqlQuery = ref('')
 const gqlVarsText = ref('')
@@ -488,18 +559,11 @@ watch(
   () => form.value.bodyType,
   (type, previous) => {
     if (type === previous) return
-    if (type === 'multipart') {
-      try {
-        const parsed = JSON.parse(form.value.body || '[]')
-        if (!Array.isArray(parsed)) form.value.body = '[]'
-      } catch {
-        form.value.body = '[]'
-      }
-    } else if (type === 'binary') {
-      form.value.body = ''
-    } else if (type === 'graphql') {
-      loadGraphqlBody()
-    }
+    // 切走前先记住旧类型的 Body，再恢复目标类型上次的内容
+    if (previous) rememberBodyDraft(previous, form.value.body ?? '')
+    const draft = bodyDrafts.value[type]
+    form.value.body = draft !== undefined ? draft : type === 'multipart' ? '[]' : ''
+    if (type === 'graphql') loadGraphqlBody()
   },
 )
 
@@ -618,6 +682,11 @@ async function loadRequest(id: number) {
   try {
     const detail = await api.requestGet(id)
     if (!detail.auth) detail.auth = emptyAuth()
+    // 先恢复各类型草稿，再赋值，避免 bodyType watcher 用空草稿覆盖当前 Body
+    bodyDrafts.value = parseBodyDrafts(detail.bodyMeta)
+    if (detail.bodyType && detail.bodyType !== 'none') {
+      bodyDrafts.value = { ...bodyDrafts.value, [detail.bodyType]: detail.body ?? '' }
+    }
     form.value = detail
     if (detail.bodyType === 'graphql') loadGraphqlBody()
     lastSaved = JSON.stringify(detail)
@@ -1896,6 +1965,18 @@ const responseHeaders = computed(() => {
                   <div class="script-label">Variables（JSON 对象，可留空）</div>
                   <CodeArea v-model="gqlVarsText" fill :rows="5" placeholder='{"id": 1}' />
                   <div v-if="gqlVarsError" class="gql-error">{{ gqlVarsError }}</div>
+                </div>
+
+                <div v-else-if="form.bodyType === 'form'" class="form-fields">
+                  <KeyValueEditor
+                    v-model="formFields"
+                    :show-check="false"
+                    key-placeholder="字段名"
+                    value-placeholder="字段值"
+                  />
+                  <div class="header-hint" v-pre>
+                    发送时自动按 application/x-www-form-urlencoded 编码，{{变量}} 保持原样
+                  </div>
                 </div>
 
                 <CodeArea

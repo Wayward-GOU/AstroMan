@@ -43,6 +43,26 @@ fn base64_encode(input: &[u8]) -> String {
     out
 }
 
+/// 去掉包裹 URL 的 Markdown 反引号，例如 '`https://example.com`'
+fn clean_url(raw: &str) -> String {
+    raw.trim().trim_matches('`').trim().to_string()
+}
+
+/// curl --data-urlencode 的编码规则：仅保留 unreserved 字符，空格编码为 %20
+fn urlencode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char)
+            }
+            b' ' => out.push_str("%20"),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 fn tokenize(input: &str) -> Vec<String> {
     let mut tokens: Vec<String> = Vec::new();
     let mut current = String::new();
@@ -139,7 +159,7 @@ fn header_item(raw: &str) -> Option<KeyValueItem> {
 
 fn collect_data(
     value: &str,
-    pairs: &mut Vec<(String, String)>,
+    pairs: &mut Vec<(String, String, bool)>,
     warnings: &mut Vec<String>,
 ) -> Option<String> {
     let trimmed = value.trim();
@@ -155,8 +175,8 @@ fn collect_data(
                 continue;
             }
             match chunk.split_once('=') {
-                Some((k, v)) => pairs.push((k.to_string(), v.to_string())),
-                None => pairs.push((chunk.to_string(), String::new())),
+                Some((k, v)) => pairs.push((k.to_string(), v.to_string(), false)),
+                None => pairs.push((chunk.to_string(), String::new(), false)),
             }
         }
         return None;
@@ -201,11 +221,13 @@ pub fn curl_parse(text: String) -> Result<CurlParsed, String> {
     let mut method: Option<String> = None;
     let mut url: Option<String> = None;
     let mut headers: Vec<KeyValueItem> = Vec::new();
-    let mut pairs: Vec<(String, String)> = Vec::new();
+    // 第三项标记该字段是否由 --data-urlencode 提供（发送前需要 URL 编码）
+    let mut pairs: Vec<(String, String, bool)> = Vec::new();
     let mut raw_body: Option<String> = None;
     let mut json_mode = false;
     let mut get_mode = false;
     let mut form_mode = false;
+    let mut urlencode_mode = false;
     let mut warnings: Vec<String> = Vec::new();
     let mut user: Option<String> = None;
     let mut cookie: Option<String> = None;
@@ -231,9 +253,10 @@ pub fn curl_parse(text: String) -> Result<CurlParsed, String> {
             | "--data-urlencode" => {
                 if let Some(value) = iter.next() {
                     if token == "--data-urlencode" {
+                        urlencode_mode = true;
                         match value.split_once('=') {
-                            Some((k, v)) => pairs.push((k.to_string(), v.to_string())),
-                            None => pairs.push((value.clone(), String::new())),
+                            Some((k, v)) => pairs.push((k.to_string(), v.to_string(), true)),
+                            None => pairs.push((value.clone(), String::new(), true)),
                         }
                     } else if let Some(body) = collect_data(&value, &mut pairs, &mut warnings) {
                         raw_body = Some(body);
@@ -256,10 +279,10 @@ pub fn curl_parse(text: String) -> Result<CurlParsed, String> {
                                     "已忽略文件字段 {k}（暂不支持 multipart 文件上传）"
                                 ));
                             } else {
-                                pairs.push((k.to_string(), v.to_string()));
+                                pairs.push((k.to_string(), v.to_string(), false));
                             }
                         }
-                        None => pairs.push((value.clone(), String::new())),
+                        None => pairs.push((value.clone(), String::new(), false)),
                     }
                 }
             }
@@ -268,7 +291,7 @@ pub fn curl_parse(text: String) -> Result<CurlParsed, String> {
             "-u" | "--user" => user = iter.next(),
             "-b" | "--cookie" => cookie = iter.next(),
             "-A" | "--user-agent" => user_agent = iter.next(),
-            "--url" => url = iter.next(),
+            "--url" => url = iter.next().map(|value| clean_url(&value)),
             "-f"
             | "--fail"
             | "--fail-with-body"
@@ -304,7 +327,7 @@ pub fn curl_parse(text: String) -> Result<CurlParsed, String> {
                         }
                     }
                 } else if url.is_none() {
-                    url = Some(other.to_string());
+                    url = Some(clean_url(other));
                 }
             }
         }
@@ -357,7 +380,7 @@ pub fn curl_parse(text: String) -> Result<CurlParsed, String> {
         }
         params = pairs
             .drain(..)
-            .map(|(key, value)| KeyValueItem {
+            .map(|(key, value, _)| KeyValueItem {
                 key,
                 value,
                 enabled: true,
@@ -367,7 +390,13 @@ pub fn curl_parse(text: String) -> Result<CurlParsed, String> {
         if !pairs.is_empty() {
             let joined = pairs
                 .iter()
-                .map(|(k, v)| format!("{k}={v}"))
+                .map(|(k, v, encode)| {
+                    if *encode {
+                        format!("{k}={}", urlencode(v))
+                    } else {
+                        format!("{k}={v}")
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join("&");
             if let Some(existing) = raw_body {
@@ -406,6 +435,7 @@ pub fn curl_parse(text: String) -> Result<CurlParsed, String> {
     {
         "json"
     } else if form_mode
+        || urlencode_mode
         || content_type
             .as_deref()
             .map(|v| v.contains("x-www-form-urlencoded"))
@@ -444,4 +474,35 @@ pub fn curl_parse(text: String) -> Result<CurlParsed, String> {
         body,
         warnings,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn imports_urlencoded_form_and_strips_backtick_wrapped_url() {
+        let command = "curl --location --request POST '`https://winesmpxc1.cofco.com/uat/login/base/user/apilogin`' \\\n--data-urlencode 'clientId=api' \\\n--data-urlencode 'password=y>arg12312'";
+        let parsed = curl_parse(command.to_string()).expect("应能解析");
+        assert_eq!(parsed.method, "POST");
+        assert_eq!(
+            parsed.url,
+            "https://winesmpxc1.cofco.com/uat/login/base/user/apilogin"
+        );
+        assert_eq!(parsed.body_type, "form");
+        assert_eq!(parsed.body, "clientId=api&password=y%3Earg12312");
+        assert!(parsed.params.is_empty());
+    }
+
+    #[test]
+    fn get_mode_keeps_data_urlencode_values_raw_for_query_params() {
+        let command = "curl -G 'https://api.example.com/search' --data-urlencode 'q=a b&c'";
+        let parsed = curl_parse(command.to_string()).expect("应能解析");
+        assert_eq!(parsed.method, "GET");
+        assert_eq!(parsed.body_type, "none");
+        assert_eq!(parsed.params.len(), 1);
+        assert_eq!(parsed.params[0].key, "q");
+        // -G 的编码交给发送侧统一处理，这里必须保留原文，避免双重编码
+        assert_eq!(parsed.params[0].value, "a b&c");
+    }
 }

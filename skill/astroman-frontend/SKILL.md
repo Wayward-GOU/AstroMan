@@ -65,6 +65,17 @@ v1.0.8 起大屏不在首页：`views/Dashboard.vue` 只剩总览 KPI、快捷�
 - 写操作与起跑前都要二次确认；`test_run_start` 返回 `runId` 后轮询 `test_run_get`，不要阻塞等待整个套件跑完
 - 数据模型、产物与 CLI 口径见 skill `astroman-automation`
 
+## 抓包页（`views/Capture.vue`）
+
+左右两栏：左侧按 host 分组的流量树，右侧详情（概览 / 请求 / 响应 / 原始）。工具栏是录制、清空、导出 HAR / ZIP、CA 状态、系统代理与设置抽屉；详情里的「重发」打开可编辑弹窗；域名分组右键可导出该分组 HAR / ZIP。
+
+- 页面用 `import * as api from '@/api/capture'`，类型在 `src/types/capture.ts`，**不要**把这些命令再塞进 `api/index.ts`
+- 流量与状态分别 1.5 秒轮询；CA 信任状态 5 秒轮询，只在页面可见时刷
+- 分组右键菜单用 `Teleport to="body"` 定位，点击窗口任意位置 / 失焦都要关闭
+- 开始录制固定传 `{ port, bindAddr, sslHosts: [], ignorePatterns: [], captureStatic: true }`；新增设置项时同步 `CaptureConfig` 与 Rust handler
+- 浏览器预览下 `invoke` 不可用，页面会显示「代理后端不可用」提示，属预期
+- 协议、证书、手机与重发规则见 skill `astroman-capture`
+
 ## 页面内 AI 入口（AiAssist）
 
 给任意页面加「用 AI 分析当前内容」的能力，不需要新建页面或弹窗，统一复用全局抽屉：

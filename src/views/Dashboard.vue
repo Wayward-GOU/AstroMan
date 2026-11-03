@@ -16,6 +16,7 @@ import {
   FundProjectionScreenOutlined,
   SettingOutlined,
   ApiOutlined,
+  GlobalOutlined,
   SafetyCertificateOutlined,
   RocketOutlined,
   PlayCircleOutlined,
@@ -64,7 +65,7 @@ const recentProject = computed(() => {
 const headerSubtitle = computed(() =>
   stats.value
     ? `${stats.value.projectCount} 个项目 · ${stats.value.requestCount} 个接口 · 数据全部保存在本机`
-    : '本地 API 调试、压测与工具箱，数据不出这台电脑',
+    : '本地 API 调试、抓包、压测与工具箱，数据不出这台电脑',
 )
 
 const kpis = computed(() => {
@@ -121,6 +122,13 @@ const kpis = computed(() => {
 })
 
 const launches = computed(() => [
+  {
+    key: 'capture',
+    title: '抓包分析',
+    desc: 'HTTPS 解密、域名分组与改参重发',
+    icon: GlobalOutlined,
+    go: () => router.push('/capture'),
+  },
   {
     key: 'automation',
     title: '自动化测试',
@@ -180,6 +188,14 @@ const features = computed(() => [
     desc: '类 Postman 的请求编辑器，方法、URL、环境变量与发送按钮集中在一条地址栏，双栏对照查看参数与响应。',
     points: ['Params / Headers / Body', '{{变量}} 与内置函数', '前后置脚本与运行历史'],
     go: goProject,
+  },
+  {
+    key: 'capture',
+    icon: GlobalOutlined,
+    title: '抓包分析',
+    desc: '本机 MITM 代理录制 HTTP / HTTPS，按域名分组查看请求与响应；一键信任根证书、接管系统代理，手机同 Wi-Fi 也能抓。',
+    points: ['HTTPS 解密与证书', '域名分组 / HAR / ZIP 导出', '改参重发与手机代理'],
+    go: () => router.push('/capture'),
   },
   {
     key: 'automation',
@@ -242,6 +258,41 @@ const runnerSteps = [
     title: '运行并导出结果',
     desc: '设置请求间隔后开始，随时可停止；结果表汇总状态码、耗时与断言。',
   },
+]
+
+/* ---------- 抓包介绍 ---------- */
+const captureSteps = [
+  {
+    title: '开始录制',
+    desc: '点「录制」启动本机代理，默认 127.0.0.1:8888；端口被占用会自动向后找。',
+  },
+  {
+    title: '装并信任根证书',
+    desc: '点「CA 未安装」→「一键安装」，HTTPS 才能解密；重新生成证书后要重新安装。',
+  },
+  {
+    title: '让流量走代理',
+    desc: '本机点「接管系统代理」；手机把监听切 0.0.0.0，同一 Wi-Fi 填电脑 IP:端口并安装证书。',
+  },
+  {
+    title: '查看、导出与重发',
+    desc: '按域名分组看请求与响应，顶部导出全部 HAR / ZIP，右键只导出该分组；任意请求可改方法 / URL / 头 / Body 重发。',
+  },
+]
+
+const captureCurlExample = `# 本机命令行走代理
+curl -x http://127.0.0.1:8888 https://example.com`
+
+const capturePhoneChecklist = [
+  { name: '同一 Wi-Fi', detail: '电脑监听 0.0.0.0，手机代理填 电脑IP:8888' },
+  { name: '安装根证书', detail: '设置抽屉导出后装到手机；iOS 还要打开完全信任' },
+  { name: '先验代理', detail: '手机浏览器访问一个 HTTP 页面，再看列表是否有流量' },
+]
+
+const captureBoundaries = [
+  { name: '微信小程序', detail: '可能绕过 Wi-Fi 代理；自己的小程序走开发者工具，其他优先 iPhone' },
+  { name: 'pinning / HTTP/3', detail: '证书固定与 QUIC 无法解密，必要时关闭浏览器 QUIC' },
+  { name: '只存内存', detail: '5000 条 / 128 MB body，重启清空；及时导出 HAR / ZIP' },
 ]
 
 // 示例内容放在常量里，避免模板把 {{变量}} 当成插值
@@ -324,41 +375,48 @@ const steps = computed(() => [
   },
   {
     key: '04',
+    title: '抓一次真实流量',
+    desc: '开始录制、信任根证书并接管系统代理，浏览器 / App 的请求会按域名分组出现；手机同 Wi-Fi 也能抓。',
+    action: '打开抓包',
+    go: () => router.push('/capture'),
+  },
+  {
+    key: '05',
     title: '发起压测',
     desc: '配置并发与时长，结束后自动生成报告与逐请求明细。',
     action: '去压测',
     go: () => router.push('/stress'),
   },
   {
-    key: '05',
+    key: '06',
     title: '沉淀回归套件',
     desc: '把常用接口保存成自动化测试套件，配好断言、变量链与失败策略后反复运行；示例项目已内置「示例回归（httpbin）」可直接试跑。',
     action: '打开自动化测试',
     go: () => router.push('/automation'),
   },
   {
-    key: '06',
+    key: '07',
     title: '签名与加密',
     desc: '脚本页「插入示例」可一键填入 MD5 / HMAC 签名、AES 加密、RSA 加密，生成的值用 {{变量}} 引用。',
     action: '打开项目',
     go: goProject,
   },
   {
-    key: '07',
+    key: '08',
     title: '导入现成接口',
     desc: '项目页可粘贴 cURL 一键解析；工作台可导入项目 JSON，用于同事共享或换机迁移。',
     action: '打开项目',
     go: goProject,
   },
   {
-    key: '08',
+    key: '09',
     title: '用航仔 提效',
     desc: '在「航仔」里说一句话就能建项目、写接口、发请求、写签名脚本、查压测报告，并能导出执行记录。',
     action: '打开航仔',
     go: () => router.push({ name: 'ai' }),
   },
   {
-    key: '09',
+    key: '10',
     title: '数据与备份',
     desc: '数据默认存在本机 SQLite；设置页可查看路径、迁移目录，项目页可导出 JSON 备份。',
     action: '打开设置',
@@ -400,6 +458,21 @@ const tips = [
   {
     title: '多标签并行调试',
     desc: '同一项目最多同时打开 20 个接口标签，编辑内容自动保存，切换或关闭都不丢改动。',
+    code: '',
+  },
+  {
+    title: 'HTTPS 抓包三步',
+    desc: '先录制，再装并信任根证书，最后接管系统代理，顺序别反。证书没信任时，HTTPS 只会显示 CONNECT、看不到明文。',
+    code: '录制 → CA 一键安装 → 接管系统代理\ncurl -x http://127.0.0.1:8888 https://example.com',
+  },
+  {
+    title: '手机抓包与微信边界',
+    desc: '监听切 0.0.0.0，手机同 Wi-Fi 填电脑 IP:端口并安装证书；iOS 还要打开完全信任。微信可能绕过 Wi-Fi 代理，自己的小程序走开发者工具，其他优先 iPhone。',
+    code: '',
+  },
+  {
+    title: '重发改参与未录制模式',
+    desc: '详情页「重发」可改方法、URL、请求头和 Body。录制中会新增一条流量；未录制时直接发送，响应只在弹窗展示，不影响录制状态。',
     code: '',
   },
   {
@@ -508,6 +581,18 @@ const faqs = [
   {
     q: '压测把接口打挂了怎么办？',
     a: '压测中随时可以点「停止」，已产生的数据仍会保存成报告。建议只在测试环境压测，并提前确认目标服务的限流策略。',
+  },
+  {
+    q: '抓包能解密 HTTPS，但列表里看不到明文？',
+    a: '看顶部「CA 未安装 / CA 已信任」。HTTPS 解密要求目标程序信任 AstroMan 根证书：点「CA 未安装」→「一键安装」（Windows 装进当前用户受信任根，无需管理员），装完重启目标程序；如果重新生成过证书，要再点一次「重新安装」。Firefox 使用独立证书库，需要单独导入；部分 App 做了证书固定（pinning），这类流量无法解密。',
+  },
+  {
+    q: '手机开代理后断网，或者抓不到微信？',
+    a: '手机开了代理像断网，通常是根证书没装或没信任：先导出证书到手机安装，iOS 还要到「设置 → 通用 → 关于本机 → 证书信任设置」打开完全信任。代理地址要填电脑局域网 IP:端口，填 127.0.0.1 会指向手机自己。微信可能绕过 Wi-Fi 代理、Android 7+ 的 App 也默认不信任用户证书：自己的小程序用微信开发者工具设置代理并勾选「不校验合法域名…」，别人的小程序优先用 iPhone，Android 通常需要 root。AstroMan 不做 VPN / TUN 全局劫持。',
+  },
+  {
+    q: '抓包流量保存在哪里？会占多少内存？',
+    a: '抓包流量不写数据库，只存在内存：最多 5000 条、body 合计 128 MB，超出淘汰最旧一条，重启应用即清空。单条 body 最多保留 2 MB 前缀，超过 8 MB 不缓冲，图片只预览 1 MB 内。需要留档请及时「导出 HAR / ZIP」，或在详情里把请求 / 响应 Body 另存为文件。',
   },
   {
     q: '航仔 能帮我做什么？',
@@ -916,6 +1001,83 @@ function fmtBytes(value: number) {
       </div>
     </div>
 
+    <!-- 抓包介绍 -->
+    <section class="runner-band capture-band fm-card">
+      <div class="runner-copy">
+        <span class="runner-eyebrow"><GlobalOutlined /> 抓包分析 · Capture</span>
+        <h2 class="runner-title">看清 App 真正发了什么，再改参数重发一次</h2>
+        <p class="runner-desc">
+          抓包用本机 MITM 代理录制 HTTP / HTTPS：开始录制、信任根证书、让流量走代理，
+          请求就会按域名分组出现在左侧。点开可看请求头 / Body、响应头 / Body 与原始报文，
+          文本能格式化、复制、另存，图片直接预览。
+          顶部可导出全部 HAR / ZIP（ZIP 解压后打开 index.html 即可阅读），域名分组右键可只导出该分组；任意请求还能改方法、URL、头与 Body 重发。
+        </p>
+        <div class="runner-tags">
+          <span>HTTP / HTTPS 解密</span>
+          <span>域名分组</span>
+          <span>根证书一键安装</span>
+          <span>系统代理接管</span>
+          <span>手机同 Wi-Fi</span>
+          <span>HAR / ZIP / 改参重发</span>
+        </div>
+        <div class="runner-actions">
+          <a-button type="primary" @click="router.push('/capture')">
+            <template #icon><GlobalOutlined /></template>
+            打开抓包
+          </a-button>
+          <a-button @click="router.push('/history')">对照历史请求</a-button>
+        </div>
+      </div>
+
+      <div class="runner-steps">
+        <div v-for="(s, i) in captureSteps" :key="s.title" class="runner-step">
+          <span class="runner-step-index mono">0{{ i + 1 }}</span>
+          <div class="runner-step-body">
+            <div class="runner-step-title">{{ s.title }}</div>
+            <div class="runner-step-desc">{{ s.desc }}</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 抓包示例与排错 -->
+    <div class="fm-card runner-example">
+      <div class="example-head">
+        <span class="example-title"><FileTextOutlined /> 示例：让本机 / 手机流量进入抓包列表</span>
+        <span class="example-note">证书没信任时，HTTPS 只会显示 CONNECT</span>
+      </div>
+      <div class="example-grid">
+        <div class="example-col">
+          <div class="example-label">本机命令行验证</div>
+          <pre class="example-code mono">{{ captureCurlExample }}</pre>
+          <div class="example-results example-gap">
+            <div><b class="mono">浏览器</b> 点「接管系统代理」即可</div>
+            <div><b class="mono">命令行</b> 显式加 -x，否则不走系统代理</div>
+          </div>
+        </div>
+        <div class="example-col">
+          <div class="example-label">手机抓包清单</div>
+          <div class="example-results">
+            <div v-for="item in capturePhoneChecklist" :key="item.name">
+              <b class="mono">{{ item.name }}</b> {{ item.detail }}
+            </div>
+          </div>
+        </div>
+        <div class="example-col">
+          <div class="example-label">边界与排错</div>
+          <div class="example-results">
+            <div v-for="item in captureBoundaries" :key="item.name">
+              <b class="mono">{{ item.name }}</b> {{ item.detail }}
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="example-foot">
+        流量只存内存（5000 条 / 128 MB body），重启清空；需要留档及时「导出 HAR / ZIP」或在详情里保存 Body。
+        更完整的手机、微信与证书排查见 <code class="mono">docs/capture.md</code>。
+      </div>
+    </div>
+
     <!-- 产品介绍 -->
     <section class="intro-band fm-card">
       <div class="intro-copy">
@@ -923,10 +1085,11 @@ function fmtBytes(value: number) {
           <RocketOutlined />
           产品概览
         </span>
-        <h2 class="intro-title">调试、压测与工具箱，一个桌面应用全部搞定</h2>
+        <h2 class="intro-title">调试、抓包、压测与工具箱，一个桌面应用全部搞定</h2>
         <p class="intro-desc">
           AstroMan 面向需要频繁调试 HTTP 接口的开发者：界面参考 Postman，压测参数参考 JMeter，
-          日常格式化与转换工具集中在一起。不用在浏览器插件和在线站点之间来回切换，也不用把接口数据交给第三方服务。
+          抓包体验接近 Charles，日常格式化与转换工具集中在一起。不用在浏览器插件和在线站点之间来回切换，
+          也不用把接口数据交给第三方服务。
         </p>
         <div class="intro-tags">
           <span>本地优先</span>
@@ -948,7 +1111,7 @@ function fmtBytes(value: number) {
     <div class="section-head feature-head">
       <div>
         <h2 class="section-title">AstroMan 能做什么</h2>
-        <div class="section-desc">从接口调试到压力测试，再到日常开发小工具，全部离线可用</div>
+        <div class="section-desc">从接口调试、抓包到压力测试，再到日常开发小工具，全部离线可用</div>
       </div>
     </div>
     <div class="feature-grid">
@@ -969,7 +1132,7 @@ function fmtBytes(value: number) {
     <div class="section-head">
       <div>
         <h2 class="section-title">使用说明</h2>
-        <div class="section-desc">从建项目到调试、批量运行、回归套件、压测与备份，右侧是常见问题</div>
+        <div class="section-desc">从建项目到调试、抓包、批量运行、回归套件、压测与备份，右侧是常见问题</div>
       </div>
     </div>
 
@@ -1702,6 +1865,12 @@ function fmtBytes(value: number) {
     var(--fm-surface);
 }
 
+.capture-band {
+  background:
+    radial-gradient(110% 150% at 0% 100%, var(--fm-primary-soft) 0%, transparent 55%),
+    var(--fm-surface);
+}
+
 .runner-eyebrow {
   display: inline-flex;
   align-items: center;
@@ -1860,6 +2029,10 @@ function fmtBytes(value: number) {
 
 .example-results .fail {
   color: var(--fm-danger);
+}
+
+.example-gap {
+  margin-top: 8px;
 }
 
 .example-foot {

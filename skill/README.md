@@ -9,10 +9,11 @@
 | [`astroman-backend`](astroman-backend/SKILL.md) | 改 Rust、SQLite、压测引擎、密钥 | 命令规范、迁移铁律、压测要点、主密钥与钥匙串、统计聚合 |
 | [`astroman-frontend`](astroman-frontend/SKILL.md) | 改 Vue 页面、样式、脚本引擎、导出 | 页面骨架、设计令牌、CodeArea、AI 抽屉、航仔挂件、常见坑 |
 | [`astroman-appearance`](astroman-appearance/SKILL.md) | 改配色、加主题、换航仔形象、调挂件 | 21 套主题与 35 个变量、新增主题流程、对比度指标、贴图与拖拽、线框图标、截图核验 |
-| [`astroman-dashboard`](astroman-dashboard/SKILL.md) | 改工作台首页、历史记录页数据大屏、引导与 FAQ 文案 | 首页区块顺序、6 个 KPI、9 步引导 / 15 张技巧卡 / 19 条 FAQ、8 张大屏卡与 SQL 口径 |
+| [`astroman-dashboard`](astroman-dashboard/SKILL.md) | 改工作台首页、历史记录页数据大屏、引导与 FAQ 文案 | 首页区块顺序、6 个 KPI、10 步引导 / 18 张技巧卡 / 22 条 FAQ、8 张大屏卡与 SQL 口径 |
+| [`astroman-capture`](astroman-capture/SKILL.md) | 改抓包模块，或排查 HTTPS / 手机 / 微信抓不到 | MITM 代理、录制上限、根证书、系统代理、手机抓包、HAR / ZIP 导出、改参重发、常见现象对照 |
 | [`astroman-automation`](astroman-automation/SKILL.md) | 改自动化测试子系统的任何一处 | 七张表、执行内核、6 类断言、数据集、Python 钩子、压测门禁、产物与 CLI 退出码 |
 | [`astroman-toolbox`](astroman-toolbox/SKILL.md) | 新增 / 修改离线工具 | 92 个工具与 9 分类、`ToolDef` 契约、纯函数 + 组件两种接入、搜索别名、清单同步 |
-| [`astroman-ai`](astroman-ai/SKILL.md) | 改航仔（模型接入、工具、提示词、流式） | 双模式、三协议、上下文预算与摘要、74 个工具（含 12 个测试域）、确认卡、复盘 |
+| [`astroman-ai`](astroman-ai/SKILL.md) | 改航仔（模型接入、工具、提示词、流式） | 双模式、三协议、上下文预算与摘要、92 个工具（含 22 个测试域、7 个抓包域）、确认卡、复盘 |
 | [`astroman-testing`](astroman-testing/SKILL.md) | 加测试、改门禁、CI 变红 | vitest、cargo test、tarpaulin 覆盖率、四道门禁、版本号同步、沙箱坑 |
 | [`astroman-build-release`](astroman-build-release/SKILL.md) | 打包、换图标、发版 | 构建命令、打包配置、图标体系、发版流程、构建排错 |
 

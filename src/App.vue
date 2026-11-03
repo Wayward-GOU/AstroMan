@@ -4,6 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { theme as AntTheme } from 'ant-design-vue'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import {
+  ApiOutlined,
   AppstoreOutlined,
   ExperimentOutlined,
   FolderOpenOutlined,
@@ -119,6 +120,7 @@ const navs: NavItem[] = [
   { key: 'home', label: '工作台', hint: '概览与快速入口', to: '/', icon: AppstoreOutlined, group: '调试' },
   { key: 'projects', label: '项目管理', hint: '项目 · 集合 · 环境', to: '/projects', icon: FolderOpenOutlined, group: '调试' },
   { key: 'stress', label: '压测', hint: '选择接口发起压测', to: '/stress', icon: ThunderboltOutlined, group: '测试' },
+  { key: 'capture', label: '抓包', hint: 'HTTP/HTTPS 录制 · 改包 · 重发', to: '/capture', icon: ApiOutlined, group: '测试' },
   { key: 'runner', label: '批量运行', hint: '集合 Runner · 数据驱动', to: '/runner', icon: PlayCircleOutlined, group: '测试' },
   { key: 'automation', label: '自动化测试', hint: '套件 · 断言 · Python · 报告', to: '/automation', icon: ExperimentOutlined, group: '测试' },
   { key: 'ai', label: '航仔', hint: 'AI 助手 · 自动建请求并分析', to: '/ai', icon: AstroBuddyIcon, group: '智能' },
@@ -353,6 +355,7 @@ onBeforeUnmount(() => {
 const activeKey = computed(() => {
   const path = route.path
   if (path.startsWith('/stress')) return 'stress'
+  if (path.startsWith('/capture')) return 'capture'
   if (path.startsWith('/runner')) return 'runner'
   if (path.startsWith('/projects')) return 'projects'
   if (path.startsWith('/project/')) return 'projects'

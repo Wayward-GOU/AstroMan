@@ -53,13 +53,13 @@ open /Applications/AstroMan.app
 
 ```bash
 curl -fLO https://github.com/Wayward-GOU/AstroMan/releases/latest/download/install-macos.sh
-bash install-macos.sh v1.0.8
+bash install-macos.sh v1.0.9
 ```
 
 不带参数执行时安装最新正式版。仓库若为私有，需要先提供 Token：
 
 ```bash
-GITHUB_TOKEN=ghp_xxx bash install-macos.sh v1.0.8
+GITHUB_TOKEN=ghp_xxx bash install-macos.sh v1.0.9
 ```
 
 **方式二：手动安装**

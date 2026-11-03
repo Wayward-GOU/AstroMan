@@ -11,7 +11,7 @@ description: AstroMan 内置 AI 助手「航仔」的开发与维护规范。接
 
 | 能力 | 落点 |
 |---|---|
-| **74 个工具**（73 业务 + `tool_search`），其中 12 个是自动化测试域 | `aiTools.ts` 的 `SPECS` / `SCHEMAS` / `WRITE_TOOLS` / `CORE_TOOL_NAMES` / `TOOL_KEYWORDS` |
+| **92 个工具**（79 业务 + 12 工具箱 + `tool_search`），其中 22 个是自动化测试域、7 个是抓包域 | `aiTools.ts` 的 `SPECS` / `SCHEMAS` / `WRITE_TOOLS` / `CORE_TOOL_NAMES` / `TOOL_KEYWORDS` |
 | 自动化测试：套件 / 用例 / 运行 / 报告 | 12 个 `test_*` 工具 → `commands/test_suite.rs`、`test_case.rs`、`test_run.rs`、`test_report.rs`、`test_preflight.rs`；流程见 §自动化测试域 |
 | 停止生成 / 自动重试 / 工具硬超时 | `ai.rs` 的 `ai_chat_cancel` + `request_id` 注册表、`retry` 事件；`aiTools.ts` 的 `toolTimeoutOf` / `withTimeout` / `ToolTimeoutError` |
 | 上下文预算与异步摘要 | `contextBudget.ts` / `modelMeta.ts`；`ai_sessions.summary / summary_until`；对话页预算条 |
@@ -25,7 +25,7 @@ description: AstroMan 内置 AI 助手「航仔」的开发与维护规范。接
 | 任务 | 先读 |
 |---|---|
 | 加一个工具、改工具参数或超时 | §新增一个工具 → §工具目录分层 → §需要确认的操作 |
-| 让模型能操作新业务（数据集、测试报告导出、套件导入导出…） | §自动化测试域 → §新增一个工具 |
+| 让模型能操作新业务（抓包流量、测试数据集、套件导入导出、运行附件…） | §自动化测试域 / §抓包域 → §新增一个工具 |
 | 改航仔的说话方式、执行流程、轮次策略 | §系统提示词注入（`hangzai_system_prompt.md` 是唯一权威） |
 | 改厂商 / 模型清单 / 报错文案 | §模型目录与报错中文化 |
 | 给会话 / 消息 / 流水加字段 | §数据表（`schema.sql` + `migrate()` 两处都要改） |
@@ -43,7 +43,7 @@ description: AstroMan 内置 AI 助手「航仔」的开发与维护规范。接
 | `src-tauri/src/models.rs` | `AiProvider`（`api_key_masked` / `has_key` / `max_tokens` / `timeout_secs`）、`AiMessage`、`AiChatPayload`、`AiStreamEvent`、`AiSession`（`pinned` / `summary`）、`AiStoredMessage`、`AiToolLog`（`round` / `trace_id` / `timeout`）、`AiUsageLog` / `AiUsagePage` / `AiUsageDay` |
 | `src-tauri/src/db/schema.sql` | `ai_providers`、`ai_sessions`、`ai_messages`、`ai_tool_logs`、`ai_usage_logs` 五张在用表（另有遗留的 `ai_conversations`，代码已不读写，见 §数据表） |
 | `src-tauri/src/commands/test_suite.rs` / `test_case.rs` / `test_run.rs` / `test_report.rs` / `test_preflight.rs` | 测试域工具的后端命令：`test_suite_*` / `test_case_*` / `test_run_*` / `test_report_generate` / `test_preflight`（工具侧只做参数归一、字段裁剪与中文键，业务逻辑在后端） |
-| `src/utils/aiTools.ts` | **工具注册表**：**74 个工具**（73 业务 + `tool_search`，含 12 个测试域工具）的声明、参数解析、执行、中文名、`danger` 标记、`isWriteTool()` 写操作判定（`WRITE_TOOLS` 38 项）、`SCHEMAS` 入参校验、`TOOL_KEYWORDS` 检索别名、`toolTimeoutOf()` 超时档位、`ToolResult` 输出信封、目录分层 |
+| `src/utils/aiTools.ts` | **工具注册表**：**92 个工具**（79 业务 + 12 工具箱 + `tool_search`，含 22 个测试域与 7 个抓包域工具）的声明、参数解析、执行、中文名、`danger` 标记、`isWriteTool()` 写操作判定（`WRITE_TOOLS` 48 项）、`SCHEMAS` 入参校验、`TOOL_KEYWORDS` 检索别名、`toolTimeoutOf()` 超时档位、`ToolResult` 输出信封、目录分层 |
 | `src/utils/aiProtocol.ts` | fenced 块解析：`parseSegments` / `normalizePseudoFence` / `liftNativeCalls` / `stripNativeTags` / `sanitizeAssistant` / `callKey` |
 | `src/utils/contextBudget.ts` | token 估算 `estimateTokens` / `estimateMessages`、预算裁剪 `buildContext`、摘要前缀 `SUMMARY_PREFIX` |
 | `src/utils/modelMeta.ts` | 模型 → 上下文窗口映射 `contextWindowOf`、预算比例 `contextBudgetOf`（窗口 60%，下限 2000） |
@@ -291,36 +291,38 @@ Rust 侧 `ai_chat(payload, on_event: Channel<AiStreamEvent>)`，逐块 `on_event
 
 改规则时的顺序：`agent_hard_rules.md`（需求） → `SCHEMAS` / `MAX_TOOL_ROUNDS` / `danger` / `WRITE_TOOLS` → 前端提示文案 → 本表。
 
-### 工具清单（73 业务 + `tool_search` = 74）
+### 工具清单（79 业务 + 12 工具箱 + `tool_search` = 92）
 
 | 分类 | 工具 |
 |---|---|
 | 项目 | `project_list` `project_request_counts` `project_create` `project_update` `project_delete` `project_import` `project_export` |
 | 集合 | `collection_tree` `collection_create` `collection_rename` `collection_delete` |
-| 请求 | `request_list` `request_get` `request_search` `request_options` `request_create` `request_update` `request_script_save` `request_delete` `curl_import` `send_request` `run_batch` |
+| 请求 | `request_list` `request_get` `request_search` `request_options` `request_create` `request_batch_create` `request_update` `request_script_save` `request_delete` `curl_import` `send_request` `run_batch` |
 | 环境 | `env_list` `env_create` `env_var_save` `env_activate` `env_delete` `env_script_save` |
 | 压测 | `plan_list` `plan_get` `plan_save` `plan_delete` `stress_start` `stress_stop` `report_list` `report_get` `report_export` `report_requests` `report_delete` `run_list` |
-| 自动化测试 | `test_suite_list` `test_suite_get` `test_suite_create` `test_suite_update` `test_suite_delete` `test_case_create` `test_case_update` `test_case_delete` `test_run_start` `test_run_stop` `test_run_get` `test_report_export` |
+| 自动化测试 | `test_suite_list` `test_suite_get` `test_suite_create` `test_suite_update` `test_suite_delete` `test_case_create` `test_case_update` `test_case_delete` `test_run_start` `test_run_stop` `test_run_get` `test_report_export` `test_dataset_list` `test_dataset_get` `test_dataset_save` `test_dataset_delete` `test_suite_import` `test_suite_export` `test_run_list` `test_artifact_list` `test_artifact_export` `test_preflight` |
+| 抓包 | `capture_status` `capture_flow_list` `capture_flow_get` `capture_start` `capture_stop` `capture_repeat` `capture_export` |
 | 数据 | `history_list` `history_export` `history_stats` `workspace_stats` `dashboard_metrics` `cookie_list` |
 | 导入导出 | `api_import` `openapi_import` `openapi_export` |
 | 工具箱 | `toolbox_json_format` `toolbox_json_to_entity` `toolbox_json_to_sql` `toolbox_convert` `toolbox_timestamp` `toolbox_base64` `toolbox_hash` `toolbox_url` `toolbox_regex` `toolbox_jwt` `toolbox_diff` `toolbox_uuid` |
 | 元工具 | `tool_search`（按中英文关键词检索长尾工具用法） |
 
-数一遍是 73 个业务工具 + `tool_search` = **74**。这个数字被算错过好几次（历史文档写过 61 / 62 / 75），原因是拿 `grep -o "name: '[a-z_0-9]*'"` 统计时会多出一个空匹配，直接多数一个。可靠算法：
+数一遍是 79 个业务工具 + 12 个工具箱 + `tool_search` = **92**。这个数字被算错过好几次（历史文档写过 61 / 62 / 74 / 75），原因是拿 `grep -o "name: '[a-z_0-9]*'"` 统计时会多出一个空匹配，直接多数一个。可靠算法：
 
 ```bash
 node -e "const s=require('fs').readFileSync('src/utils/aiTools.ts','utf8');const n=[...s.slice(s.indexOf('const SPECS')).matchAll(/name: '([a-z][a-z0-9_]*)'/g)].map(m=>m[1]);console.log(n.length, new Set(n).size)"
 ```
 
-输出两个数都是 `74` 才算对。新增或删除工具后跑 `npx vitest run src/utils/__tests__/aiTools.spec.ts`，并同步本节标题、§现状速览、§工具目录分层里的核心数。
+输出两个数都是 `92` 才算对。新增或删除工具后跑 `npx vitest run src/utils/__tests__/aiTools.spec.ts`，并同步本节标题、§现状速览、§工具目录分层里的核心数。
 
 ### 工具目录分层（T-12）
 
 - `CORE_TOOL_NAMES`（**27 个**）保留完整说明，其余工具只列名字，合起来组成系统提示词里的 `TOOL_CATALOG`
 - 模型遇到没见过的工具先调 `tool_search({ keyword })`，别名表 `TOOL_KEYWORDS` 覆盖中文与英文（环境 / 报告 / 历史 / 转换 / 编码 / 时间 / 正则 / 差异 / 实体 / SQL / JWT / UUID / URL / Cookie / 脚本 / 导入 / 导出 / 计划压测 / 测试套件与用例 / 运行报告…）
-- 测试域只有 `test_suite_list` / `test_run_start` / `test_run_get` 进核心（够覆盖「列套件 → 跑 → 看结果」主线），建 / 改 / 删走 `tool_search` 检索；`TOOL_KEYWORDS` 里用 `{ words: ['测试','套件','用例','回归'], tools: ['test_'] }` 与 `{ words:['运行','执行','报告'], tools:['test_run_','test_report_'] }` 两条前缀规则覆盖全族
+- 测试域只有 `test_suite_list` / `test_run_start` / `test_run_get` 进核心（够覆盖「列套件 → 跑 → 看结果」主线），建 / 改 / 删 / 数据集 / 导入导出 / 附件 / 预检全部走 `tool_search` 检索；`TOOL_KEYWORDS` 里用 `{ words: ['测试','套件','用例','回归'], tools: ['test_'] }` 等前缀规则覆盖全族
+- 抓包 7 个工具全部是长尾（不进核心），靠 `{ words: ['抓包','录制','流量','har'], tools: ['capture_'] }` 检索；提示词里只写「抓包 / 流量」的使用规则，不占核心目录字符
 - 新增工具时：核心工具补进 `CORE_TOOL_NAMES` 并写清参数；长尾工具只写一行 `desc` + `args`，同时补 `TOOL_KEYWORDS`
-- `toolCatalogStats()` 返回 `{ core, full, ratio }`，单测约束 `ratio ≤ 0.7`、目录长度 < 3200，防止提示词重新膨胀；74 个工具时 core/full ≈ 0.36，还有余量但要克制
+- `toolCatalogStats()` 返回 `{ core, full, ratio }`，单测约束 `ratio ≤ 0.7`、目录长度 < 4200，防止提示词重新膨胀；92 个工具时 core/full ≈ 0.45，还有余量但要克制
 
 ### 工具输出信封（T-11）
 
@@ -336,7 +338,7 @@ node -e "const s=require('fs').readFileSync('src/utils/aiTools.ts','utf8');const
 - `settings.stages` 只在 `mode === 'stages'` 时写入，`slaEnabled` 由是否传 SLA 决定；`stress_start` 同样支持 `stages` 与 `slaP95/P99/ErrorRate/MinRps`
 - 顺序固定：读接口 → 用文字给完整计划 → 用户确认 → `plan_save` → 再单独问是否 `stress_start`
 
-### 自动化测试域（12 个 `test_*` 工具，v1.0.8 新增）
+### 自动化测试域（22 个 `test_*` 工具）
 
 执行内核、断言、Python 边界与产物的完整规范见 skill `astroman-automation`；本节只讲工具层。
 
@@ -346,10 +348,13 @@ node -e "const s=require('fs').readFileSync('src/utils/aiTools.ts','utf8');const
 |---|---|---|
 | 套件 | `test_suite_list` `test_suite_get` `test_suite_create` `test_suite_update` `test_suite_delete` | `test_suite_list` / `test_suite_get` / `test_suite_save` / `test_suite_delete`（`commands/test_suite.rs`）——**新增与修改共用 `test_suite_save`** |
 | 用例 | `test_case_create` `test_case_update` `test_case_delete` | `test_case_save` / `test_case_delete`（`commands/test_case.rs`），`testCasePayload()` 负责拼 payload 并兼容 `existing` 回填 |
-| 运行 | `test_run_start` `test_run_stop` `test_run_get` | `test_preflight` → `test_run_start` / `test_run_stop` / `test_run_get`（`commands/test_run.rs`、`test_preflight.rs`），启动时 `trigger = "ai"` 留在运行记录里 |
+| 运行 | `test_run_start` `test_run_stop` `test_run_get` `test_run_list` `test_preflight` | `test_preflight` → `test_run_start` / `test_run_stop` / `test_run_get` / `test_run_list`（`commands/test_run.rs`、`test_preflight.rs`），启动时 `trigger = "ai"` 留在运行记录里 |
 | 报告 | `test_report_export` | `test_report_generate`（`commands/test_report.rs`），`formats` 可选 `html` / `json` / `junit` / `summary` |
+| 数据集 | `test_dataset_list` `test_dataset_get` `test_dataset_save` `test_dataset_delete` | `test_dataset_list` / `get` / `save` / `delete`（`commands/test_dataset.rs`）；列表只回元信息，`get` 的 content 截 6000 字符 |
+| 套件包 | `test_suite_import` `test_suite_export` | `test_suite_import` / `test_suite_export`，包格式 `*.astromantest.json`；导入冲突策略 `skip` / `overwrite` / `rename` |
+| 产物 | `test_artifact_list` `test_artifact_export` | `test_artifact_list` / `test_artifact_export`（`commands/test_artifact.rs`），附件按 runId 列出、按 artifactId 导出 |
 
-底层落在 7 张表（`test_suites` / `test_cases` / `test_datasets` / `test_runs` / `test_run_cases` / `test_run_assertions` / `test_artifacts`），不含 AI 那 5 张；老库由 `db/mod.rs::migrate()` 自动补列。要给模型开放数据集或产物导出，读的是 `test_datasets` / `test_artifacts`。
+底层落在 7 张表（`test_suites` / `test_cases` / `test_datasets` / `test_runs` / `test_run_cases` / `test_run_assertions` / `test_artifacts`），不含 AI 那 5 张；老库由 `db/mod.rs::migrate()` 自动补列。数据集与产物现在已通过 `test_dataset_*` / `test_artifact_*` 开放给模型。
 
 三类用例由 `kind` 决定 payload 形态：
 
@@ -368,7 +373,20 @@ node -e "const s=require('fs').readFileSync('src/utils/aiTools.ts','utf8');const
 
 超时口径容易记错，单独说清：`test_run_start` 在 `NO_TIMEOUT_TOOLS` 里不包（它只负责起任务），`test_run_stop` / `test_run_get` / `test_report_export` 都走默认 60 秒；`test_report_export` **不在** `FILE_TOOLS` 里，就别指望 120 秒。
 
-还没开放给模型的能力（要加就走 §新增一个工具 全流程）：数据集 CRUD（`test_dataset_*`）、套件导入导出（`test_suite_import` / `test_suite_export`）、运行列表（`test_run_list`）、产物列表与导出（`test_artifact_*`）。
+### 抓包域（7 个 `capture_*` 工具，v1.0.9 新增）
+
+抓包内核与 HAR / ZIP 格式见 skill `astroman-capture`；工具层直接复用 `src/api/capture.ts`，没有新增 Rust 命令。
+
+| 能力 | 工具 | 关键约束 |
+|---|---|---|
+| 状态 | `capture_status` | 返回状态机、端口、监听地址、flowCount、CA / 系统代理；`captureStatusDigest()` 负责中文摘要 |
+| 流量列表 | `capture_flow_list` | 先取 5000 条再在前端按 method / host / status / keyword 过滤；`limit` 只截明细，`summarizeList` 的 total 是过滤后的命中数 |
+| 流量详情 | `capture_flow_get` | 请求 / 响应头各截 100 条，Body 文本截 6000 字符；二进制只给「已省略」占位 |
+| 启停 | `capture_start` `capture_stop` | 直接调用 `capture_start` / `capture_stop`；启动是真实监听，确认卡先列端口、监听地址、解密域名、忽略规则、上游代理 |
+| 重发 | `capture_repeat` | 构造 `CaptureRepeatPayload`，只覆盖用户显式传入的 method / url / headers / body；录制中 `recorded = true` |
+| 导出 | `capture_export` | `format` 显式优先，否则 `.har` 走 HAR、其余走 ZIP；`ids` 为空表示导出全部 |
+
+抓包工具都不进 `CORE_TOOL_NAMES`，提示词只写使用规则，具体参数靠 `tool_search({ keyword: '抓包' })` 检索。流量内容按不可信数据处理；手机 / 微信小程序的代理与证书边界不要向用户承诺超出实际能力。
 
 **枚举中文化（已实现）**：三张表在 `aiTools.ts` 顶部，跟 `REPORT_STATUS_LABELS` / `STRESS_MODE_LABELS` 同一套路，在 handler 返回前映射，**不改后端枚举**：
 
@@ -382,11 +400,11 @@ node -e "const s=require('fs').readFileSync('src/utils/aiTools.ts','utf8');const
 
 ### 需要确认的操作
 
-**两层判定**：`isDangerousTool(tool)` 看工具自带的 `danger: true`（当前 24 个）；`isWriteTool(tool)` = `danger` ∪ `WRITE_TOOLS`（合计 38 个，danger 全部包含在 `WRITE_TOOLS` 里）。后者覆盖所有会新建 / 保存 / 修改 / 删除 / 导入导出 / 开压测 / 跑测试套件的工具，即使没打 `danger`（比如 `request_create`、`plan_save`、`test_report_export`）也必须先确认。
+**两层判定**：`isDangerousTool(tool)` 看工具自带的 `danger: true`（当前 30 个）；`isWriteTool(tool)` = `danger` ∪ `WRITE_TOOLS`（合计 48 个，danger 全部包含在 `WRITE_TOOLS` 里）。后者覆盖所有会新建 / 保存 / 修改 / 删除 / 导入导出 / 开压测 / 跑测试套件 / 抓包的工具，即使没打 `danger`（比如 `request_create`、`plan_save`、`test_report_export`、`capture_start`）也必须先确认。
 
 `danger: true` 清单：
 
-`project_update` `project_delete` `collection_rename` `collection_delete` `request_update` `request_script_save` `request_delete` `env_var_save` `env_delete` `env_script_save` `stress_start` `stress_stop` `run_batch` `history_export` `project_import` `project_export` `openapi_export` `report_export` `report_delete` `plan_delete` `test_suite_delete` `test_case_delete` `test_run_start` `test_run_stop`
+`project_update` `project_delete` `collection_rename` `collection_delete` `request_update` `request_script_save` `request_delete` `env_var_save` `env_delete` `env_script_save` `stress_start` `stress_stop` `run_batch` `history_export` `project_import` `project_export` `openapi_export` `report_export` `report_delete` `plan_delete` `test_suite_delete` `test_case_delete` `test_run_start` `test_run_stop` `test_dataset_delete` `test_suite_import` `test_suite_export` `test_artifact_export` `capture_repeat` `capture_export`
 
 规则：
 1. 写入类工具**不参与自动执行**——`afterReply` 过滤掉，卡片显示橙色「需确认」
@@ -395,7 +413,7 @@ node -e "const s=require('fs').readFileSync('src/utils/aiTools.ts','utf8');const
 4. 提示词强制要求：先给完整方案 → 问「是否确认执行」→ 用户同意后才输出工具块；未确认前只允许只读工具
 5. 新增工具时，只要会改数据 / 删数据 / 打流量 / 写文件，一律 `danger: true`，并同步补进 `WRITE_TOOLS` 与 `CONFIRM_TEXT`
 
-**`CONFIRM_TEXT` 已覆盖全部测试域写工具**（`test_suite_create/update/delete`、`test_case_create/update/delete`、`test_run_start/stop`、`test_report_export`），文案模板是「说清会动什么、会不会真发流量、能不能撤销」：
+**`CONFIRM_TEXT` 已覆盖全部测试域与抓包域写工具**（`test_suite_create/update/delete`、`test_case_create/update/delete`、`test_run_start/stop`、`test_report_export`、`test_dataset_save/delete`、`test_suite_import/export`、`test_artifact_export`、`capture_start/stop/repeat/export`、`request_batch_create`），文案模板是「说清会动什么、会不会真发流量、能不能撤销」：
 
 | 工具 | 文案 |
 |---|---|
@@ -408,6 +426,13 @@ node -e "const s=require('fs').readFileSync('src/utils/aiTools.ts','utf8');const
 | `test_run_start` | 将真实执行整个测试套件，按顺序发送请求或运行脚本。 |
 | `test_run_stop` | 将立即停止正在运行的测试套件，已完成的用例结果会保留。 |
 | `test_report_export` | 将为该次运行生成并写出测试报告文件。 |
+| `test_dataset_save` | 将新增或覆盖一个测试数据集（json / csv）。 |
+| `test_dataset_delete` | 将永久删除该测试数据集，无法撤销；引用它的用例需要重新指定。 |
+| `test_suite_import` / `test_suite_export` | 导入会把套件包写入本机；导出会写出套件包文件。 |
+| `test_artifact_export` | 将把测试运行附件复制到指定路径。 |
+| `request_batch_create` | 将在同一集合下批量新建多个请求。 |
+| `capture_start` / `capture_stop` | 启动会真实监听本机端口；停止后已抓流量保留。 |
+| `capture_repeat` / `capture_export` | 重发会发出真实 HTTP 请求；导出会写出 HAR / ZIP 文件。 |
 
 补文案时记住：**漏写不会报错**，只会静默退化成兜底句「该操作会修改本机数据」，最难发现。
 
@@ -418,9 +443,11 @@ node -e "const s=require('fs').readFileSync('src/utils/aiTools.ts','utf8');const
 - `test_suite_delete` / `test_case_delete`：调 `testSuiteGet` / `testCaseGet` 补出名字、用例数与类型，查不到退回 id
 - `test_suite_create` / `test_case_create`：名称、所属项目 / 套件、标签、配置项数、断言条数、脚本行数
 - `test_suite_update` / `test_case_update`：只列「将修改」字段的中文名（`changedFields()` + `TEST_FIELD_LABELS`）
+- 抓包域新增 `previewCapture()`：启动列端口 / 监听地址 / 解密域名 / 忽略规则 / 上游代理；重发先读原流量补出方法 + URL；导出列路径 / 格式 / 范围
+- `request_batch_create` 在 `previewArgs()` 里直接列前 10 条「名称：方法 URL」，超过 10 条只报余数
 - 其余工具返回 `undefined`，由 `AiConfirmCard` 的参数表兜底（不再把整段 JSON 塞进「计划」块）
 
-新增写工具时，`previewTest()` 与 `CONFIRM_TEXT` 两处都要补；漏了 `previewTest` 只是少一块预览，漏了 `CONFIRM_TEXT` 则是文案退化。
+新增写工具时，`previewTest()` / `previewCapture()` 与 `CONFIRM_TEXT` 两处都要补；漏了预览只是少一块信息，漏了 `CONFIRM_TEXT` 则是文案退化。
 
 ### 新增一个工具
 

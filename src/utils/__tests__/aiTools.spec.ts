@@ -147,8 +147,9 @@ describe('阶段四：工具生态', () => {
     // 长尾工具只在名字清单里出现，不再占提示词字符
     expect(TOOL_CATALOG).toContain('toolbox_json_to_entity')
     expect(TOOL_CATALOG).not.toContain('把 JSON 转成 Java')
-    // 目录整体保持精简（v1.0.8 新增测试域 3 个核心工具，上限随之放宽）
-    expect(TOOL_CATALOG.length).toBeLessThan(3800)
+    // 目录整体保持精简（v1.0.9 新增抓包 7 + 测试 10 + 批量创建 1 个长尾工具，
+    // 只增加名字、不增加说明，上限随名字清单长度放宽）
+    expect(TOOL_CATALOG.length).toBeLessThan(4200)
     // 验收：注入字符数相比全量目录下降 ≥30%
     const stats = toolCatalogStats()
     expect(stats.ratio).toBeLessThanOrEqual(0.7)
@@ -192,5 +193,96 @@ describe('阶段四：工具生态', () => {
     expect(testCaseKindLabel('REQUEST')).toBe('接口用例')
     expect(testCaseKindLabel('network')).toBe('')
     expect(testCaseKindLabel(undefined)).toBe('')
+  })
+})
+
+describe('P0：抓包域与测试域补齐', () => {
+  it('抓包 7 个工具已注册，启停 / 重发 / 导出需确认', () => {
+    const names = toolNames()
+    for (const name of [
+      'capture_status',
+      'capture_flow_list',
+      'capture_flow_get',
+      'capture_start',
+      'capture_stop',
+      'capture_repeat',
+      'capture_export',
+    ]) {
+      expect(names).toContain(name)
+    }
+    expect(isWriteTool('capture_start')).toBe(true)
+    expect(isWriteTool('capture_stop')).toBe(true)
+    expect(isWriteTool('capture_repeat')).toBe(true)
+    expect(isWriteTool('capture_export')).toBe(true)
+    expect(isWriteTool('capture_status')).toBe(false)
+    expect(isWriteTool('capture_flow_list')).toBe(false)
+    expect(isWriteTool('capture_flow_get')).toBe(false)
+    expect(toolTimeoutOf('capture_export', { path: 'D:\\a.har' })).toBe(120_000)
+  })
+
+  it('测试域补齐 10 个工具：写入需确认、只读自动执行', () => {
+    const names = toolNames()
+    for (const name of [
+      'test_dataset_list',
+      'test_dataset_get',
+      'test_dataset_save',
+      'test_dataset_delete',
+      'test_suite_import',
+      'test_suite_export',
+      'test_run_list',
+      'test_artifact_list',
+      'test_artifact_export',
+      'test_preflight',
+    ]) {
+      expect(names).toContain(name)
+    }
+    expect(isWriteTool('test_dataset_save')).toBe(true)
+    expect(isWriteTool('test_dataset_delete')).toBe(true)
+    expect(isWriteTool('test_suite_import')).toBe(true)
+    expect(isWriteTool('test_suite_export')).toBe(true)
+    expect(isWriteTool('test_artifact_export')).toBe(true)
+    expect(isWriteTool('test_dataset_list')).toBe(false)
+    expect(isWriteTool('test_dataset_get')).toBe(false)
+    expect(isWriteTool('test_run_list')).toBe(false)
+    expect(isWriteTool('test_artifact_list')).toBe(false)
+    expect(isWriteTool('test_preflight')).toBe(false)
+    expect(toolTimeoutOf('test_suite_import', { path: 'D:\\a.json' })).toBe(120_000)
+    expect(toolTimeoutOf('test_suite_export', { suiteId: 1, path: 'D:\\a.json' })).toBe(120_000)
+    expect(toolTimeoutOf('test_artifact_export', { artifactId: 1, path: 'D:\\a.log' })).toBe(120_000)
+    expect(toolTimeoutOf('test_preflight', { suiteId: 1 })).toBe(60_000)
+  })
+
+  it('request_batch_create 已注册且参数受约束', () => {
+    expect(toolNames()).toContain('request_batch_create')
+    expect(isWriteTool('request_batch_create')).toBe(true)
+    expect(validateToolArgs('request_batch_create', { collectionId: 1, requests: [] })).toContain(
+      '至少需要 1 项',
+    )
+    expect(validateToolArgs('request_batch_create', { collectionId: 1, requests: [{}] })).toBeNull()
+    expect(toolTimeoutOf('request_batch_create', { collectionId: 1, requests: [{}] })).toBe(60_000)
+  })
+
+  it('send_request 可以只传 requestId，走已保存请求的脚本链路', () => {
+    expect(validateToolArgs('send_request', { requestId: 12 })).toBeNull()
+    expect(validateToolArgs('send_request', {})).toBeNull()
+    expect(validateToolArgs('send_request', { method: 'FETCH', url: 'https://a.com' })).toContain(
+      '必须是',
+    )
+  })
+
+  it('新工具参数强校验', () => {
+    expect(validateToolArgs('capture_flow_get', {})).toBe('缺少必填参数 id')
+    expect(validateToolArgs('capture_export', { path: 'out.har' })).toContain('绝对路径')
+    expect(validateToolArgs('capture_export', { path: 'D:\\out.har', format: 'json' })).toContain(
+      '必须是',
+    )
+    expect(validateToolArgs('capture_flow_list', { status: 99 })).toContain('不能小于 100')
+    expect(validateToolArgs('test_dataset_save', { format: 'yaml' })).toContain('必须是')
+    expect(validateToolArgs('test_suite_export', {})).toBe('缺少必填参数 suiteId')
+    expect(validateToolArgs('test_artifact_export', { artifactId: 1, path: 'a.log' })).toContain(
+      '绝对路径',
+    )
+    expect(validateToolArgs('test_preflight', {})).toBe('缺少必填参数 suiteId')
+    expect(validateToolArgs('test_run_list', { size: 500 })).toContain('不能大于 100')
   })
 })

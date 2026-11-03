@@ -1,6 +1,6 @@
 [package]
 name = "astroman"
-version = "1.0.8"
+version = "1.0.9"
 description = "AstroMan - 本地 API 调试与压测工具"
 edition = "2021"
 # 新增 astroman-cli 后仍让 `cargo run`（tauri dev 使用）默认启动桌面端
@@ -35,7 +35,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 thiserror = "2"
 log = "0.4"
 env_logger = "0.11"
-tokio = { version = "1", features = ["time", "sync", "rt"] }
+tokio = { version = "1", features = [
+  "time", "sync", "rt", "rt-multi-thread", "net", "io-util", "macros", "fs"
+] }
 md-5 = "0.10"
 sha1 = "0.10"
 sha2 = "0.10"
@@ -44,6 +46,14 @@ regex = "1"
 argon2 = "0.5"
 # 仅用 tower 的 Layer/Service 抽象给 reqwest 加计时连接器（已在依赖树中，无新增体积）
 tower = { version = "0.5", default-features = false }
+# 抓包内核：0.25 才提供 should_intercept_tls（要求 Rust >= 1.86）
+hudsucker = { version = "0.25", default-features = false, features = [
+  "http2", "rcgen-ca", "rustls-client", "decoder"
+] }
+http-body-util = "0.1"
+bytes = "1"
+# 抓包 ZIP 导出：只启用 deflate，避免带入 bzip2 / zstd 等未用压缩器
+zip = { version = "2", default-features = false, features = ["deflate"] }
 sysinfo = { version = "0.33", default-features = false, features = ["system", "disk", "network"] }
 
 [target.'cfg(windows)'.dependencies]
@@ -54,6 +64,7 @@ windows-sys = { version = "0.60", features = [
   "Win32_NetworkManagement_IpHelper",
   "Win32_NetworkManagement_Ndis",
   "Win32_Networking_WinSock",
+  "Win32_Networking_WinInet",
   "Win32_Security_Credentials"
 ] }
 

@@ -27,11 +27,14 @@ AstroMan/
 │  ├─ types/models.ts # 与 Rust models.rs 对应的 TS 类型
 │  ├─ utils/          # scriptRunner（脚本引擎）、cryptoScript、rsa、curl、xlsx、diff、mybatis、markdown
 │  │                  # 报告：reportExport（HTML/Excel/JSON）、reportAnalytics（QPS/拐点/体检/自洽）、reportNarrative
-│  │                  # AI：aiTools（74 个工具：73 业务 + tool_search）、aiProtocol（围栏协议）、contextBudget（token 预算）、modelMeta（窗口）、untrusted（注入隔离）、aiPricing（费用）、promptText（压缩）
+│  │                  # AI：aiTools（92 个工具：79 业务 + 12 工具箱 + tool_search）、aiProtocol（围栏协议）、contextBudget（token 预算）、modelMeta（窗口）、untrusted（注入隔离）、aiPricing（费用）、promptText（压缩）
 │  └─ views/          # Dashboard / Projects / Project / RequestEditor / StressTest / Runner / Automation / Reports / History
 │                     # Tools / SystemMonitor / Settings / Environment / ReportDetail / AiAssistant / AiUsage / AiToolLogs
+│                     # Capture（抓包：流量列表 / 详情 / 设置抽屉 / 重发弹窗）
 ├─ src-tauri/
 │  ├─ src/commands/   # 每个文件一个业务域，全部 #[tauri::command]；测试域为 test_suite/test_case/test_pack/test_preflight/test_run/test_report
+│  │                  # capture.rs：抓包启停、清单、CA、系统代理、HAR / ZIP、改参重发
+│  ├─ src/capture/    # 抓包内核：mod（生命周期）/ proxy / handler / store / ca / sysproxy / har / archive
 │  ├─ src/db/         # schema.sql + mod.rs（init → migrate → seed）+ seed.rs
 │  ├─ src/test_runner.rs   # 自动化测试执行内核（不依赖 Tauri，CLI 复用）
 │  ├─ src/test_assert.rs   # 6 类声明式断言
@@ -63,7 +66,7 @@ npm run test       # vitest run：10 spec / 134 条
 npm run version:check       # 三处版本号一致性校验，不一致退出码 1
 npm run version:set 1.0.8   # 一次写入 package.json / tauri.conf.json / Cargo.toml
 cargo check        # 在 src-tauri 目录执行
-cargo test --lib   # 101 条 Rust 用例
+cargo test --lib   # 106 条 Rust 用例
 cargo tarpaulin --config tarpaulin.toml   # 覆盖率门槛；Windows 本地加 --engine llvm
 ```
 
@@ -114,6 +117,8 @@ Windows 下 `cargo check` 在受限沙箱里会命中 `D:\Software\Rust\cargo\.g
 - 自动化测试：桌面端与 `astroman-cli` 共用 `test_runner::run_suite`，产物写 `<数据目录>/test-reports/<runId>/` 且库里只存相对路径；改判定逻辑必须两端一起验
 - 工具箱：92 个工具的实现全部在 `src/tools/*.ts` 纯函数，`registry.ts` 只做声明；页面与 `ToolWorkbench` 只管交互
 - 压测报告 QPS 指标组唯一入口：`utils/reportAnalytics.ts::qpsOverview()`，详情页与 HTML / Excel 导出都调它
+- 抓包：流量**只存内存**（5000 条 / 128 MB body），不写 SQLite；根证书在 `<数据目录>/certs/`；Windows 系统代理改动先备份到数据目录并在停止/退出/下次启动时还原；macOS / Linux 只能手动设代理与装证书
+- 抓包网络请求由 hudsucker MITM 代理转发，不走 `commands/http.rs` 的 reqwest 客户端；「重发」在录制中经本机代理，未录制时直连
 
 ## 配套 skill
 
@@ -124,6 +129,7 @@ Windows 下 `cargo check` 在受限沙箱里会命中 `D:\Software\Rust\cargo\.g
 | `astroman-frontend` | 页面骨架、主题变量、脚本引擎、导出 |
 | `astroman-appearance` | 21 套主题的变量约定与新增流程、对比度校验、航仔贴图与拖拽、线框图标 |
 | `astroman-dashboard` | 工作台首页区块、历史记录页数据大屏、引导 / 技巧 / FAQ 文案口径、Runner 与测试场景介绍 |
+| `astroman-capture` | 抓包模块：MITM 代理、录制上限、根证书、系统代理、手机与微信边界、HAR / ZIP 导出、改参重发 |
 | `astroman-automation` | 自动化测试子系统：套件 / 用例 / 断言 / 数据集 / Python 钩子 / 运行产物 / CLI 退出码 / 压测门禁 |
 | `astroman-toolbox` | 离线工具箱：92 个工具的注册契约、两种接入方式、新增流程、搜索别名与工具清单同步 |
 | `astroman-ai` | AI 助手「航仔」：双模式、三协议、流式渲染、上下文预算与摘要、停止/重试/工具超时、注入隔离、74+1 工具与目录分层、写操作确认卡、消息操作、复盘时间线、会话管理 |

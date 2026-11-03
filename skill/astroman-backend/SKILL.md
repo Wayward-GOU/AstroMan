@@ -27,6 +27,8 @@ description: AstroMan 的 Rust/Tauri 后端开发规范。改数据库 schema、
 | `commands/files.rs` / `commands/storage.rs` | 文本文件读写、数据目录迁移 |
 | `commands/settings.rs` | 代理与客户端证书设置 |
 | `commands/system.rs` / `commands/winstats.rs` | 应用信息、工作区统计、首页数据大屏聚合（`dashboard_metrics`）、Windows 进程指标 |
+| `commands/capture.rs` | 抓包启停 / 状态 / 流量清单与详情 / CA / 系统代理 / HAR / ZIP 导出 / 保存 body / 改参重发 |
+| `capture/` | 抓包内核：`mod`（生命周期）/ `proxy` / `handler` / `store` / `ca` / `sysproxy` / `har` / `archive`（详见 `astroman-capture`） |
 | `commands/update.rs` | 版本检查与下载 |
 | `commands/ai.rs` | AI 助手「航仔」：服务商、流式对话、会话消息、工具流水（详见 `astroman-ai`） |
 | `commands/test_suite.rs` / `commands/test_case.rs` | 测试套件、用例、数据集的 CRUD（`test_suite_save` 兼新建与更新） |
@@ -122,6 +124,18 @@ description: AstroMan 的 Rust/Tauri 后端开发规范。改数据库 schema、
 - 压测请求自身也会写历史，注意不要绕过 `MAX_HISTORY` 裁剪
 - 请求体与手动发送走同一套规则：`body_type == "json"` 时先 `strip_json_comments` 再渲染变量，保证「请求编辑器能发、压测也能发」
 
+## 抓包后端（`capture/` + `commands/capture.rs`）
+
+- **不写库**：流量全部在 `capture/store.rs` 的内存 `VecDeque` 里，上限 5000 条 / 128 MB body，超出淘汰最旧；重启即清空。不要顺手加 `INSERT`，需要留档走 HAR / ZIP 导出。
+- 代理跑独立线程 + `current_thread` tokio runtime（线程名 `capture-proxy`）；`Runtime` 不能在 async 上下文 drop，也不要和 Tauri 主 runtime 混用。
+- 默认端口 8888，占用时向上扫 10 个；`bind_addr` 默认 `127.0.0.1`，手机抓包显式传 `0.0.0.0`。
+- 单条 body 上限 2 MB、完整读取上限 8 MB、图片预览上限 1 MB；SSE 不缓冲；压缩响应先解码。
+- CA 文件在 `<数据目录>/certs/`；Windows 一键安装走 `certutil -user -f -addstore Root`，macOS / Linux 只支持导出。
+- 系统代理由 `capture/sysproxy.rs` 接管 Windows `HKCU` WinINET，改动前备份到数据目录，停止 / 线程退出 / 下次启动都会还原；非 Windows 返回明确错误。
+- 改配置结构（`CaptureConfig` / `CaptureStatus` / `CaptureFlow*`）要同步 `src/types/capture.ts`；新增命令注册到 `lib.rs::generate_handler!`。
+- 改录制或重发逻辑后跑 `cargo test --lib capture`（代理转发 + 未录制重发覆盖参数），再用 `npm run tauri dev` 手工冒烟。
+- 手机 / 微信边界、HTTPS 排错与命令清单见 skill `astroman-capture`。
+
 ## 自动化测试执行内核（v1.0.8 新增）
 
 七张表：`test_suites` / `test_cases` / `test_datasets` / `test_runs` / `test_run_cases` / `test_run_assertions` / `test_artifacts`。老库由 `db/mod.rs::migrate()` 逐列补齐，不改存量数据。
@@ -135,7 +149,7 @@ description: AstroMan 的 Rust/Tauri 后端开发规范。改数据库 schema、
 - 产物目录 `<数据目录>/test-reports/<runId>/`（`report.html` / `report.json` / `junit.xml` / `summary.txt` / `logs/` / `files/`），**库里只存相对路径**，切换数据目录后历史仍可读；每套件保留 50 份，启动时清理无主目录
 - 改断言、钩子或数据行语义后至少跑 `cargo test --lib test_runner:: test_assert:: test_dataset:: python_exec::`（合计 32 条）
 
-完整流程（预检项、退出码、套件包、AI 12 个测试域工具）见 skill `astroman-automation`。
+完整流程（预检项、退出码、套件包、AI 22 个测试域工具）见 skill `astroman-automation`。
 
 ## 统计聚合
 

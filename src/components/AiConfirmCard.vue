@@ -65,6 +65,21 @@ const labelMap: Record<string, string> = {
   setupScript: '前置脚本',
   teardownScript: '后置脚本',
   mainScript: '主脚本',
+  content: '内容',
+  port: '端口',
+  bindAddr: '监听地址',
+  sslHosts: '解密域名',
+  ignorePatterns: '忽略规则',
+  captureStatic: '抓取静态资源',
+  upstreamProxy: '上游代理',
+  onConflict: '同名冲突策略',
+  artifactId: '附件',
+  ids: '流量 ID 列表',
+  requests: '请求列表',
+  keyword: '关键字',
+  host: '域名',
+  status: '状态码',
+  rowCount: '数据行数',
 }
 
 /** 预览值：短参数直接展示，长参数（如整条 cURL、大 Body）完整保留并单独滚动 */
@@ -101,6 +116,8 @@ function display(value: unknown): PreviewValue {
 function rowLabel(key: string): string {
   if (key === 'id' && props.tool.startsWith('test_suite')) return '测试套件'
   if (key === 'id' && props.tool.startsWith('test_case')) return '测试用例'
+  if (key === 'id' && props.tool.startsWith('test_dataset')) return '数据集'
+  if (key === 'id' && props.tool.startsWith('capture')) return '抓包流量'
   return labelMap[key] ?? key
 }
 
@@ -127,15 +144,22 @@ const targets = computed(() => {
   push(args.envId, '环境')
   push(args.suiteId, '测试套件')
   push(args.runId, '运行记录')
-  // test_* 的删除 / 修改只传 id，按工具前缀说清它是套件还是用例
+  push(args.datasetId, '数据集')
+  push(args.artifactId, '附件')
+  // test_* 的删除 / 修改只传 id，按工具前缀说清它是什么对象
   push(
     args.id,
     props.tool.startsWith('test_suite')
       ? '测试套件'
       : props.tool.startsWith('test_case')
         ? '测试用例'
-        : '对象',
+        : props.tool.startsWith('test_dataset')
+          ? '数据集'
+          : props.tool.startsWith('capture')
+            ? '抓包流量'
+            : '对象',
   )
+  if (Array.isArray(args.requests)) list.push(`批量请求 ${args.requests.length} 个`)
   if (typeof args.path === 'string' && args.path.trim()) list.push(`文件 ${args.path}`)
   return list.length ? [...new Set(list)] : ['本机数据']
 })

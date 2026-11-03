@@ -14,7 +14,7 @@ description: AstroMan 的打包、图标、托盘与发布流程。需要构建 
 | macOS 安装包 | `npm run build:mac` | `AstroMan_<版本>_universal.dmg` |
 | 仅校验 Rust | `cd src-tauri && cargo check` | — |
 | 前端单测 | `npm run test` | vitest：10 spec / 134 条 |
-| Rust 单测 | `cd src-tauri && cargo test --lib` | 101 条 |
+| Rust 单测 | `cd src-tauri && cargo test --lib` | 106 条 |
 | 覆盖率（本地） | `cd src-tauri && cargo tarpaulin --config tarpaulin.toml --engine llvm` | `target/coverage/` |
 | 版本号 | `npm run version:check` / `npm run version:set 1.0.8` | 三处版本一致 |
 

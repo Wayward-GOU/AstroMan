@@ -13,6 +13,7 @@ import {
   envCreate,
   envDelete,
   envList,
+  envPlainVars,
   envScriptSave,
   envVarSave,
   fileWriteText,
@@ -44,22 +45,41 @@ import {
   runList,
   stressStart,
   stressStop,
+  testArtifactExport,
+  testArtifactList,
   testCaseDelete,
   testCaseGet,
   testCaseSave,
+  testDatasetDelete,
+  testDatasetGet,
+  testDatasetList,
+  testDatasetSave,
   testPreflight,
   testReportGenerate,
   testRunGet,
+  testRunList,
   testRunStart,
   testRunStop,
   testSuiteDelete,
+  testSuiteExport,
   testSuiteGet,
+  testSuiteImport,
   testSuiteList,
   testSuiteSave,
   toolHash,
   toolHmac,
   workspaceStats,
 } from '@/api'
+import {
+  captureExportHar,
+  captureExportZip,
+  captureFlowDetail,
+  captureFlows,
+  captureRepeat,
+  captureStart,
+  captureStatus,
+  captureStop,
+} from '@/api/capture'
 import type {
   CookieItem,
   DashboardMetrics,
@@ -73,14 +93,32 @@ import type {
   ReportRequestsPage,
   RequestAuth,
   RequestRun,
-  SendRequestPayload,
   SlaTargets,
   StressConfig,
   StressReport,
   StressStage,
   TestCase,
   TestCasePayload,
+  TestDatasetPayload,
 } from '@/types/models'
+import type {
+  CaptureBody,
+  CaptureFlow,
+  CaptureHeader,
+  CaptureRepeatPayload,
+  CaptureStartOptions,
+  CaptureStatus,
+} from '@/types/capture'
+import { runScriptJob } from '@/utils/scriptHost'
+import {
+  clearRuntimeVars,
+  listRuntimeVars,
+  renderRuntimeVars,
+  setRuntimeVars,
+  type ScriptAssertion,
+  type ScriptLog,
+  type ScriptRequest,
+} from '@/utils/scriptRunner'
 import { diffAsText, diffLines } from '@/tools/analysis'
 import { timestampInfo, uuidV4 } from '@/tools/calc'
 import {
@@ -205,8 +243,10 @@ const SCHEMAS: Record<string, Record<string, ArgRule>> = {
     auth: { kind: 'any' },
   },
   send_request: {
-    method: { kind: 'string', required: true, enum: METHODS },
-    url: { kind: 'string', required: true },
+    // 传 requestId 时加载已保存请求的脚本与断言；不传则按裸请求发送
+    requestId: { kind: 'number' },
+    method: { kind: 'string', enum: METHODS },
+    url: { kind: 'string' },
     headers: { kind: 'any' },
     params: { kind: 'any' },
     bodyType: { kind: 'string', enum: BODY_TYPES },
@@ -502,6 +542,77 @@ const SCHEMAS: Record<string, Record<string, ArgRule>> = {
     runId: { kind: 'number', required: true },
     formats: { kind: 'array', item: 'string' },
   },
+  /* ---------------- 抓包域 ---------------- */
+  capture_status: {},
+  capture_flow_list: {
+    limit: { kind: 'number', min: 1, max: 5000 },
+    method: { kind: 'string', enum: METHODS },
+    host: { kind: 'string' },
+    status: { kind: 'number', min: 100, max: 599 },
+    keyword: { kind: 'string' },
+  },
+  capture_flow_get: { id: { kind: 'number', required: true } },
+  capture_start: {
+    port: { kind: 'number', min: 1, max: 65535 },
+    bindAddr: { kind: 'string' },
+    sslHosts: { kind: 'array', item: 'string' },
+    ignorePatterns: { kind: 'array', item: 'string' },
+    captureStatic: { kind: 'boolean' },
+    upstreamProxy: { kind: 'string' },
+  },
+  capture_stop: {},
+  capture_repeat: {
+    id: { kind: 'number', required: true },
+    method: { kind: 'string', enum: METHODS },
+    url: { kind: 'string' },
+    headers: { kind: 'any' },
+    body: { kind: 'string' },
+  },
+  capture_export: {
+    path: { kind: 'string', required: true, pattern: ABS_PATH },
+    format: { kind: 'string', enum: ['har', 'zip'] },
+    ids: { kind: 'array', item: 'number' },
+  },
+  /* ---------------- 测试域补齐 ---------------- */
+  test_dataset_list: { suiteId: { kind: 'number', required: true } },
+  test_dataset_get: { id: { kind: 'number', required: true } },
+  test_dataset_save: {
+    id: { kind: 'number' },
+    suiteId: { kind: 'number' },
+    name: { kind: 'string' },
+    format: { kind: 'string', enum: ['json', 'csv'] },
+    path: { kind: 'string' },
+    content: { kind: 'string' },
+  },
+  test_dataset_delete: { id: { kind: 'number', required: true } },
+  test_suite_import: {
+    path: { kind: 'string', required: true, pattern: ABS_PATH },
+    projectId: { kind: 'number' },
+    onConflict: { kind: 'string', enum: ['skip', 'overwrite', 'rename'] },
+  },
+  test_suite_export: {
+    suiteId: { kind: 'number', required: true },
+    path: { kind: 'string', required: true, pattern: ABS_PATH },
+  },
+  test_run_list: {
+    suiteId: { kind: 'number' },
+    page: { kind: 'number', min: 1 },
+    size: { kind: 'number', min: 1, max: 100 },
+  },
+  test_artifact_list: { runId: { kind: 'number', required: true } },
+  test_artifact_export: {
+    artifactId: { kind: 'number', required: true },
+    path: { kind: 'string', required: true, pattern: ABS_PATH },
+  },
+  test_preflight: {
+    suiteId: { kind: 'number', required: true },
+    envId: { kind: 'number' },
+  },
+  /* ---------------- 批量创建请求 ---------------- */
+  request_batch_create: {
+    collectionId: { kind: 'number', required: true },
+    requests: { kind: 'array', required: true, min: 1, max: 50 },
+  },
 }
 
 function checkRule(key: string, value: unknown, rule: ArgRule): string | null {
@@ -636,6 +747,13 @@ function envelopeOf(
   }
   if (raw && typeof raw === 'object') {
     const record = raw as Record<string, unknown>
+    // 发送类工具自己算好了摘要（含断言 / 脚本结果），直接采用
+    if (typeof record.summary === 'string' && record.summary) {
+      const total = Number(record.total)
+      return Number.isFinite(total)
+        ? { summary: record.summary, total, truncated: record.truncated === true }
+        : { summary: record.summary }
+    }
     const total = Number(record.total)
     if (Number.isFinite(total) && Array.isArray(record.items)) {
       const shown = record.items.length
@@ -1244,22 +1362,6 @@ function requestDetail(args: ToolArgs): HttpRequestDetail {
   return detail
 }
 
-function sendPayload(args: ToolArgs): SendRequestPayload {
-  const url = str(args.url).trim()
-  if (!url) throw new Error('参数 url 不能为空')
-  return {
-    method: str(args.method, 'GET').toUpperCase(),
-    url,
-    headers: toItems(args.headers),
-    params: toItems(args.params ?? args.query),
-    bodyType: bodyTypeOf(args),
-    body: bodyText(args.body),
-    envId: optionalNum(args.envId) ?? null,
-    timeoutMs: optionalNum(args.timeoutMs) ?? 30000,
-    cookieEnabled: args.cookieEnabled !== false,
-  }
-}
-
 function needPath(value: unknown): string {
   const path = str(value).trim()
   if (!path) throw new Error('参数 path 不能为空，需要用户提供本机绝对路径')
@@ -1271,25 +1373,292 @@ function csvCell(value: string): string {
   return /[",\n\r]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value
 }
 
-/** 已保存请求 → 可直接发送的载荷 */
-function detailPayload(
-  detail: HttpRequestDetail,
-  extra: { envId?: number | null; timeoutMs?: number } = {},
-): SendRequestPayload {
+/* ---------------- 发送链路：环境 / 前置 / 后置脚本 ---------------- */
+
+interface SendOutcome {
+  summary: string
+  result: HttpResult
+  assertions: ScriptAssertion[]
+  scriptLogs: ScriptLog[]
+  scriptError?: string
+}
+
+interface DetailRunOptions {
+  envId: number | null
+  timeoutMs: number
+  cookieEnabled: boolean
+}
+
+let envSnapshotCache: { envId: number; script: string; vars: Record<string, string> } | null = null
+
+/** 已保存请求 → 脚本可读写的请求对象 */
+function toScriptRequest(detail: HttpRequestDetail): ScriptRequest {
+  const enabled = (items: KeyValueItem[]) => {
+    const map: Record<string, string> = {}
+    for (const item of items) {
+      if (item.enabled && item.key) map[item.key] = item.value
+    }
+    return map
+  }
   return {
-    requestId: detail.id ?? null,
-    name: detail.name,
     method: detail.method,
     url: detail.url,
-    headers: detail.headers,
-    params: detail.params,
+    headers: enabled(detail.headers),
+    params: enabled(detail.params),
     bodyType: detail.bodyType,
     body: detail.body,
-    envId: extra.envId ?? null,
-    timeoutMs: extra.timeoutMs ?? 30000,
-    auth: detail.auth ?? null,
-    cookieEnabled: true,
   }
+}
+
+/** 环境脚本与明文变量；同一轮批量只查一次 */
+async function envSnapshot(
+  envId: number | null,
+): Promise<{ script: string; vars: Record<string, string> }> {
+  if (envId === null) return { script: '', vars: {} }
+  if (envSnapshotCache?.envId === envId) return envSnapshotCache
+  const vars = await envPlainVars(envId).catch(() => ({} as Record<string, string>))
+  let script = ''
+  const projects = await projectList().catch(() => [])
+  for (const project of projects) {
+    const envs = await envList(project.id).catch(() => [])
+    const hit = envs.find((item) => item.id === envId)
+    if (hit) {
+      script = hit.script ?? ''
+      break
+    }
+  }
+  envSnapshotCache = { envId, script, vars }
+  return envSnapshotCache
+}
+
+/** 与界面「发送 / 批量执行」同链路：环境脚本 → 前置脚本 → HTTP → 后置脚本与断言 */
+async function runDetailWithScripts(
+  detail: HttpRequestDetail,
+  options: DetailRunOptions,
+): Promise<SendOutcome> {
+  const snapshot = await envSnapshot(options.envId)
+  let outgoing = toScriptRequest(detail)
+  const logs: ScriptLog[] = []
+
+  if (snapshot.script.trim()) {
+    const envResult = await runScriptJob({
+      phase: 'env',
+      code: snapshot.script,
+      request: outgoing,
+      env: snapshot.vars,
+      vars: listRuntimeVars(),
+    })
+    logs.push(...envResult.logs)
+    if (envResult.error) throw new Error(`环境脚本执行失败：${envResult.error}`)
+    setRuntimeVars(envResult.vars)
+    outgoing = envResult.request
+  }
+
+  if (detail.preScript?.trim()) {
+    const preResult = await runScriptJob({
+      phase: 'pre',
+      code: detail.preScript,
+      request: outgoing,
+      env: snapshot.vars,
+      vars: listRuntimeVars(),
+    })
+    logs.push(...preResult.logs)
+    if (preResult.error) throw new Error(`前置脚本执行失败：${preResult.error}`)
+    setRuntimeVars(preResult.vars)
+    outgoing = preResult.request
+  }
+
+  const render = (text: string) => renderRuntimeVars(text)
+  const result = await aiExecute({
+    requestId: detail.id ?? null,
+    name: detail.name,
+    method: outgoing.method,
+    url: render(outgoing.url),
+    headers: Object.entries(outgoing.headers).map(([key, value]) => ({
+      key,
+      value: render(value),
+      enabled: true,
+    })),
+    params: Object.entries(outgoing.params).map(([key, value]) => ({
+      key,
+      value: render(value),
+      enabled: true,
+    })),
+    bodyType: outgoing.bodyType,
+    body: render(outgoing.body),
+    envId: options.envId,
+    timeoutMs: options.timeoutMs,
+    auth: detail.auth ?? null,
+    cookieEnabled: options.cookieEnabled,
+  })
+
+  const assertions: ScriptAssertion[] = []
+  let scriptError: string | undefined
+  if (detail.postScript?.trim() && !result.error) {
+    const postResult = await runScriptJob({
+      phase: 'post',
+      code: detail.postScript,
+      request: outgoing,
+      response: result,
+      env: snapshot.vars,
+      vars: listRuntimeVars(),
+    })
+    logs.push(...postResult.logs)
+    if (!postResult.error) setRuntimeVars(postResult.vars)
+    assertions.push(...postResult.assertions)
+    if (postResult.error) scriptError = `后置脚本执行失败：${postResult.error}`
+  }
+
+  const passed = assertions.filter((item) => item.passed).length
+  return {
+    summary: `发送完成：${statusLabel(result.status)}${
+      assertions.length ? `，断言 ${passed}/${assertions.length} 通过` : ''
+    }${scriptError ? '（脚本报错）' : ''}`,
+    result,
+    assertions,
+    scriptLogs: logs,
+    scriptError,
+  }
+}
+
+function formatSendOutcome(value: unknown): string {
+  const outcome = value as SendOutcome
+  const lines = [formatHttpResult(outcome.result)]
+  if (outcome.assertions.length) {
+    const passed = outcome.assertions.filter((item) => item.passed).length
+    lines.push(`断言：${passed} 通过 / ${outcome.assertions.length - passed} 失败`)
+    for (const item of outcome.assertions.slice(0, 20)) {
+      lines.push(
+        `- ${item.passed ? '通过' : '失败'} ${item.name}${item.message ? `：${item.message}` : ''}`,
+      )
+    }
+    if (outcome.assertions.length > 20) {
+      lines.push(`…（其余 ${outcome.assertions.length - 20} 条断言省略）`)
+    }
+  }
+  if (outcome.scriptError) {
+    lines.push(`脚本错误：${outcome.scriptError}`)
+    if (outcome.scriptLogs.length) {
+      lines.push('脚本日志：')
+      for (const log of outcome.scriptLogs.slice(-10)) {
+        lines.push(`- [${log.level}] ${log.text}`)
+      }
+    }
+  }
+  return lines.join('\n')
+}
+
+/* ---------------- 抓包域辅助 ---------------- */
+
+const CAPTURE_STATE_LABELS: Record<string, string> = {
+  idle: '未启动',
+  starting: '启动中',
+  running: '抓包中',
+  stopping: '停止中',
+  error: '异常',
+}
+
+function captureStatusDigest(status: CaptureStatus) {
+  return {
+    summary: `抓包${CAPTURE_STATE_LABELS[status.state] ?? status.state}，已抓 ${status.flowCount} 条${
+      status.sysproxyOn ? '，系统代理已接管' : ''
+    }`,
+    状态: CAPTURE_STATE_LABELS[status.state] ?? status.state,
+    端口: status.port,
+    监听地址: status.bindAddr,
+    会话编号: status.sessionId ?? '—',
+    已抓流量: status.flowCount,
+    丢弃流量: status.dropped,
+    CA证书已安装: status.caInstalled ? '是' : '否',
+    系统代理已接管: status.sysproxyOn ? '是' : '否',
+    上游代理: status.upstreamProxy || '无',
+    开始时间: fmtTime(status.startedAt),
+    最近错误: status.lastError || '无',
+  }
+}
+
+function captureFlowRows(flows: CaptureFlow[]) {
+  return flows.map((flow) => ({
+    id: flow.id,
+    时间: fmtTime(flow.startedAt),
+    方法: flow.method,
+    状态码: flow.status ?? '无响应',
+    地址: `${flow.scheme}://${flow.host}${flow.path}`,
+    耗时毫秒: flow.durationMs,
+    请求大小: fmtBytes(flow.requestSize),
+    响应大小: fmtBytes(flow.responseSize),
+    类型: flow.contentType || '未知',
+    客户端: flow.clientAddr || '—',
+    错误: flow.error || '',
+  }))
+}
+
+function captureBodyDigest(body: CaptureBody) {
+  const meta = {
+    大小: fmtBytes(body.size),
+    截断: body.truncated ? '是' : '否',
+    二进制: body.binary ? '是' : '否',
+    类型: body.contentType || '未知',
+  }
+  if (body.text !== null && body.text !== undefined) {
+    return { ...meta, 内容: clip(body.text, 6000) }
+  }
+  if (body.base64) return { ...meta, 内容: '（图片 / 二进制，已省略；可在抓包页预览）' }
+  return { ...meta, 内容: '（空或不可读）' }
+}
+
+function toCaptureHeaders(value: unknown): CaptureHeader[] | undefined {
+  if (value === null || value === undefined || value === '') return undefined
+  if (Array.isArray(value)) {
+    const out: CaptureHeader[] = []
+    for (const entry of value) {
+      if (entry && typeof entry === 'object') {
+        const obj = entry as ToolArgs
+        const name = str(obj.name ?? obj.key).trim()
+        if (name) out.push({ name, value: str(obj.value) })
+      } else {
+        const text = str(entry)
+        const pos = text.indexOf(':')
+        if (pos > 0) {
+          out.push({ name: text.slice(0, pos).trim(), value: text.slice(pos + 1).trim() })
+        }
+      }
+    }
+    return out
+  }
+  if (typeof value === 'object') {
+    return Object.entries(value as ToolArgs).map(([name, val]) => ({ name, value: str(val) }))
+  }
+  return undefined
+}
+
+function formatCaptureRepeat(value: unknown): string {
+  const digest = value as {
+    status: number
+    statusText: string
+    durationMs: number
+    url: string
+    recorded: boolean
+    headers: CaptureHeader[]
+    body: { text: string | null; base64?: string | null }
+  }
+  const lines = [
+    `状态：${statusLabel(digest.status)}${digest.statusText ? ` ${digest.statusText}` : ''}`,
+    `耗时：${digest.durationMs} 毫秒`,
+    `地址：${digest.url}`,
+    `录制为新流量：${digest.recorded ? '是' : '否'}`,
+  ]
+  if (digest.headers.length) {
+    lines.push('响应头：')
+    for (const header of digest.headers.slice(0, 80)) {
+      lines.push(`  ${header.name}: ${header.value}`)
+    }
+  }
+  lines.push(
+    '响应体：',
+    digest.body.text ?? (digest.body.base64 ? '（二进制 / 图片，已省略）' : '（空）'),
+  )
+  return lines.join('\n')
 }
 
 /* ---------------- 自动化测试域辅助 ---------------- */
@@ -1543,11 +1912,87 @@ const SPECS: ToolSpec[] = [
     handler: (args) => requestSave(requestDetail(args)),
   },
   {
+    name: 'request_batch_create',
+    desc: '在同一个集合下批量新建请求（最多 50 个，一次确认后全部落库，适合按接口清单快速铺量）',
+    args: '{ collectionId, requests: [{ name, method, url, headers?, params?, bodyType?, body?, preScript?, postScript?, assertions? }] }',
+    handler: async (args) => {
+      const collectionId = needNum(args.collectionId, 'collectionId')
+      const rawItems = Array.isArray(args.requests) ? args.requests : []
+      if (!rawItems.length) throw new Error('参数 requests 不能为空')
+      // 先全部构造并校验，避免写到一半才发现第 N 条缺 URL
+      const details = rawItems.slice(0, 50).map((entry, index) => {
+        if (!entry || typeof entry !== 'object') {
+          throw new Error(`第 ${index + 1} 个请求必须是 JSON 对象`)
+        }
+        const item = entry as ToolArgs
+        return requestDetail({
+          ...item,
+          collectionId,
+          name: str(item.name, `批量请求 ${index + 1}`).trim() || `批量请求 ${index + 1}`,
+          assertions:
+            item.assertions === undefined
+              ? ''
+              : Array.isArray(item.assertions)
+                ? JSON.stringify(item.assertions)
+                : str(item.assertions),
+        })
+      })
+      const created: Array<{ id: number; name: string; method: string; url: string }> = []
+      for (const detail of details) {
+        const saved = await requestSave(detail)
+        created.push({
+          id: saved.id ?? 0,
+          name: saved.name,
+          method: saved.method,
+          url: saved.url,
+        })
+      }
+      return {
+        total: created.length,
+        items: created,
+        说明: `已在集合 #${collectionId} 批量创建 ${created.length} 个请求`,
+      }
+    },
+  },
+  {
     name: 'send_request',
-    desc: '发送真实 HTTP 请求并返回状态码、耗时与响应体（与手动发送同一条链路）',
-    args: '{ method, url, headers?, params?, bodyType?, body?, envId?, timeoutMs?, cookieEnabled? }',
-    handler: (args) => aiExecute(sendPayload(args)),
-    format: formatHttpResult,
+    desc: '发送真实 HTTP 请求并返回状态码、耗时、响应体、断言结果与脚本日志。传 requestId 时完整执行该请求的环境 / 前置 / 后置脚本与断言（与界面发送同一条链路）；只传 method + url 时按裸请求发送',
+    args: '{ requestId?, method?, url?, headers?, params?, bodyType?, body?, envId?, timeoutMs?, cookieEnabled? }',
+    handler: async (args) => {
+      const requestId = optionalNum(args.requestId)
+      const envId = optionalNum(args.envId) ?? null
+      const timeoutMs = Math.round(optionalNum(args.timeoutMs) ?? 30000)
+      const cookieEnabled = args.cookieEnabled !== false
+
+      let detail: HttpRequestDetail
+      if (requestId !== undefined) {
+        detail = await requestGet(requestId)
+        // 允许在已保存请求上临时覆盖字段，便于「改一个参数再发一次」
+        if (args.method !== undefined) detail.method = str(args.method, detail.method).toUpperCase()
+        if (args.url !== undefined) detail.url = str(args.url)
+        if (args.headers !== undefined) detail.headers = toItems(args.headers)
+        if (args.params !== undefined) detail.params = toItems(args.params)
+        if (args.bodyType !== undefined) detail.bodyType = bodyTypeOf(args)
+        if (args.body !== undefined) detail.body = bodyText(args.body)
+      } else {
+        detail = {
+          collectionId: 0,
+          name: 'AI 临时请求',
+          method: str(args.method, 'GET').toUpperCase(),
+          url: str(args.url).trim(),
+          headers: toItems(args.headers),
+          params: toItems(args.params ?? args.query),
+          bodyType: bodyTypeOf(args),
+          body: bodyText(args.body),
+          preScript: '',
+          postScript: '',
+          assertions: '',
+        }
+      }
+      if (!detail.url.trim()) throw new Error('参数 url 不能为空')
+      return runDetailWithScripts(detail, { envId, timeoutMs, cookieEnabled })
+    },
+    format: formatSendOutcome,
   },
   {
     name: 'curl_import',
@@ -2264,8 +2709,230 @@ const SPECS: ToolSpec[] = [
     },
   },
   {
+    name: 'test_dataset_list',
+    desc: '列出测试套件的数据集（只返回元信息，不返回 content 全文）',
+    args: '{ suiteId }',
+    handler: async (args) => {
+      const datasets = await testDatasetList(needNum(args.suiteId, 'suiteId'))
+      return summarizeList(
+        datasets.map((item) => ({
+          id: item.id,
+          名称: item.name,
+          格式: item.format,
+          行数: item.rowCount,
+          路径: item.path ?? '',
+          sha256: item.sha256 ?? '',
+          创建时间: fmtTime(item.createdAt),
+        })),
+      )
+    },
+  },
+  {
+    name: 'test_dataset_get',
+    desc: '读取数据集详情与内容预览（content 最多返回 6000 字符）',
+    args: '{ id }',
+    handler: async (args) => {
+      const dataset = await testDatasetGet(needNum(args.id, 'id'))
+      const content = dataset.content ?? ''
+      return {
+        summary: `${dataset.name}（${dataset.format.toUpperCase()}，${dataset.rowCount} 行）`,
+        id: dataset.id,
+        suiteId: dataset.suiteId,
+        name: dataset.name,
+        format: dataset.format,
+        rowCount: dataset.rowCount,
+        path: dataset.path ?? '',
+        sha256: dataset.sha256 ?? '',
+        content: clip(content, 6000),
+        contentChars: content.length,
+        truncated: content.length > 6000,
+      }
+    },
+  },
+  {
+    name: 'test_dataset_save',
+    desc: '新建或修改数据集（json / csv；提供 path 或 content 之一，需用户确认）',
+    args: '{ id?, suiteId?, name?, format?: json|csv, path?, content? }',
+    handler: async (args) => {
+      const id = optionalNum(args.id)
+      let suiteId = optionalNum(args.suiteId)
+      let name = str(args.name).trim()
+      let format = str(args.format).trim().toLowerCase()
+      if (id !== undefined) {
+        const existing = await testDatasetGet(id)
+        suiteId = suiteId ?? existing.suiteId
+        name = name || existing.name
+        format = format || existing.format
+      }
+      if (suiteId === undefined) throw new Error('新建数据集需要参数 suiteId')
+      if (!name) throw new Error('参数 name 不能为空')
+      if (format !== 'json' && format !== 'csv') {
+        throw new Error('参数 format 必须是 json / csv 之一')
+      }
+      const path = str(args.path).trim() || undefined
+      const content = args.content === undefined ? undefined : str(args.content)
+      if (!path && content === undefined) {
+        throw new Error('参数 path 和 content 至少提供一个')
+      }
+      const payload: TestDatasetPayload = {
+        id,
+        suiteId,
+        name,
+        format,
+        path,
+        content,
+      }
+      const savedId = await testDatasetSave(payload)
+      return { id: savedId, name, 说明: id === undefined ? '数据集已创建' : '数据集已更新' }
+    },
+  },
+  {
+    name: 'test_dataset_delete',
+    desc: '删除测试数据集（危险操作，需用户确认）',
+    args: '{ id }',
+    danger: true,
+    handler: async (args) => {
+      const id = needNum(args.id, 'id')
+      await testDatasetDelete(id)
+      return `数据集 #${id} 已删除`
+    },
+  },
+  {
+    name: 'test_suite_import',
+    desc: '从套件包（*.astromantest.json）导入测试套件（可能覆盖同名套件，需用户确认）',
+    args: '{ path, projectId?, onConflict?: skip|overwrite|rename }',
+    danger: true,
+    handler: async (args) => {
+      const path = needPath(args.path)
+      const projectId = optionalNum(args.projectId)
+      const onConflict = str(args.onConflict, 'rename').trim() || 'rename'
+      if (!['skip', 'overwrite', 'rename'].includes(onConflict)) {
+        throw new Error('参数 onConflict 必须是 skip / overwrite / rename 之一')
+      }
+      const id = await testSuiteImport(path, projectId, onConflict)
+      const detail = await testSuiteGet(id).catch(() => null)
+      return {
+        id,
+        name: detail?.suite.name ?? `套件 #${id}`,
+        说明: `已从 ${path} 导入测试套件（冲突策略：${onConflict}）`,
+      }
+    },
+  },
+  {
+    name: 'test_suite_export',
+    desc: '把测试套件导出为套件包（*.astromantest.json，会写入用户给出的路径）',
+    args: '{ suiteId, path }',
+    danger: true,
+    handler: async (args) => {
+      const suiteId = needNum(args.suiteId, 'suiteId')
+      const path = needPath(args.path)
+      const saved = await testSuiteExport(suiteId, path)
+      return { summary: `已导出测试套件 #${suiteId} 到 ${saved || path}`, path: saved || path }
+    },
+  },
+  {
+    name: 'test_run_list',
+    desc: '分页列出测试运行记录（可按套件过滤；返回 total 总条数，items 最多前 50 条）',
+    args: '{ suiteId?, page?, size? }',
+    handler: async (args) => {
+      const suiteId = optionalNum(args.suiteId)
+      const page = Math.max(1, Math.round(optionalNum(args.page) ?? 1))
+      const size = Math.min(100, Math.max(1, Math.round(optionalNum(args.size) ?? 20)))
+      const runs = await testRunList(suiteId, page, size)
+      // 后端只返回当前页，没有全局 total；不要把它伪装成总数
+      return {
+        summary: `第 ${page} 页，返回 ${runs.length} 条${
+          runs.length >= size ? '（可能还有更多，可翻下一页）' : ''
+        }`,
+        page,
+        size,
+        本页条数: runs.length,
+        items: runs.map((item) => ({
+          id: item.id,
+          套件: item.suiteId,
+          环境: item.envName ?? '',
+          触发方式: cnLabel(TEST_TRIGGER_LABELS, item.trigger, '未知'),
+          状态: cnLabel(TEST_RUN_STATUS_LABELS, item.status, '未知'),
+          总数: item.total,
+          通过: item.passed,
+          失败: item.failed,
+          跳过: item.skipped,
+          错误: item.errored,
+          耗时毫秒: item.durationMs,
+          开始时间: item.startedAt ? fmtTime(item.startedAt) : '',
+        })),
+      }
+    },
+  },
+  {
+    name: 'test_artifact_list',
+    desc: '列出一次测试运行产生的附件（日志 / 截图 / 导出文件），含文件是否存在与大小',
+    args: '{ runId }',
+    handler: async (args) => {
+      const artifacts = await testArtifactList(needNum(args.runId, 'runId'))
+      return summarizeList(
+        artifacts.map((item) => ({
+          id: item.id,
+          类型: item.kind,
+          名称: item.name,
+          路径: item.path,
+          相对路径: item.relativePath ?? '',
+          大小: fmtBytes(item.sizeBytes),
+          文件存在: item.exists ? '是' : '否',
+        })),
+      )
+    },
+  },
+  {
+    name: 'test_artifact_export',
+    desc: '把测试运行附件复制到用户指定路径（需用户确认）',
+    args: '{ artifactId, path }',
+    danger: true,
+    handler: async (args) => {
+      const artifactId = needNum(args.artifactId, 'artifactId')
+      const path = needPath(args.path)
+      await testArtifactExport(artifactId, path)
+      return { summary: `已导出附件 #${artifactId} 到 ${path}`, path }
+    },
+  },
+  {
+    name: 'test_preflight',
+    desc: '运行前预检：检查环境、引用、脚本、数据集与压测配置，给出 errors / warnings 与是否可运行',
+    args: '{ suiteId, envId? }',
+    handler: async (args) => {
+      const report = await testPreflight(
+        needNum(args.suiteId, 'suiteId'),
+        optionalNum(args.envId),
+      )
+      const levelLabel: Record<string, string> = {
+        error: '错误',
+        warning: '警告',
+        info: '提示',
+      }
+      return {
+        summary: `预检${report.runnable ? '通过' : '未通过'}：错误 ${report.errors}，警告 ${report.warnings}`,
+        suiteId: report.suiteId,
+        suiteName: report.suiteName,
+        envName: report.envName ?? '',
+        可运行: report.runnable ? '是' : '否',
+        用例总数: report.totalCases,
+        启用用例: report.enabledCases,
+        错误数: report.errors,
+        警告数: report.warnings,
+        items: report.items.slice(0, 30).map((item) => ({
+          级别: levelLabel[item.level] ?? item.level,
+          代码: item.code,
+          用例: item.caseName ?? '',
+          说明: item.message,
+          建议: item.hint ?? '',
+        })),
+        omittedItems: Math.max(0, report.items.length - 30),
+      }
+    },
+  },
+  {
     name: 'run_batch',
-    desc: '按顺序批量执行已保存请求（最多 50 个 × 20 轮），返回每次的状态码与耗时',
+    desc: '按顺序批量执行已保存请求（最多 50 个 × 20 轮），每个请求完整走环境 / 前置 / 后置脚本与断言，返回状态码、耗时与断言结果',
     args: '{ requestIds: number[], rounds?, envId?, stopOnError?, timeoutMs? }',
     danger: true,
     handler: async (args) => {
@@ -2280,6 +2947,9 @@ const SPECS: ToolSpec[] = [
       const details: HttpRequestDetail[] = []
       for (const id of requestIds) details.push(await requestGet(id))
 
+      // 与界面批量执行一致：本轮开始前清空脚本运行时变量，避免上一轮残留
+      clearRuntimeVars()
+
       let total = 0
       let okCount = 0
       let failCount = 0
@@ -2291,12 +2961,27 @@ const SPECS: ToolSpec[] = [
           total += 1
           const label = `${detail.name} ${detail.method} ${detail.url}`
           try {
-            const result = await aiExecute(detailPayload(detail, { envId, timeoutMs }))
-            const good = result.status >= 200 && result.status < 400
+            const outcome = await runDetailWithScripts(detail, {
+              envId,
+              timeoutMs,
+              cookieEnabled: true,
+            })
+            const failedAssertions = outcome.assertions.filter((item) => !item.passed).length
+            const good =
+              outcome.result.status >= 200 &&
+              outcome.result.status < 400 &&
+              failedAssertions === 0 &&
+              !outcome.scriptError
             if (good) okCount += 1
             else failCount += 1
-            const extra = result.error ? ` ${result.error}` : ''
-            lines.push(`第 ${round} 轮 · ${label} → ${result.status} (${result.durationMs}ms)${extra}`)
+            const extra = [
+              outcome.result.error ? ` ${outcome.result.error}` : '',
+              outcome.assertions.length
+                ? ` 断言 ${outcome.assertions.length - failedAssertions}/${outcome.assertions.length}`
+                : '',
+              outcome.scriptError ? ` ${outcome.scriptError}` : '',
+            ].join('')
+            lines.push(`第 ${round} 轮 · ${label} → ${outcome.result.status} (${outcome.result.durationMs}ms)${extra}`)
             if (!good && stopOnError) {
               aborted = true
               lines.push('已按 stopOnError 中止后续请求')
@@ -2314,10 +2999,142 @@ const SPECS: ToolSpec[] = [
         }
       }
 
+      // 50 × 20 最多 1000 条，全量回灌会挤掉上下文，只保留末尾 300 条明细
+      const shown = lines.slice(-300)
+      const omitted = lines.length - shown.length
       return [
         `批量执行完成：${requestIds.length} 个请求 × ${rounds} 轮 = ${total} 次，成功 ${okCount}，失败 ${failCount}`,
-        ...lines,
+        ...(omitted > 0 ? [`（较早的 ${omitted} 条明细已省略）`] : []),
+        ...shown,
       ].join('\n')
+    },
+  },
+  /* ---------------- 抓包 / 流量 ---------------- */
+  {
+    name: 'capture_status',
+    desc: '读取抓包状态：是否录制、端口、监听地址、已抓流量数、CA 证书与系统代理状态',
+    args: '{}',
+    handler: async () => captureStatusDigest(await captureStatus()),
+  },
+  {
+    name: 'capture_flow_list',
+    desc: '列出已抓到的流量（按方法 / 域名 / 状态码 / 关键字过滤；返回 total 命中数，items 最多前 50 条）',
+    args: '{ limit?, method?, host?, status?, keyword? }',
+    handler: async (args) => {
+      const limit = Math.min(5000, Math.max(1, Math.round(optionalNum(args.limit) ?? 100)))
+      const method = str(args.method).trim().toUpperCase()
+      const host = str(args.host).trim().toLowerCase()
+      const status = optionalNum(args.status)
+      const keyword = str(args.keyword).trim().toLowerCase()
+      const flows = await captureFlows(5000)
+      const hits = flows.filter((flow) => {
+        if (method && flow.method.toUpperCase() !== method) return false
+        if (host && !flow.host.toLowerCase().includes(host)) return false
+        if (status !== undefined && flow.status !== status) return false
+        if (keyword) {
+          const haystack = `${flow.method} ${flow.scheme}://${flow.host}${flow.path} ${flow.contentType} ${flow.error ?? ''}`.toLowerCase()
+          if (!haystack.includes(keyword)) return false
+        }
+        return true
+      })
+      return summarizeList(captureFlowRows(hits.slice(0, limit)))
+    },
+  },
+  {
+    name: 'capture_flow_get',
+    desc: '读取单条抓包流量的完整请求 / 响应：头、Body（文本最多 6000 字符）、耗时与错误',
+    args: '{ id }',
+    handler: async (args) => {
+      const detail = await captureFlowDetail(needNum(args.id, 'id'))
+      const headerRows = (list: CaptureHeader[]) =>
+        list.slice(0, 100).map((item) => `${item.name}: ${item.value}`)
+      return {
+        summary: `${detail.method} ${statusLabel(detail.status ?? 0)} ${detail.scheme}://${detail.host}${detail.path}`,
+        id: detail.id,
+        时间: fmtTime(detail.startedAt),
+        方法: detail.method,
+        状态码: detail.status ?? '无响应',
+        地址: `${detail.scheme}://${detail.host}${detail.path}`,
+        耗时毫秒: detail.durationMs,
+        客户端: detail.clientAddr || '—',
+        错误: detail.error ?? '',
+        请求头: headerRows(detail.requestHeaders),
+        响应头: headerRows(detail.responseHeaders),
+        请求体: captureBodyDigest(detail.requestBody),
+        响应体: captureBodyDigest(detail.responseBody),
+      }
+    },
+  },
+  {
+    name: 'capture_start',
+    desc: '启动本地抓包代理（会开始真实监听；需用户确认）。端口默认沿用当前配置',
+    args: '{ port?, bindAddr?, sslHosts?, ignorePatterns?, captureStatic?, upstreamProxy? }',
+    handler: async (args) => {
+      const options: CaptureStartOptions = {}
+      const port = optionalNum(args.port)
+      if (port !== undefined) options.port = port
+      if (str(args.bindAddr).trim()) options.bindAddr = str(args.bindAddr).trim()
+      if (Array.isArray(args.sslHosts)) options.sslHosts = args.sslHosts.map((item) => str(item)).filter(Boolean)
+      if (Array.isArray(args.ignorePatterns)) {
+        options.ignorePatterns = args.ignorePatterns.map((item) => str(item)).filter(Boolean)
+      }
+      if (args.captureStatic !== undefined) options.captureStatic = args.captureStatic === true
+      if (args.upstreamProxy !== undefined) {
+        options.upstreamProxy = str(args.upstreamProxy).trim() || null
+      }
+      return captureStatusDigest(await captureStart(options))
+    },
+  },
+  {
+    name: 'capture_stop',
+    desc: '停止抓包代理（已抓到的流量会保留，不会清空）',
+    args: '{}',
+    handler: async () => captureStatusDigest(await captureStop()),
+  },
+  {
+    name: 'capture_repeat',
+    desc: '重发一条抓包流量，可临时改方法 / URL / 请求头 / Body；录制中会生成一条新流量',
+    args: '{ id, method?, url?, headers?, body? }',
+    danger: true,
+    handler: async (args) => {
+      const payload: CaptureRepeatPayload = { id: needNum(args.id, 'id') }
+      if (args.method !== undefined) payload.method = str(args.method).toUpperCase()
+      if (args.url !== undefined) payload.url = str(args.url).trim()
+      const headers = toCaptureHeaders(args.headers)
+      if (headers) payload.headers = headers
+      if (args.body !== undefined) payload.body = str(args.body)
+      const result = await captureRepeat(payload)
+      return {
+        ...result,
+        summary: `重发完成：${statusLabel(result.status)}，耗时 ${result.durationMs} 毫秒${
+          result.recorded ? '，已录制为新流量' : ''
+        }`,
+      }
+    },
+    format: formatCaptureRepeat,
+  },
+  {
+    name: 'capture_export',
+    desc: '把抓到的流量导出为 HAR 或 ZIP（ZIP 内含按域名分组的请求 / 响应明细，用户可直接打开查看）',
+    args: '{ path, format?: har|zip, ids?: number[] }',
+    danger: true,
+    handler: async (args) => {
+      const path = needPath(args.path)
+      const explicit = str(args.format).trim().toLowerCase()
+      const format = explicit || (path.toLowerCase().endsWith('.har') ? 'har' : 'zip')
+      if (format !== 'har' && format !== 'zip') {
+        throw new Error('参数 format 必须是 har / zip 之一')
+      }
+      const ids = Array.isArray(args.ids)
+        ? args.ids.map((item) => needNum(item, 'ids')).filter((item) => item > 0)
+        : undefined
+      if (format === 'har') await captureExportHar(path, ids)
+      else await captureExportZip(path, ids)
+      return {
+        summary: `已导出${ids?.length ? ` ${ids.length} 条` : '全部'}流量（${format.toUpperCase()}）到 ${path}`,
+        path,
+        format,
+      }
     },
   },
   {
@@ -2753,6 +3570,11 @@ const TOOL_KEYWORDS: Array<{ words: string[]; tools: string[] }> = [
   { words: ['计划', '压测'], tools: ['plan_', 'stress_'] },
   { words: ['测试', '套件', '用例', '回归'], tools: ['test_'] },
   { words: ['运行', '执行', '报告'], tools: ['test_run_', 'test_report_'] },
+  { words: ['抓包', '录制', '流量', 'har'], tools: ['capture_'] },
+  { words: ['数据集', 'dataset', '测试数据'], tools: ['test_dataset_'] },
+  { words: ['附件', 'artifact', '用例日志'], tools: ['test_artifact_'] },
+  { words: ['预检', '运行前检查'], tools: ['test_preflight'] },
+  { words: ['批量创建', '批量新建', '铺量'], tools: ['request_batch_create'] },
 ]
 
 const TOOL_MAP = new Map(SPECS.map((spec) => [spec.name, spec]))
@@ -2775,6 +3597,7 @@ export const TOOL_LABELS: Record<string, string> = {
   request_search: '搜索请求',
   request_options: '待选请求清单',
   request_create: '创建接口请求',
+  request_batch_create: '批量创建接口请求',
   request_update: '修改接口请求',
   request_script_save: '写入前后置脚本',
   request_delete: '删除接口请求',
@@ -2813,6 +3636,23 @@ export const TOOL_LABELS: Record<string, string> = {
   test_run_stop: '停止套件运行',
   test_run_get: '读取运行结果',
   test_report_export: '导出测试报告',
+  test_dataset_list: '读取测试数据集',
+  test_dataset_get: '读取数据集详情',
+  test_dataset_save: '保存测试数据集',
+  test_dataset_delete: '删除测试数据集',
+  test_suite_import: '导入测试套件',
+  test_suite_export: '导出测试套件',
+  test_run_list: '读取测试运行记录',
+  test_artifact_list: '读取运行附件',
+  test_artifact_export: '导出运行附件',
+  test_preflight: '运行前预检',
+  capture_status: '读取抓包状态',
+  capture_flow_list: '读取抓包流量',
+  capture_flow_get: '读取流量详情',
+  capture_start: '启动抓包',
+  capture_stop: '停止抓包',
+  capture_repeat: '重发抓包流量',
+  capture_export: '导出抓包流量',
   workspace_stats: '工作台统计',
   dashboard_metrics: '数据大屏指标',
   env_delete: '删除环境',
@@ -2854,6 +3694,7 @@ const WRITE_TOOLS = new Set([
   'collection_rename',
   'collection_delete',
   'request_create',
+  'request_batch_create',
   'request_update',
   'request_delete',
   'request_script_save',
@@ -2876,6 +3717,15 @@ const WRITE_TOOLS = new Set([
   'test_run_start',
   'test_run_stop',
   'test_report_export',
+  'test_dataset_save',
+  'test_dataset_delete',
+  'test_suite_import',
+  'test_suite_export',
+  'test_artifact_export',
+  'capture_start',
+  'capture_stop',
+  'capture_repeat',
+  'capture_export',
   'run_batch',
   'history_export',
   'report_export',
@@ -2968,6 +3818,10 @@ const FILE_TOOLS = new Set([
   'project_import',
   'api_import',
   'openapi_import',
+  'capture_export',
+  'test_suite_import',
+  'test_suite_export',
+  'test_artifact_export',
 ])
 /** 压测启停本身立即返回任务句柄，包超时反而会误判 */
 const NO_TIMEOUT_TOOLS = new Set(['stress_start', 'stress_stop', 'test_run_start'])

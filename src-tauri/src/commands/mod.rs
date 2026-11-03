@@ -1,5 +1,6 @@
 pub mod ai;
 pub mod backup;
+pub mod capture;
 pub mod collection;
 pub mod cookie;
 pub mod curl;

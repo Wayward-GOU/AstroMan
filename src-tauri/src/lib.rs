@@ -1,4 +1,5 @@
 mod backup;
+mod capture;
 pub mod cli;
 mod commands;
 mod db;
@@ -302,6 +303,23 @@ pub fn run() {
             commands::storage::storage_reset,
             commands::storage::storage_open,
             commands::storage::app_restart,
+            commands::capture::capture_start,
+            commands::capture::capture_stop,
+            commands::capture::capture_status,
+            commands::capture::capture_flows,
+            commands::capture::capture_flow_detail,
+            commands::capture::capture_flow_clear,
+            commands::capture::capture_lan_ips,
+            commands::capture::capture_ca_info,
+            commands::capture::capture_ca_generate,
+            commands::capture::capture_ca_install,
+            commands::capture::capture_ca_export,
+            commands::capture::capture_sysproxy_enable,
+            commands::capture::capture_sysproxy_disable,
+            commands::capture::capture_repeat,
+            commands::capture::capture_export_har,
+            commands::capture::capture_export_zip,
+            commands::capture::capture_save_body,
         ])
         .on_window_event(|window, event| {
             // 关闭主窗口时隐藏到托盘，从托盘菜单「退出 AstroMan」才会真正结束进程

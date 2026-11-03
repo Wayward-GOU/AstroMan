@@ -73,6 +73,8 @@ pub struct AppState {
     pub http_cancels: Arc<parking_lot::Mutex<HashMap<String, Arc<AtomicBool>>>>,
     /// 重任务互斥锁：备份 / VACUUM / integrity_check 与压测互斥（4.0.2）
     pub heavy_ops: Arc<parking_lot::Mutex<()>>,
+    /// 抓包代理管理器：独立 runtime，空闲时不占资源
+    pub capture: crate::capture::CaptureManager,
 }
 
 impl AppState {
@@ -146,6 +148,7 @@ impl AppState {
         let settings = read_settings(&settings_file);
         let clients = build_clients(&settings)?;
 
+        let capture = crate::capture::CaptureManager::new(data_dir.clone());
         Ok(Self {
             pool,
             data_dir,
@@ -162,6 +165,7 @@ impl AppState {
             test_cancels: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             http_cancels: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             heavy_ops: Arc::new(parking_lot::Mutex::new(())),
+            capture,
         })
     }
 
@@ -188,6 +192,7 @@ impl AppState {
         let clients = build_clients(&settings)?;
         let secrets = crate::secret::SecretStore::bootstrap(&data_dir, &pool)?;
         crate::secret::install(secrets);
+        let capture = crate::capture::CaptureManager::new(data_dir.clone());
         Ok(Self {
             pool,
             db_path,
@@ -204,6 +209,7 @@ impl AppState {
             test_cancels: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             http_cancels: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             heavy_ops: Arc::new(parking_lot::Mutex::new(())),
+            capture,
         })
     }
 

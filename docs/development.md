@@ -91,7 +91,7 @@ npm.cmd run build       # vue-tsc --noEmit + vite build（类型错误在这里�
 cd src-tauri
 cargo fmt --check --all                            # 格式门禁
 cargo clippy --lib --all-targets -- -D warnings    # 静态检查，注意 -- 只能在 --all-targets 之后
-cargo test --lib                                   # 101 条用例
+cargo test --lib                                   # 106 条用例
 ```
 
 > `cargo test` 会在临时目录建库。环境不允许写 SQLite（受限沙箱、只读盘）时会集中报 `attempt to write a readonly database`，属于环境问题，单独重跑或换可写目录即可。
@@ -118,7 +118,7 @@ cargo tarpaulin --config tarpaulin.toml --engine llvm
 
 ```powershell
 npm.cmd run version:check        # 校验，不一致以退出码 1 结束
-npm.cmd run version:set 1.0.8    # 一次写入三处
+npm.cmd run version:set 1.0.9    # 一次写入三处
 ```
 
 CI 的 `frontend` job 第一步就是 `version:check`，漏改一处会直接失败（`.github/workflows/ci.yml`）。
@@ -160,8 +160,8 @@ npm.cmd run build:win32
 
 | 产物 | 路径 |
 |---|---|
-| **exe 安装包** | `src-tauri\target\release\bundle\nsis\AstroMan_1.0.8_x64-setup.exe` |
-| msi 安装包 | `src-tauri\target\release\bundle\msi\AstroMan_1.0.8_x64_en-US.msi` |
+| **exe 安装包** | `src-tauri\target\release\bundle\nsis\AstroMan_1.0.9_x64-setup.exe` |
+| msi 安装包 | `src-tauri\target\release\bundle\msi\AstroMan_1.0.9_x64_en-US.msi` |
 | 免安装可执行文件 | `src-tauri\target\release\astroman.exe` |
 
 安装向导内置语言与路径选择：
@@ -170,7 +170,7 @@ npm.cmd run build:win32
 - 随后在「选择安装位置」页可修改安装目录，默认 `%LOCALAPPDATA%\AstroMan`
 - 采用当前用户安装模式，全程无需管理员权限
 
-**分发方式**：把 `AstroMan_1.0.8_x64-setup.exe` 发给对方，双击安装即可使用。`astroman.exe` 只是免安装可执行文件，没有卸载入口和开始菜单快捷方式，不建议直接分发。
+**分发方式**：把 `AstroMan_1.0.9_x64-setup.exe` 发给对方，双击安装即可使用。`astroman.exe` 只是免安装可执行文件，没有卸载入口和开始菜单快捷方式，不建议直接分发。
 
 标准安装包在缺少 WebView2 时联网下载安装；目标机器完全离线时，改用 `AstroMan_*_offline-setup.exe` 离线包。
 
@@ -185,7 +185,7 @@ npm.cmd run build:win32
 | TLS 后端 | reqwest `native-tls` | 复用系统证书库，移除 rustls / ring 依赖 |
 | 安装器压缩 | NSIS `compression = "lzma"` | 安装包使用 LZMA 最高压缩 |
 
-实测体积：`astroman.exe` 约 7.4 MB，`AstroMan_1.0.8_x64-setup.exe` 约 5.2 MB（离线包约 211 MB）。
+实测体积：`astroman.exe` 约 7.4 MB，`AstroMan_1.0.9_x64-setup.exe` 约 5.2 MB（离线包约 211 MB）。
 
 > 国内网络首次打包时，下载 NSIS 工具容易超时（`timeout: global`）。可先设置镜像再执行：
 >

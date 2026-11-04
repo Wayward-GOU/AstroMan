@@ -7,7 +7,7 @@ description: AstroMan 内置 AI 助手「航仔」的开发与维护规范。接
 
 航仔 是内置在 AstroMan 里的接口调试助手：用户自备模型 API Key，它既能纯聊天，也能通过「工具」直接操作软件（建项目、建请求、发请求、压测、跑自动化测试套件、导入导出），并把每次工具调用单独落库供用户审计。
 
-## 现状速览（v1.0.8，先读这张表）
+## 现状速览（v1.0.9，先读这张表）
 
 | 能力 | 落点 |
 |---|---|
@@ -55,7 +55,7 @@ description: AstroMan 内置 AI 助手「航仔」的开发与维护规范。接
 | `src/components/AiAssistDrawer.vue` | 全局右侧抽屉，`App.vue` 挂载，所有页面 AI 入口共用；打开后先停在「开始分析？」确认页（显示上下文体量），点按钮才真正调模型 |
 | `src/components/AiConfirmCard.vue` | 写操作结构化确认卡：任务 / 影响对象 / 计划 / 参数表 / 风险 / 预检；`labelMap` + `rowLabel()` 负责参数名中文化（`id` 按工具前缀标成测试套件 / 测试用例），布尔值显示「是 / 否」，`kind` 值走 `testCaseKindLabel()` |
 | `src/views/AiAssistant.vue` | 对话页：会话侧栏（搜索 / 置顶 / 导出）+ 消息操作 + 工具卡片 + 预算条 + 复盘时间线 + 模型服务抽屉 + 「自动执行工具」开关；工具调度（`ask` / `afterReply` / `runToolSegment`）与 `CONFIRM_TEXT` 文案表都在这里 |
-| `src/utils/__tests__/` | vitest：`aiProtocol` / `aiTools` / `contextBudget` / `untrusted` 四组纯函数用例（全量 10 spec / 134 条，见 `astroman-testing`） |
+| `src/utils/__tests__/` | vitest：`aiProtocol` / `aiTools` / `contextBudget` / `untrusted` 四组纯函数用例（全量 14 spec / 160 条，见 `astroman-testing`） |
 | `src/views/AiUsage.vue` | 用量统计独立页（`/ai/usage`）：6 张指标卡 + 每日 token 柱 + 调用记录 / 模型汇总 / 工具准确率三 Tab + 右侧抽屉 |
 | `src/views/AiToolLogs.vue` | 工具调用记录页（`/ai/logs`）：指标卡、趋势柱、表格、详情抽屉 |
 | `src/views/Settings.vue` | 设置页「AI 辅助（航仔）」卡片：已上线说明 + 「打开航仔」「用量统计」 |
@@ -331,6 +331,15 @@ node -e "const s=require('fs').readFileSync('src/utils/aiTools.ts','utf8');const
 - `envelopeOf(tool, raw)` 生成一句话摘要：数组 →「共 N 条记录」，`{total, items}` →「共 N 条 / 仅展示前 M 条」，删除类 →「已删除 #x」，算法类 →「SHA256：…」
 - 列表类工具（`summarizeList`）返回 `{ total, shown, truncated, items }`，模型引用 `total` 而不是逐条数
 - 前端工具卡片先显示 `summary`，被截断时加「已截断」标签，详情里再看全文
+
+### `send_request` 与 `run_batch` 的脚本 / 断言链路（v1.0.9）
+
+这两个工具是「真实发送」的唯一入口，不要在工具层自己拼裸请求。
+
+- `send_request` 传 `requestId`：复用 `commands/http.rs::execute` 的完整链路——环境脚本 → 前置脚本 → HTTP → 后置脚本与断言，返回值里带 `assertions`；只有同时显式传 `method + url` 且没有 `requestId` 时才按裸请求发送。
+- `run_batch`：每个请求单独走上述完整链路，环境变量、前置 / 后置脚本与断言全部生效；成功判定是「2xx/3xx + 断言全过 + 无脚本错误」，不再只看状态码。
+- 模型只给 `requestId` 时就能复现界面发送效果；如果用户要的是「改了 URL / Body 的临时请求」，才用 `method + url + body` 的裸模式，并在确认卡里写清不会执行脚本与断言。
+- 工具硬超时仍按 `toolTimeoutOf`：`send_request` = 入参超时 + 5 秒，`run_batch` = 轮数 × 单请求超时 + 10 秒（上限 10 分钟）。
 
 压测计划三件套与 `stress_start` 的约定：
 
@@ -663,7 +672,7 @@ node -e "const s=require('fs').readFileSync('src/utils/aiTools.ts','utf8');const
 ```powershell
 # 前端（根目录）
 npm.cmd run build            # vue-tsc --noEmit + vite build
-npm.cmd run test             # vitest：全量 10 spec / 134 条，AI 相关 4 组
+npm.cmd run test             # vitest：全量 14 spec / 160 条，AI 相关 4 组
 npx vitest run src/utils/__tests__/aiTools.spec.ts   # 只跑工具注册表（含 ratio / 参数校验）
 
 # 后端（src-tauri）

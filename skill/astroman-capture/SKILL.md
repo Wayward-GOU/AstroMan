@@ -1,6 +1,6 @@
 ---
 name: astroman-capture
-description: AstroMan 抓包模块的开发与使用约定（HTTP/HTTPS 录制、根证书、系统代理、手机抓包、HAR / ZIP 导出、改参重发）。触发词：抓包、HTTPS 解密、根证书、CA、系统代理、手机代理、微信小程序、HAR、ZIP、压缩包、导出、重发、改包。
+description: AstroMan 抓包模块的开发与使用约定（HTTP/HTTPS 录制、根证书、系统代理、手机抓包、HAR / ZIP 导出、改参重发、断点改包、Map Local、弱网模拟）。触发词：抓包、HTTPS 解密、根证书、CA、系统代理、手机代理、微信小程序、HAR、ZIP、压缩包、导出、重发、改包、断点、Map Local、本地映射、弱网。
 ---
 
 # 抓包模块（Charles 式流量分析）
@@ -15,7 +15,8 @@ description: AstroMan 抓包模块的开发与使用约定（HTTP/HTTPS 录制�
 |---|---|
 | `src-tauri/src/capture/mod.rs` | `CaptureManager`、状态机、端口绑定、代理线程生命周期 |
 | `src-tauri/src/capture/proxy.rs` | hudsucker 服务装配、CONNECT 隧道、上游代理 |
-| `src-tauri/src/capture/handler.rs` | 请求/响应录制管道、body 截断与解码、静态资源过滤 |
+| `src-tauri/src/capture/handler.rs` | 请求/响应录制管道、body 截断与解码、静态资源过滤、三类拦截的挂载点 |
+| `src-tauri/src/capture/intercept.rs` | 断点 / 本地映射 / 弱网规则、持久化与挂起队列 |
 | `src-tauri/src/capture/store.rs` | 内存流量仓库（5000 条 / 128 MB body）、分组与查询 |
 | `src-tauri/src/capture/ca.rs` | 根证书生成、信任检测、一键安装、导出 |
 | `src-tauri/src/capture/sysproxy.rs` | Windows 系统代理接管/还原、崩溃残留清理 |
@@ -25,7 +26,9 @@ description: AstroMan 抓包模块的开发与使用约定（HTTP/HTTPS 录制�
 | `src-tauri/src/commands/capture.rs` | 全部 IPC 命令，注册在 `lib.rs::generate_handler!` |
 | `src/api/capture.ts` | 前端 invoke 封装 |
 | `src/types/capture.ts` | 与 Rust camelCase 对齐的类型 |
-| `src/views/Capture.vue` | 列表、详情、设置抽屉、分组右键菜单、重发弹窗 |
+| `src/views/Capture.vue` | 列表、详情、设置抽屉、分组右键菜单、重发弹窗、拦截入口 |
+| `src/components/CaptureInterceptDrawer.vue` | 断点 / 本地映射 / 弱网规则编辑抽屉 |
+| `src/components/CaptureBreakpointModal.vue` | 挂起队列与改包弹窗 |
 
 ## 2. 状态机与代理生命周期
 
@@ -142,7 +145,25 @@ astroman-ca.json   创建时间 / 过期时间 / 指纹元数据
 - body 覆盖规则：用户改过才传 `body`；没改则沿用原文本；原 body 是二进制且未改时按 base64 原样发送；二进制且被改动时弹窗禁止编辑并提示。
 - 录制中必须把响应体读完，否则新流量的响应可能来不及落库。
 
-## 9. IPC 契约
+## 9. 断点 / 本地映射 / 弱网
+
+三类能力共享 `CaptureManager.intercept: Arc<InterceptState>`，规则落盘 `<数据目录>/capture/intercept.json`（camelCase；临时 `.json.part` + rename）。UI 每次保存都会整体替换规则列表，后端归一化：清掉空 `pattern`、`id=0` 分配序号、最多 200 条。
+
+执行顺序（`handler.rs`）：
+
+```text
+请求：弱网延迟/丢包 → 请求断点 → 本地映射 → 上游
+响应：响应断点 → 弱网限速 → 下发
+```
+
+- 弱网丢包命中直接返回 504，不进入断点；本地映射命中后由 `RequestOrResponse::Response` 短路，不再走 `handle_response`，所以映射流量在 `handle_request` 里落库并标 `mapped=true`。
+- 断点用 `oneshot` 把流量交给 UI：`InterceptState::pause()` 插入槽位后 await，**绝不持锁 await**。120 秒超时 / 停止录制 / 「全部放行」都按放行处理；队列满 32 条时新请求直接放行。
+- 正文可编辑性：请求体只有被缓冲且为文本时 `request_editable=true`；响应体只有明文且未截断时 `response_editable=true`。流式（SSE / 大响应）仍可暂停，但只能改状态码与头。
+- 头重建：`apply_header_list` 保留原逐跳头，按提交列表 append（保留多值 `set-cookie`）；`is_hop_by_hop` **不含 `content-encoding`**，未解码的压缩响应必须原样保留。改 URL 在改头之后应用，保证 Host 以新 URL 为准。
+- 响应改写后重算 `content-length` / 移除 `transfer-encoding`；改过请求或响应的流量标 `modified=true`。
+- 前端 `Capture.vue` 每 1.5 秒轮询 `capture_intercept_state`；挂起队列非空时弹窗常驻，不能点遮罩关闭。
+
+## 10. IPC 契约
 
 | 命令 | 入参（前端 camelCase） | 返回 |
 |---|---|---|
@@ -163,6 +184,12 @@ astroman-ca.json   创建时间 / 过期时间 / 指纹元数据
 | `capture_export_har` | `path` `ids?` | — |
 | `capture_export_zip` | `path` `ids?` | — |
 | `capture_save_body` | `id` `part` `path` | — |
+| `capture_intercept_state` | — | `InterceptView` |
+| `capture_breakpoint_set_rules` | `enabled?` `rules?` | `InterceptView` |
+| `capture_map_set_rules` | `enabled?` `rules?` | `InterceptView` |
+| `capture_weak_set` | `weak` | `InterceptView` |
+| `capture_breakpoint_resolve` | `pauseId` `action`（`continue` / `abort` / `edit`）`request?` `response?` | `InterceptView` |
+| `capture_breakpoint_release_all` | — | `InterceptView` |
 
 ```ts
 const status = await api.captureStart({ port: 8888, bindAddr: '127.0.0.1', captureStatic: true })
@@ -171,7 +198,7 @@ const result = await api.captureRepeat({ id: flow.id, method: 'POST', url, heade
 
 增删命令时三处一起改：`commands/capture.rs` → `commands/mod.rs`（模块已存在，新增函数不用改）→ `lib.rs::generate_handler!`，再补 `src/api/capture.ts` 与 `src/types/capture.ts`。
 
-## 10. 常见现象对照
+## 11. 常见现象对照
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
@@ -186,13 +213,13 @@ const result = await api.captureRepeat({ id: flow.id, method: 'POST', url, heade
 | 大响应 / 大文件没有 body | 超过 8 MB 不缓冲，超过 2 MB 只留前缀 | 用「保存 body」前先确认 `truncated` / `binary` |
 | 流量突然变少、出现「丢弃」 | 超过 5000 条或 128 MB body | 及时导出 HAR 后清空 |
 
-## 11. 验证
+## 12. 验证
 
 ```bash
-cd src-tauri && cargo test --lib capture   # 代理链路 + 未录制重发覆盖参数
+cd src-tauri && cargo test --lib capture   # 代理链路、重发、规则匹配、断点改包、Map Local、弱网
 cd src-tauri && cargo check
 npm run build                              # vue-tsc + vite
 npm run tauri dev                          # 浏览器模式没有 IPC，必须桌面端验证
 ```
 
-手工冒烟：开始录制 → 浏览器访问 `http://example.com` 与任意 HTTPS 站点 → 确认两条都进列表且 HTTPS 能看到明文 → 右键分组导出 HAR 与 ZIP → 解压 ZIP 打开 `index.html`，确认 request.txt / response.txt / meta.json 可读、图片能打开 → 在详情里改 URL/body 重发 → 停止录制后再重发一次（应弹「重发结果」且列表不新增）。
+手工冒烟：开始录制 → 浏览器访问 `http://example.com` 与任意 HTTPS 站点 → 确认两条都进列表且 HTTPS 能看到明文 → 右键分组导出 HAR 与 ZIP → 解压 ZIP 打开 `index.html`，确认 request.txt / response.txt / meta.json 可读、图片能打开 → 在详情里改 URL/body 重发 → 停止录制后再重发一次（应弹「重发结果」且列表不新增）→ 「拦截」里加一条断点规则并触发，改 body 后「改包放行」，确认列表出现「已改」；加一条 Map Local 指向内联 JSON，确认返回 200 且带「本地」；弱网丢包设 100%，确认请求返回 504。

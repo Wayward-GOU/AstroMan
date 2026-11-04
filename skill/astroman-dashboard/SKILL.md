@@ -9,10 +9,10 @@ v1.0.8 把首页拆成「工作台」和「数据大屏」两块，**大屏不�
 
 | 位置 | 文件 | 内容 |
 |---|---|---|
-| 工作台 `/` | `views/Dashboard.vue` | 总览 + 6 个 KPI、快捷入口、测试场景介绍与示例、批量运行介绍与示例、抓包介绍与示例、产品介绍、能力清单、上手引导、常用操作、FAQ |
+| 工作台 `/` | `views/Dashboard.vue` | 总览 + 6 个 KPI、今日待办卡、快捷入口、测试场景介绍与示例、批量运行介绍与示例、抓包介绍与示例、产品介绍、能力清单、上手引导、常用操作、FAQ |
 | 历史记录 `/history` | `views/History.vue` + `components/DashboardMetrics.vue` | 历史检索 / 清理 + 数据大屏（8 张卡，挂在列表下方） |
 
-两个页面都调 `api.dashboardMetrics()`：首页只用它填 KPI 与概况文案，图表全部在 `DashboardMetrics.vue` 里。
+两个页面都调 `api.dashboardMetrics()`：首页只用它填 KPI 与概况文案，图表全部在 `DashboardMetrics.vue` 里。首页另外调 `notesCounts()` + `notesList({ scope: 'today', limit: 5 })` 填「今日待办」卡，并监听 `notes:changed` 刷新。
 
 ## 数据口径
 
@@ -74,6 +74,7 @@ ReportPoint { id, name, p95Rt, errorRate, totalRequests, createdAt }
 PageHeader
 console（总览 + 6 个 KPI：项目 / 接口 / 集合 / 环境 / 压测报告 / 历史请求）
 kpi-grid（点击 KPI 跳到对应页面）
+今日待办（notes-card：未完成 / 今天到期 / 逾期 + 前 5 条预览 + 快速记一笔）
 测试场景介绍（suite-band）+ 测试场景示例
 批量运行介绍（runner-band）+ 批量运行示例
 抓包介绍（runner-band capture-band）+ 抓包示例与排错

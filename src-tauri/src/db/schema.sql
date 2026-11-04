@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS requests (
     assertions    TEXT,
     auth          TEXT,
     sort_order    INTEGER DEFAULT 0,
+    net_json      TEXT,
     created_at    INTEGER NOT NULL,
     updated_at    INTEGER NOT NULL
 );
@@ -348,7 +349,7 @@ CREATE TABLE IF NOT EXISTS notes (
     ref_id          INTEGER,
     title           TEXT NOT NULL DEFAULT '',
     content         TEXT NOT NULL DEFAULT '',
-    kind            TEXT NOT NULL DEFAULT 'note',
+    kind            TEXT NOT NULL DEFAULT 'todo',
     status          TEXT NOT NULL DEFAULT 'open',
     priority        INTEGER NOT NULL DEFAULT 1,
     tags            TEXT NOT NULL DEFAULT '',
@@ -360,7 +361,28 @@ CREATE TABLE IF NOT EXISTS notes (
     notified_at     INTEGER,
     pinned          INTEGER NOT NULL DEFAULT 0,
     created_at      INTEGER NOT NULL,
-    updated_at      INTEGER NOT NULL
+    updated_at      INTEGER NOT NULL,
+    done_at         INTEGER,
+    deleted_at      INTEGER,
+    deleted_from_status TEXT
+);
+
+-- 记事本图片：按内容去重，多条待办通过关联表共享
+CREATE TABLE IF NOT EXISTS note_files (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    sha256     TEXT NOT NULL,
+    file_name  TEXT NOT NULL DEFAULT '',
+    mime       TEXT NOT NULL,
+    size       INTEGER NOT NULL,
+    data       BLOB NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS note_file_links (
+    note_id    INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+    file_id    INTEGER NOT NULL REFERENCES note_files(id) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (note_id, file_id)
 );
 
 -- AI Provider（api_key_enc 为 AES-GCM 密文，见 commands/ai.rs）
@@ -377,6 +399,7 @@ CREATE TABLE IF NOT EXISTS ai_providers (
     timeout_secs  INTEGER DEFAULT 300,
     is_default    INTEGER DEFAULT 0,
     enabled       INTEGER DEFAULT 1,
+    supports_vision INTEGER NOT NULL DEFAULT 0,
     created_at    INTEGER NOT NULL,
     updated_at    INTEGER NOT NULL
 );
@@ -483,4 +506,7 @@ CREATE INDEX IF NOT EXISTS idx_artifacts_run ON test_artifacts(run_id);
 CREATE INDEX IF NOT EXISTS idx_notes_due ON notes(status, remind_at);
 CREATE INDEX IF NOT EXISTS idx_notes_ref ON notes(ref_type, ref_id);
 CREATE INDEX IF NOT EXISTS idx_notes_project ON notes(project_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_notes_status_due ON notes(status, due_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_note_files_sha ON note_files(sha256);
+CREATE INDEX IF NOT EXISTS idx_note_file_links_file ON note_file_links(file_id);
 -- idx_plans_project 依赖 updated_at 列，老库需先补列，因此放在 migrate() 中创建

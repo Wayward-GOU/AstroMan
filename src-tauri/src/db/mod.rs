@@ -7,7 +7,10 @@ mod seed;
 ///
 /// 1 = v1.0.7；2 = v1.0.8（耗时分解、响应体类型、按请求网络配置、app_meta）
 /// 3 = 按 Body 类型保留草稿（requests.body_meta）
-pub const DB_VERSION: i64 = 3;
+/// 4 = 请求级凭据字段加密（无新列）+ 补齐 schema.sql 缺失的 requests.net_json
+/// 5 = 记事本（notes.done_at / deleted_at / deleted_from_status、note_files、ai_providers.supports_vision）
+/// 6 = 记事本类型（notes.kind：todo / note / idea / reference）
+pub const DB_VERSION: i64 = 6;
 
 /// 打开库时发现库版本高于本程序：说明用户降级了应用。
 /// 直接返回错误而不是继续写，避免旧代码用旧结构写坏新数据。
@@ -136,6 +139,15 @@ const COLUMN_MIGRATIONS: &[(&str, &str, &str)] = &[
     ("requests", "net_json", "TEXT"),
     // 各 Body 类型的草稿，切换类型时不丢失内容
     ("requests", "body_meta", "TEXT"),
+    // v1.0.9：记事本软删除、完成时间与截图识别标记
+    ("notes", "done_at", "INTEGER"),
+    ("notes", "deleted_at", "INTEGER"),
+    ("notes", "deleted_from_status", "TEXT"),
+    (
+        "ai_providers",
+        "supports_vision",
+        "INTEGER NOT NULL DEFAULT 0",
+    ),
 ];
 
 fn column_exists(conn: &rusqlite::Connection, table: &str, column: &str) -> Result<bool, String> {
@@ -188,11 +200,23 @@ fn migrate(pool: &DbPool) -> Result<(), String> {
             [],
         )
         .map_err(err)?;
+        // 依赖新增列的索引必须放这里：schema.sql 先于补列执行，老库直接建会报 no such column
         tx.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_history_origin ON request_history(origin, created_at DESC);
-             CREATE INDEX IF NOT EXISTS idx_runs_origin ON request_runs(origin, created_at DESC);",
+             CREATE INDEX IF NOT EXISTS idx_runs_origin ON request_runs(origin, created_at DESC);
+             CREATE INDEX IF NOT EXISTS idx_notes_status_done ON notes(status, done_at DESC);",
         )
         .map_err(err)?;
+        if version < 6 {
+            // 旧库的 kind 一直是占位值：有截止时间的视为待办，纯文字仍留在笔记。
+            // 未知值统一收敛到待办，避免前端筛选漏数据。
+            tx.execute_batch(
+                "UPDATE notes SET kind = 'todo' WHERE kind = 'note' AND due_at IS NOT NULL;
+                 UPDATE notes SET kind = 'todo'
+                 WHERE kind NOT IN ('todo', 'note', 'idea', 'reference');",
+            )
+            .map_err(err)?;
+        }
         if version < DB_VERSION {
             tx.execute_batch(&format!("PRAGMA user_version = {DB_VERSION}"))
                 .map_err(err)?;
@@ -340,6 +364,59 @@ mod tests {
             .unwrap();
         assert_eq!(version, DB_VERSION);
         drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bootstrap_encrypts_legacy_request_auth_and_is_idempotent() {
+        let (dir, pool) = temp_pool("auth-migrate");
+        init(&pool).unwrap();
+        let now = crate::util::now_ms();
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "INSERT INTO projects (name, created_at, updated_at) VALUES ('p', ?1, ?1)",
+            params![now],
+        )
+        .unwrap();
+        let project_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO collections (project_id, name, created_at, updated_at)
+             VALUES (?1, 'c', ?2, ?2)",
+            params![project_id, now],
+        )
+        .unwrap();
+        let collection_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO requests (collection_id, name, method, url, auth, created_at, updated_at)
+             VALUES (?1, 'r', 'GET', 'https://example.com', ?2, ?3, ?3)",
+            params![
+                collection_id,
+                r#"{"kind":"bearer","token":"tk-legacy","username":"alice"}"#,
+                now
+            ],
+        )
+        .unwrap();
+        let request_id = conn.last_insert_rowid();
+        drop(conn);
+
+        // 启动时 bootstrap 会把历史明文认证就地加密
+        let store = crate::secret::SecretStore::bootstrap(&dir, &pool).unwrap();
+        let conn = pool.get().unwrap();
+        let stored: String = conn
+            .query_row(
+                "SELECT auth FROM requests WHERE id = ?1",
+                params![request_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(stored.contains("enc:v1:"), "历史明文认证必须被加密");
+        assert!(!stored.contains("tk-legacy"), "token 不能以明文留在库里");
+        assert!(stored.contains("alice"), "非敏感字段保持明文");
+        drop(conn);
+
+        // 幂等：再次迁移不应继续套加密
+        assert_eq!(store.encrypt_plaintext(&pool).unwrap(), 0);
+        assert!(store.decrypt_auth(&stored).contains("tk-legacy"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

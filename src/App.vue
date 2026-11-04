@@ -3,6 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, type Compon
 import { useRoute, useRouter } from 'vue-router'
 import { theme as AntTheme } from 'ant-design-vue'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import {
   ApiOutlined,
   AppstoreOutlined,
@@ -20,19 +21,28 @@ import {
   MenuFoldOutlined,
   MenuUnfoldOutlined,
   ArrowLeftOutlined,
+  ScheduleOutlined,
 } from '@ant-design/icons-vue'
 import AppLogo from '@/components/AppLogo.vue'
 import AstroBuddy from '@/components/AstroBuddy.vue'
 import AstroBuddyIcon from '@/components/AstroBuddyIcon.vue'
 import AiAssistDrawer from '@/components/AiAssistDrawer.vue'
 import ErrorDialog from '@/components/ErrorDialog.vue'
+import NotesReminderHost from '@/components/notes/NotesReminderHost.vue'
 import { currentTheme, currentThemeId, setTheme, themes } from '@/stores/theme'
 import { canGoBack, previousEntry, stepBack } from '@/stores/navHistory'
 import { isMac, shortcutText } from '@/utils/platform'
 import { checkForUpdates, isAutoUpdateEnabled } from '@/utils/updater'
+import { useNotesStore } from '@/stores/notes'
 
 const route = useRoute()
 const router = useRouter()
+const notesStore = useNotesStore()
+const isBare = computed(() => Boolean(route.meta.bare))
+
+let notesTicker: number | undefined
+let unlistenNotesChanged: UnlistenFn | null = null
+let unlistenNotesOpen: UnlistenFn | null = null
 
 /* ---------- 全局返回 ---------- */
 const backKeyText = isMac ? '⌥ ←' : 'Alt + ←'
@@ -90,6 +100,7 @@ function resetZoom() {
 }
 
 function onZoomHotkey(event: KeyboardEvent) {
+  if (isBare.value) return
   if (event.altKey) return
   const modifier = isMac ? event.metaKey : event.ctrlKey
   if (!modifier) return
@@ -123,6 +134,7 @@ const navs: NavItem[] = [
   { key: 'capture', label: '抓包', hint: 'HTTP/HTTPS 录制 · 改包 · 重发', to: '/capture', icon: ApiOutlined, group: '测试' },
   { key: 'runner', label: '批量运行', hint: '集合 Runner · 数据驱动', to: '/runner', icon: PlayCircleOutlined, group: '测试' },
   { key: 'automation', label: '自动化测试', hint: '套件 · 断言 · Python · 报告', to: '/automation', icon: ExperimentOutlined, group: '测试' },
+  { key: 'notes', label: '记事本', hint: '待办 · 提醒 · 截图生成', to: '/notes', icon: ScheduleOutlined, group: '智能' },
   { key: 'ai', label: '航仔', hint: 'AI 助手 · 自动建请求并分析', to: '/ai', icon: AstroBuddyIcon, group: '智能' },
   { key: 'history', label: '历史记录', hint: '数据概览 · 最近发送记录', to: '/history', icon: HistoryOutlined, group: '智能' },
   { key: 'monitor', label: '系统监视', hint: 'CPU · 内存 · 磁盘 · 网络', to: '/monitor', icon: LineChartOutlined, group: '系统' },
@@ -287,6 +299,7 @@ function onPaletteKeydown(event: KeyboardEvent) {
 }
 
 function onGlobalHotkey(event: KeyboardEvent) {
+  if (isBare.value) return
   // Alt + ← 返回上一次停留的页面（桌面软件通用习惯）
   if (event.altKey && !event.ctrlKey && !event.metaKey && event.key === 'ArrowLeft') {
     if (canGoBack.value) {
@@ -330,12 +343,39 @@ function groupPalette(items: PaletteItem[]) {
 }
 
 onMounted(() => {
+  if (isBare.value) return
   const stored = Number(localStorage.getItem(ZOOM_KEY) ?? '1')
   applyZoom(Number.isFinite(stored) && stored > 0 ? stored : 1, false)
   syncSidebarWidth()
   window.addEventListener('resize', syncSidebarWidth)
   window.addEventListener('keydown', onZoomHotkey)
   window.addEventListener('keydown', onGlobalHotkey)
+
+  // 记事本角标：启动加载一次，之后每分钟与窗口重新可见时刷新
+  void notesStore.loadSettings()
+  void notesStore.refreshCounts()
+  notesTicker = window.setInterval(() => {
+    notesStore.touchNow()
+    void notesStore.refreshCounts()
+  }, 60_000)
+  document.addEventListener('visibilitychange', onNotesVisible)
+  void (async () => {
+    try {
+      unlistenNotesChanged = await listen<{ reason?: string }>('notes:changed', (event) => {
+        void notesStore.refreshCounts()
+        if (event.payload?.reason === 'settings') void notesStore.loadSettings()
+      })
+    } catch {
+      // 浏览器预览没有 Tauri 事件，跳过即可
+    }
+    try {
+      unlistenNotesOpen = await listen('notes:open', () => {
+        go('/notes')
+      })
+    } catch {
+      // 同上
+    }
+  })()
 
   // 启动后静默检查一次 GitHub 最新版本，有更新才提示
   if (isAutoUpdateEnabled()) {
@@ -345,7 +385,17 @@ onMounted(() => {
   }
 })
 
+function onNotesVisible() {
+  if (document.visibilityState !== 'visible') return
+  notesStore.touchNow()
+  void notesStore.refreshCounts()
+}
+
 onBeforeUnmount(() => {
+  if (notesTicker) window.clearInterval(notesTicker)
+  document.removeEventListener('visibilitychange', onNotesVisible)
+  unlistenNotesChanged?.()
+  unlistenNotesOpen?.()
   window.removeEventListener('resize', syncSidebarWidth)
   window.removeEventListener('keydown', onZoomHotkey)
   window.removeEventListener('keydown', onGlobalHotkey)
@@ -360,6 +410,7 @@ const activeKey = computed(() => {
   if (path.startsWith('/projects')) return 'projects'
   if (path.startsWith('/project/')) return 'projects'
   if (path.startsWith('/automation')) return 'automation'
+  if (path.startsWith('/notes')) return 'notes'
   if (path.startsWith('/ai')) return 'ai'
   if (path.startsWith('/history')) return 'history'
   if (path.startsWith('/monitor')) return 'monitor'
@@ -406,7 +457,8 @@ const theme = computed(() => {
 
 <template>
   <a-config-provider :theme="theme">
-    <div class="shell">
+    <router-view v-if="isBare" />
+    <div v-else class="shell">
       <aside class="sider" :class="{ collapsed: sidebarCollapsed }">
         <div class="brand">
           <AppLogo :size="34" />
@@ -457,6 +509,9 @@ const theme = computed(() => {
               </span>
               <span class="nav-text">
                 <span class="nav-name">{{ item.label }}</span>
+              </span>
+              <span v-if="item.key === 'notes' && notesStore.badge" class="nav-badge">
+                {{ notesStore.badge }}
               </span>
               <span class="nav-indicator" />
             </router-link>
@@ -552,6 +607,7 @@ const theme = computed(() => {
         </div>
       </a-modal>
 
+      <NotesReminderHost />
       <AiAssistDrawer />
       <ErrorDialog />
     </div>
@@ -853,6 +909,24 @@ const theme = computed(() => {
 .nav-hint {
   font-size: 10px;
   color: #64748b;
+}
+
+.nav-badge {
+  margin-left: auto;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: var(--fm-danger);
+  color: #fff;
+  font-size: 9px;
+  line-height: 16px;
+  text-align: center;
+  flex-shrink: 0;
+}
+
+.sider.collapsed .nav-badge {
+  display: none;
 }
 
 .nav-item.active .nav-hint {

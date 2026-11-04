@@ -108,6 +108,8 @@ const loading = ref(true)
 const saving = ref(false)
 const sending = ref(false)
 const result = ref<HttpResult | null>(null)
+const bodyPreEl = ref<HTMLElement | null>(null)
+const tabsScrollEl = ref<HTMLElement | null>(null)
 const activeTab = ref('params')
 const responseTab = ref('body')
 const insecure = ref(false)
@@ -226,7 +228,14 @@ let saveQueue: Promise<boolean> = Promise.resolve(true)
 
 function syncTabMeta() {
   if (!form.value.id) return
-  tabStore.touch(form.value.id, form.value.name.trim() || '未命名请求', form.value.method)
+  const name = form.value.name.trim() || '未命名请求'
+  tabStore.touch(form.value.id, name, form.value.method)
+  // 「打开其他接口」下拉是进页面时拉的一次快照，改名/改方法后同步一份，免得显示旧名字
+  const hit = quickOptions.value.find((item) => item.id === form.value.id)
+  if (hit) {
+    hit.name = name
+    hit.method = form.value.method
+  }
 }
 
 function scheduleAutoSave() {
@@ -293,6 +302,30 @@ function resetScriptOutput() {
   scriptAssertions.value = []
   scriptError.value = ''
   scriptMs.value = 0
+}
+
+/**
+ * 切换接口时清空上一条接口的响应与脚本产物。
+ * 路由复用同一个 RequestEditor 实例，不清空就会把 A 的响应带到 B 的标签页上。
+ */
+function resetResponseState() {
+  result.value = null
+  wasCancelled.value = false
+  // 旧接口的在途请求不再属于当前面板，按钮状态回到空闲
+  sending.value = false
+  cancelling.value = false
+  requestKey.value = ''
+  resetScriptOutput()
+  // 运行时变量是跨接口共享的（例如登录接口写入 token），切标签时保留
+  responseTab.value = 'body'
+  bodyView.value = 'pretty'
+  bodyAbsPath.value = ''
+  bodyPreviewError.value = ''
+  diffOpen.value = false
+  diffBaseRunId.value = null
+  diffCustomText.value = ''
+  diffUseCustom.value = false
+  expandedRunId.value = null
 }
 
 function resetScriptVars() {
@@ -672,15 +705,23 @@ function applyHeaderPreset(id: number) {
   message.success(`已加入 ${preset.key}`)
 }
 
+// 连续快速切标签会并发触发 loadRequest，只让最后一次加载落地，
+// 否则先发出的旧请求返回时会把上一个接口的详情写回面板
+let loadToken = 0
+
 async function loadRequest(id: number) {
+  const token = ++loadToken
   if (!id) {
     loading.value = false
     return
   }
   loading.value = true
   hydrating = true
+  // 先清响应再拉详情：切标签立即可见空白，也不会把上一条的响应带过来
+  resetResponseState()
   try {
     const detail = await api.requestGet(id)
+    if (token !== loadToken) return
     if (!detail.auth) detail.auth = emptyAuth()
     // 先恢复各类型草稿，再赋值，避免 bodyType watcher 用空草稿覆盖当前 Body
     bodyDrafts.value = parseBodyDrafts(detail.bodyMeta)
@@ -700,6 +741,7 @@ async function loadRequest(id: number) {
     if (!opened) {
       message.warning(`最多同时打开 ${MAX_REQUEST_TABS} 个接口，请先关闭部分标签`)
     }
+    revealActiveTab()
     // 记住本接口，返回项目页时自动定位
     rememberLastRequest(projectId.value, {
       id,
@@ -709,11 +751,14 @@ async function loadRequest(id: number) {
     })
     await loadRuns()
   } catch (e) {
+    if (token !== loadToken) return
     tabStore.close(id)
     message.error(String(e))
   } finally {
-    loading.value = false
-    hydrating = false
+    if (token === loadToken) {
+      loading.value = false
+      hydrating = false
+    }
   }
 }
 
@@ -756,7 +801,11 @@ onMounted(async () => {
 
 watch(requestId, async (id, previous) => {
   if (!id || id === previous) return
+  // 路由已被其他入口（关闭标签、返回）带走了，作废还在排队的 switchTab
+  switchToken++
   await flushSave()
+  // 连续点击多个标签时，路由最终停在最后一个；前面排队的旧切换直接放弃
+  if (requestId.value !== id) return
   await loadRequest(id)
 })
 
@@ -821,9 +870,22 @@ async function goBack() {
   router.push(fromHistory ? backOr(`/project/${projectId.value}`) : `/project/${projectId.value}`)
 }
 
+/** 标签过多出现横向滚动时，把当前激活标签滚进视野 */
+function revealActiveTab() {
+  nextTick(() => {
+    const active = tabsScrollEl.value?.querySelector<HTMLElement>('.req-tab.active')
+    active?.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+  })
+}
+
+// 连续点击不同标签时只认最后一次点击，避免慢保存把路由推回上一个标签
+let switchToken = 0
+
 async function switchTab(id: number) {
   if (id === requestId.value) return
+  const token = ++switchToken
   await flushSave()
+  if (token !== switchToken) return
   router.push({
     name: 'request',
     params: { id },
@@ -900,6 +962,8 @@ async function send() {
   sending.value = true
   result.value = null
   wasCancelled.value = false
+  // 记住发起时的接口：中途切标签后，旧请求的结果不能再写进新接口的面板
+  const ownerId = form.value.id
   // 每次发送一个新标识：重试/重定向都在同一标识下，取消时能一次打中
   requestKey.value = `req-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
   resetScriptOutput()
@@ -962,6 +1026,7 @@ async function send() {
       outgoing = preResult.request
     }
 
+    if (form.value.id !== ownerId) return
     const payload: SendRequestPayload = {
       requestId: form.value.id ?? null,
       name: form.value.name,
@@ -993,7 +1058,10 @@ async function send() {
       },
     }
 
-    result.value = await api.sendRequest(payload)
+    const incoming = await api.sendRequest(payload)
+    // 请求返回前已切到别的接口：只保留后端运行记录，不再渲染到当前面板
+    if (form.value.id !== ownerId) return
+    result.value = incoming
     wasCancelled.value = result.value.cancelled === true
 
     // 用户主动停止：不是错误，用 info 提示即可，不弹错误框
@@ -1033,16 +1101,22 @@ async function send() {
       if (postResult.assertions.length || postResult.error) responseTab.value = 'tests'
     }
   } catch (e) {
-    errorDialog.show({
-      title: '请求执行失败',
-      error: e,
-      context: execContext('请求执行'),
-    })
+    // 已经切到别的接口：旧请求的错误不再打扰当前接口
+    if (form.value.id === ownerId) {
+      errorDialog.show({
+        title: '请求执行失败',
+        error: e,
+        context: execContext('请求执行'),
+      })
+    }
   } finally {
-    sending.value = false
-    scriptVars.value = listRuntimeVars()
+    // 切标签后可能已经在新接口上发起请求，别把新请求的「发送中」状态提前关掉
+    if (form.value.id === ownerId) {
+      sending.value = false
+      scriptVars.value = listRuntimeVars()
+    }
   }
-  await loadRuns()
+  if (form.value.id === ownerId) await loadRuns()
 }
 
 /* ---------- v1.0.8：停止在途请求 ---------- */
@@ -1275,15 +1349,19 @@ function setRunsPage(page: number) {
 }
 
 async function loadRuns() {
-  if (!form.value.id) return
+  const id = form.value.id
+  if (!id) return
   runsLoading.value = true
   try {
-    runs.value = await api.runList(form.value.id, 200)
+    const list = await api.runList(id, 200)
+    // 等结果期间已切到别的接口：不要把旧接口的运行记录塞进当前面板
+    if (form.value.id !== id) return
+    runs.value = list
     runsPage.value = 1
   } catch (e) {
-    message.error(String(e))
+    if (form.value.id === id) message.error(String(e))
   } finally {
-    runsLoading.value = false
+    if (form.value.id === id) runsLoading.value = false
   }
 }
 
@@ -1430,6 +1508,13 @@ const prettyBody = computed(() => {
 })
 
 const bodyView = ref<'pretty' | 'raw'>('pretty')
+
+// 新响应或切换 Pretty/Raw 后正文滚回顶部，避免停在上一次的滚动位置
+watch([result, bodyView], () => {
+  nextTick(() => {
+    if (bodyPreEl.value) bodyPreEl.value.scrollTop = 0
+  })
+})
 
 const bodySize = computed(() => new Blob([form.value.body ?? '']).size)
 
@@ -1686,7 +1771,7 @@ const responseHeaders = computed(() => {
       </div>
 
       <div class="tabs-bar">
-        <div class="tabs-scroll">
+        <div ref="tabsScrollEl" class="tabs-scroll">
           <div
             v-for="tab in tabStore.tabs"
             :key="tab.id"
@@ -2165,7 +2250,7 @@ const responseHeaders = computed(() => {
                   </div>
                   <div v-else-if="result.truncated" class="truncate-hint">响应体超过 5MB，已截断显示</div>
                   <div class="res-body-wrap">
-                    <pre class="mono body-pre">{{ bodyView === 'pretty' ? prettyBody : result.body }}</pre>
+                    <pre ref="bodyPreEl" class="mono body-pre">{{ bodyView === 'pretty' ? prettyBody : result.body }}</pre>
                   </div>
                 </template>
               </a-tab-pane>

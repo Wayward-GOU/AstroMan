@@ -7,6 +7,7 @@ mod logging;
 mod models;
 mod net_probe;
 mod netinfo;
+mod notes;
 mod prompts;
 mod python_exec;
 mod report_builder;
@@ -20,7 +21,7 @@ mod util;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Manager,
+    Emitter, Manager,
 };
 
 fn show_main_window(app: &tauri::AppHandle) {
@@ -43,11 +44,50 @@ fn tray_icon_bytes(scale: f64) -> &'static [u8] {
     }
 }
 
+/// 托盘菜单里暂停待办提醒，并同步托盘 tooltip
+fn pause_notes(app: &tauri::AppHandle, minutes: i64) {
+    let state = app.state::<state::AppState>();
+    let mut settings = notes::get_settings(&state.pool);
+    let now = util::now_ms();
+    settings.pause_until = if minutes <= 0 {
+        notes::start_of_tomorrow(now)
+    } else {
+        now + minutes * 60_000
+    };
+    if let Err(error) = notes::set_settings(&state.pool, &settings) {
+        log::warn!("暂停待办提醒失败：{error}");
+        return;
+    }
+    if let Some(tray) = app.tray_by_id("main-tray") {
+        let _ = tray.set_tooltip(Some("AstroMan · 提醒已暂停"));
+    }
+    let _ = app.emit("notes:changed", serde_json::json!({ "reason": "settings" }));
+}
+
 /// 系统托盘：左键点击显示主窗口，右键菜单可显示或退出
 fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
+    let open_notes = MenuItem::with_id(app, "open-notes", "打开记事本", true, None::<&str>)?;
+    let quick = MenuItem::with_id(app, "notes-quick", "快速记录", true, None::<&str>)?;
+    let pause_hour = MenuItem::with_id(
+        app,
+        "notes-pause-hour",
+        "暂停提醒 1 小时",
+        true,
+        None::<&str>,
+    )?;
+    let pause_today = MenuItem::with_id(
+        app,
+        "notes-pause-today",
+        "暂停提醒到今天结束",
+        true,
+        None::<&str>,
+    )?;
     let quit = MenuItem::with_id(app, "quit", "退出 AstroMan", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &quit])?;
+    let menu = Menu::with_items(
+        app,
+        &[&show, &open_notes, &quick, &pause_hour, &pause_today, &quit],
+    )?;
 
     // 主窗口还没建好时退回主显示器缩放，保证始终能拿到接近托盘槽位的尺寸
     let scale = app
@@ -68,6 +108,13 @@ fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => show_main_window(app),
+            "open-notes" => {
+                show_main_window(app);
+                let _ = app.emit("notes:open", ());
+            }
+            "notes-quick" => notes::quick::show(app),
+            "notes-pause-hour" => pause_notes(app, 60),
+            "notes-pause-today" => pause_notes(app, 0),
             "quit" => app.exit(0),
             _ => {}
         })
@@ -93,8 +140,14 @@ pub fn run() {
             show_main_window(app);
         }))
         .plugin(tauri_plugin_dialog::init())
-        // 记住窗口尺寸/位置/最大化状态，下次启动原样恢复
-        .plugin(tauri_plugin_window_state::Builder::default().build())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        // 记住窗口尺寸/位置/最大化状态，下次启动原样恢复；
+        // 快速记录窗口每次居中弹出，不参与状态记忆
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_denylist(&["quick-capture"])
+                .build(),
+        )
         .setup(|app| {
             // 日志落盘：数据目录确定后才能建写入器，因此放在 setup 里初始化
             let data_dir = state::resolve_data_dir(app.handle());
@@ -152,6 +205,23 @@ pub fn run() {
 
             app.manage(commands::winstats::WinStatsState::new());
             setup_tray(app.handle())?;
+
+            // 待办：恢复全局快捷键并启动提醒调度（隐藏到托盘后仍然生效）
+            {
+                let state = app.state::<state::AppState>();
+                let settings = notes::get_settings(&state.pool);
+                if let Err(error) =
+                    notes::quick::sync_shortcut(app.handle(), settings.global_shortcut)
+                {
+                    log::warn!("{error}");
+                    if settings.global_shortcut {
+                        let mut fallback = settings.clone();
+                        fallback.global_shortcut = false;
+                        let _ = notes::set_settings(&state.pool, &fallback);
+                    }
+                }
+            }
+            notes::reminder::spawn(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -296,6 +366,28 @@ pub fn run() {
             commands::tools::tool_hmac,
             commands::tools::ip_lookup,
             commands::winstats::winstats_snapshot,
+            commands::notes::notes_list,
+            commands::notes::notes_get,
+            commands::notes::notes_create,
+            commands::notes::notes_update,
+            commands::notes::notes_toggle,
+            commands::notes::notes_snooze,
+            commands::notes::notes_delete,
+            commands::notes::notes_restore,
+            commands::notes::notes_clear_done,
+            commands::notes::notes_counts,
+            commands::notes::notes_tags,
+            commands::notes::notes_settings_get,
+            commands::notes::notes_settings_set,
+            commands::notes::notes_quick_show,
+            commands::notes::notes_attachment_add,
+            commands::notes::notes_attachment_list,
+            commands::notes::notes_attachment_data,
+            commands::notes::notes_attachment_remove,
+            commands::notes::notes_attachment_save,
+            commands::notes::notes_extract_image,
+            commands::notes::notes_extract_cancel,
+            commands::notes::notes_create_from_image,
             commands::winstats::winstats_processes,
             commands::winstats::winstats_process_kill,
             commands::storage::storage_info,
@@ -320,6 +412,13 @@ pub fn run() {
             commands::capture::capture_export_har,
             commands::capture::capture_export_zip,
             commands::capture::capture_save_body,
+            commands::capture::capture_intercept_state,
+            commands::capture::capture_breakpoint_set_rules,
+            commands::capture::capture_map_set_rules,
+            commands::capture::capture_remote_set_rules,
+            commands::capture::capture_weak_set,
+            commands::capture::capture_breakpoint_resolve,
+            commands::capture::capture_breakpoint_release_all,
         ])
         .on_window_event(|window, event| {
             // 关闭主窗口时隐藏到托盘，从托盘菜单「退出 AstroMan」才会真正结束进程

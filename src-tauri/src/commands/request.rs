@@ -42,6 +42,7 @@ fn map_detail(row: &Row<'_>) -> rusqlite::Result<HttpRequestDetail> {
         post_script: row.get::<_, Option<String>>(10)?.unwrap_or_default(),
         assertions: row.get::<_, Option<String>>(11)?.unwrap_or_default(),
         auth: auth
+            .map(|text| crate::secret::decrypt_auth_json(&text))
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or_default(),
     })
@@ -172,7 +173,8 @@ pub fn request_save(
     };
     let headers = serde_json::to_string(&request.headers).map_err(err)?;
     let query = serde_json::to_string(&request.params).map_err(err)?;
-    let auth = serde_json::to_string(&request.auth).map_err(err)?;
+    let auth =
+        crate::secret::encrypt_auth_json(&serde_json::to_string(&request.auth).map_err(err)?)?;
     let now = now_ms();
 
     let conn = state.pool.get().map_err(err)?;

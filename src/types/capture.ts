@@ -58,6 +58,12 @@ export interface CaptureFlow {
   contentType: string
   clientAddr: string
   error: string | null
+  /** 响应由本地映射直接返回 */
+  mapped: boolean
+  /** 断点改过请求或响应 */
+  modified: boolean
+  /** 远程映射真正发往的上游地址；未命中时为 null */
+  remote: string | null
 }
 
 export interface CaptureFlowDetail extends CaptureFlow {
@@ -94,4 +100,117 @@ export interface CaptureRepeatResult {
   url: string
   headers: CaptureHeader[]
   body: CaptureBody
+}
+
+/** 断点阶段 */
+export type BreakpointPhase = 'request' | 'response' | 'both'
+
+export interface BreakpointRule {
+  id: number
+  enabled: boolean
+  name: string
+  /** URL 匹配：含 `*` 走通配，否则按包含；只写 host/path 也能命中 */
+  pattern: string
+  /** 空串或 any 表示不限方法 */
+  method: string
+  phase: BreakpointPhase
+}
+
+export type MapSource = 'file' | 'inline'
+
+export interface MapRule {
+  id: number
+  enabled: boolean
+  name: string
+  pattern: string
+  method: string
+  source: MapSource
+  /** source=file 时的本地路径，每次命中实时读取 */
+  filePath: string
+  status: number
+  /** 留空按扩展名或内容猜 */
+  contentType: string
+  /** source=inline 时的响应正文 */
+  body: string
+  headers: CaptureHeader[]
+}
+
+/** 远程映射：命中后把请求改发到 target，列表里仍显示原地址 */
+export interface MapRemoteRule {
+  id: number
+  enabled: boolean
+  name: string
+  pattern: string
+  method: string
+  /** 目标地址，可只写 host:port，也可写完整 URL */
+  target: string
+  /** 是否保留原请求的路径与查询串（默认 true） */
+  keepPath: boolean
+}
+
+export interface WeakNetwork {
+  enabled: boolean
+  /** 只记录 UI 选中的预设名，参数仍可单独改 */
+  preset: string
+  latencyMs: number
+  jitterMs: number
+  /** 下行带宽（kbps），0 表示不限速 */
+  bandwidthKbps: number
+  /** 0~100，命中的请求直接返回 504 */
+  lossPercent: number
+  /** 作用范围，空表示全部流量 */
+  patterns: string[]
+}
+
+/** 一条被断点挂起的流量 */
+export interface PendingBreakpoint {
+  pauseId: number
+  phase: 'request' | 'response'
+  rule: string
+  method: string
+  url: string
+  httpVersion: string
+  status: number | null
+  requestHeaders: CaptureHeader[]
+  requestBody: CaptureBody
+  /** false 表示请求体是二进制或过大，只能原样放行 */
+  requestEditable: boolean
+  responseHeaders: CaptureHeader[]
+  responseBody: CaptureBody
+  /** false 表示响应体未缓冲（流式或过大），只能改状态码与响应头 */
+  responseEditable: boolean
+  createdAt: number
+}
+
+export interface InterceptView {
+  breakpointsEnabled: boolean
+  breakpointsActive: boolean
+  mapEnabled: boolean
+  mapActive: boolean
+  remoteEnabled: boolean
+  remoteActive: boolean
+  weak: WeakNetwork
+  breakpointRules: BreakpointRule[]
+  mapRules: MapRule[]
+  remoteRules: MapRemoteRule[]
+  pausedTotal: number
+  pendingCount: number
+  maxPending: number
+  timeoutSeconds: number
+  pending: PendingBreakpoint[]
+}
+
+/** 断点里改写入参 */
+export interface RequestEdit {
+  method?: string
+  url?: string
+  headers?: CaptureHeader[]
+  body?: string
+}
+
+/** 断点里改写返参 */
+export interface ResponseEdit {
+  status?: number
+  headers?: CaptureHeader[]
+  body?: string
 }

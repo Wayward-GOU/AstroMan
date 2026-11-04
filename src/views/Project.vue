@@ -547,9 +547,9 @@ async function importOpenapiFile() {
 async function importApiFile() {
   try {
     const path = await open({
-      title: '导入 Postman / Apifox 数据',
+      title: '导入 Postman / Apifox / HAR 数据',
       multiple: false,
-      filters: [{ name: 'JSON 文件', extensions: ['json'] }],
+      filters: [{ name: 'JSON / HAR 文件', extensions: ['json', 'har'] }],
     })
     if (!path) return
     importingApi.value = true
@@ -564,6 +564,9 @@ async function importApiFile() {
       await loadRequests(store.tree[0].id)
     }
     message.success('接口已导入到当前项目')
+    if (path.toLowerCase().endsWith('.har')) {
+      message.info('HAR 中 Authorization / Cookie 已默认停用，上传文件字段与 base64 请求体未导入', 6)
+    }
   } catch (e) {
     message.error(String(e))
   } finally {
@@ -664,7 +667,7 @@ const columns = computed(() =>
           <template #overlay>
             <a-menu @click="onImportMenu">
               <a-menu-item key="curl">cURL 命令</a-menu-item>
-              <a-menu-item key="postman">Postman / Apifox</a-menu-item>
+              <a-menu-item key="postman">Postman / Apifox / HAR</a-menu-item>
               <a-menu-item key="openapi">OpenAPI / Swagger</a-menu-item>
             </a-menu>
           </template>

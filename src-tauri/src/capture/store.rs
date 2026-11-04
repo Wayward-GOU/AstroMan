@@ -73,6 +73,15 @@ pub struct FlowBrief {
     pub content_type: String,
     pub client_addr: String,
     pub error: Option<String>,
+    /// 由本地映射直接应答，没有走上游
+    #[serde(default)]
+    pub mapped: bool,
+    /// 被断点改过包（请求或响应任一）
+    #[serde(default)]
+    pub modified: bool,
+    /// 远程映射真正发往的上游地址；未命中远程映射时为 None
+    #[serde(default)]
+    pub remote: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

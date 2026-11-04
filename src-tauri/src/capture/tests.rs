@@ -207,6 +207,9 @@ fn zip_export_contains_readable_text_and_binary_bodies() {
             content_type: "application/json".into(),
             client_addr: "127.0.0.1:5555".into(),
             error: None,
+            mapped: false,
+            modified: false,
+            remote: None,
         },
         request_headers: vec![HeaderEntry {
             name: "content-type".into(),
@@ -250,6 +253,9 @@ fn zip_export_contains_readable_text_and_binary_bodies() {
             content_type: "image/png".into(),
             client_addr: "127.0.0.1:5556".into(),
             error: None,
+            mapped: false,
+            modified: false,
+            remote: None,
         },
         request_headers: Vec::new(),
         response_headers: vec![HeaderEntry {
@@ -364,6 +370,9 @@ fn repeat_detail(port: u16) -> FlowDetail {
             content_type: "text/plain".into(),
             client_addr: String::new(),
             error: None,
+            mapped: false,
+            modified: false,
+            remote: None,
         },
         request_headers: vec![HeaderEntry {
             name: "host".into(),
@@ -420,4 +429,524 @@ async fn repeat_without_recording_applies_overrides() {
     );
 
     upstream.join().expect("echo upstream thread");
+}
+
+#[test]
+fn intercept_rules_match_and_persist() {
+    use crate::capture::intercept::{
+        resolve_remote_target, url_matches, BreakpointPhase, BreakpointRule, InterceptState,
+        MapLocalRule, MapRemoteRule, MapSource, PendingPhase, WeakNetwork,
+    };
+
+    // 通配与「包含」两种写法；只写 host/path 也要能命中
+    assert!(url_matches(
+        "*/api/login*",
+        "https://example.com/api/login?x=1"
+    ));
+    assert!(url_matches(
+        "api.example.com/users",
+        "https://api.example.com/users"
+    ));
+    assert!(!url_matches(
+        "api.example.com/users",
+        "https://api.example.com/orders"
+    ));
+
+    let dir = temp_dir();
+    let path = dir.join("capture").join("intercept.json");
+    let state = InterceptState::new();
+    state.set_breakpoints(
+        Some(true),
+        Some(vec![BreakpointRule {
+            id: 0,
+            enabled: true,
+            name: "登录请求".into(),
+            pattern: "*/api/login*".into(),
+            method: "POST".into(),
+            phase: BreakpointPhase::Request,
+        }]),
+    );
+    state.set_map(
+        Some(true),
+        Some(vec![MapLocalRule {
+            id: 0,
+            enabled: true,
+            name: "mock".into(),
+            pattern: "example.com/mock".into(),
+            method: String::new(),
+            source: MapSource::Inline,
+            file_path: String::new(),
+            status: 201,
+            content_type: "application/json".into(),
+            body: "{\"ok\":true}".into(),
+            headers: Vec::new(),
+        }]),
+    );
+    state.set_remote(
+        Some(true),
+        Some(vec![MapRemoteRule {
+            id: 0,
+            enabled: true,
+            name: "换域名".into(),
+            pattern: "example.com/api".into(),
+            method: String::new(),
+            target: "localhost:8080".into(),
+            keep_path: true,
+        }]),
+    );
+    state.set_weak(WeakNetwork {
+        enabled: true,
+        preset: "3g".into(),
+        latency_ms: 10,
+        jitter_ms: 0,
+        bandwidth_kbps: 8,
+        loss_percent: 0,
+        patterns: vec!["example.com".into()],
+    });
+    state.save(&path).expect("save rules");
+
+    let loaded = InterceptState::load(&path);
+    let view = loaded.snapshot();
+    assert!(view.breakpoints_enabled);
+    assert_eq!(view.breakpoint_rules.len(), 1);
+    assert_eq!(view.breakpoint_rules[0].id, 1, "空 id 应被补齐");
+    assert_eq!(view.map_rules[0].status, 201);
+    assert!(view.remote_enabled);
+    assert_eq!(view.remote_rules.len(), 1);
+    assert!(view.remote_rules[0].keep_path);
+    assert!(view.weak.enabled);
+    assert_eq!(view.weak.bandwidth_kbps, 8);
+
+    let hit = loaded
+        .match_breakpoint(
+            "https://example.com/api/login",
+            "POST",
+            PendingPhase::Request,
+        )
+        .expect("请求断点应命中");
+    assert_eq!(hit.name, "登录请求");
+    assert!(loaded
+        .match_breakpoint(
+            "https://example.com/api/login",
+            "GET",
+            PendingPhase::Request
+        )
+        .is_none());
+    assert!(loaded
+        .match_breakpoint(
+            "https://example.com/api/login",
+            "POST",
+            PendingPhase::Response
+        )
+        .is_none());
+    assert!(loaded
+        .match_map("https://example.com/mock", "GET")
+        .is_some());
+    assert!(loaded
+        .match_remote("https://example.com/api/users?x=1", "GET")
+        .is_some());
+    assert!(loaded
+        .match_remote("https://example.com/orders", "GET")
+        .is_none());
+
+    // 只写 host:port、保留原路径；关掉保留路径时完全用规则里的目标地址
+    let rule = loaded
+        .match_remote("https://example.com/api/users?x=1", "GET")
+        .expect("远程映射应命中");
+    assert_eq!(
+        resolve_remote_target(&rule, "https://example.com/api/users?x=1").as_deref(),
+        Some("http://localhost:8080/api/users?x=1")
+    );
+    let exact = MapRemoteRule {
+        target: "http://localhost:9000/v2/users".into(),
+        keep_path: false,
+        ..rule
+    };
+    assert_eq!(
+        resolve_remote_target(&exact, "https://example.com/api/users?x=1").as_deref(),
+        Some("http://localhost:9000/v2/users")
+    );
+    let bare = MapRemoteRule {
+        target: "localhost:9000".into(),
+        keep_path: false,
+        ..exact
+    };
+    assert_eq!(
+        resolve_remote_target(&bare, "https://example.com/api/users?x=1").as_deref(),
+        Some("http://localhost:9000/")
+    );
+
+    let plan = loaded
+        .weak_request_plan("https://example.com/x")
+        .expect("弱网应命中");
+    assert!(!plan.drop);
+    assert!(plan.delay >= Duration::from_millis(10));
+    assert!(loaded.weak_request_plan("https://other.com/x").is_none());
+    assert!(loaded
+        .weak_response_delay("https://example.com/x", 10_000)
+        .is_some());
+}
+
+#[test]
+fn map_local_answers_without_upstream() {
+    use crate::capture::intercept::{MapLocalRule, MapSource};
+
+    let data_dir = temp_dir();
+    let manager = CaptureManager::new(data_dir);
+    manager
+        .set_map(
+            Some(true),
+            Some(vec![MapLocalRule {
+                id: 0,
+                enabled: true,
+                name: "mock".into(),
+                // 9 端口上没有服务：命中说明确实没走上游
+                pattern: "127.0.0.1:9/mock".into(),
+                method: "GET".into(),
+                source: MapSource::Inline,
+                status: 200,
+                content_type: "application/json".into(),
+                body: "{\"mapped\":true}".into(),
+                ..MapLocalRule::default()
+            }]),
+        )
+        .expect("set map rules");
+
+    let status = manager
+        .start(Some(CaptureConfig {
+            port: 0,
+            bind_addr: "127.0.0.1".into(),
+            ..CaptureConfig::default()
+        }))
+        .expect("start capture");
+
+    let mut client = TcpStream::connect(("127.0.0.1", status.port)).expect("connect proxy");
+    let _ = client.set_read_timeout(Some(Duration::from_secs(10)));
+    let request =
+        "GET http://127.0.0.1:9/mock HTTP/1.1\r\nHost: 127.0.0.1:9\r\nConnection: close\r\n\r\n";
+    client
+        .write_all(request.as_bytes())
+        .expect("write proxy request");
+    let mut response = Vec::new();
+    let _ = client.read_to_end(&mut response);
+    let text = String::from_utf8_lossy(&response);
+    assert!(text.starts_with("HTTP/1.1 200"), "unexpected: {text}");
+    assert!(text.contains("{\"mapped\":true}"), "unexpected: {text}");
+
+    let mut flows = manager.flows(10);
+    for _ in 0..50 {
+        if !flows.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        flows = manager.flows(10);
+    }
+    assert_eq!(flows.len(), 1, "expected one flow, got {flows:?}");
+    assert_eq!(flows[0].status, Some(200));
+    assert!(flows[0].mapped, "本地映射应标记 mapped");
+    manager.stop().expect("stop capture");
+}
+
+/// 远程映射：原地址没有服务，命中规则后应改发到真正的上游，并保留路径与查询串。
+#[test]
+fn map_remote_rewrites_upstream_target() {
+    use crate::capture::intercept::MapRemoteRule;
+
+    let data_dir = temp_dir();
+    let manager = CaptureManager::new(data_dir);
+    let (upstream_port, upstream) = spawn_echo_upstream();
+    manager
+        .set_remote(
+            Some(true),
+            Some(vec![MapRemoteRule {
+                id: 0,
+                enabled: true,
+                name: "换测试环境".into(),
+                pattern: "127.0.0.1:9/api".into(),
+                method: "GET".into(),
+                target: format!("http://127.0.0.1:{upstream_port}"),
+                keep_path: true,
+            }]),
+        )
+        .expect("set remote rules");
+
+    let status = manager
+        .start(Some(CaptureConfig {
+            port: 0,
+            bind_addr: "127.0.0.1".into(),
+            ..CaptureConfig::default()
+        }))
+        .expect("start capture");
+
+    let mut client = TcpStream::connect(("127.0.0.1", status.port)).expect("connect proxy");
+    let _ = client.set_read_timeout(Some(Duration::from_secs(10)));
+    let request = "GET http://127.0.0.1:9/api/hello?x=1 HTTP/1.1\r\nHost: 127.0.0.1:9\r\nConnection: close\r\n\r\n";
+    client
+        .write_all(request.as_bytes())
+        .expect("write proxy request");
+    let mut response = Vec::new();
+    let _ = client.read_to_end(&mut response);
+    let text = String::from_utf8_lossy(&response);
+    assert!(text.starts_with("HTTP/1.1 200"), "unexpected: {text}");
+    // 回显上游把收到的请求原文作为响应，路径与查询串必须原样保留
+    assert!(
+        text.contains("GET /api/hello?x=1 HTTP/1.1"),
+        "path/query should be preserved: {text}"
+    );
+
+    let mut flows = manager.flows(10);
+    for _ in 0..50 {
+        if !flows.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        flows = manager.flows(10);
+    }
+    assert_eq!(flows.len(), 1, "expected one flow, got {flows:?}");
+    // 列表里仍展示客户端请求的原地址，便于和浏览器对照
+    assert_eq!(flows[0].host, "127.0.0.1:9");
+    assert_eq!(flows[0].path, "/api/hello?x=1");
+    let expected = format!("http://127.0.0.1:{upstream_port}/api/hello?x=1");
+    assert_eq!(flows[0].remote.as_deref(), Some(expected.as_str()));
+
+    manager.stop().expect("stop capture");
+    upstream.join().expect("echo upstream thread");
+}
+
+#[test]
+fn weak_network_drop_returns_timeout() {
+    use crate::capture::intercept::WeakNetwork;
+
+    let data_dir = temp_dir();
+    let manager = CaptureManager::new(data_dir);
+    manager
+        .set_weak(WeakNetwork {
+            enabled: true,
+            preset: "loss".into(),
+            latency_ms: 0,
+            jitter_ms: 0,
+            bandwidth_kbps: 0,
+            loss_percent: 100,
+            patterns: Vec::new(),
+        })
+        .expect("set weak network");
+
+    let status = manager
+        .start(Some(CaptureConfig {
+            port: 0,
+            bind_addr: "127.0.0.1".into(),
+            ..CaptureConfig::default()
+        }))
+        .expect("start capture");
+
+    let mut client = TcpStream::connect(("127.0.0.1", status.port)).expect("connect proxy");
+    let _ = client.set_read_timeout(Some(Duration::from_secs(10)));
+    let request =
+        "GET http://127.0.0.1:9/lost HTTP/1.1\r\nHost: 127.0.0.1:9\r\nConnection: close\r\n\r\n";
+    client
+        .write_all(request.as_bytes())
+        .expect("write proxy request");
+    let mut response = Vec::new();
+    let _ = client.read_to_end(&mut response);
+    let text = String::from_utf8_lossy(&response);
+    // 与「连不上上游」的 502 区分开
+    assert!(text.starts_with("HTTP/1.1 504"), "unexpected: {text}");
+
+    let mut flows = manager.flows(10);
+    for _ in 0..50 {
+        if !flows.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        flows = manager.flows(10);
+    }
+    assert_eq!(flows.len(), 1, "expected one flow, got {flows:?}");
+    assert!(flows[0]
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("弱网"));
+    manager.stop().expect("stop capture");
+}
+
+/// 响应断点改包：改状态码与正文后再下发，并标记 modified。
+#[test]
+fn response_breakpoint_rewrites_status_and_body() {
+    use crate::capture::intercept::{BreakpointPhase, BreakpointRule, Decision, ResponseEdit};
+    use std::sync::Arc;
+
+    let data_dir = temp_dir();
+    let manager = Arc::new(CaptureManager::new(data_dir));
+    manager
+        .set_breakpoints(
+            Some(true),
+            Some(vec![BreakpointRule {
+                id: 0,
+                enabled: true,
+                name: "改响应".into(),
+                pattern: "*/hello".into(),
+                method: "GET".into(),
+                phase: BreakpointPhase::Response,
+            }]),
+        )
+        .expect("set breakpoints");
+
+    let (upstream_port, upstream) = spawn_upstream();
+    let status = manager
+        .start(Some(CaptureConfig {
+            port: 0,
+            bind_addr: "127.0.0.1".into(),
+            ..CaptureConfig::default()
+        }))
+        .expect("start capture");
+
+    let resolver = {
+        let manager = manager.clone();
+        std::thread::spawn(move || {
+            for _ in 0..200 {
+                let view = manager.intercept_view();
+                if let Some(pending) = view.pending.first() {
+                    manager
+                        .resolve_pause(
+                            pending.pause_id,
+                            Decision::Response(ResponseEdit {
+                                status: Some(201),
+                                headers: None,
+                                body: Some("{\"ok\":true}".into()),
+                            }),
+                        )
+                        .expect("resolve pause");
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            panic!("响应断点没有挂起");
+        })
+    };
+
+    let mut client = TcpStream::connect(("127.0.0.1", status.port)).expect("connect proxy");
+    let _ = client.set_read_timeout(Some(Duration::from_secs(10)));
+    let request = format!(
+        "GET http://127.0.0.1:{upstream_port}/hello HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nConnection: close\r\n\r\n"
+    );
+    client
+        .write_all(request.as_bytes())
+        .expect("write proxy request");
+    let mut response = Vec::new();
+    let _ = client.read_to_end(&mut response);
+    let text = String::from_utf8_lossy(&response);
+    assert!(text.starts_with("HTTP/1.1 201"), "unexpected: {text}");
+    assert!(text.contains("{\"ok\":true}"), "响应体未改写: {text}");
+    assert!(!text.contains("hello-from-upstream"));
+
+    resolver.join().expect("resolver thread");
+    upstream.join().expect("upstream thread");
+
+    let mut flows = manager.flows(10);
+    for _ in 0..50 {
+        if !flows.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        flows = manager.flows(10);
+    }
+    assert_eq!(flows.len(), 1, "expected one flow, got {flows:?}");
+    assert_eq!(flows[0].status, Some(201));
+    assert!(flows[0].modified, "断点改包应标记 modified");
+    manager.stop().expect("stop capture");
+}
+
+/// 请求断点改包：改方法 / URL / 头 / body 后再发上游，并标记 modified。
+#[test]
+fn request_breakpoint_applies_edit_before_upstream() {
+    use crate::capture::intercept::{BreakpointPhase, BreakpointRule, Decision, RequestEdit};
+    use std::sync::Arc;
+
+    let data_dir = temp_dir();
+    let manager = Arc::new(CaptureManager::new(data_dir));
+    manager
+        .set_breakpoints(
+            Some(true),
+            Some(vec![BreakpointRule {
+                id: 0,
+                enabled: true,
+                name: "改登录".into(),
+                pattern: "*/hello".into(),
+                method: "POST".into(),
+                phase: BreakpointPhase::Request,
+            }]),
+        )
+        .expect("set breakpoints");
+
+    let (upstream_port, upstream) = spawn_echo_upstream();
+    let status = manager
+        .start(Some(CaptureConfig {
+            port: 0,
+            bind_addr: "127.0.0.1".into(),
+            ..CaptureConfig::default()
+        }))
+        .expect("start capture");
+
+    let resolver = {
+        let manager = manager.clone();
+        let edited_url = format!("http://127.0.0.1:{upstream_port}/edited?from=bp");
+        std::thread::spawn(move || {
+            for _ in 0..200 {
+                let view = manager.intercept_view();
+                if let Some(pending) = view.pending.first() {
+                    manager
+                        .resolve_pause(
+                            pending.pause_id,
+                            Decision::Request(RequestEdit {
+                                method: Some("PUT".into()),
+                                url: Some(edited_url),
+                                headers: Some(vec![HeaderEntry {
+                                    name: "x-test".into(),
+                                    value: "1".into(),
+                                }]),
+                                body: Some("pong".into()),
+                            }),
+                        )
+                        .expect("resolve pause");
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            panic!("请求断点没有挂起");
+        })
+    };
+
+    let mut client = TcpStream::connect(("127.0.0.1", status.port)).expect("connect proxy");
+    let _ = client.set_read_timeout(Some(Duration::from_secs(10)));
+    let request = format!(
+        "POST http://127.0.0.1:{upstream_port}/hello HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nContent-Type: text/plain\r\nContent-Length: 4\r\nConnection: close\r\n\r\nping"
+    );
+    client
+        .write_all(request.as_bytes())
+        .expect("write proxy request");
+    let mut response = Vec::new();
+    let _ = client.read_to_end(&mut response);
+    let text = String::from_utf8_lossy(&response).to_ascii_lowercase();
+    assert!(text.starts_with("http/1.1 200"), "unexpected: {text}");
+    assert!(text.contains("put "), "方法未改写: {text}");
+    assert!(text.contains("/edited?from=bp"), "URL 未改写: {text}");
+    assert!(text.contains("x-test: 1"), "请求头未改写: {text}");
+    assert!(text.contains("pong"), "请求体未改写: {text}");
+
+    resolver.join().expect("resolver thread");
+    upstream.join().expect("echo upstream thread");
+
+    let mut flows = manager.flows(10);
+    for _ in 0..50 {
+        if !flows.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        flows = manager.flows(10);
+    }
+    assert_eq!(flows.len(), 1, "expected one flow, got {flows:?}");
+    assert_eq!(flows[0].method, "PUT");
+    assert_eq!(flows[0].path, "/edited?from=bp");
+    assert!(flows[0].modified, "断点改包应标记 modified");
+    manager.stop().expect("stop capture");
 }

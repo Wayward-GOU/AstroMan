@@ -1360,7 +1360,10 @@ fn insert_pack_request(
             request.get("params").map(|value| value.to_string()),
             text_field(request, "bodyType").unwrap_or_else(|| "none".into()),
             text_field(request, "body"),
-            request.get("auth").map(|value| value.to_string()),
+            match request.get("auth").map(|value| value.to_string()) {
+                Some(text) => Some(config(crate::secret::encrypt_auth_json(&text))?),
+                None => None,
+            },
             order,
             now
         ],

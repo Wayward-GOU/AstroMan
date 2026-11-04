@@ -45,11 +45,22 @@ description: AstroMan 前端开发规范（Vue 3 + Ant Design Vue + Pinia + 设�
 
 ## 工作台与数据大屏
 
-v1.0.8 起大屏不在首页：`views/Dashboard.vue` 只剩总览 KPI、快捷入口、测试场景 / 批量运行介绍、产品介绍、引导与 FAQ；图表全部在 `components/DashboardMetrics.vue`，由 `views/History.vue`（历史记录）挂载。
+v1.0.8 起大屏不在首页：`views/Dashboard.vue` 只剩总览 KPI、快捷入口、测试场景 / 批量运行介绍、产品介绍、引导与 FAQ；图表全部在 `components/DashboardMetrics.vue`，由 `views/History.vue`（历史记录）挂载。v1.0.9 首页新增「今日待办」卡片，只读 `notes_counts`，点击跳 `/notes`，不要在首页再拉全量待办。
 
 - 图表**不依赖图表库**：柱高/宽度用峰值归一后的百分比，颜色只用 `--fm-*`（成功/警告/危险），空数据必须走 `.dash-empty` 文案而不是空坐标轴
 - 两个页面都用 `Promise.allSettled` 拉数据，失败时保留空态、不阻断其他区块
 - 新增/调整图表的完整约定（SQL 口径、补零、断点）见 skill `astroman-dashboard`
+
+## 请求编辑器多标签（`views/RequestEditor.vue`）
+
+一个组件复用于 `/request/:id`，切标签只换路由参数，**不会重建组件**，所有瞬时状态都得自己清理。
+
+- 响应结果、断言、计时、运行时变量都要在 `loadRequest` 开始时 `resetResponseState()`；否则新标签会看到上一个接口的结果
+- 连续快速切标签会并发触发加载，用 `loadToken` 只让最后一次落地；发送中的响应还要用 owner id 校验，归属不符直接丢弃
+- `switchTab` 先 `flushSave()` 再 `router.push`，并用 `switchToken` 作废排队中的切换；路由已被其他入口带走时不要再跳
+- 新响应或切换 Pretty / Raw 后把正文滚动回顶部（`watch([result, bodyView])`）
+- 标签栏溢出时 `revealActiveTab()` 把当前标签 `scrollIntoView({ inline: 'nearest' })`
+- 重命名后同步 `stores/tabs` 与快速打开下拉项，避免下拉里还是旧名字
 
 ## 工具箱（`src/tools`）
 
@@ -74,7 +85,21 @@ v1.0.8 起大屏不在首页：`views/Dashboard.vue` 只剩总览 KPI、快捷�
 - 分组右键菜单用 `Teleport to="body"` 定位，点击窗口任意位置 / 失焦都要关闭
 - 开始录制固定传 `{ port, bindAddr, sslHosts: [], ignorePatterns: [], captureStatic: true }`；新增设置项时同步 `CaptureConfig` 与 Rust handler
 - 浏览器预览下 `invoke` 不可用，页面会显示「代理后端不可用」提示，属预期
-- 协议、证书、手机与重发规则见 skill `astroman-capture`
+- 拦截能力拆在 `components/CaptureInterceptDrawer.vue`（规则列表与开关）与 `CaptureBreakpointModal.vue`（命中后的改包）；断点弹窗要能被外部事件唤醒，关闭时必须调 `capture_breakpoint_release_all`，否则请求会挂到 120 秒超时
+- 协议、证书、手机、重发与拦截规则见 skill `astroman-capture`
+
+## 记事本页（`views/Notes.vue` + `views/QuickCapture.vue`）
+
+三栏布局：左栏类型 + 标签筛选，中间卡片流，右侧 **50% 宽度**详情抽屉；新建与编辑都走抽屉，不要退回居中弹窗。
+
+- 列表状态在 `stores/notes.ts`，筛选（scope / keyword / tag / kind）变化后重新 `notes_list`；长列表前端静态分页
+- 完成 / 删除走页面内 undo 条，不弹二次确认；稍后 10 分钟调用 `notes_snooze` 后必须用返回值刷新抽屉里的 `snoozeUntil`，不能只改本地展示
+- 标签颜色由 `utils/notesTags.ts` 按名称稳定派生，侧栏、列表、卡片共用；不要随机取色
+- 附件预览用 `components/notes/NotesImageViewer.vue`；上传前 `utils/notesImage.ts` 压缩，原图以 base64 传后端去重
+- 截图生成走 `components/notes/NotesImportDialog.vue`：只列 `supportsVision` 的服务商，识别失败要保留原图与 `rawText`
+- 全局提醒卡片挂在 `NotesReminderHost.vue`，监听 `notes:reminder`；点击卡片发 `notes:open` 并定位到对应记录
+- `QuickCapture.vue` 是独立窗口（hash `#/quick-capture`），不要塞进主窗口路由；解析逻辑在 `utils/notesQuickParse.ts` 纯函数里
+- 数据语义与提醒规则见 skill `astroman-notes`
 
 ## 页面内 AI 入口（AiAssist）
 
@@ -105,12 +130,13 @@ v1.0.8 起大屏不在首页：`views/Dashboard.vue` 只剩总览 KPI、快捷�
 | `stores/aiAssist.ts` | 页面内 AI 抽屉：`open/title/hint/messages/streaming`、`show()` 与 `ask()`，负责服务商选择与流式渲染 |
 | `stores/tabs.ts` | 请求标签页（打开/切换/关闭），持久化到 localStorage |
 | `stores/theme.ts` | 主题定义、`applyTheme`、初始化与持久化 |
+| `stores/notes.ts` | 待办列表、筛选、计数、标签、设置缓存；监听 `notes:changed` 刷新 |
 
 约定：**跨页面共享的状态才进 store**，单页面状态用 `ref`；调用后端后主动更新 store 而不是让多个页面各自缓存。
 
 ## API 层
 
-- 全部走 `src/api/index.ts` 的封装，页面里不直接 `invoke`
+- 全部走 `src/api/index.ts` 的封装，页面里不直接 `invoke`；抓包与记事本各自有 `src/api/capture.ts` / `src/api/notes.ts`
 - 命名与 Rust 命令一一对应：`invoke<T>('request_save', { request })`
 - 需要文件选择/保存时用 `@tauri-apps/plugin-dialog` 的 `open` / `save`，依赖 `capabilities/default.json` 中已有的 `dialog:default`
 

@@ -1,8 +1,9 @@
 ﻿<script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
 import { open, save } from '@tauri-apps/plugin-dialog'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import {
   ArrowRightOutlined,
   ThunderboltOutlined,
@@ -22,9 +23,14 @@ import {
   PlayCircleOutlined,
   FileTextOutlined,
   ExperimentOutlined,
+  ScheduleOutlined,
+  PlusOutlined,
 } from '@ant-design/icons-vue'
 import AiSparkIcon from '@/components/AiSparkIcon.vue'
 import PageHeader from '@/components/PageHeader.vue'
+import { notesCreate, notesCounts, notesList, notesToggle } from '@/api/notes'
+import { formatDueLabel, parseQuickNote } from '@/utils/notesQuickParse'
+import type { NoteCounts, NoteSummary } from '@/types/notes'
 import { useProjectStore } from '@/stores/project'
 import { useAiAssistStore } from '@/stores/aiAssist'
 import { dashboardInsightPrompt } from '@/utils/aiScenarios'
@@ -44,6 +50,75 @@ const stats = ref<WorkspaceStats | null>(null)
 const metrics = ref<DashboardMetrics | null>(null)
 
 const aiAssist = useAiAssistStore()
+
+/* ---------- 今日待办 ---------- */
+const noteCounts = ref<NoteCounts>({ open: 0, dueToday: 0, overdue: 0, done: 0 })
+const notePreview = ref<NoteSummary[]>([])
+const noteQuick = ref('')
+const noteSaving = ref(false)
+const noteNow = ref(Date.now())
+let unlistenNotes: UnlistenFn | null = null
+
+const noteParsed = computed(() => parseQuickNote(noteQuick.value, new Date(noteNow.value)))
+
+async function loadNotes() {
+  noteNow.value = Date.now()
+  try {
+    const [nextCounts, result] = await Promise.all([
+      notesCounts(),
+      notesList({ scope: 'today', limit: 5 }),
+    ])
+    noteCounts.value = nextCounts
+    notePreview.value = result.items
+  } catch {
+    // 后端未就绪或浏览器预览时保持空态
+  }
+}
+
+async function saveNoteQuick() {
+  if (!noteQuick.value.trim() || noteSaving.value) return
+  if (!noteParsed.value.title.trim()) {
+    message.warning('再写点内容')
+    return
+  }
+  noteSaving.value = true
+  try {
+    await notesCreate({
+      title: noteParsed.value.title,
+      dueAt: noteParsed.value.dueAt,
+      repeat: noteParsed.value.repeat,
+      tags: noteParsed.value.tags,
+      priority: noteParsed.value.priority,
+    })
+    noteQuick.value = ''
+    await loadNotes()
+  } catch (error) {
+    message.error(String(error))
+  } finally {
+    noteSaving.value = false
+  }
+}
+
+function onNoteQuickKeydown(event: KeyboardEvent) {
+  if (event.key === 'Enter' && !event.isComposing) {
+    event.preventDefault()
+    void saveNoteQuick()
+  }
+}
+
+async function toggleNoteDone(item: NoteSummary, done: boolean) {
+  try {
+    await notesToggle(item.id, done)
+    await loadNotes()
+  } catch (error) {
+    message.error(String(error))
+  }
+}
+
+function onNotesVisible() {
+  if (document.visibilityState === 'visible') void loadNotes()
+}
+
 
 function aiInsight() {
   void aiAssist.show({
@@ -627,6 +702,22 @@ onMounted(async () => {
   if (storageInfo.status === 'fulfilled') storage.value = storageInfo.value
   if (info.status === 'fulfilled') appVersion.value = info.value.version
   if (dash.status === 'fulfilled') metrics.value = dash.value
+
+  await loadNotes()
+  document.addEventListener('visibilitychange', onNotesVisible)
+  try {
+    unlistenNotes = await listen('notes:changed', () => {
+      void loadNotes()
+    })
+  } catch {
+    unlistenNotes = null
+  }
+})
+
+onBeforeUnmount(() => {
+  document.removeEventListener('visibilitychange', onNotesVisible)
+  unlistenNotes?.()
+  unlistenNotes = null
 })
 
 /* ---------- 创建 / 删除 / 导入 ---------- */
@@ -713,9 +804,9 @@ const importingApi = ref(false)
 async function importApiProject() {
   try {
     const path = await open({
-      title: '导入 Postman / Apifox 数据',
+      title: '导入 Postman / Apifox / HAR 数据',
       multiple: false,
-      filters: [{ name: 'JSON 文件', extensions: ['json'] }],
+      filters: [{ name: 'JSON / HAR 文件', extensions: ['json', 'har'] }],
     })
     if (!path) return
     importingApi.value = true
@@ -723,6 +814,9 @@ async function importApiProject() {
     await store.loadProjects()
     refreshStats()
     message.success(`已导入「${project.name}」`)
+    if (path.toLowerCase().endsWith('.har')) {
+      message.info('HAR 中 Authorization / Cookie 已默认停用，上传文件字段与 base64 请求体未导入', 6)
+    }
     router.push(`/project/${project.id}`)
   } catch (e) {
     message.error(String(e))
@@ -784,7 +878,7 @@ function fmtBytes(value: number) {
         <template #overlay>
           <a-menu @click="onImportMenu">
             <a-menu-item key="astroman">导入项目 JSON</a-menu-item>
-            <a-menu-item key="api">导入 Postman / Apifox 数据</a-menu-item>
+            <a-menu-item key="api">导入 Postman / Apifox / HAR 数据</a-menu-item>
           </a-menu>
         </template>
       </a-dropdown>
@@ -839,6 +933,80 @@ function fmtBytes(value: number) {
           <span class="kpi-value mono">{{ item.value == null ? '—' : fmtInt(item.value) }}</span>
           <span class="kpi-note">{{ item.note }}</span>
         </button>
+      </div>
+    </section>
+
+    <!-- 今日待办 -->
+    <section class="notes-card fm-card">
+      <div class="notes-card-main">
+        <div class="notes-card-head">
+          <span class="notes-card-icon"><ScheduleOutlined /></span>
+          <div class="notes-card-title">
+            <h3>今日待办</h3>
+            <p>随手记下，到点提醒；截图也能直接生成待办</p>
+          </div>
+          <button type="button" class="notes-open" @click="router.push('/notes')">
+            打开记事本
+            <ArrowRightOutlined />
+          </button>
+        </div>
+        <div class="notes-stats">
+          <span class="notes-stat">
+            <strong :class="{ danger: noteCounts.overdue > 0 }">{{ noteCounts.overdue }}</strong>
+            逾期
+          </span>
+          <span class="notes-stat">
+            <strong>{{ noteCounts.dueToday }}</strong>
+            今天到期
+          </span>
+          <span class="notes-stat">
+            <strong>{{ noteCounts.open }}</strong>
+            未完成
+          </span>
+        </div>
+        <div class="notes-preview">
+          <label
+            v-for="item in notePreview"
+            :key="item.id"
+            class="notes-preview-row"
+            :class="{ overdue: item.dueAt !== null && item.dueAt < noteNow }"
+            @click="router.push('/notes')"
+          >
+            <a-checkbox
+              :checked="item.status === 'done'"
+              @click.stop
+              @change="toggleNoteDone(item, Boolean(($event.target as HTMLInputElement)?.checked))"
+            />
+            <span class="notes-preview-title">{{ item.title || '未命名' }}</span>
+            <span v-if="item.dueAt" class="notes-preview-time">
+              {{ formatDueLabel(item.dueAt, noteNow) }}
+            </span>
+          </label>
+          <div v-if="!notePreview.length" class="notes-preview-empty">今天还没有待办，右侧记一笔。</div>
+        </div>
+      </div>
+      <div class="notes-quick">
+        <a-input
+          v-model:value="noteQuick"
+          placeholder="记一笔… 明天10点 交周报 #工作"
+          @keydown="onNoteQuickKeydown"
+        >
+          <template #suffix>
+            <a-spin v-if="noteSaving" size="small" />
+            <PlusOutlined v-else />
+          </template>
+        </a-input>
+        <div class="notes-quick-labels">
+          <span v-for="label in noteParsed.labels" :key="label" class="notes-quick-tag">
+            {{ label }}
+          </span>
+          <span v-if="!noteParsed.labels.length" class="notes-quick-hint">
+            回车保存，不带时间也会出现在「无截止」
+          </span>
+        </div>
+        <a-button type="primary" block :loading="noteSaving" @click="saveNoteQuick">
+          记一笔
+        </a-button>
       </div>
     </section>
 
@@ -2139,4 +2307,175 @@ function fmtBytes(value: number) {
     transition: none;
   }
 }
+
+/* ---------- 今日待办 ---------- */
+.notes-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1.5fr) minmax(260px, 0.8fr);
+  gap: 18px;
+  padding: 14px 16px;
+  margin-bottom: 14px;
+}
+
+@media (max-width: 860px) {
+  .notes-card {
+    grid-template-columns: 1fr;
+  }
+}
+
+.notes-card-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.notes-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.notes-card-icon {
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
+  display: grid;
+  place-items: center;
+  background: var(--fm-primary-soft);
+  color: var(--fm-primary);
+  font-size: 14px;
+}
+
+.notes-card-title {
+  flex: 1;
+  min-width: 0;
+}
+
+.notes-card-title h3 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.notes-card-title p {
+  margin: 1px 0 0;
+  font-size: 11px;
+  color: var(--fm-muted);
+}
+
+.notes-open {
+  border: none;
+  background: transparent;
+  color: var(--fm-primary);
+  font-size: 11px;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  cursor: pointer;
+  padding: 0;
+}
+
+.notes-stats {
+  display: flex;
+  gap: 14px;
+}
+
+.notes-stat {
+  font-size: 11px;
+  color: var(--fm-muted);
+}
+
+.notes-stat strong {
+  font-size: 16px;
+  color: var(--fm-text);
+  margin-right: 3px;
+}
+
+.notes-stat strong.danger {
+  color: var(--fm-danger);
+}
+
+.notes-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.notes-preview-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  border-radius: var(--fm-radius-sm);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.notes-preview-row:hover {
+  background: var(--fm-surface-alt);
+}
+
+.notes-preview-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.notes-preview-time {
+  font-size: 10px;
+  color: var(--fm-muted);
+  flex-shrink: 0;
+}
+
+.notes-preview-row.overdue .notes-preview-time {
+  color: var(--fm-danger);
+}
+
+.notes-preview-empty {
+  font-size: 11px;
+  color: var(--fm-muted);
+  padding: 4px 6px;
+}
+
+.notes-quick {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  justify-content: center;
+  border-left: 1px solid var(--fm-border);
+  padding-left: 18px;
+}
+
+@media (max-width: 860px) {
+  .notes-quick {
+    border-left: none;
+    border-top: 1px solid var(--fm-border);
+    padding-left: 0;
+    padding-top: 12px;
+  }
+}
+
+.notes-quick-labels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-height: 18px;
+}
+
+.notes-quick-tag {
+  font-size: 10px;
+  color: var(--fm-primary);
+  background: var(--fm-primary-soft);
+  border-radius: 4px;
+  padding: 1px 6px;
+}
+
+.notes-quick-hint {
+  font-size: 10px;
+  color: var(--fm-muted);
+}
+
 </style>

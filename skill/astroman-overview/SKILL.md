@@ -5,7 +5,7 @@ description: AstroMan 项目全景。接手本项目、需要了解目录结构�
 
 # AstroMan 项目全景
 
-AstroMan 是一个**完全本地运行**的 API 调试、压测与开发工具箱：无账号、无云端，项目/接口/环境变量/请求历史/压测报告全部写入本机 SQLite。
+AstroMan 是一个**完全本地运行**的 API 调试、抓包、压测、记事本与开发工具箱：无账号、无云端，项目/接口/环境变量/请求历史/压测报告/待办全部写入本机 SQLite；抓包流量只存内存。
 
 - 前端：Vue 3 + TypeScript + Vite + Pinia + vue-router（hash 模式）+ Ant Design Vue 4
 - 后端：Tauri 2 + Rust，SQLite（rusqlite + r2d2 连接池）
@@ -20,21 +20,27 @@ AstroMan/
 │  ├─ assets/         # buddy.png：航仔宇航员挂件贴图（透明底，界面唯一使用的位图）
 │  ├─ components/     # PageHeader / CodeArea / JsonTree / KeyValueEditor / LineChart / AppLogo
 │  │                  # DashboardMetrics（历史记录页数据大屏）、tools/（20 个工具组件 + ToolWorkbench）
+│  │                  # 抓包：CaptureInterceptDrawer（断点/映射/弱网）、CaptureBreakpointModal（断点改包）
+│  │                  # 记事本：notes/NotesEditor、NotesImageViewer、NotesImportDialog（截图识别）、NotesReminderHost
 │  │                  # 航仔：AstroBuddy.vue（挂件，可拖拽）/ AstroBuddyIcon.vue（1em 线框图标）
-│  ├─ stores/         # pinia：project（项目+集合树+环境）、tabs（标签页持久化）、theme（21 套主题）、toolPrefs（工具收藏/最近）
+│  ├─ stores/         # pinia：project（项目+集合树+环境）、tabs（标签页持久化）、theme（21 套主题）、toolPrefs（工具收藏/最近）、notes（待办列表/筛选/设置）
 │  ├─ styles/main.css # 设计系统：--fm-* 变量
 │  ├─ tools/          # 离线工具箱：registry.ts（92 个工具 / 9 分类）+ 各域纯函数 + __tests__/toolbox.spec.ts
 │  ├─ types/models.ts # 与 Rust models.rs 对应的 TS 类型
 │  ├─ utils/          # scriptRunner（脚本引擎）、cryptoScript、rsa、curl、xlsx、diff、mybatis、markdown
 │  │                  # 报告：reportExport（HTML/Excel/JSON）、reportAnalytics（QPS/拐点/体检/自洽）、reportNarrative
+│  │                  # 记事本：notesGrouping（分组/排序）、notesImage（压缩/哈希）、notesQuickParse（自然语言解析）、notesTags（标签配色）
 │  │                  # AI：aiTools（92 个工具：79 业务 + 12 工具箱 + tool_search）、aiProtocol（围栏协议）、contextBudget（token 预算）、modelMeta（窗口）、untrusted（注入隔离）、aiPricing（费用）、promptText（压缩）
 │  └─ views/          # Dashboard / Projects / Project / RequestEditor / StressTest / Runner / Automation / Reports / History
 │                     # Tools / SystemMonitor / Settings / Environment / ReportDetail / AiAssistant / AiUsage / AiToolLogs
-│                     # Capture（抓包：流量列表 / 详情 / 设置抽屉 / 重发弹窗）
+│                     # Capture（抓包：流量列表 / 详情 / 设置抽屉 / 重发弹窗 / 拦截）
+│                     # Notes（记事本与待办）、QuickCapture（Ctrl+Alt+N 迷你快速记录，独立窗口）
 ├─ src-tauri/
 │  ├─ src/commands/   # 每个文件一个业务域，全部 #[tauri::command]；测试域为 test_suite/test_case/test_pack/test_preflight/test_run/test_report
-│  │                  # capture.rs：抓包启停、清单、CA、系统代理、HAR / ZIP、改参重发
-│  ├─ src/capture/    # 抓包内核：mod（生命周期）/ proxy / handler / store / ca / sysproxy / har / archive
+│  │                  # capture.rs：抓包启停、清单、CA、系统代理、HAR / ZIP、改参重发、断点 / 映射 / 弱网
+│  │                  # notes.rs：待办 CRUD、计数、标签、设置、附件、截图识别
+│  ├─ src/capture/    # 抓包内核：mod（生命周期）/ proxy / handler / store / ca / sysproxy / har / archive / intercept（断点 / 映射 / 弱网）
+│  ├─ src/notes/      # 待办领域：mod（CRUD / 设置 / 静默时段）/ quick（迷你窗口 + 全局快捷键）/ reminder（30 秒调度）/ attachment（哈希去重）/ vision（截图识别）
 │  ├─ src/db/         # schema.sql + mod.rs（init → migrate → seed）+ seed.rs
 │  ├─ src/test_runner.rs   # 自动化测试执行内核（不依赖 Tauri，CLI 复用）
 │  ├─ src/test_assert.rs   # 6 类声明式断言
@@ -62,11 +68,11 @@ npm run tauri dev  # 完整桌面应用
 npm run build      # vue-tsc --noEmit + vite build
 npm run build:win  # tauri build --bundles nsis
 npm run build:mac  # tauri build --target universal-apple-darwin --bundles dmg
-npm run test       # vitest run：10 spec / 134 条
+npm run test       # vitest run：14 spec / 160 条
 npm run version:check       # 三处版本号一致性校验，不一致退出码 1
-npm run version:set 1.0.8   # 一次写入 package.json / tauri.conf.json / Cargo.toml
+npm run version:set 1.0.9   # 一次写入 package.json / tauri.conf.json / Cargo.toml
 cargo check        # 在 src-tauri 目录执行
-cargo test --lib   # 106 条 Rust 用例
+cargo test --lib   # 140 条 Rust 用例
 cargo tarpaulin --config tarpaulin.toml   # 覆盖率门槛；Windows 本地加 --engine llvm
 ```
 
@@ -80,6 +86,8 @@ Windows 下 `cargo check` 在受限沙箱里会命中 `D:\Software\Rust\cargo\.g
 - 系统托盘在 `lib.rs::setup_tray` 创建：左键点击 → 显示主窗口；右键菜单「显示主窗口 / 退出 AstroMan」。
 - **关闭窗口 = 隐藏到托盘**（`on_window_event` 中 `prevent_close` + `hide`），真正退出只走托盘菜单或 `app.exit(0)`。
 - macOS 点击 Dock 图标时通过 `RunEvent::Reopen` 重新显示窗口。
+- 快速记录窗口 label 固定为 `quick-capture`，由 `notes::quick::show()` 首次调用时在独立线程创建（窗口创建会阻塞主事件循环，不能直接 build）；全局快捷键 `Ctrl + Alt + N` 由 `tauri-plugin-global-shortcut` 注册，设置里可关闭，被占用时回退并提示。
+- 托盘菜单额外提供「打开记事本 / 快速记录 / 暂停提醒 1 小时 / 暂停到今天结束」；隐藏到托盘后提醒调度仍继续。
 - 托盘图标来自 `include_bytes!("../icons/tray.png")`，改图标必须重新生成该文件，否则编译期就嵌入旧图。
 
 ## 数据位置
@@ -90,6 +98,9 @@ Windows 下 `cargo check` 在受限沙箱里会命中 `D:\Software\Rust\cargo\.g
 | 数据库文件 | `数据目录\astroman.db` |
 | 自定义数据目录配置 | 系统配置目录下 `storage.json` |
 | 网络设置（代理、mTLS 证书） | 系统配置目录下 `settings.json` |
+| 抓包根证书与私钥 | `<数据目录>\certs\`（私钥不要分发） |
+| 抓包拦截规则 | `<数据目录>\capture\intercept.json` |
+| 待办与图片附件 | 同在 `astroman.db`：`notes` / `note_files`（BLOB，按 sha256 去重）/ `note_file_links` |
 
 启动时若发现旧版 `FinkMeter\finkmeter.db` 且新目录还没有数据库，会**自动复制**到 `AstroMan\astroman.db`（含 `-wal`/`-shm`），原目录保留；自定义目录里的旧数据库会被就地重命名为 `astroman.db`。自定义目录打不开时只回退默认目录、不删除配置。
 
@@ -119,6 +130,9 @@ Windows 下 `cargo check` 在受限沙箱里会命中 `D:\Software\Rust\cargo\.g
 - 压测报告 QPS 指标组唯一入口：`utils/reportAnalytics.ts::qpsOverview()`，详情页与 HTML / Excel 导出都调它
 - 抓包：流量**只存内存**（5000 条 / 128 MB body），不写 SQLite；根证书在 `<数据目录>/certs/`；Windows 系统代理改动先备份到数据目录并在停止/退出/下次启动时还原；macOS / Linux 只能手动设代理与装证书
 - 抓包网络请求由 hudsucker MITM 代理转发，不走 `commands/http.rs` 的 reqwest 客户端；「重发」在录制中经本机代理，未录制时直连
+- 抓包拦截：断点队列上限 32 条、120 秒自动放行；Map Local 文件 ≤ 50 MB；弱网超时返回 504；规则写 `<数据目录>/capture/intercept.json`，改规则后必须同步 `capture_intercept_state`
+- 记事本：数据库结构版本 6（`notes` / `note_files` / `note_file_links`）；提醒只发**应用内卡片**（`notes:reminder`），不调系统通知，30 秒轮询一次，暂停 / 免打扰期间整轮跳过；「稍后 10 分钟」必须改写 `snooze_until` 并在到点后重新触发，不能只改前端展示
+- 记事本附件按内容 sha256 去重存 BLOB；截图识别只列出 `supportsVision` 的服务商，上传前压缩、原图仍存附件；快速记录解析在 `utils/notesQuickParse.ts`，纯函数便于单测
 
 ## 配套 skill
 
@@ -129,9 +143,10 @@ Windows 下 `cargo check` 在受限沙箱里会命中 `D:\Software\Rust\cargo\.g
 | `astroman-frontend` | 页面骨架、主题变量、脚本引擎、导出 |
 | `astroman-appearance` | 21 套主题的变量约定与新增流程、对比度校验、航仔贴图与拖拽、线框图标 |
 | `astroman-dashboard` | 工作台首页区块、历史记录页数据大屏、引导 / 技巧 / FAQ 文案口径、Runner 与测试场景介绍 |
-| `astroman-capture` | 抓包模块：MITM 代理、录制上限、根证书、系统代理、手机与微信边界、HAR / ZIP 导出、改参重发 |
+| `astroman-capture` | 抓包模块：MITM 代理、录制上限、根证书、系统代理、手机与微信边界、HAR / ZIP 导出、改参重发、断点 / 映射 / 弱网 |
+| `astroman-notes` | 记事本与待办：四种类型、标签与 50% 抽屉、提醒 / 重复 / 稍后 / 暂停 / 免打扰、快速记录、截图识别、附件去重、数据表 |
 | `astroman-automation` | 自动化测试子系统：套件 / 用例 / 断言 / 数据集 / Python 钩子 / 运行产物 / CLI 退出码 / 压测门禁 |
 | `astroman-toolbox` | 离线工具箱：92 个工具的注册契约、两种接入方式、新增流程、搜索别名与工具清单同步 |
-| `astroman-ai` | AI 助手「航仔」：双模式、三协议、流式渲染、上下文预算与摘要、停止/重试/工具超时、注入隔离、74+1 工具与目录分层、写操作确认卡、消息操作、复盘时间线、会话管理 |
+| `astroman-ai` | AI 助手「航仔」：双模式、三协议、流式渲染、上下文预算与摘要、停止/重试/工具超时、注入隔离、92 个工具与目录分层、写操作确认卡、消息操作、复盘时间线、会话管理 |
 | `astroman-testing` | vitest / cargo test / tarpaulin 覆盖率 / CI 四道门禁 / 版本号同步与沙箱坑 |
 | `astroman-build-release` | 构建、打包与发布 |

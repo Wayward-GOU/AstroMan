@@ -20,6 +20,14 @@ const router = createRouter({
     { path: '/reports', name: 'reports', component: () => import('@/views/Reports.vue') },
     { path: '/history', name: 'history', component: () => import('@/views/History.vue') },
     { path: '/ai', name: 'ai', component: () => import('@/views/AiAssistant.vue') },
+    { path: '/notes', name: 'notes', component: () => import('@/views/Notes.vue') },
+    // 迷你快速记录窗口：裸布局，不写导航历史与上次停留页
+    {
+      path: '/quick-capture',
+      name: 'quick-capture',
+      component: () => import('@/views/QuickCapture.vue'),
+      meta: { bare: true },
+    },
     { path: '/ai/logs', name: 'ai-logs', component: () => import('@/views/AiToolLogs.vue') },
     { path: '/ai/usage', name: 'ai-usage', component: () => import('@/views/AiUsage.vue') },
     { path: '/reports/:id', name: 'report-detail', component: () => import('@/views/ReportDetail.vue') },
@@ -32,6 +40,8 @@ const router = createRouter({
 })
 
 router.beforeEach((to) => {
+  // 裸布局窗口（迷你快速记录）不参与上次页面恢复
+  if (to.meta.bare) return true
   if (routeRestored) return true
   routeRestored = true
   // 直接带 hash 进入时以用户输入为准；只有从默认首页启动才恢复上次页面
@@ -49,6 +59,8 @@ router.beforeEach((to) => {
 
 router.afterEach((to) => {
   if (!to.matched.length) return
+  // 裸布局窗口与主窗口共用 localStorage，写入会污染主窗口的恢复位置
+  if (to.meta.bare) return
   // 维护「上一次停留页面」栈，供全局返回按钮使用
   recordVisit(to)
   try {

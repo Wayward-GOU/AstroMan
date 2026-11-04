@@ -406,6 +406,8 @@ export interface AiProvider {
   maxTokens?: number | null
   /** 单次请求超时秒数，0 / 空 = 默认 300 */
   timeoutSecs?: number | null
+  /** 是否支持图片输入（记事本截图识别） */
+  supportsVision?: boolean
   isDefault?: boolean
 }
 

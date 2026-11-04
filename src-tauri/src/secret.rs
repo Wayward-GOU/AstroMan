@@ -57,6 +57,12 @@ const DISABLE_KEYRING_ENV: &str = "ASTROMAN_DISABLE_KEYRING";
 pub const AAD_ENV: &str = "env_variables:value";
 /// AI Key 的加密上下文
 pub const AAD_AI: &str = "ai_providers:api_key";
+/// 请求级认证配置的加密上下文
+pub const AAD_REQUEST_AUTH: &str = "requests:auth";
+
+/// 认证 JSON 中需要加密的字段：其余字段（kind / username / addTo 等）保持明文，
+/// 便于列表与表单直接展示，不要求每次读取都解密整块配置
+const AUTH_SECRET_FIELDS: [&str; 4] = ["token", "password", "value", "client_secret"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -314,6 +320,34 @@ impl SecretStore {
         decrypt_with(&key, aad, stored)
     }
 
+    /// 加密请求级认证 JSON：未解锁时返回可判定错误，绝不写入明文
+    pub fn encrypt_auth(&self, text: &str) -> Result<String, String> {
+        if text.trim().is_empty() {
+            return Ok(String::new());
+        }
+        // 没有需要加密的明文字段时（例如 `{}` 或已全部加密），
+        // 不因未解锁而让「保存请求」整体失败
+        if !auth_has_plaintext_secret(text)? {
+            return Ok(text.to_string());
+        }
+        let key = self.current_key()?;
+        Ok(auth_fields_encrypt(&key, text)?.unwrap_or_else(|| text.to_string()))
+    }
+
+    /// 解密请求级认证 JSON
+    ///
+    /// 未解锁时把敏感字段清空而不是回吐密文，避免用户在表单里看到 `enc:v1:`；
+    /// 密钥不匹配时同样只清空解不开的字段，认证类型等配置仍然保留。
+    pub fn decrypt_auth(&self, text: &str) -> String {
+        if text.trim().is_empty() {
+            return String::new();
+        }
+        match self.current_key() {
+            Ok(key) => auth_fields_decrypt(&key, text),
+            Err(_) => auth_fields_clear(text).unwrap_or_else(|| text.to_string()),
+        }
+    }
+
     pub fn status(&self, pool: &DbPool) -> SecretStatus {
         let inner = self.inner.read();
         let (env_count, ai_count, created) = match pool.get() {
@@ -429,6 +463,37 @@ impl SecretStore {
             for (id, value) in updates {
                 tx.execute(
                     "UPDATE ai_providers SET api_key_enc = ?1 WHERE id = ?2",
+                    params![value, id],
+                )
+                .map_err(err)?;
+                count += 1;
+            }
+        }
+
+        // 请求级认证配置：只加密 token/password/value/client_secret 字段
+        {
+            let mut stmt = tx
+                .prepare("SELECT id, auth FROM requests WHERE auth IS NOT NULL AND auth <> ''")
+                .map_err(err)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(err)?;
+            let mut updates: Vec<(i64, String)> = Vec::new();
+            for row in rows {
+                let (id, text) = row.map_err(err)?;
+                match auth_fields_encrypt(&key, &text) {
+                    Ok(Some(value)) => updates.push((id, value)),
+                    // 格式不对的历史数据跳过，保留原样，避免把用户配置清空
+                    Ok(None) => {}
+                    Err(error) => log::warn!("请求 #{id} 的认证配置加密失败，已跳过：{error}"),
+                }
+            }
+            drop(stmt);
+            for (id, value) in updates {
+                tx.execute(
+                    "UPDATE requests SET auth = ?1 WHERE id = ?2",
                     params![value, id],
                 )
                 .map_err(err)?;
@@ -601,11 +666,12 @@ impl SecretStore {
                 [],
             )
             .map_err(err)?;
+        let auth = clear_request_auth(&conn)?;
         // 值都清掉了，就不该再报「解不开」；下次启动校验也没有密文可比对
-        if env + ai > 0 {
+        if env + ai + auth > 0 {
             self.inner.write().mismatch = None;
         }
-        Ok(env + ai)
+        Ok(env + ai + auth)
     }
 
     /// 用新密钥重写所有已加密值
@@ -673,6 +739,36 @@ impl SecretStore {
             }
         }
 
+        // 请求级认证配置里的密文字段同样要换钥，否则切口令/导入密钥包后解不开
+        {
+            let mut stmt = tx
+                .prepare("SELECT id, auth FROM requests WHERE auth LIKE '%enc:v1:%'")
+                .map_err(err)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(err)?;
+            let mut updates: Vec<(i64, String)> = Vec::new();
+            for row in rows {
+                let (id, text) = row.map_err(err)?;
+                match auth_fields_rotate(old_key, new_key, &text) {
+                    Ok(Some(value)) => updates.push((id, value)),
+                    Ok(None) => {}
+                    Err(error) => log::warn!("请求 #{id} 的认证配置换钥失败，已跳过：{error}"),
+                }
+            }
+            drop(stmt);
+            for (id, value) in updates {
+                tx.execute(
+                    "UPDATE requests SET auth = ?1 WHERE id = ?2",
+                    params![value, id],
+                )
+                .map_err(err)?;
+                count += 1;
+            }
+        }
+
         tx.commit().map_err(err)?;
         Ok(count)
     }
@@ -731,6 +827,22 @@ pub fn decrypt(aad: &str, stored: &str) -> String {
     }
 }
 
+/// 加密请求级认证 JSON（未安装密钥库时返回错误，绝不落明文）
+pub fn encrypt_auth_json(text: &str) -> Result<String, String> {
+    match store() {
+        Some(store) => store.encrypt_auth(text),
+        None => Err("E_LOCKED: 密钥模块尚未初始化".to_string()),
+    }
+}
+
+/// 解密请求级认证 JSON：敏感字段解不开时置空，不影响其余字段
+pub fn decrypt_auth_json(text: &str) -> String {
+    match store() {
+        Some(store) => store.decrypt_auth(text),
+        None => text.to_string(),
+    }
+}
+
 /* ---------- 加解密原语 ---------- */
 
 fn encrypt_with(key: &[u8; KEY_LEN], aad: &str, plain: &str) -> Result<String, String> {
@@ -772,6 +884,170 @@ fn decrypt_with(key: &[u8; KEY_LEN], aad: &str, stored: &str) -> Result<String, 
         )
         .map_err(|_| "解密失败（密钥不匹配或数据被篡改）".to_string())?;
     String::from_utf8(plain).map_err(err)
+}
+
+/// 清空请求表里已加密的认证字段（重置密钥值时使用）
+fn clear_request_auth(conn: &rusqlite::Connection) -> Result<usize, String> {
+    let mut stmt = conn
+        .prepare("SELECT id, auth FROM requests WHERE auth LIKE '%enc:v1:%'")
+        .map_err(err)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(err)?;
+    let mut updates = Vec::new();
+    for row in rows {
+        let (id, text) = row.map_err(err)?;
+        if let Some(value) = auth_fields_clear(&text) {
+            updates.push((id, value));
+        }
+    }
+    drop(stmt);
+    for (id, value) in &updates {
+        conn.execute(
+            "UPDATE requests SET auth = ?1 WHERE id = ?2",
+            params![value, id],
+        )
+        .map_err(err)?;
+    }
+    Ok(updates.len())
+}
+
+/// 解析认证 JSON；非对象（空串 / null）时返回 None
+fn auth_object(text: &str) -> Result<Option<serde_json::Value>, String> {
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| format!("认证配置格式不正确：{e}"))?;
+    if value.as_object().is_none() {
+        return Ok(None);
+    }
+    Ok(Some(value))
+}
+
+/// 是否存在需要加密的明文字段（已加密或空值都不算）
+fn auth_has_plaintext_secret(text: &str) -> Result<bool, String> {
+    let Some(value) = auth_object(text)? else {
+        return Ok(false);
+    };
+    let Some(obj) = value.as_object() else {
+        return Ok(false);
+    };
+    Ok(AUTH_SECRET_FIELDS.iter().any(|name| {
+        matches!(obj.get(*name), Some(serde_json::Value::String(field))
+            if !field.is_empty() && !field.starts_with(ENC_PREFIX))
+    }))
+}
+
+/// 把认证 JSON 中的敏感字段加密；无需变更时返回 None
+fn auth_fields_encrypt(key: &[u8; KEY_LEN], text: &str) -> Result<Option<String>, String> {
+    let Some(mut value) = auth_object(text)? else {
+        return Ok(None);
+    };
+    let Some(obj) = value.as_object_mut() else {
+        return Ok(None);
+    };
+    let mut changed = false;
+    for name in AUTH_SECRET_FIELDS {
+        if let Some(serde_json::Value::String(field)) = obj.get_mut(name) {
+            if field.is_empty() || field.starts_with(ENC_PREFIX) {
+                continue;
+            }
+            let plain = field.clone();
+            *field = encrypt_with(key, AAD_REQUEST_AUTH, &plain)?;
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::to_string(&value).map_err(err)?))
+}
+
+/// 换密钥时重写认证 JSON 中已加密的敏感字段
+fn auth_fields_rotate(
+    old_key: &[u8; KEY_LEN],
+    new_key: &[u8; KEY_LEN],
+    text: &str,
+) -> Result<Option<String>, String> {
+    let Some(mut value) = auth_object(text)? else {
+        return Ok(None);
+    };
+    let Some(obj) = value.as_object_mut() else {
+        return Ok(None);
+    };
+    let mut changed = false;
+    for name in AUTH_SECRET_FIELDS {
+        if let Some(serde_json::Value::String(field)) = obj.get_mut(name) {
+            if !field.starts_with(ENC_PREFIX) {
+                continue;
+            }
+            let plain = decrypt_with(old_key, AAD_REQUEST_AUTH, field)?;
+            *field = encrypt_with(new_key, AAD_REQUEST_AUTH, &plain)?;
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::to_string(&value).map_err(err)?))
+}
+
+/// 重置密钥值时清空认证 JSON 中的敏感字段（保留认证类型等非敏感配置）
+fn auth_fields_clear(text: &str) -> Option<String> {
+    let Ok(Some(mut value)) = auth_object(text) else {
+        return None;
+    };
+    let obj = value.as_object_mut()?;
+    let mut changed = false;
+    for name in AUTH_SECRET_FIELDS {
+        if let Some(serde_json::Value::String(field)) = obj.get_mut(name) {
+            if field.starts_with(ENC_PREFIX) {
+                *field = String::new();
+                changed = true;
+            }
+        }
+    }
+    if !changed {
+        return None;
+    }
+    serde_json::to_string(&value).ok()
+}
+
+/// 把认证 JSON 中的敏感字段解密；解析失败时原样返回，避免整块配置丢失
+fn auth_fields_decrypt(key: &[u8; KEY_LEN], text: &str) -> String {
+    let Ok(Some(mut value)) = auth_object(text) else {
+        return text.to_string();
+    };
+    let Some(obj) = value.as_object_mut() else {
+        return text.to_string();
+    };
+    let mut changed = false;
+    for name in AUTH_SECRET_FIELDS {
+        if let Some(serde_json::Value::String(field)) = obj.get_mut(name) {
+            if !field.starts_with(ENC_PREFIX) {
+                continue;
+            }
+            // 逐字段容错：单个字段解不开时只清空该字段，其余配置仍可编辑
+            match decrypt_with(key, AAD_REQUEST_AUTH, field) {
+                Ok(plain) => {
+                    *field = plain;
+                    changed = true;
+                }
+                Err(error) => {
+                    log::debug!("请求认证字段 {name} 解密失败：{error}");
+                    *field = String::new();
+                    changed = true;
+                }
+            }
+        }
+    }
+    if !changed {
+        return text.to_string();
+    }
+    serde_json::to_string(&value).unwrap_or_else(|_| text.to_string())
 }
 
 /// v1.0.7 的 AI Key 格式：`v1:<base64(nonce||ct)>`，密钥是固定字符串的 SHA-256
@@ -1221,5 +1497,93 @@ mod tests {
         assert!(cipher.starts_with(ENC_PREFIX));
         // 已知不匹配时不再逐条打印解密告警，直接返回空串
         assert_eq!(store.decrypt(AAD_AI, &cipher), "");
+    }
+
+    #[test]
+    fn auth_secret_fields_are_encrypted_and_rest_stays_plain() {
+        let store = store();
+        let text = r#"{"kind":"bearer","token":"tk-123","username":"alice","addTo":"header"}"#;
+        let stored = store.encrypt_auth(text).unwrap();
+        assert!(stored.contains(ENC_PREFIX));
+        assert!(!stored.contains("tk-123"), "token 不能以明文入库");
+        // 非敏感字段保持明文，列表与表单无需解密
+        assert!(stored.contains("alice"));
+        assert!(stored.contains("\"kind\":\"bearer\""));
+
+        let plain = store.decrypt_auth(&stored);
+        assert!(plain.contains("tk-123"));
+        assert!(!plain.contains(ENC_PREFIX));
+    }
+
+    #[test]
+    fn auth_encrypt_is_idempotent() {
+        let store = store();
+        let text = r#"{"kind":"basic","password":"p@ss"}"#;
+        let first = store.encrypt_auth(text).unwrap();
+        let second = store.encrypt_auth(&first).unwrap();
+        assert_eq!(first, second, "重复加密不能套第二层");
+        assert!(store.decrypt_auth(&first).contains("p@ss"));
+    }
+
+    #[test]
+    fn auth_rotate_switches_key() {
+        let old = SecretStore::from_key(std::env::temp_dir(), [1u8; KEY_LEN], KeySource::File);
+        let new = SecretStore::from_key(std::env::temp_dir(), [2u8; KEY_LEN], KeySource::File);
+        let stored = old
+            .encrypt_auth(r#"{"kind":"bearer","token":"tk-old"}"#)
+            .unwrap();
+        let rotated = auth_fields_rotate(&[1u8; KEY_LEN], &[2u8; KEY_LEN], &stored)
+            .unwrap()
+            .expect("应当产生新密文");
+        assert!(new.decrypt_auth(&rotated).contains("tk-old"));
+        // 旧密钥已解不开，逐字段容错后 token 为空但配置结构仍在
+        let stale = old.decrypt_auth(&rotated);
+        assert!(!stale.contains("tk-old"));
+        assert!(stale.contains("\"kind\":\"bearer\""));
+    }
+
+    #[test]
+    fn auth_clear_only_wipes_encrypted_fields() {
+        let store = store();
+        let stored = store
+            .encrypt_auth(r#"{"kind":"basic","username":"alice","password":"p@ss"}"#)
+            .unwrap();
+        let cleared = auth_fields_clear(&stored).expect("应当清理敏感字段");
+        assert!(cleared.contains("alice"));
+        assert!(cleared.contains("\"password\":\"\""));
+    }
+
+    #[test]
+    fn auth_legacy_plaintext_is_decrypted_unchanged() {
+        let store = store();
+        let text = r#"{"kind":"none"}"#;
+        assert_eq!(store.decrypt_auth(text), text);
+        // 格式损坏的历史值原样返回，不能悄悄清空用户配置
+        assert_eq!(store.decrypt_auth("not-json"), "not-json");
+    }
+
+    #[test]
+    fn auth_without_secret_fields_saves_even_when_locked() {
+        // 口令模式未解锁时，不含敏感字段的认证配置仍必须能保存
+        let store = SecretStore {
+            data_dir: std::env::temp_dir(),
+            inner: parking_lot::RwLock::new(Inner {
+                key: None,
+                source: KeySource::Passphrase,
+                locked: Some("E_LOCKED".to_string()),
+                keyring_available: false,
+                mismatch: None,
+            }),
+        };
+        let text = r#"{"kind":"none"}"#;
+        assert_eq!(store.encrypt_auth(text).unwrap(), text);
+        // 有明文敏感字段时必须报错，不能退回明文入库
+        assert!(store
+            .encrypt_auth(r#"{"kind":"bearer","token":"tk"}"#)
+            .is_err());
+        // 未解锁时读取要清空敏感字段，不能把密文暴露到表单
+        let shown = store.decrypt_auth(r#"{"kind":"bearer","token":"enc:v1:abc"}"#);
+        assert!(shown.contains("\"token\":\"\""));
+        assert!(shown.contains("\"kind\":\"bearer\""));
     }
 }

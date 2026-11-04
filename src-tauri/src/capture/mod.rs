@@ -8,6 +8,7 @@ pub mod archive;
 pub mod ca;
 pub mod handler;
 pub mod har;
+pub mod intercept;
 pub mod proxy;
 pub mod store;
 pub mod sysproxy;
@@ -15,10 +16,14 @@ pub mod sysproxy;
 #[cfg(test)]
 mod tests;
 
+use intercept::{
+    BreakpointRule, Decision, InterceptState, InterceptView, MapLocalRule, MapRemoteRule,
+    WeakNetwork,
+};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr, TcpListener};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use store::{CaptureStore, FlowBrief, FlowDetail};
 use tokio::sync::oneshot;
@@ -104,6 +109,7 @@ pub struct CaptureManager {
     data_dir: PathBuf,
     status: Arc<Mutex<CaptureStatus>>,
     store: Arc<CaptureStore>,
+    intercept: Arc<InterceptState>,
     control: Mutex<Control>,
 }
 
@@ -112,9 +118,11 @@ impl CaptureManager {
         // 上次异常退出可能没来得及恢复系统代理，启动时先清理
         sysproxy::restore_stale(&data_dir);
         Self {
-            data_dir,
+            data_dir: data_dir.clone(),
             status: Arc::new(Mutex::new(CaptureStatus::default())),
             store: Arc::new(CaptureStore::new()),
+            // 断点/映射/弱网规则落盘，重启后仍然生效
+            intercept: Arc::new(InterceptState::load(&intercept_path(&data_dir))),
             control: Mutex::new(Control {
                 shutdown: None,
                 join: None,
@@ -125,6 +133,68 @@ impl CaptureManager {
 
     pub fn data_dir(&self) -> &PathBuf {
         &self.data_dir
+    }
+
+    /// 拦截规则总览：规则、开关、挂起中的流量。
+    pub fn intercept_view(&self) -> InterceptView {
+        self.intercept.snapshot()
+    }
+
+    /// 保存断点开关与规则；传 None 表示只改开关或只改规则。
+    pub fn set_breakpoints(
+        &self,
+        enabled: Option<bool>,
+        rules: Option<Vec<BreakpointRule>>,
+    ) -> Result<InterceptView, String> {
+        self.intercept.set_breakpoints(enabled, rules);
+        self.persist()?;
+        Ok(self.intercept.snapshot())
+    }
+
+    pub fn set_map(
+        &self,
+        enabled: Option<bool>,
+        rules: Option<Vec<MapLocalRule>>,
+    ) -> Result<InterceptView, String> {
+        self.intercept.set_map(enabled, rules);
+        self.persist()?;
+        Ok(self.intercept.snapshot())
+    }
+
+    /// 保存远程映射开关与规则。
+    pub fn set_remote(
+        &self,
+        enabled: Option<bool>,
+        rules: Option<Vec<MapRemoteRule>>,
+    ) -> Result<InterceptView, String> {
+        self.intercept.set_remote(enabled, rules);
+        self.persist()?;
+        Ok(self.intercept.snapshot())
+    }
+
+    pub fn set_weak(&self, weak: WeakNetwork) -> Result<InterceptView, String> {
+        self.intercept.set_weak(weak);
+        self.persist()?;
+        Ok(self.intercept.snapshot())
+    }
+
+    /// 处理一条挂起的断点；暂停已超时时返回 E_PAUSE_GONE。
+    pub fn resolve_pause(
+        &self,
+        pause_id: u64,
+        decision: Decision,
+    ) -> Result<InterceptView, String> {
+        self.intercept.resolve(pause_id, decision)?;
+        Ok(self.intercept.snapshot())
+    }
+
+    /// 全部放行，返回被释放的条数。
+    pub fn release_pauses(&self) -> usize {
+        self.intercept.release_all()
+    }
+
+    fn persist(&self) -> Result<(), String> {
+        self.intercept.save(&intercept_path(&self.data_dir))
     }
 
     pub fn flows(&self, limit: usize) -> Vec<FlowBrief> {
@@ -284,6 +354,7 @@ impl CaptureManager {
         let shared = self.status.clone();
         let thread_config = config.clone();
         let thread_store = self.store.clone();
+        let thread_intercept = self.intercept.clone();
         let thread_data_dir = self.data_dir.clone();
         let spawned = std::thread::Builder::new()
             .name("capture-proxy".into())
@@ -306,6 +377,7 @@ impl CaptureManager {
                         authority,
                         thread_config,
                         thread_store,
+                        thread_intercept,
                         async move {
                             let _ = shutdown_rx.await;
                         },
@@ -355,6 +427,12 @@ impl CaptureManager {
             (control.shutdown.take(), control.join.take())
         };
 
+        // 停止时把挂起的断点全部放行，否则代理线程会一直等到超时
+        let released = self.intercept.release_all();
+        if released > 0 {
+            log::info!("停止录制：放行 {released} 条挂起断点");
+        }
+
         if let Some(shutdown) = shutdown {
             let _ = shutdown.send(());
         }
@@ -373,6 +451,11 @@ impl CaptureManager {
         status.sysproxy_on = false;
         Ok(status.clone())
     }
+}
+
+/// 断点 / 本地映射 / 弱网的规则文件。
+fn intercept_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("capture").join("intercept.json")
 }
 
 fn mark_error(shared: &Arc<Mutex<CaptureStatus>>, error: String) {

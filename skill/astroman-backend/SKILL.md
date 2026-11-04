@@ -22,13 +22,15 @@ description: AstroMan 的 Rust/Tauri 后端开发规范。改数据库 schema、
 | `commands/history.rs` | 历史列表、统计、按范围清理 |
 | `commands/run.rs` | 单接口运行记录 |
 | `commands/transfer.rs` | 项目 JSON 导入导出、OpenAPI 导入导出 |
-| `commands/importer.rs` | Postman/Apifox 数据导入 |
+| `commands/importer.rs` | Postman / Apifox / HAR 1.2 数据导入（HAR 按 host 分组，query → Params，form → Form） |
 | `commands/curl.rs` / `commands/tools.rs` | cURL 解析、哈希/HMAC、IP 查询 |
 | `commands/files.rs` / `commands/storage.rs` | 文本文件读写、数据目录迁移 |
 | `commands/settings.rs` | 代理与客户端证书设置 |
 | `commands/system.rs` / `commands/winstats.rs` | 应用信息、工作区统计、首页数据大屏聚合（`dashboard_metrics`）、Windows 进程指标 |
-| `commands/capture.rs` | 抓包启停 / 状态 / 流量清单与详情 / CA / 系统代理 / HAR / ZIP 导出 / 保存 body / 改参重发 |
-| `capture/` | 抓包内核：`mod`（生命周期）/ `proxy` / `handler` / `store` / `ca` / `sysproxy` / `har` / `archive`（详见 `astroman-capture`） |
+| `commands/capture.rs` | 抓包启停 / 状态 / 流量清单与详情 / CA / 系统代理 / HAR / ZIP 导出 / 保存 body / 改参重发 / 断点 / 映射 / 弱网 |
+| `capture/` | 抓包内核：`mod`（生命周期）/ `proxy` / `handler` / `store` / `ca` / `sysproxy` / `har` / `archive` / `intercept`（断点队列、Map Local / Remote、弱网）（详见 `astroman-capture`） |
+| `commands/notes.rs` | 待办 CRUD、计数、标签、设置、附件、截图识别；薄封装，领域逻辑在 `notes/` |
+| `notes/` | `mod`（CRUD / 筛选 / 重复推进 / 静默判断）/ `quick`（迷你窗口 + 全局快捷键）/ `reminder`（30 秒调度）/ `attachment`（sha256 去重 BLOB）/ `vision`（视觉模型识别）（详见 `astroman-notes`） |
 | `commands/update.rs` | 版本检查与下载 |
 | `commands/ai.rs` | AI 助手「航仔」：服务商、流式对话、会话消息、工具流水（详见 `astroman-ai`） |
 | `commands/test_suite.rs` / `commands/test_case.rs` | 测试套件、用例、数据集的 CRUD（`test_suite_save` 兼新建与更新） |
@@ -85,6 +87,22 @@ description: AstroMan 的 Rust/Tauri 后端开发规范。改数据库 schema、
 
 示例数据在 `db/seed.rs`：空库 `seed()`，已有库 `upgrade_sample()` 补齐示例场景。
 
+当前数据库结构版本 **6**（`astroman.db` 的 `PRAGMA user_version`）。v1.0.9 新增三张表，均由 `db/mod.rs::migrate()` 幂等创建：
+
+```sql
+notes(id, project_id?, ref_type, ref_id?, title, content, kind, status, priority,
+      tags, due_at, remind_at, remind_lead_min, remind_repeat, snooze_until,
+      notified_at, pinned, created_at, updated_at, done_at, deleted_at,
+      deleted_from_status)
+note_files(id, sha256, file_name, mime, size, data BLOB, created_at)
+  -- idx_note_files_sha UNIQUE(sha256)
+note_file_links(note_id, file_id, created_at)   -- 联合主键 + ON DELETE CASCADE
+```
+
+- 抓包流量、抓包拦截规则**不进数据库**：流量在内存，规则在 `<数据目录>/capture/intercept.json`。
+- 待办图片附件存 `note_files.data` BLOB，按 `sha256` 去重；`note_file_links` 解绑时只删链接，不立即删文件，由每日清理回收孤儿。
+- 改表结构时 `DB_VERSION` 递增，并同时补 `schema.sql` 与迁移；老库升级不丢数据。
+
 ## 主密钥与钥匙串（`secret.rs`）
 
 敏感字段（`environment_variables.value`、`ai_providers.api_key`）全部走同一套加密，**不要自己拼 AES**。
@@ -101,6 +119,8 @@ description: AstroMan 的 Rust/Tauri 后端开发规范。改数据库 schema、
 - 改密钥相关代码后必须跑 `cargo test --lib secret::`（10 条），并确认没有新增写钥匙串的路径
 
 新增敏感列的做法：写入前 `secret::encrypt`，读取时 `secret::decrypt`；列表接口只返回掩码 `••••••` + `hasValue`，提交值为掩码或空时沿用旧密文。
+
+请求级认证（`requests.auth`）不是普通列，而是整段 JSON 经 `secret::encrypt_auth_json` / `decrypt_auth_json` 处理：token、password、value、client_secret 逐字段加密，读取时解不开的字段置空但不影响其余字段。`commands/request.rs` 的读写入口必须成对使用，**不要**把 `auth` 当普通 JSON 直接 `serde_json::to_string` 入库。
 
 ## 关键上限常量
 
@@ -134,7 +154,19 @@ description: AstroMan 的 Rust/Tauri 后端开发规范。改数据库 schema、
 - 系统代理由 `capture/sysproxy.rs` 接管 Windows `HKCU` WinINET，改动前备份到数据目录，停止 / 线程退出 / 下次启动都会还原；非 Windows 返回明确错误。
 - 改配置结构（`CaptureConfig` / `CaptureStatus` / `CaptureFlow*`）要同步 `src/types/capture.ts`；新增命令注册到 `lib.rs::generate_handler!`。
 - 改录制或重发逻辑后跑 `cargo test --lib capture`（代理转发 + 未录制重发覆盖参数），再用 `npm run tauri dev` 手工冒烟。
+- 断点 / 映射 / 弱网在 `capture/intercept.rs`：挂起队列上限 `MAX_PENDING = 32`、`PAUSE_TIMEOUT = 120s`，Map Local 文件上限 `MAX_MAP_FILE = 50MB`，弱网单次最多等 120 秒后返回 504；规则持久化到 `<数据目录>/capture/intercept.json`，改规则后同步 `capture_intercept_state`，解析失败的规则要跳过而不是让整个抓包启动失败。
 - 手机 / 微信边界、HTTPS 排错与命令清单见 skill `astroman-capture`。
+
+## 记事本后端（`notes/` + `commands/notes.rs`）
+
+- 领域函数全部在 `notes/mod.rs`，`commands/notes.rs` 只做参数透传与事件广播；新增逻辑先加领域函数与单测，再包命令。
+- 提醒只发应用内事件：`reminder::tick` 每 30 秒查 `due_notes`，`mark_fired` 事务写入后再 `emit("notes:reminder")`。**先写库、后通知**，顺序反了会重复弹。
+- 暂停 / 免打扰期间整轮 return 且不写库；结束后只补一条聚合提醒。
+- 稍后提醒必须写 `snooze_until` 并清 `notified_at`；重复条目完成时顺延下一次 `due_at` / `remind_at`，状态保持 `open`。
+- 附件 `attachment::add` 先按 sha256 查重，命中只加链接；删除只删链接，孤儿由每日清理回收（累计超过 32MB 才 VACUUM）。
+- 截图识别 `vision::extract` 只接受 `supports_vision = 1` 的服务商；失败保留 `rawText`，原图仍作为附件保存。
+- 快速记录窗口必须独立线程创建；全局快捷键注册失败要把 `globalShortcut` 回退为 false 并提示占用。
+- 改提醒 / 附件语义后跑 `cargo test --lib notes::`；表结构与 UI 约定见 skill `astroman-notes`。
 
 ## 自动化测试执行内核（v1.0.8 新增）
 

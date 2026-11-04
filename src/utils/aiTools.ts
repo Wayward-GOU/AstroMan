@@ -3162,7 +3162,7 @@ const SPECS: ToolSpec[] = [
   },
   {
     name: 'api_import',
-    desc: '导入 Postman Collection v2 / Apifox 文件（projectId 为空则新建项目）',
+    desc: '导入 Postman Collection v2 / Apifox / HAR 文件（projectId 为空则新建项目）',
     args: '{ path, projectId? }',
     handler: async (args) => {
       const project = await apiImport(needPath(args.path), optionalNum(args.projectId) ?? null)
@@ -3615,7 +3615,7 @@ export const TOOL_LABELS: Record<string, string> = {
   report_export: '导出压测报告',
   project_import: '导入项目',
   project_export: '导出项目',
-  api_import: '导入 Postman / Apifox',
+  api_import: '导入 Postman / Apifox / HAR',
   openapi_import: '导入 OpenAPI',
   openapi_export: '导出 OpenAPI',
   plan_list: '读取压测计划',

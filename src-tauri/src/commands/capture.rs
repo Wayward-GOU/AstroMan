@@ -2,6 +2,10 @@
 
 use crate::capture::ca::{self, CaInfo};
 use crate::capture::handler::build_body;
+use crate::capture::intercept::{
+    BreakpointRule, Decision, InterceptView, MapLocalRule, MapRemoteRule, RequestEdit,
+    ResponseEdit, WeakNetwork,
+};
 use crate::capture::store::{BodyPayload, FlowBrief, FlowDetail, HeaderEntry};
 use crate::capture::{CaptureConfig, CaptureState, CaptureStatus};
 use crate::state::AppState;
@@ -392,4 +396,82 @@ pub fn capture_save_body(
         return Err("E_BODY: 该流量没有可保存的 body".into());
     };
     std::fs::write(&path, bytes).map_err(|error| format!("保存 body 失败：{error}"))
+}
+
+/// 拦截总览：断点/映射/弱网规则 + 当前挂起的流量。
+#[tauri::command]
+pub fn capture_intercept_state(state: tauri::State<'_, AppState>) -> InterceptView {
+    state.capture.intercept_view()
+}
+
+/// 保存断点开关与规则；只传其中一个也可以。
+#[tauri::command]
+pub fn capture_breakpoint_set_rules(
+    state: tauri::State<'_, AppState>,
+    enabled: Option<bool>,
+    rules: Option<Vec<BreakpointRule>>,
+) -> Result<InterceptView, String> {
+    state.capture.set_breakpoints(enabled, rules)
+}
+
+/// 保存本地映射开关与规则。
+#[tauri::command]
+pub fn capture_map_set_rules(
+    state: tauri::State<'_, AppState>,
+    enabled: Option<bool>,
+    rules: Option<Vec<MapLocalRule>>,
+) -> Result<InterceptView, String> {
+    state.capture.set_map(enabled, rules)
+}
+
+/// 保存远程映射开关与规则。
+#[tauri::command]
+pub fn capture_remote_set_rules(
+    state: tauri::State<'_, AppState>,
+    enabled: Option<bool>,
+    rules: Option<Vec<MapRemoteRule>>,
+) -> Result<InterceptView, String> {
+    state.capture.set_remote(enabled, rules)
+}
+
+/// 保存弱网参数。
+#[tauri::command]
+pub fn capture_weak_set(
+    state: tauri::State<'_, AppState>,
+    weak: WeakNetwork,
+) -> Result<InterceptView, String> {
+    state.capture.set_weak(weak)
+}
+
+/// 处理一条挂起的断点：放行 / 中止 / 带着修改继续。
+#[tauri::command]
+pub fn capture_breakpoint_resolve(
+    state: tauri::State<'_, AppState>,
+    pause_id: u64,
+    action: String,
+    request: Option<RequestEdit>,
+    response: Option<ResponseEdit>,
+) -> Result<InterceptView, String> {
+    let decision = match action.as_str() {
+        "continue" => Decision::Continue,
+        "abort" => Decision::Abort,
+        "edit" => {
+            if let Some(request) = request {
+                Decision::Request(request)
+            } else if let Some(response) = response {
+                Decision::Response(response)
+            } else {
+                return Err("E_ARG: 改包请求缺少 request / response 内容".into());
+            }
+        }
+        other => return Err(format!("E_ARG: 未知的断点操作 {other}")),
+    };
+    state.capture.resolve_pause(pause_id, decision)
+}
+
+/// 全部放行挂起的断点。
+#[tauri::command]
+pub fn capture_breakpoint_release_all(state: tauri::State<'_, AppState>) -> InterceptView {
+    state.capture.release_pauses();
+    state.capture.intercept_view()
 }

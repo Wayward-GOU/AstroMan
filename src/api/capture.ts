@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core'
 import type {
+  BreakpointRule,
   CaptureCaInfo,
   CaptureFlow,
   CaptureFlowDetail,
@@ -7,6 +8,12 @@ import type {
   CaptureRepeatResult,
   CaptureStartOptions,
   CaptureStatus,
+  InterceptView,
+  MapRemoteRule,
+  MapRule,
+  RequestEdit,
+  ResponseEdit,
+  WeakNetwork,
 } from '@/types/capture'
 
 export const captureStart = (options: CaptureStartOptions = {}) =>
@@ -55,3 +62,40 @@ export const captureSysproxyEnable = () =>
 
 export const captureSysproxyDisable = () =>
   invoke<CaptureStatus>('capture_sysproxy_disable')
+
+/** 断点 / 本地映射 / 弱网的总览与挂起队列 */
+export const captureInterceptState = () => invoke<InterceptView>('capture_intercept_state')
+
+/** 保存断点开关与规则；只传一个字段表示部分更新 */
+export const captureBreakpointSetRules = (options: {
+  enabled?: boolean
+  rules?: BreakpointRule[]
+} = {}) =>
+  invoke<InterceptView>('capture_breakpoint_set_rules', { ...options } as Record<string, unknown>)
+
+/** 保存本地映射开关与规则 */
+export const captureMapSetRules = (options: { enabled?: boolean; rules?: MapRule[] } = {}) =>
+  invoke<InterceptView>('capture_map_set_rules', { ...options } as Record<string, unknown>)
+
+/** 保存远程映射开关与规则 */
+export const captureRemoteSetRules = (options: {
+  enabled?: boolean
+  rules?: MapRemoteRule[]
+} = {}) =>
+  invoke<InterceptView>('capture_remote_set_rules', { ...options } as Record<string, unknown>)
+
+/** 保存弱网参数 */
+export const captureWeakSet = (weak: WeakNetwork) =>
+  invoke<InterceptView>('capture_weak_set', { weak })
+
+/** 处理一条挂起的断点：continue / abort / edit */
+export const captureBreakpointResolve = (payload: {
+  pauseId: number
+  action: 'continue' | 'abort' | 'edit'
+  request?: RequestEdit
+  response?: ResponseEdit
+}) => invoke<InterceptView>('capture_breakpoint_resolve', { ...payload })
+
+/** 放行全部挂起的断点（停止录制时也会自动释放） */
+export const captureBreakpointReleaseAll = () =>
+  invoke<InterceptView>('capture_breakpoint_release_all')

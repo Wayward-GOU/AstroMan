@@ -1,11 +1,12 @@
 use std::collections::HashMap;
+use std::path::Path;
 
 use rusqlite::{params, OptionalExtension, Transaction};
 use serde_json::Value;
 use tauri::State;
 
 use crate::commands::transfer::unique_project_name;
-use crate::models::{KeyValueItem, Project};
+use crate::models::{FormField, KeyValueItem, Project};
 use crate::state::AppState;
 use crate::util::{err, now_ms};
 
@@ -45,7 +46,14 @@ pub fn api_import(
     let content = std::fs::read_to_string(&path).map_err(|e| format!("读取文件失败：{e}"))?;
     let content = content.trim_start_matches('\u{feff}');
     let root: Value = serde_json::from_str(content).map_err(|e| format!("JSON 解析失败：{e}"))?;
-    let parsed = parse_import(&root)?;
+    let mut parsed = parse_import(&root)?;
+    // HAR 本身没有项目名，用文件名兜底
+    if parsed.name.trim().is_empty() {
+        parsed.name = Path::new(&path)
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().to_string())
+            .unwrap_or_default();
+    }
 
     let mut conn = state.pool.get().map_err(err)?;
     let now = now_ms();
@@ -110,6 +118,14 @@ pub fn api_import(
 }
 
 fn parse_import(root: &Value) -> Result<ParsedImport, String> {
+    if root
+        .get("log")
+        .and_then(|log| log.get("entries"))
+        .and_then(|entries| entries.as_array())
+        .is_some()
+    {
+        return parse_har(root);
+    }
     if root.get("info").is_some() && root.get("item").and_then(|v| v.as_array()).is_some() {
         return parse_postman(root);
     }
@@ -121,7 +137,7 @@ fn parse_import(root: &Value) -> Result<ParsedImport, String> {
             "暂不支持 Postman v1 格式，请在 Postman 中重新导出为 Collection v2.1".to_string(),
         );
     }
-    Err("无法识别文件格式：请选择 Postman Collection v2.0/v2.1 导出的 JSON，或 Apifox 导出的 OpenAPI JSON".to_string())
+    Err("无法识别文件格式：请选择 Postman Collection v2.0/v2.1、Apifox 导出的 OpenAPI JSON，或浏览器 / Charles 导出的 HAR".to_string())
 }
 
 // ---------- 通用工具 ----------
@@ -445,6 +461,238 @@ fn parse_postman_body(body: &Value) -> (String, String) {
         }
         _ => ("none".to_string(), String::new()),
     }
+}
+
+// ---------- HAR ----------
+
+/// 解析浏览器 DevTools / Charles / Fiddler 导出的 HAR 1.2：按 host 分组，
+/// 每个 entry 生成一个请求，查询串拆到 params，敏感头保留占位但默认不启用。
+fn parse_har(root: &Value) -> Result<ParsedImport, String> {
+    let entries = root
+        .get("log")
+        .and_then(|log| log.get("entries"))
+        .and_then(|entries| entries.as_array())
+        .ok_or_else(|| "HAR 文件缺少 log.entries".to_string())?;
+
+    let mut groups: Vec<ParsedCollection> = Vec::new();
+    let mut indexes: HashMap<String, usize> = HashMap::new();
+
+    for entry in entries {
+        let request = entry.get("request").unwrap_or(&Value::Null);
+        let url = optional_text(request.get("url")).unwrap_or_default();
+        if url.is_empty() {
+            continue;
+        }
+
+        let host = url_host(&url);
+        let (base, mut params) = split_har_url(&url);
+        if let Some(list) = request
+            .get("queryString")
+            .and_then(|value| value.as_array())
+            .filter(|list| !list.is_empty())
+        {
+            params = list
+                .iter()
+                .filter_map(|item| {
+                    let key = optional_text(item.get("name"))?;
+                    Some(KeyValueItem {
+                        key,
+                        value: item.get("value").map(value_text).unwrap_or_default(),
+                        enabled: true,
+                    })
+                })
+                .collect();
+        }
+
+        let headers = parse_har_headers(request.get("headers"));
+        let (body_type, body) = parse_har_body(request.get("postData"));
+        let parsed = ParsedRequest {
+            name: har_request_name(&base, request),
+            method: optional_text(request.get("method"))
+                .unwrap_or_else(|| "GET".to_string())
+                .to_uppercase(),
+            url: base,
+            headers,
+            params,
+            body_type,
+            body,
+        };
+
+        let index = match indexes.get(&host) {
+            Some(index) => *index,
+            None => {
+                let index = groups.len();
+                indexes.insert(host.clone(), index);
+                groups.push(ParsedCollection {
+                    name: host,
+                    ..Default::default()
+                });
+                index
+            }
+        };
+        groups[index].requests.push(parsed);
+    }
+
+    if groups.is_empty() {
+        return Err("HAR 文件中没有可导入的请求".to_string());
+    }
+
+    Ok(ParsedImport {
+        name: String::new(),
+        description: None,
+        collections: groups,
+        variables: Vec::new(),
+    })
+}
+
+/// 请求名取 URL 路径最后一段，HAR 本身不记录接口名。
+fn har_request_name(url: &str, request: &Value) -> String {
+    let path = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    let last = path.split('/').rfind(|part| !part.is_empty()).unwrap_or("");
+    if !last.is_empty() {
+        return last.to_string();
+    }
+    optional_text(request.get("method"))
+        .map(|method| method.to_uppercase())
+        .unwrap_or_else(|| "请求".to_string())
+}
+
+fn url_host(url: &str) -> String {
+    let rest = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let host = rest
+        .split(['/', '?', '#'])
+        .find(|part| !part.is_empty())
+        .unwrap_or("");
+    if host.is_empty() {
+        "HAR 导入".to_string()
+    } else {
+        host.to_string()
+    }
+}
+
+/// 拆出查询串；HAR 的 url 往往已经带完整 query。
+fn split_har_url(url: &str) -> (String, Vec<KeyValueItem>) {
+    let (base, query) = match url.split_once('?') {
+        Some((base, query)) => (base.to_string(), Some(query.to_string())),
+        None => (url.to_string(), None),
+    };
+    let base = base.split('#').next().unwrap_or("").to_string();
+    let mut params = Vec::new();
+    if let Some(query) = query {
+        for pair in query.split('#').next().unwrap_or("").split('&') {
+            if pair.is_empty() {
+                continue;
+            }
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            params.push(KeyValueItem {
+                key: key.to_string(),
+                value: value.to_string(),
+                enabled: true,
+            });
+        }
+    }
+    (base, params)
+}
+
+/// 伪头（`:authority` 等）与由客户端重算的长度/连接头直接丢弃；
+/// Authorization / Cookie / Proxy-Authorization 保留值但默认不启用，避免明文凭据被重放。
+fn parse_har_headers(value: Option<&Value>) -> Vec<KeyValueItem> {
+    let mut items = Vec::new();
+    let Some(list) = value.and_then(|value| value.as_array()) else {
+        return items;
+    };
+    for item in list {
+        let key = optional_text(item.get("name")).unwrap_or_default();
+        if key.is_empty() || key.starts_with(':') {
+            continue;
+        }
+        let lower = key.to_ascii_lowercase();
+        if lower == "content-length" || lower == "connection" {
+            continue;
+        }
+        let value = item.get("value").map(value_text).unwrap_or_default();
+        let sensitive = matches!(
+            lower.as_str(),
+            "authorization" | "cookie" | "proxy-authorization"
+        );
+        items.push(KeyValueItem {
+            key,
+            value,
+            enabled: !sensitive,
+        });
+    }
+    items
+}
+
+fn parse_har_body(post: Option<&Value>) -> (String, String) {
+    let Some(post) = post else {
+        return ("none".to_string(), String::new());
+    };
+    // base64 编码的上传体无法还原成可编辑文本，宁可不导入也不写坏
+    if post.get("encoding").and_then(|value| value.as_str()) == Some("base64") {
+        return ("none".to_string(), String::new());
+    }
+    let mime = optional_text(post.get("mimeType"))
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let params = post.get("params").and_then(|value| value.as_array());
+
+    if mime.contains("multipart/form-data") {
+        let fields: Vec<FormField> = params
+            .map(|list| {
+                list.iter()
+                    .filter_map(|item| {
+                        let key = optional_text(item.get("name"))?;
+                        let file_name = optional_text(item.get("fileName"));
+                        let is_file = file_name.is_some();
+                        Some(FormField {
+                            key,
+                            value: file_name.unwrap_or_else(|| {
+                                item.get("value").map(value_text).unwrap_or_default()
+                            }),
+                            // 文件字段只有文件名，不能直接当路径发送，先留占位不启用
+                            enabled: !is_file,
+                            kind: if is_file { "file" } else { "text" }.to_string(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !fields.is_empty() {
+            return (
+                "multipart".to_string(),
+                serde_json::to_string(&fields).unwrap_or_else(|_| "[]".to_string()),
+            );
+        }
+    }
+
+    if mime.contains("application/x-www-form-urlencoded") {
+        if let Some(list) = params {
+            let pairs: Vec<String> = list
+                .iter()
+                .filter_map(|item| {
+                    let key = optional_text(item.get("name"))?;
+                    Some(format!(
+                        "{key}={}",
+                        item.get("value").map(value_text).unwrap_or_default()
+                    ))
+                })
+                .collect();
+            if !pairs.is_empty() {
+                return ("form".to_string(), pairs.join("&"));
+            }
+        }
+    }
+
+    let text = optional_text(post.get("text")).unwrap_or_default();
+    if text.is_empty() {
+        return ("none".to_string(), String::new());
+    }
+    if mime.contains("json") || looks_like_json(&text) {
+        return ("json".to_string(), text);
+    }
+    ("raw".to_string(), text)
 }
 
 // ---------- OpenAPI / Apifox ----------
@@ -960,4 +1208,141 @@ fn apply_variables(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn har_groups_by_host_and_splits_query() {
+        let har = json!({
+            "log": {
+                "entries": [
+                    {
+                        "request": {
+                            "method": "GET",
+                            "url": "https://api.example.com/orders?page=2&size=10",
+                            "headers": [
+                                {"name": "Authorization", "value": "Bearer token"},
+                                {"name": ":authority", "value": "api.example.com"}
+                            ]
+                        }
+                    },
+                    {
+                        "request": {
+                            "method": "POST",
+                            "url": "https://api.example.com/orders",
+                            "headers": [{"name": "Content-Type", "value": "application/json"}],
+                            "postData": {
+                                "mimeType": "application/json",
+                                "text": "{\"sku\":\"A1\"}"
+                            }
+                        }
+                    },
+                    {
+                        "request": {
+                            "method": "GET",
+                            "url": "https://cdn.example.com/assets/app.js",
+                            "headers": []
+                        }
+                    }
+                ]
+            }
+        });
+
+        let parsed = parse_import(&har).unwrap();
+        assert_eq!(parsed.collections.len(), 2);
+
+        let api = parsed
+            .collections
+            .iter()
+            .find(|collection| collection.name == "api.example.com")
+            .unwrap();
+        assert_eq!(api.requests.len(), 2);
+
+        let get = api
+            .requests
+            .iter()
+            .find(|request| request.method == "GET")
+            .unwrap();
+        assert_eq!(get.url, "https://api.example.com/orders");
+        assert_eq!(get.name, "orders");
+        assert_eq!(get.params.len(), 2);
+        let auth = get
+            .headers
+            .iter()
+            .find(|header| header.key == "Authorization")
+            .unwrap();
+        assert!(!auth.enabled);
+        assert!(get
+            .headers
+            .iter()
+            .all(|header| !header.key.starts_with(':')));
+
+        let post = api
+            .requests
+            .iter()
+            .find(|request| request.method == "POST")
+            .unwrap();
+        assert_eq!(post.body_type, "json");
+        assert_eq!(post.body, "{\"sku\":\"A1\"}");
+
+        let cdn = parsed
+            .collections
+            .iter()
+            .find(|collection| collection.name == "cdn.example.com")
+            .unwrap();
+        assert_eq!(cdn.requests[0].name, "app.js");
+    }
+
+    #[test]
+    fn har_form_and_multipart_bodies() {
+        let form = json!({
+            "mimeType": "application/x-www-form-urlencoded",
+            "params": [
+                {"name": "a", "value": "1"},
+                {"name": "b", "value": "2"}
+            ]
+        });
+        assert_eq!(
+            parse_har_body(Some(&form)),
+            ("form".to_string(), "a=1&b=2".to_string())
+        );
+
+        let multipart = json!({
+            "mimeType": "multipart/form-data",
+            "params": [
+                {"name": "note", "value": "hi"},
+                {"name": "file", "fileName": "report.pdf"}
+            ]
+        });
+        let (kind, body) = parse_har_body(Some(&multipart));
+        assert_eq!(kind, "multipart");
+        let fields: Vec<FormField> = serde_json::from_str(&body).unwrap();
+        assert_eq!(fields.len(), 2);
+        assert!(fields
+            .iter()
+            .any(|field| field.key == "note" && field.enabled && field.kind == "text"));
+        assert!(fields.iter().any(|field| {
+            field.key == "file"
+                && !field.enabled
+                && field.kind == "file"
+                && field.value == "report.pdf"
+        }));
+    }
+
+    #[test]
+    fn har_base64_body_is_skipped() {
+        let post = json!({
+            "mimeType": "application/octet-stream",
+            "encoding": "base64",
+            "text": "AAAA"
+        });
+        assert_eq!(
+            parse_har_body(Some(&post)),
+            ("none".to_string(), String::new())
+        );
+    }
 }

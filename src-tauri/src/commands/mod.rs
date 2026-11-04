@@ -9,6 +9,7 @@ pub mod files;
 pub mod history;
 pub mod http;
 pub mod importer;
+pub mod notes;
 pub mod oauth;
 pub mod plan;
 pub mod project;

@@ -92,6 +92,7 @@ const blank = (): AiProvider => ({
   temperature: 0.3,
   maxTokens: 0,
   timeoutSecs: 300,
+  supportsVision: false,
   isDefault: false,
 })
 
@@ -1233,7 +1234,7 @@ const CONFIRM_TEXT: Record<string, string> = {
   report_export: '将把压测报告写出到本地文件。',
   project_export: '将把项目导出到本地文件。',
   project_import: '将把文件内容导入为本机项目。',
-  api_import: '将把 Postman / Apifox 文件导入为本机项目。',
+  api_import: '将把 Postman / Apifox 文件或 HAR 抓包导入为本机项目。',
   openapi_import: '将把 OpenAPI 文档导入为本机项目。',
   openapi_export: '将导出 OpenAPI 文档到本地文件。',
   env_delete: '将删除该环境及其变量，无法撤销；引用此环境的请求会回退到无环境。',
@@ -3106,6 +3107,14 @@ onMounted(async () => {
           <template #extra>
             <span class="dialog-hint">
               {{ isEdit ? '密钥只以掩码回显，输入新值才会覆盖；留空则沿用原 Key' : '密钥加密后保存在本机，不会上传' }}
+            </span>
+          </template>
+        </a-form-item>
+        <a-form-item label="图片识别">
+          <a-checkbox v-model:checked="form.supportsVision">支持图片输入</a-checkbox>
+          <template #extra>
+            <span class="dialog-hint">
+              勾选后可在「记事本 → 截图生成」里用这个模型识别截图；纯文本模型保持不勾
             </span>
           </template>
         </a-form-item>

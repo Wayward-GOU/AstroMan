@@ -7,6 +7,7 @@ import {
   CheckCircleOutlined,
   ClearOutlined,
   CodeOutlined,
+  ControlOutlined,
   CopyOutlined,
   DownOutlined,
   DownloadOutlined,
@@ -32,8 +33,12 @@ import type {
   CaptureHeader,
   CaptureRepeatResult,
   CaptureStatus,
+  InterceptView,
+  PendingBreakpoint,
 } from '@/types/capture'
 import { formatDateTime } from '@/utils/datetime'
+import CaptureInterceptDrawer from '@/components/CaptureInterceptDrawer.vue'
+import CaptureBreakpointModal from '@/components/CaptureBreakpointModal.vue'
 
 interface HostGroup {
   host: string
@@ -67,6 +72,12 @@ const detail = ref<CaptureFlowDetail | null>(null)
 const selectedId = ref<number | null>(null)
 const filter = ref('')
 const onlyErrors = ref(false)
+// 展示层过滤：只影响列表显示，不影响录制、重发与导出
+const hostFilter = ref<string[]>([])
+const methodFilter = ref<string[]>([])
+const statusFilter = ref('all')
+const mimeFilter = ref<string[]>([])
+const minDuration = ref<number | null>(null)
 const autoScroll = ref(true)
 const port = ref(8888)
 const bindAddr = ref('127.0.0.1')
@@ -76,6 +87,8 @@ const loadingCa = ref(false)
 const installingCa = ref(false)
 const sysproxyBusy = ref(false)
 const settingsOpen = ref(false)
+const interceptOpen = ref(false)
+const interceptView = ref<InterceptView>(emptyIntercept())
 const repeatBusy = ref(false)
 const repeatOpen = ref(false)
 const repeatResultOpen = ref(false)
@@ -140,6 +153,46 @@ function emptyCa(): CaptureCaInfo {
   }
 }
 
+function emptyIntercept(): InterceptView {
+  return {
+    breakpointsEnabled: false,
+    breakpointsActive: false,
+    mapEnabled: false,
+    mapActive: false,
+    remoteEnabled: false,
+    remoteActive: false,
+    weak: {
+      enabled: false,
+      preset: 'custom',
+      latencyMs: 200,
+      jitterMs: 50,
+      bandwidthKbps: 0,
+      lossPercent: 0,
+      patterns: [],
+    },
+    breakpointRules: [],
+    mapRules: [],
+    remoteRules: [],
+    pausedTotal: 0,
+    pendingCount: 0,
+    maxPending: 32,
+    timeoutSeconds: 120,
+    pending: [],
+  }
+}
+
+const pendingBreakpoints = computed<PendingBreakpoint[]>(
+  () => interceptView.value.pending ?? [],
+)
+const pendingCount = computed(() => pendingBreakpoints.value.length)
+const interceptActive = computed(
+  () =>
+    interceptView.value.breakpointsActive ||
+    interceptView.value.mapActive ||
+    interceptView.value.remoteActive ||
+    interceptView.value.weak?.enabled === true,
+)
+
 const running = computed(
   () => status.value.state === 'running' || status.value.state === 'starting',
 )
@@ -187,12 +240,110 @@ const phoneProxy = computed(() => {
   const activePort = status.value.port > 0 ? status.value.port : Number(port.value) || 8888
   return `${ip}:${activePort}`
 })
-const filterActive = computed(() => !!filter.value.trim() || onlyErrors.value)
+const statusOptions = [
+  { value: 'all', label: '全部状态' },
+  { value: '2xx', label: '2xx 成功' },
+  { value: '3xx', label: '3xx 重定向' },
+  { value: '4xx', label: '4xx 客户端错误' },
+  { value: '5xx', label: '5xx 服务端错误' },
+  { value: 'error', label: '请求失败' },
+]
+
+const mimeKinds = [
+  { value: 'json', label: 'JSON' },
+  { value: 'xml', label: 'XML' },
+  { value: 'html', label: 'HTML' },
+  { value: 'javascript', label: 'JS' },
+  { value: 'css', label: 'CSS' },
+  { value: 'image', label: '图片' },
+  { value: 'font', label: '字体' },
+  { value: 'text', label: '文本' },
+  { value: 'other', label: '其他' },
+]
+
+/** 把 Content-Type 归成有限的几类，避免下拉里出现几百种带参数的写法 */
+function mimeKind(contentType: string) {
+  const value = (contentType || '').toLowerCase()
+  if (!value) return 'other'
+  if (value.includes('json')) return 'json'
+  if (value.includes('xml')) return 'xml'
+  if (value.includes('html')) return 'html'
+  if (value.includes('javascript') || value.includes('ecmascript')) return 'javascript'
+  if (value.includes('css')) return 'css'
+  if (value.startsWith('image/')) return 'image'
+  if (value.includes('font')) return 'font'
+  if (value.startsWith('text/')) return 'text'
+  return 'other'
+}
+
+function statusKind(flow: CaptureFlow) {
+  if (flow.error || flow.status == null) return 'error'
+  if (flow.status >= 500) return '5xx'
+  if (flow.status >= 400) return '4xx'
+  if (flow.status >= 300) return '3xx'
+  return '2xx'
+}
+
+const hostOptions = computed(() =>
+  [...new Set(flows.value.map((flow) => flow.host))].sort().map((host) => ({
+    value: host,
+    label: host,
+  })),
+)
+const methodOptions = computed(() =>
+  [...new Set(flows.value.map((flow) => flow.method.toUpperCase()))].sort().map((method) => ({
+    value: method,
+    label: method,
+  })),
+)
+const mimeOptions = computed(() =>
+  mimeKinds.filter((kind) => flows.value.some((flow) => mimeKind(flow.contentType) === kind.value)),
+)
+
+const filterActive = computed(
+  () =>
+    !!filter.value.trim() ||
+    onlyErrors.value ||
+    hostFilter.value.length > 0 ||
+    methodFilter.value.length > 0 ||
+    statusFilter.value !== 'all' ||
+    mimeFilter.value.length > 0 ||
+    (minDuration.value ?? 0) > 0,
+)
+const activeFilterCount = computed(() => {
+  let count = 0
+  if (filter.value.trim()) count += 1
+  if (onlyErrors.value) count += 1
+  if (hostFilter.value.length) count += 1
+  if (methodFilter.value.length) count += 1
+  if (statusFilter.value !== 'all') count += 1
+  if (mimeFilter.value.length) count += 1
+  if ((minDuration.value ?? 0) > 0) count += 1
+  return count
+})
+
+function resetFilters() {
+  filter.value = ''
+  onlyErrors.value = false
+  hostFilter.value = []
+  methodFilter.value = []
+  statusFilter.value = 'all'
+  mimeFilter.value = []
+  minDuration.value = null
+}
 
 const visibleFlows = computed(() => {
   const keyword = filter.value.trim().toLowerCase()
+  const minMs = minDuration.value ?? 0
   return flows.value.filter((flow) => {
     if (onlyErrors.value && !flow.error && (flow.status ?? 0) < 400) return false
+    if (hostFilter.value.length && !hostFilter.value.includes(flow.host)) return false
+    if (methodFilter.value.length && !methodFilter.value.includes(flow.method.toUpperCase())) {
+      return false
+    }
+    if (statusFilter.value !== 'all' && statusKind(flow) !== statusFilter.value) return false
+    if (mimeFilter.value.length && !mimeFilter.value.includes(mimeKind(flow.contentType))) return false
+    if (minMs > 0 && flow.durationMs < minMs) return false
     if (!keyword) return true
     return [flow.method, flow.host, flow.path, flow.status?.toString() ?? '', flow.contentType]
       .some((value) => value.toLowerCase().includes(keyword))
@@ -458,6 +609,19 @@ async function refreshFlows() {
   }
 }
 
+/** 断点 / 本地映射 / 弱网状态与挂起队列；空闲时也取，方便显示已有规则 */
+async function refreshIntercept() {
+  try {
+    interceptView.value = await api.captureInterceptState()
+  } catch {
+    // 后端未就绪时忽略，下一轮再取
+  }
+}
+
+function onInterceptChanged(view: InterceptView) {
+  interceptView.value = view
+}
+
 async function refreshCa(silent = false) {
   if (!silent) loadingCa.value = true
   try {
@@ -521,6 +685,7 @@ async function start() {
     port.value = status.value.port || targetPort
     autoScroll.value = true
     message.success(`代理已启动：${proxyAddress.value}`)
+    void refreshIntercept()
     if (!ca.value.installed) {
       message.warning('代理已启动，但根证书未被系统信任，HTTPS 仍无法解密')
     }
@@ -537,6 +702,7 @@ async function stop() {
   stopping.value = true
   try {
     status.value = await api.captureStop()
+    void refreshIntercept()
     message.success('已停止录制，端口已释放')
   } catch (error) {
     message.error(String(error))
@@ -855,10 +1021,13 @@ onMounted(async () => {
   window.addEventListener('click', closeGroupMenu)
   window.addEventListener('keydown', onGlobalKeydown)
   window.addEventListener('blur', closeGroupMenu)
-  await Promise.all([refreshStatus(), refreshCa(), refreshFlows(), refreshLanIps()])
+  await Promise.all([refreshStatus(), refreshCa(), refreshFlows(), refreshLanIps(), refreshIntercept()])
   timer = window.setInterval(() => {
     refreshStatus()
-    if (running.value) refreshFlows()
+    if (running.value) {
+      refreshIntercept()
+      refreshFlows()
+    }
   }, 1500)
   caTimer = window.setInterval(() => {
     if (document.visibilityState === 'visible') refreshCa(true)
@@ -932,6 +1101,18 @@ watch(settingsOpen, (open) => {
         </a-button>
         <a-button
           size="small"
+          class="intercept-btn"
+          :class="{ 'is-on': interceptActive }"
+          title="断点改入参/返参、本地/远程映射、弱网模拟"
+          @click="interceptOpen = true"
+        >
+          <ControlOutlined />
+          拦截
+          <span v-if="pendingCount" class="intercept-count">{{ pendingCount }}</span>
+          <span v-else-if="interceptActive" class="intercept-dot" />
+        </a-button>
+        <a-button
+          size="small"
           class="ca-btn"
           :class="{ trusted: ca.installed }"
           @click="settingsOpen = true"
@@ -1002,6 +1183,58 @@ watch(settingsOpen, (open) => {
           </div>
         </div>
 
+        <div class="flow-filters">
+          <a-select
+            v-model:value="hostFilter"
+            mode="multiple"
+            size="small"
+            allow-clear
+            :max-tag-count="1"
+            placeholder="全部域名"
+            :options="hostOptions"
+            class="filter-select host-select"
+          />
+          <a-select
+            v-model:value="methodFilter"
+            mode="multiple"
+            size="small"
+            allow-clear
+            :max-tag-count="1"
+            placeholder="全部方法"
+            :options="methodOptions"
+            class="filter-select"
+          />
+          <a-select
+            v-model:value="statusFilter"
+            size="small"
+            :options="statusOptions"
+            class="filter-select"
+          />
+          <a-select
+            v-model:value="mimeFilter"
+            mode="multiple"
+            size="small"
+            allow-clear
+            :max-tag-count="1"
+            placeholder="全部类型"
+            :options="mimeOptions"
+            class="filter-select"
+          />
+          <a-input-number
+            v-model:value="minDuration"
+            size="small"
+            :min="0"
+            :precision="0"
+            placeholder="≥ 耗时"
+            class="filter-duration"
+          >
+            <template #suffix><span class="unit">ms</span></template>
+          </a-input-number>
+          <a-button v-if="activeFilterCount" type="text" size="small" @click="resetFilters">
+            清除（{{ activeFilterCount }}）
+          </a-button>
+        </div>
+
         <div v-if="!flows.length" class="empty-state guide">
           <div class="guide-top">
             <div class="empty-icon">
@@ -1053,7 +1286,7 @@ watch(settingsOpen, (open) => {
             <ApiOutlined />
           </div>
           <h2>没有匹配的流量</h2>
-          <p>换个过滤词，或取消「仅错误」后再看。</p>
+          <p>调整过滤条件，或点「清除」后再看；过滤只影响展示，不影响录制与导出。</p>
         </div>
 
         <div v-else ref="flowList" class="tree" @scroll="onListScroll">
@@ -1090,8 +1323,17 @@ watch(settingsOpen, (open) => {
                 <span class="flow-path" :title="`${flow.path}\n${flow.status ?? 'ERR'} · ${formatDuration(flow.durationMs)}`">
                   {{ flow.path }}
                 </span>
-                <span class="flow-status" :class="statusClass(flow)">
-                  {{ flow.status ?? 'ERR' }}
+                <span class="flow-state">
+                  <span class="flow-status" :class="statusClass(flow)">
+                    {{ flow.status ?? 'ERR' }}
+                  </span>
+                  <span v-if="flow.mapped" class="flow-flag mapped" title="本地映射直接返回">本地</span>
+                  <span
+                    v-if="flow.remote"
+                    class="flow-flag remote"
+                    :title="`远程映射到 ${flow.remote}`"
+                  >远程</span>
+                  <span v-if="flow.modified" class="flow-flag modified" title="断点修改过请求或响应">已改</span>
                 </span>
                 <span class="flow-time">{{ formatDuration(flow.durationMs) }}</span>
                 <span class="flow-size">{{ formatBytes(flow.responseSize) }}</span>
@@ -1122,6 +1364,9 @@ watch(settingsOpen, (open) => {
               </span>
               <span class="detail-duration">{{ formatDuration(detail.durationMs) }}</span>
               <span class="detail-clock">{{ formatClock(detail.startedAt) }}</span>
+              <a-tag v-if="detail.mapped" color="purple" class="detail-flag">本地映射</a-tag>
+              <a-tag v-if="detail.remote" color="cyan" class="detail-flag">远程映射</a-tag>
+              <a-tag v-if="detail.modified" color="orange" class="detail-flag">断点改包</a-tag>
               <div class="detail-actions">
                 <a-button size="small" :loading="repeatBusy" @click="openRepeat">
                   <SendOutlined />
@@ -1184,6 +1429,9 @@ watch(settingsOpen, (open) => {
                 </div>
                 <div class="meta-item wide">
                   <span>完整 URL</span><b class="mono">{{ currentUrl(detail) }}</b>
+                </div>
+                <div v-if="detail.remote" class="meta-item wide">
+                  <span>远程映射目标</span><b class="mono remote-target">{{ detail.remote }}</b>
                 </div>
               </div>
               <p class="overview-hint">
@@ -1389,6 +1637,12 @@ watch(settingsOpen, (open) => {
       <span>请求 {{ status.flowCount }}</span>
       <span>域名 {{ groups.length }}</span>
       <span v-if="status.dropped">丢弃 {{ status.dropped }}</span>
+      <span v-if="interceptView.breakpointsActive" :class="{ 'status-warn': pendingCount }">
+        断点 {{ pendingCount ? `挂起 ${pendingCount}` : '已启用' }}
+      </span>
+      <span v-if="interceptView.mapActive" class="status-info">本地映射</span>
+      <span v-if="interceptView.remoteActive" class="status-info">远程映射</span>
+      <span v-if="interceptView.weak.enabled" class="status-warn">弱网模拟</span>
       <span>系统代理 {{ status.sysproxyOn ? '已接管' : '未接管' }}</span>
       <span :class="{ 'status-ok': ca.installed, 'status-bad': !ca.installed }">
         CA {{ ca.installed ? '已信任' : '未信任' }}
@@ -1779,6 +2033,17 @@ watch(settingsOpen, (open) => {
         </a-tabs>
       </div>
     </a-modal>
+
+    <CaptureInterceptDrawer
+      v-model:open="interceptOpen"
+      @changed="onInterceptChanged"
+    />
+    <CaptureBreakpointModal
+      :pending="pendingBreakpoints"
+      :timeout-seconds="interceptView.timeoutSeconds"
+      :max-pending="interceptView.maxPending"
+      @resolved="onInterceptChanged"
+    />
   </div>
 </template>
 
@@ -1897,6 +2162,33 @@ watch(settingsOpen, (open) => {
   border-color: color-mix(in srgb, var(--fm-success) 35%, var(--fm-border));
 }
 
+.intercept-btn.is-on {
+  color: var(--fm-primary);
+  border-color: color-mix(in srgb, var(--fm-primary) 45%, var(--fm-border));
+}
+
+.intercept-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  margin-left: 2px;
+  padding: 0 4px;
+  font-size: 10px;
+  color: #fff;
+  background: var(--fm-warning, #faad14);
+  border-radius: 8px;
+}
+
+.intercept-dot {
+  width: 6px;
+  height: 6px;
+  margin-left: 2px;
+  background: var(--fm-primary);
+  border-radius: 50%;
+}
+
 .icon-btn {
   width: 28px;
   padding: 0;
@@ -2010,6 +2302,34 @@ watch(settingsOpen, (open) => {
   display: flex;
   align-items: center;
   gap: 2px;
+}
+
+.flow-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  flex: none;
+  padding: 6px 10px 8px;
+  background: var(--fm-surface-alt);
+  border-bottom: 1px solid var(--fm-border);
+}
+
+.flow-filters .filter-select {
+  flex: 1 1 96px;
+  min-width: 96px;
+}
+
+.flow-filters .host-select {
+  flex-basis: 100%;
+}
+
+.flow-filters .filter-duration {
+  width: 108px;
+}
+
+.flow-filters .unit {
+  font-size: 10px;
+  color: var(--fm-muted);
 }
 
 .tree-actions :deep(.ant-btn) {
@@ -2170,7 +2490,7 @@ watch(settingsOpen, (open) => {
 
 .flow-row {
   display: grid;
-  grid-template-columns: 46px minmax(0, 1fr) 36px 54px 58px;
+  grid-template-columns: 46px minmax(0, 1fr) 64px 54px 58px;
   gap: 6px;
   align-items: center;
   width: 100%;
@@ -2216,6 +2536,33 @@ watch(settingsOpen, (open) => {
 .flow-status {
   font-weight: 650;
   font-variant-numeric: tabular-nums;
+}
+
+.flow-state {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  min-width: 0;
+}
+
+.flow-flag {
+  flex: none;
+  padding: 0 3px;
+  font-size: 8.5px;
+  line-height: 14px;
+  color: var(--fm-method-put);
+  background: color-mix(in srgb, var(--fm-method-put) 12%, transparent);
+  border-radius: 2px;
+}
+
+.flow-flag.modified {
+  color: var(--fm-warning);
+  background: color-mix(in srgb, var(--fm-warning) 14%, transparent);
+}
+
+.flow-flag.remote {
+  color: var(--fm-primary);
+  background: color-mix(in srgb, var(--fm-primary) 14%, transparent);
 }
 
 .flow-time,
@@ -2760,6 +3107,19 @@ watch(settingsOpen, (open) => {
 
 .status-bad {
   color: var(--fm-warning);
+}
+
+.status-warn {
+  color: var(--fm-warning);
+}
+
+.status-info {
+  color: var(--fm-primary);
+}
+
+.detail-flag {
+  font-size: 10px;
+  line-height: 16px;
 }
 
 .settings-body {

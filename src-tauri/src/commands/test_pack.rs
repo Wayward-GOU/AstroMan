@@ -41,6 +41,7 @@ fn request_snapshot(conn: &Connection, id: i64) -> Result<Value, String> {
             let headers: Option<String> = row.get(3)?;
             let params_text: Option<String> = row.get(4)?;
             let auth: Option<String> = row.get(7)?;
+            let auth = auth.map(|text| crate::secret::decrypt_auth_json(&text));
             Ok(json!({
                 "name": row.get::<_, String>(0)?,
                 "method": row.get::<_, String>(1)?,
@@ -268,7 +269,10 @@ fn insert_snapshot_request(
             request.get("params").map(|value| value.to_string()),
             text_field(request, "bodyType").unwrap_or_else(|| "none".into()),
             text_field(request, "body"),
-            request.get("auth").map(|value| value.to_string()),
+            match request.get("auth").map(|value| value.to_string()) {
+                Some(text) => Some(crate::secret::encrypt_auth_json(&text)?),
+                None => None,
+            },
             order,
             now
         ],

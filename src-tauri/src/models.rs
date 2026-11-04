@@ -846,6 +846,9 @@ pub struct AiProvider {
     pub timeout_secs: Option<i64>,
     #[serde(default)]
     pub is_default: bool,
+    /// 是否支持图片输入（截图识别用）；默认 false
+    #[serde(default)]
+    pub supports_vision: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

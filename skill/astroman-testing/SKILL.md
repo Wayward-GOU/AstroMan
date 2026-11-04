@@ -7,10 +7,10 @@ description: AstroMan 的测试体系与质量门禁：vitest 前端纯函数用
 
 四层验收，命令与规模：
 
-| 层 | 命令 | 规模（2026-11-03 实测） | 位置 |
+| 层 | 命令 | 规模（2026-11-04 实测） | 位置 |
 |---|---|---|---|
-| 前端纯函数 | `npm run test` | 10 spec / 134 条 | `src/**/*.spec.ts` |
-| Rust lib | `cd src-tauri && cargo test --lib` | 106 条 / 21 文件 | 模块内 `#[cfg(test)]` |
+| 前端纯函数 | `npm run test` | 14 spec / 160 条 | `src/**/*.spec.ts` |
+| Rust lib | `cd src-tauri && cargo test --lib` | 140 条 / 25 文件 | 模块内 `#[cfg(test)]` |
 | Rust 覆盖率 | `cargo tarpaulin --config tarpaulin.toml` | 门槛 25%（防倒退） | `src-tauri/tarpaulin.toml` |
 | 类型 / 构建 | `npm run build` | `vue-tsc --noEmit` + `vite build` | — |
 
@@ -73,6 +73,15 @@ cargo test --lib secret::
 cargo test --lib test_runner:: test_assert:: test_dataset:: python_exec::
 ```
 
+- 记事本域的用例在 `src-tauri/src/notes/tests.rs`（覆盖重复顺延、稍后提醒、暂停 / 免打扰、附件去重），抓包拦截在 `src-tauri/src/capture/tests.rs`；改提醒或拦截规则后至少跑：
+
+```bash
+cargo test --lib notes::
+cargo test --lib capture::
+```
+
+- 前端记事本纯函数各有一份 spec：`notesGrouping.spec.ts` / `notesImage.spec.ts` / `notesQuickParse.spec.ts` / `notesTags.spec.ts`；改解析语法或标签配色先补这里
+
 - 受限环境（沙箱 / 只读盘）会集中报 `attempt to write a readonly database`，一批用例同时失败；这是环境不是代码。单独重跑、把临时目录换到可写盘，或在关闭沙箱的模式下执行
 
 ## 三、覆盖率（cargo-tarpaulin）
@@ -127,7 +136,7 @@ cargo tarpaulin --config tarpaulin.toml --engine llvm
 
 ```bash
 npm run version:check        # 只校验，不一致退出码 1（CI 用）
-npm run version:set 1.0.8    # 三处统一写入
+npm run version:set 1.0.9    # 三处统一写入
 ```
 
 `scripts/sync-version.mjs` 用各自文件的匹配规则（`Cargo.toml` 只取顶层第一个 `version`），不会误伤依赖里的版本号。

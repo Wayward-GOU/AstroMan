@@ -1269,8 +1269,8 @@ pub fn prune_reports(
         } else {
             data_dir.join(report_dir)
         };
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(data_dir.join("test-runs").join(run_id.to_string()));
+        remove_dir_if_exists(&dir)?;
+        remove_dir_if_exists(&data_dir.join("test-runs").join(run_id.to_string()))?;
         conn.execute(
             "UPDATE test_runs SET report_dir = NULL WHERE id = ?1",
             params![run_id],
@@ -1283,6 +1283,23 @@ pub fn prune_reports(
         .map_err(err)?;
     }
     Ok(stale.len())
+}
+
+/// 删除已存在的目录；目录不存在视为成功，其余错误向上返回，避免静默留下过期报告。
+/// Windows 上杀软 / 索引器可能短暂占用文件，删除失败时重试几次。
+fn remove_dir_if_exists(dir: &Path) -> Result<(), String> {
+    for attempt in 0..3 {
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if attempt < 2 => {
+                log::debug!("清理旧报告失败，稍后重试（{}）：{error}", dir.display());
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            }
+            Err(error) => return Err(format!("清理旧报告失败（{}）：{error}", dir.display())),
+        }
+    }
+    Ok(())
 }
 
 /// 启动时清理无主目录：库里不存在的 runId 目录（崩溃残留）

@@ -79,7 +79,7 @@ npm.cmd run dev
 ### 前端
 
 ```powershell
-npm.cmd run test        # vitest run：10 个 spec / 134 条
+npm.cmd run test        # vitest run：14 个 spec / 160 条
 npm.cmd run build       # vue-tsc --noEmit + vite build（类型错误在这里拦）
 ```
 
@@ -91,7 +91,7 @@ npm.cmd run build       # vue-tsc --noEmit + vite build（类型错误在这里�
 cd src-tauri
 cargo fmt --check --all                            # 格式门禁
 cargo clippy --lib --all-targets -- -D warnings    # 静态检查，注意 -- 只能在 --all-targets 之后
-cargo test --lib                                   # 106 条用例
+cargo test --lib                                   # 140 条用例
 ```
 
 > `cargo test` 会在临时目录建库。环境不允许写 SQLite（受限沙箱、只读盘）时会集中报 `attempt to write a readonly database`，属于环境问题，单独重跑或换可写目录即可。
@@ -271,5 +271,6 @@ npm run tauri build
 - 航仔挂件用设计稿贴图 `src/assets/buddy.png`（透明底，72×121 显示），不要改回手绘 SVG；侧栏 / 空状态 / AI 抽屉的小图标用 `src/components/AstroBuddyIcon.vue` 的 1em 线框版（14px 下位图会糊）
 - 自动化测试的执行语义只改 `src-tauri/src/test_runner.rs`（含断言、数据行、依赖跳过），桌面端与 `astroman-cli` 共用；运行产物写 `<数据目录>/test-reports/<runId>/`，库里只存相对路径
 - 离线工具的算法放 `src/tools/*.ts` 纯函数（可进 vitest），`registry.ts` 只做声明；新增工具要同时补单测与 `docs/toolbox.md`
+- 记事本的提醒语义集中在 `src-tauri/src/notes/reminder.rs` 与 `notes/mod.rs`：先写库推进时间、再 `emit("notes:reminder")`；「稍后」必须改 `snooze_until` 并清 `notified_at`，不能只改前端展示；附件按 sha256 去重存 BLOB
 - 压测报告 QPS 指标组的唯一入口是 `src/utils/reportAnalytics.ts` 的 `qpsOverview()`，详情页与 HTML / Excel 导出都调它，不要在模板或导出函数里另算
 - 视觉改动不要只看代码：起 `vite preview` + 无头 Chrome 截图核对，或 `npm run tauri dev` 实机确认；`prefers-reduced-motion` 下的静止态要一起验

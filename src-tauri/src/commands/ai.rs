@@ -79,6 +79,7 @@ fn row_to_provider(row: &Row) -> rusqlite::Result<AiProvider> {
         max_tokens: Some(row.get::<_, i64>(7)?),
         timeout_secs: Some(row.get::<_, i64>(8)?),
         is_default: row.get::<_, i64>(9)? != 0,
+        supports_vision: row.get::<_, i64>(10)? != 0,
     })
 }
 
@@ -99,13 +100,14 @@ fn row_to_provider_plain(row: &Row) -> rusqlite::Result<AiProvider> {
         max_tokens: Some(row.get::<_, i64>(7)?),
         timeout_secs: Some(row.get::<_, i64>(8)?),
         is_default: row.get::<_, i64>(9)? != 0,
+        supports_vision: row.get::<_, i64>(10)? != 0,
     })
 }
 
 const PROVIDER_COLUMNS: &str = "id, name, COALESCE(kind, 'openai'), base_url, model,
                                 COALESCE(api_key_enc, ''), COALESCE(temperature, 0.3),
                                 COALESCE(max_tokens, 0), COALESCE(timeout_secs, 300),
-                                COALESCE(is_default, 0)";
+                                COALESCE(is_default, 0), COALESCE(supports_vision, 0)";
 
 #[tauri::command]
 pub fn ai_provider_list(state: State<'_, AppState>) -> Result<Vec<AiProvider>, String> {
@@ -162,8 +164,9 @@ pub fn ai_provider_save(
                     "UPDATE ai_providers
                      SET name = ?1, kind = ?2, base_url = ?3, model = ?4,
                          temperature = ?5, is_default = ?6, max_tokens = ?7,
-                         timeout_secs = ?8, enabled = 1, updated_at = ?9
-                     WHERE id = ?10",
+                         timeout_secs = ?8, enabled = 1, updated_at = ?9,
+                         supports_vision = ?10
+                     WHERE id = ?11",
                     params![
                         provider.name.trim(),
                         kind,
@@ -174,6 +177,7 @@ pub fn ai_provider_save(
                         max_tokens,
                         timeout_secs,
                         now,
+                        provider.supports_vision as i64,
                         id
                     ],
                 )
@@ -183,8 +187,9 @@ pub fn ai_provider_save(
                     "UPDATE ai_providers
                      SET name = ?1, kind = ?2, base_url = ?3, model = ?4, api_key_enc = ?5,
                          temperature = ?6, is_default = ?7, max_tokens = ?8,
-                         timeout_secs = ?9, enabled = 1, updated_at = ?10
-                     WHERE id = ?11",
+                         timeout_secs = ?9, enabled = 1, updated_at = ?10,
+                         supports_vision = ?11
+                     WHERE id = ?12",
                     params![
                         provider.name.trim(),
                         kind,
@@ -196,6 +201,7 @@ pub fn ai_provider_save(
                         max_tokens,
                         timeout_secs,
                         now,
+                        provider.supports_vision as i64,
                         id
                     ],
                 )
@@ -207,8 +213,8 @@ pub fn ai_provider_save(
             conn.execute(
                 "INSERT INTO ai_providers
                    (name, kind, base_url, model, api_key_enc, temperature, max_tokens,
-                    timeout_secs, is_default, enabled, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?10)",
+                    timeout_secs, is_default, enabled, supports_vision, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?11)",
                 params![
                     provider.name.trim(),
                     kind,
@@ -219,6 +225,7 @@ pub fn ai_provider_save(
                     max_tokens,
                     timeout_secs,
                     provider.is_default as i64,
+                    provider.supports_vision as i64,
                     now
                 ],
             )
@@ -253,6 +260,7 @@ pub fn ai_provider_save(
         max_tokens: Some(max_tokens),
         timeout_secs: Some(timeout_secs),
         is_default: provider.is_default,
+        supports_vision: provider.supports_vision,
     })
 }
 
@@ -264,7 +272,7 @@ pub fn ai_provider_delete(state: State<'_, AppState>, id: i64) -> Result<(), Str
     Ok(())
 }
 
-fn load_provider(state: &AppState, id: i64) -> Result<AiProvider, String> {
+pub(crate) fn load_provider(state: &AppState, id: i64) -> Result<AiProvider, String> {
     let conn = state.pool.get().map_err(err)?;
     let sql = format!(
         "SELECT {PROVIDER_COLUMNS} FROM ai_providers
@@ -281,7 +289,7 @@ struct Prepared {
     body: serde_json::Value,
 }
 
-fn default_base(kind: &str) -> &'static str {
+pub(crate) fn default_base(kind: &str) -> &'static str {
     match kind {
         "anthropic" => "https://api.anthropic.com",
         "gemini" => "https://generativelanguage.googleapis.com",
@@ -413,7 +421,7 @@ fn prepare(
 }
 
 /// 从错误响应体里尽量捞出可读信息
-fn extract_api_error(raw: &str) -> String {
+pub(crate) fn extract_api_error(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return "服务无响应内容".to_string();
@@ -434,7 +442,7 @@ fn extract_api_error(raw: &str) -> String {
 }
 
 /// 常见服务商错误转成中文提示；识别不了的保留原文，避免吞掉有效信息
-fn humanize_api_error(status: u16, message: &str) -> String {
+pub(crate) fn humanize_api_error(status: u16, message: &str) -> String {
     let lower = message.to_ascii_lowercase();
 
     // 模型名不被支持：The supported API model names are A, B, but you passed C.
@@ -522,7 +530,7 @@ fn humanize_api_error(status: u16, message: &str) -> String {
 }
 
 /// 网络层错误转中文，保留原文便于排查代理与本地服务
-fn humanize_network_error(raw: &str) -> String {
+pub(crate) fn humanize_network_error(raw: &str) -> String {
     let lower = raw.to_ascii_lowercase();
     if lower.contains("dns") || lower.contains("failed to lookup address") {
         return format!("无法解析服务商域名，请检查网络或 Base URL 是否写错。（原始错误：{raw}）");
@@ -542,7 +550,7 @@ fn humanize_network_error(raw: &str) -> String {
 }
 
 /// 把非流式响应解析成纯文本
-fn parse_full_text(kind: &str, raw: &str) -> Result<String, String> {
+pub(crate) fn parse_full_text(kind: &str, raw: &str) -> Result<String, String> {
     let json: serde_json::Value = serde_json::from_str(raw).map_err(|_| extract_api_error(raw))?;
     let collect_text = |items: Option<&serde_json::Value>| -> String {
         items
@@ -760,7 +768,7 @@ fn emit(channel: &Channel<AiStreamEvent>, kind: &str, text: impl Into<String>) {
 
 /// 记录一次模型调用的 token 与成败，供「模型统计」使用
 #[allow(clippy::too_many_arguments)]
-fn record_usage(
+pub(crate) fn record_usage(
     state: &AppState,
     provider: &AiProvider,
     prompt_tokens: i64,

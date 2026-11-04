@@ -1,6 +1,7 @@
 //! 代理组装：MITM + 录制 handler。
 
 use crate::capture::handler::CaptureHandler;
+use crate::capture::intercept::InterceptState;
 use crate::capture::store::CaptureStore;
 use crate::capture::CaptureConfig;
 use hudsucker::certificate_authority::RcgenAuthority;
@@ -14,12 +15,13 @@ pub async fn run<F>(
     authority: RcgenAuthority,
     config: CaptureConfig,
     store: Arc<CaptureStore>,
+    intercept: Arc<InterceptState>,
     shutdown: F,
 ) -> Result<(), String>
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let handler = CaptureHandler::new(store, config);
+    let handler = CaptureHandler::new(store, config, intercept);
     Proxy::builder()
         .with_listener(listener)
         .with_ca(authority)

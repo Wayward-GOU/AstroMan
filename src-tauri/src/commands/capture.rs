@@ -67,17 +67,17 @@ pub fn capture_stop(state: tauri::State<'_, AppState>) -> Result<CaptureStatus, 
     state.capture.stop()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn capture_status(state: tauri::State<'_, AppState>) -> CaptureStatus {
     state.capture.status()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn capture_flows(state: tauri::State<'_, AppState>, limit: Option<usize>) -> Vec<FlowBrief> {
     state.capture.flows(limit.unwrap_or(500))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn capture_flow_detail(
     state: tauri::State<'_, AppState>,
     id: u64,
@@ -88,14 +88,14 @@ pub fn capture_flow_detail(
         .ok_or_else(|| format!("E_FLOW_NOT_FOUND: 流量 #{id} 不存在或已淘汰"))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn capture_flow_clear(state: tauri::State<'_, AppState>) -> CaptureStatus {
     state.capture.clear_flows();
     state.capture.status()
 }
 
 /// 手机抓包时展示电脑的局域网 IPv4，优先返回带网关的地址。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn capture_lan_ips() -> Vec<String> {
     let mut items: Vec<(bool, String)> = Vec::new();
     for adapter in crate::netinfo::adapters() {
@@ -113,7 +113,7 @@ pub fn capture_lan_ips() -> Vec<String> {
     items.into_iter().map(|(_, address)| address).collect()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn capture_ca_info(state: tauri::State<'_, AppState>) -> CaInfo {
     ca::info(state.capture.data_dir())
 }
@@ -132,7 +132,7 @@ pub fn capture_ca_install(state: tauri::State<'_, AppState>) -> Result<CaInfo, S
     ca::install(state.capture.data_dir())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn capture_ca_export(state: tauri::State<'_, AppState>, path: String) -> Result<(), String> {
     if path.trim().is_empty() {
         return Err("E_ARG: 导出路径不能为空".into());
@@ -331,7 +331,7 @@ pub async fn capture_repeat(
     .await
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn capture_export_har(
     state: tauri::State<'_, AppState>,
     path: String,
@@ -349,7 +349,7 @@ pub fn capture_export_har(
 }
 
 /// 导出 ZIP：索引页、HAR、汇总与每条流量的可读明细。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn capture_export_zip(
     state: tauri::State<'_, AppState>,
     path: String,
@@ -367,7 +367,7 @@ pub fn capture_export_zip(
 }
 
 /// 保存请求体 / 响应体到文件；文本直接写，图片等二进制按 base64 还原。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn capture_save_body(
     state: tauri::State<'_, AppState>,
     id: u64,
@@ -399,7 +399,7 @@ pub fn capture_save_body(
 }
 
 /// 拦截总览：断点/映射/弱网规则 + 当前挂起的流量。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn capture_intercept_state(state: tauri::State<'_, AppState>) -> InterceptView {
     state.capture.intercept_view()
 }

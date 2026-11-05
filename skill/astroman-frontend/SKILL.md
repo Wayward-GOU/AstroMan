@@ -81,7 +81,7 @@ v1.0.8 起大屏不在首页：`views/Dashboard.vue` 只剩总览 KPI、快捷�
 左右两栏：左侧按 host 分组的流量树，右侧详情（概览 / 请求 / 响应 / 原始）。工具栏是录制、清空、导出 HAR / ZIP、CA 状态、系统代理与设置抽屉；详情里的「重发」打开可编辑弹窗；域名分组右键可导出该分组 HAR / ZIP。
 
 - 页面用 `import * as api from '@/api/capture'`，类型在 `src/types/capture.ts`，**不要**把这些命令再塞进 `api/index.ts`
-- 流量与状态分别 1.5 秒轮询；CA 信任状态 5 秒轮询，只在页面可见时刷
+- 流量与状态分别 1.5 秒轮询；CA 信任状态 10 秒轮询、已信任后停止，只在页面可见时刷
 - 分组右键菜单用 `Teleport to="body"` 定位，点击窗口任意位置 / 失焦都要关闭
 - 开始录制固定传 `{ port, bindAddr, sslHosts: [], ignorePatterns: [], captureStatic: true }`；新增设置项时同步 `CaptureConfig` 与 Rust handler
 - 浏览器预览下 `invoke` 不可用，页面会显示「代理后端不可用」提示，属预期

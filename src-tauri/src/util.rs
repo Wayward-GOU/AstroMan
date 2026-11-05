@@ -38,6 +38,22 @@ pub fn err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
 }
 
+/// 创建不弹控制台窗口的子进程命令。
+///
+/// Windows 上 `reg`、`certutil`、`icacls` 这类控制台程序默认会闪一个黑窗；
+/// 定时轮询证书状态时会被用户看成“狂弹 CMD”，统一加上 `CREATE_NO_WINDOW`。
+pub fn hidden_command(program: &str) -> std::process::Command {
+    #[allow(unused_mut)]
+    let mut command = std::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 /// 去掉 JSON 文本里的注释，与 Postman 的 raw(JSON) 编辑器保持一致
 ///
 /// 支持 `// 行注释` 与 `/* 块注释 */`，字符串内部的 `//`（例如 URL）不会被误删。

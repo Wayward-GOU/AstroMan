@@ -110,7 +110,7 @@ pub fn restore_stale(data_dir: &Path) {
 
 #[cfg(windows)]
 fn read_value(name: &str) -> Option<String> {
-    let output = std::process::Command::new("reg")
+    let output = crate::util::hidden_command("reg")
         .args(["query", REG_KEY, "/v", name])
         .output()
         .ok()?;
@@ -158,7 +158,7 @@ fn restore_key(name: &str, value: Option<&str>, dword: bool) -> Result<(), Strin
         Some(value) => write_string(name, value),
         None => {
             // 原值不存在就删掉，避免把一个空字符串写回用户配置
-            let _ = std::process::Command::new("reg")
+            let _ = crate::util::hidden_command("reg")
                 .args(["delete", REG_KEY, "/v", name, "/f"])
                 .output();
             Ok(())
@@ -181,7 +181,7 @@ fn parse_dword(value: &str) -> u32 {
 
 #[cfg(windows)]
 fn run_reg(args: &[&str]) -> Result<(), String> {
-    let output = std::process::Command::new("reg")
+    let output = crate::util::hidden_command("reg")
         .args(args)
         .output()
         .map_err(|e| format!("E_SYSPROXY: 调用 reg 失败 {e}"))?;

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
 import { message, Modal } from 'ant-design-vue'
 import { save as saveDialog } from '@tauri-apps/plugin-dialog'
 import {
@@ -67,8 +67,9 @@ interface RepeatForm {
 
 const status = ref<CaptureStatus>(emptyStatus())
 const ca = ref<CaptureCaInfo>(emptyCa())
-const flows = ref<CaptureFlow[]>([])
-const detail = ref<CaptureFlowDetail | null>(null)
+// 流量与详情都是整块替换，用 shallowRef 避免每次轮询为上千条记录创建深层响应式代理
+const flows = shallowRef<CaptureFlow[]>([])
+const detail = shallowRef<CaptureFlowDetail | null>(null)
 const selectedId = ref<number | null>(null)
 const filter = ref('')
 const onlyErrors = ref(false)
@@ -88,7 +89,7 @@ const installingCa = ref(false)
 const sysproxyBusy = ref(false)
 const settingsOpen = ref(false)
 const interceptOpen = ref(false)
-const interceptView = ref<InterceptView>(emptyIntercept())
+const interceptView = shallowRef<InterceptView>(emptyIntercept())
 const repeatBusy = ref(false)
 const repeatOpen = ref(false)
 const repeatResultOpen = ref(false)
@@ -125,6 +126,9 @@ const resizing = ref(false)
 const tauriReady = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
 let timer: number | undefined
 let caTimer: number | undefined
+/** 上一次列表刷新时后端已记录的流量总数，用来跳过没有新增流量的轮询 */
+let lastFlowCount = -1
+let tickBusy = false
 
 function emptyStatus(): CaptureStatus {
   return {
@@ -540,9 +544,12 @@ function isJsonBody(body: CaptureBody) {
   return /^\s*[{\[]/.test(body.text)
 }
 
+/** 超过这个体积不再做 JSON 美化：大 body 的 parse/stringify 会明显阻塞渲染 */
+const BODY_PRETTY_LIMIT = 512 * 1024
+
 function bodyText(body: CaptureBody, pretty: boolean) {
   if (!body.text) return ''
-  if (!pretty || !isJsonBody(body)) return body.text
+  if (!pretty || !isJsonBody(body) || body.text.length > BODY_PRETTY_LIMIT) return body.text
   try {
     return JSON.stringify(JSON.parse(body.text), null, 2)
   } catch {
@@ -569,6 +576,16 @@ function rawResponse() {
   return `${flow.httpVersion} ${flow.status ?? 'ERR'}\n${headerText(flow.responseHeaders)}${body}`
 }
 
+// 模板里多次读取同一份 body；缓存成 computed，轮询引起的重渲染不再重复 parse / stringify
+const requestBodyDisplay = computed(() =>
+  detail.value ? bodyText(detail.value.requestBody, requestPretty.value) : '',
+)
+const responseBodyDisplay = computed(() =>
+  detail.value ? bodyText(detail.value.responseBody, responsePretty.value) : '',
+)
+const rawRequestText = computed(() => rawRequest())
+const rawResponseText = computed(() => rawResponse())
+
 function bodyExtension(body: CaptureBody) {
   const type = body.contentType
   if (type.includes('json')) return 'json'
@@ -585,21 +602,55 @@ function bodyExtension(body: CaptureBody) {
   return 'bin'
 }
 
+/** 状态对象每次都是新引用；值没变就不赋值，避免整页无意义重渲染 */
+function sameStatus(a: CaptureStatus, b: CaptureStatus) {
+  return (
+    a.state === b.state &&
+    a.port === b.port &&
+    a.bindAddr === b.bindAddr &&
+    a.sessionId === b.sessionId &&
+    a.startedAt === b.startedAt &&
+    a.flowCount === b.flowCount &&
+    a.dropped === b.dropped &&
+    a.caInstalled === b.caInstalled &&
+    a.sysproxyOn === b.sysproxyOn &&
+    a.upstreamProxy === b.upstreamProxy &&
+    a.lastError === b.lastError
+  )
+}
+
+function sameCa(a: CaptureCaInfo, b: CaptureCaInfo) {
+  return (
+    a.exists === b.exists &&
+    a.fingerprint === b.fingerprint &&
+    a.thumbprint === b.thumbprint &&
+    a.createdAt === b.createdAt &&
+    a.expiresAt === b.expiresAt &&
+    a.installed === b.installed
+  )
+}
+
 async function refreshStatus() {
   try {
-    status.value = await api.captureStatus()
-    if (status.value.state !== 'idle') {
-      port.value = status.value.port || port.value
-      bindAddr.value = status.value.bindAddr || bindAddr.value
+    const next = await api.captureStatus()
+    if (sameStatus(status.value, next)) return
+    status.value = next
+    if (next.state !== 'idle') {
+      port.value = next.port || port.value
+      bindAddr.value = next.bindAddr || bindAddr.value
     }
   } catch {
     // 页面刚启动或后端重启时忽略，下一轮再取
   }
 }
 
-async function refreshFlows() {
+/** `force` 用于主动刷新（首次进入、重发、清空后），轮询时流量数没变就跳过 */
+async function refreshFlows(force = false) {
+  if (!force && flows.value.length > 0 && status.value.flowCount === lastFlowCount) return
   try {
-    flows.value = await api.captureFlows(1000)
+    const next = await api.captureFlows(1000)
+    lastFlowCount = status.value.flowCount
+    flows.value = next
     if (autoScroll.value && !filterActive.value) {
       await nextTick()
       if (flowList.value) flowList.value.scrollTop = flowList.value.scrollHeight
@@ -609,27 +660,72 @@ async function refreshFlows() {
   }
 }
 
+/** 挂起队列里带 body，不能整体深比较；用轻量签名判断是否真的变了 */
+function interceptKey(view: InterceptView) {
+  return [
+    view.breakpointsEnabled,
+    view.mapEnabled,
+    view.remoteEnabled,
+    view.pendingCount,
+    view.pausedTotal,
+    view.pending.map((item) => item.pauseId).join(','),
+    view.weak.enabled,
+    view.weak.preset,
+    view.weak.latencyMs,
+    view.weak.jitterMs,
+    view.weak.bandwidthKbps,
+    view.weak.lossPercent,
+    view.weak.patterns.join('|'),
+    view.breakpointRules.length,
+    view.mapRules.length,
+    view.remoteRules.length,
+  ].join('|')
+}
+
+let lastInterceptKey = ''
+
 /** 断点 / 本地映射 / 弱网状态与挂起队列；空闲时也取，方便显示已有规则 */
 async function refreshIntercept() {
   try {
-    interceptView.value = await api.captureInterceptState()
+    const next = await api.captureInterceptState()
+    const key = interceptKey(next)
+    if (key === lastInterceptKey) return
+    lastInterceptKey = key
+    interceptView.value = next
   } catch {
     // 后端未就绪时忽略，下一轮再取
   }
 }
 
 function onInterceptChanged(view: InterceptView) {
+  lastInterceptKey = interceptKey(view)
   interceptView.value = view
 }
 
 async function refreshCa(silent = false) {
   if (!silent) loadingCa.value = true
   try {
-    ca.value = await api.captureCaInfo()
+    const next = await api.captureCaInfo()
+    if (!sameCa(ca.value, next)) ca.value = next
   } catch (error) {
     if (!silent) message.error(String(error))
   } finally {
     if (!silent) loadingCa.value = false
+  }
+}
+
+/** 页面不可见或上一轮没跑完时跳过，避免后台空转与请求堆积 */
+async function tick() {
+  if (tickBusy || document.visibilityState !== 'visible') return
+  tickBusy = true
+  try {
+    await refreshStatus()
+    if (running.value) {
+      void refreshIntercept()
+      await refreshFlows()
+    }
+  } finally {
+    tickBusy = false
   }
 }
 
@@ -656,6 +752,7 @@ async function clearFlows() {
   try {
     status.value = await api.captureFlowClear()
     flows.value = []
+    lastFlowCount = 0
     selectedId.value = null
     detail.value = null
   } catch (error) {
@@ -673,6 +770,7 @@ async function start() {
   starting.value = true
   try {
     flows.value = []
+    lastFlowCount = 0
     selectedId.value = null
     detail.value = null
     status.value = await api.captureStart({
@@ -883,7 +981,7 @@ async function submitRepeat() {
     }
     message.success('已重发，新流量已记录')
     window.setTimeout(async () => {
-      await refreshFlows()
+      await refreshFlows(true)
       try {
         const target = new URL(result.url)
         const path = `${target.pathname}${target.search}`
@@ -1021,17 +1119,22 @@ onMounted(async () => {
   window.addEventListener('click', closeGroupMenu)
   window.addEventListener('keydown', onGlobalKeydown)
   window.addEventListener('blur', closeGroupMenu)
-  await Promise.all([refreshStatus(), refreshCa(), refreshFlows(), refreshLanIps(), refreshIntercept()])
+  await Promise.all([
+    refreshStatus(),
+    refreshCa(),
+    refreshFlows(true),
+    refreshLanIps(),
+    refreshIntercept(),
+  ])
   timer = window.setInterval(() => {
-    refreshStatus()
-    if (running.value) {
-      refreshIntercept()
-      refreshFlows()
-    }
+    void tick()
   }, 1500)
   caTimer = window.setInterval(() => {
-    if (document.visibilityState === 'visible') refreshCa(true)
-  }, 5000)
+    // 已信任后不再轮询：证书状态查询要启动 reg/certutil，没必要一直空转；
+    // 手动卸载证书后可用「刷新」按钮重新检测。
+    if (ca.value.installed || document.visibilityState !== 'visible') return
+    void refreshCa(true)
+  }, 10000)
 })
 
 onBeforeUnmount(() => {
@@ -1501,7 +1604,7 @@ watch(settingsOpen, (open) => {
                       size="small"
                       type="text"
                       title="复制请求体"
-                      @click="copyText(bodyText(detail.requestBody, requestPretty), '请求体')"
+                      @click="copyText(requestBodyDisplay, '请求体')"
                     >
                       <CopyOutlined />
                     </a-button>
@@ -1513,7 +1616,7 @@ watch(settingsOpen, (open) => {
                   <pre
                     v-else-if="detail.requestBody.text !== null"
                     class="body-pre"
-                  >{{ bodyText(detail.requestBody, requestPretty) }}</pre>
+                  >{{ requestBodyDisplay }}</pre>
                   <div v-else class="body-empty">
                     二进制内容（{{ formatBytes(detail.requestBody.size) }}），暂不预览
                   </div>
@@ -1570,7 +1673,7 @@ watch(settingsOpen, (open) => {
                       size="small"
                       type="text"
                       title="复制响应体"
-                      @click="copyText(bodyText(detail.responseBody, responsePretty), '响应体')"
+                      @click="copyText(responseBodyDisplay, '响应体')"
                     >
                       <CopyOutlined />
                     </a-button>
@@ -1588,7 +1691,7 @@ watch(settingsOpen, (open) => {
                   <pre
                     v-else-if="detail.responseBody.text !== null"
                     class="body-pre"
-                  >{{ bodyText(detail.responseBody, responsePretty) }}</pre>
+                  >{{ responseBodyDisplay }}</pre>
                   <div v-else class="body-empty">
                     二进制内容（{{ formatBytes(detail.responseBody.size) }}），暂不预览
                   </div>
@@ -1600,20 +1703,20 @@ watch(settingsOpen, (open) => {
               <div class="raw-block">
                 <div class="raw-head">
                   <span>请求</span>
-                  <a-button type="text" size="small" @click="copyText(rawRequest(), '原始请求')">
+                  <a-button type="text" size="small" @click="copyText(rawRequestText, '原始请求')">
                     <CopyOutlined />
                   </a-button>
                 </div>
-                <pre class="raw-pre">{{ rawRequest() }}</pre>
+                <pre class="raw-pre">{{ rawRequestText }}</pre>
               </div>
               <div class="raw-block">
                 <div class="raw-head">
                   <span>响应</span>
-                  <a-button type="text" size="small" @click="copyText(rawResponse(), '原始响应')">
+                  <a-button type="text" size="small" @click="copyText(rawResponseText, '原始响应')">
                     <CopyOutlined />
                   </a-button>
                 </div>
-                <pre class="raw-pre">{{ rawResponse() }}</pre>
+                <pre class="raw-pre">{{ rawResponseText }}</pre>
               </div>
             </a-tab-pane>
           </a-tabs>
@@ -2504,6 +2607,9 @@ watch(settingsOpen, (open) => {
   font-size: 11px;
   color: var(--fm-text-2);
   cursor: pointer;
+  /* 上千条流量时让浏览器跳过视口外行的布局与绘制 */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 27px;
 }
 
 .flow-row:hover {

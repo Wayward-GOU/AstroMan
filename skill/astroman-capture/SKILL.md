@@ -75,7 +75,7 @@ astroman-ca.json   创建时间 / 过期时间 / 指纹元数据
 - `capture_ca_generate(force=true)` 重新生成。**旧证书随即失效**，已安装的旧证书必须重新安装。
 - `capture_ca_install`：Windows 走 `certutil -user -f -addstore Root`，装进「当前用户 → 受信任的根证书颁发机构」，不需要管理员权限。macOS / Linux 返回「请手动导入」。
 - `capture_ca_export(path)`：把 PEM 证书导出到用户选择的位置，供手机或其它设备安装。
-- 前端 5 秒轮询一次信任状态，装完证书通常几秒内变「CA 已信任」。
+- 前端每 10 秒轮询一次信任状态（已信任后停止），装完证书通常几秒内变「CA 已信任」；外部卸载后点「刷新」重新检测。
 - Firefox 使用独立证书库与代理设置，需要单独导入证书、单独填代理；系统层面信任对它不生效。
 - Android 7+ 把用户证书与系统证书分开；App 默认只信系统证书。微信等 App 不认用户证书时，HTTPS 仍会失败。
 

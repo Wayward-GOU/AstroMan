@@ -2,7 +2,9 @@
 //!
 //! 本模块只负责「代理生命周期」，请求处理逻辑在 `handler.rs`（C-05 起接入）。
 //! 代理跑在独立线程 + 独立 tokio runtime 上：`Runtime` 不能在 async 上下文里
-//! drop，也不该和 Tauri 主 runtime 抢线程。
+//! drop，也不该和 Tauri 主 runtime 抢线程。代理 runtime 使用 2 个 worker：
+//! 响应解压（gzip / br / zstd）和 body 收集是 CPU 活，单线程时一个大响应就会
+//! 把所有并发请求堵在身后。
 
 pub mod archive;
 pub mod ca;
@@ -359,7 +361,8 @@ impl CaptureManager {
         let spawned = std::thread::Builder::new()
             .name("capture-proxy".into())
             .spawn(move || {
-                let runtime = match tokio::runtime::Builder::new_current_thread()
+                let runtime = match tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
                     .enable_all()
                     .build()
                 {

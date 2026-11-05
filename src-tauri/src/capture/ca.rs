@@ -201,7 +201,7 @@ pub fn install(data_dir: &Path) -> Result<CaInfo, String> {
 
 #[cfg(windows)]
 fn install_file(path: &Path) -> Result<(), String> {
-    let output = std::process::Command::new("certutil")
+    let output = crate::util::hidden_command("certutil")
         .args(["-user", "-f", "-addstore", "Root"])
         .arg(path)
         .output()
@@ -308,7 +308,7 @@ fn in_root_store(thumbprint: &str) -> bool {
     for root in ["HKCU", "HKLM"] {
         let key =
             format!(r"{root}\Software\Microsoft\SystemCertificates\Root\Certificates\{thumbprint}");
-        let found = std::process::Command::new("reg")
+        let found = crate::util::hidden_command("reg")
             .args(["query", &key])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -318,7 +318,7 @@ fn in_root_store(thumbprint: &str) -> bool {
         }
     }
     // 某些根证书会进 ProtectedRoots，注册表里看不到，再用 certutil 兜底
-    let user = std::process::Command::new("certutil")
+    let user = crate::util::hidden_command("certutil")
         .args(["-user", "-store", "Root", thumbprint])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -326,7 +326,7 @@ fn in_root_store(thumbprint: &str) -> bool {
     if matches!(user, Ok(status) if status.success()) {
         return true;
     }
-    let machine = std::process::Command::new("certutil")
+    let machine = crate::util::hidden_command("certutil")
         .args(["-store", "Root", thumbprint])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -366,7 +366,7 @@ fn restrict_key(path: &Path) {
         log::warn!("未能读取 USERNAME，跳过 CA 私钥 ACL 收紧");
         return;
     };
-    let output = std::process::Command::new("icacls")
+    let output = crate::util::hidden_command("icacls")
         .arg(path)
         .args(["/inheritance:r"])
         .arg("/grant:r")

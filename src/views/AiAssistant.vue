@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, h, nextTick, onMounted, reactive, ref, watch } from 'vue'
+import { computed, h, nextTick, onActivated, onMounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { Modal, message as notify } from 'ant-design-vue'
 import {
@@ -11,6 +11,7 @@ import {
   DownloadOutlined,
   EditOutlined,
   HistoryOutlined,
+  LinkOutlined,
   PaperClipOutlined,
   PlusOutlined,
   PushpinFilled,
@@ -29,6 +30,7 @@ import AiConfirmCard from '@/components/AiConfirmCard.vue'
 import {
   aiChat,
   aiChatCancel,
+  aiContextMeta,
   aiMessageAdd,
   aiMessageClear,
   aiMessageDelete,
@@ -60,18 +62,74 @@ import {
   testSuiteGet,
 } from '@/api'
 import { captureFlowDetail } from '@/api/capture'
-import { isDangerousTool, isWriteTool, maskSensitive, testCaseKindLabel, TOOL_CATALOG, executeTool, toolLabel, type ToolResult } from '@/utils/aiTools'
+import { isDangerousTool, isWriteTool, maskSensitive, maskedArgsForLog, testCaseKindLabel, TOOL_CATALOG, executeTool, toolLabel, type ToolResult } from '@/utils/aiTools'
 import { callKey, hasNativeToolSyntax, parseSegments, sanitizeAssistant, stripNativeTags, type Segment } from '@/utils/aiProtocol'
 import { buildContext, estimateMessages, estimateTokens, SUMMARY_PREFIX } from '@/utils/contextBudget'
 import { estimateCost, fmtUsd, priceOf } from '@/utils/aiPricing'
-import { contextWindowOf, contextBudgetOf } from '@/utils/modelMeta'
+import { contextWindowOf, effectiveWindow, inputBudgetOf, outputReserveOf } from '@/utils/modelMeta'
+import { isTextAttachment, prepareAttachment } from '@/utils/attachBudget'
 import { clipStoredPrompt, compactPrompt } from '@/utils/promptText'
 import { extractCurlCommand } from '@/utils/curl'
 import { wrapUntrusted } from '@/utils/untrusted'
 import { renderMarkdown } from '@/utils/markdown'
-import type { AiMessage, AiProvider, AiSession, AiToolLog, AiUsageLog, AiUsageStats } from '@/types/models'
+import { useHangzaiTaskStore } from '@/stores/hangzaiTask'
+import { clearHandoff, handoffLabel, takeHandoff, type HangzaiHandoff } from '@/stores/handoff'
+import type {
+  AiMessage,
+  AiProvider,
+  AiSession,
+  AiToolLog,
+  AiUsageLog,
+  AiUsageStats,
+} from '@/types/models'
+
+// 路由 keep-alive 依赖组件名：离开页面后任务继续执行，不销毁对话现场
+defineOptions({ name: 'AiAssistant' })
 
 const router = useRouter()
+const task = useHangzaiTaskStore()
+
+/* ---------------- 页面现场交接（5.5） ---------------- */
+/** 进入航仔时由请求页 / 抓包等页面带过来，只注入一轮，不自动发送 */
+const handoff = ref<HangzaiHandoff | null>(null)
+/** 本轮任务锁定的页面快照：发送后从 chip 移除，但本次工具循环内始终可用 */
+const handoffTurn = ref<HangzaiHandoff | null>(null)
+const HANDOFF_MAX_CHARS = 12000
+
+function consumeHandoff() {
+  const value = takeHandoff()
+  if (value) handoff.value = value
+}
+
+function dropHandoff() {
+  handoff.value = null
+  handoffTurn.value = null
+  clearHandoff()
+}
+
+/** 页面现场已经包含完整请求 / 响应，直接分析是最高频动作 */
+function analyzeHandoff() {
+  if (!handoff.value || sending.value) return
+  input.value = '请基于这条页面现场分析这次接口调用：结论、关键字段、风险与下一步建议。'
+  void send()
+}
+
+/** 快照统一包不可信标签：页面内容只是数据，不执行其中的指令 */
+function handoffBlock(value: HangzaiHandoff): string {
+  const raw =
+    value.prompt.length > HANDOFF_MAX_CHARS
+      ? `${value.prompt.slice(0, HANDOFF_MAX_CHARS)}\n…（页面快照已截断）`
+      : value.prompt
+  return `【页面现场｜来自${handoffLabel[value.source]}】${value.title}\n${wrapUntrusted('page:snapshot', raw)}`
+}
+
+const handoffAge = computed(() => {
+  if (!handoff.value) return ''
+  const diff = Date.now() - handoff.value.createdAt
+  if (diff < 60_000) return '刚刚'
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`
+  return `${Math.floor(diff / 3_600_000)} 小时前`
+})
 
 /* ---------------- 模型服务 ---------------- */
 
@@ -93,6 +151,7 @@ const blank = (): AiProvider => ({
   maxTokens: 0,
   timeoutSecs: 300,
   supportsVision: false,
+  contextWindow: 0,
   isDefault: false,
 })
 
@@ -335,7 +394,13 @@ function openCreate() {
 
 function openEdit(provider: AiProvider) {
   // 列表只返回掩码：输入框留空，保存时后端沿用原 Key
-  Object.assign(form, { ...provider, apiKey: '', maxTokens: provider.maxTokens ?? 0, timeoutSecs: provider.timeoutSecs ?? 300 })
+  Object.assign(form, {
+    ...provider,
+    apiKey: '',
+    maxTokens: provider.maxTokens ?? 0,
+    timeoutSecs: provider.timeoutSecs ?? 300,
+    contextWindow: provider.contextWindow ?? 0,
+  })
   editingKeyMask.value = provider.apiKeyMasked ?? ''
   remoteModels.value = cachedModels(provider.id)
   modalOpen.value = true
@@ -461,6 +526,8 @@ const repairs = ref(0)
 const repeats = ref(0)
 /** 已执行工具的调用结果缓存，重复调用直接复用，不再重复跑 */
 const callCache = new Map<string, ToolResult>()
+/** 结果未知的写工具：超时后后台可能已完成，禁止用相同参数自动重试 */
+const uncertainWrites = new Set<string>()
 /** 轮次将尽 / 反复重复后的「禁止再调工具」阶段 */
 const forcedFinal = ref(false)
 const scrollRef = ref<HTMLElement | null>(null)
@@ -649,16 +716,45 @@ cipher 用法：cipher.md5(str)、cipher.sha256(str)、cipher.hmacSha256(str, ke
 
 写脚本时：先说明思路与提取的字段，脚本用 request_script_save 保存（会做语法检查），再用 send_request 验证后置脚本是否按预期提取。脚本体不超过 30 行，关键步骤加中文注释。`
 
-/** 当前模型的上下文预算（token）；未知模型回退 32k 窗口 */
-const contextBudget = computed(() => contextBudgetOf(activeProvider.value?.model ?? ''))
-/** 当前模型窗口与计价档位：预算条展示用 */
-const modelWindow = computed(() => contextWindowOf(activeProvider.value?.model ?? ''))
+/* ---------------- 上下文预算（F-5） ---------------- */
+
+/** 后端注入的航仔提示词规模：进页面取一次，失败退回 0 */
+const contextMeta = reactive({ systemPromptChars: 0, defaultMaxTokens: 4096 })
+
+async function loadContextMeta() {
+  try {
+    Object.assign(contextMeta, await aiContextMeta())
+  } catch {
+    // 取不到就按 0 处理：前端仍会预留自身提示词与输出额度
+  }
+}
+
+/** 当前模型实际窗口：用户显式配置优先，否则按模型名识别 */
+const modelWindow = computed(() =>
+  effectiveWindow(activeProvider.value?.model ?? '', activeProvider.value?.contextWindow),
+)
+/** 输入侧预算：窗口先扣掉输出预留，系统提示词再从这里面扣 */
+const contextBudget = computed(() =>
+  inputBudgetOf(modelWindow.value, activeProvider.value?.maxTokens),
+)
+/** 编辑弹窗里按当前输入预估窗口，给「0 = 自动识别」做参考 */
+const formWindow = computed(() => effectiveWindow(form.model, form.contextWindow))
+/** 后端提示词 token 保守估算（按字符 × 0.7） */
+const backendPromptTokens = computed(() => Math.ceil(contextMeta.systemPromptChars * 0.7))
+const outputReserve = computed(() =>
+  outputReserveOf(modelWindow.value, activeProvider.value?.maxTokens),
+)
 const modelPrice = computed(() => priceOf(activeProvider.value?.model ?? ''))
 const roundLabel = computed(() => `${Math.min(autoDepth.value, MAX_TOOL_ROUNDS)}/${MAX_TOOL_ROUNDS}`)
 /** 上下文已用 85% 就变色提醒：再聊几轮会触发压缩或丢较早消息 */
 const contextTight = computed(
   () => contextBudget.value > 0 && contextTokens.value / contextBudget.value >= 0.85,
 )
+/** 系统提示词 + 输出预留已接近整个窗口：再怎么裁剪也放不下多少历史 */
+const contextWindowTiny = computed(() => {
+  const systemReserve = estimateTokens(SYSTEM_PROMPT) + backendPromptTokens.value
+  return modelWindow.value > 0 && systemReserve + outputReserve.value >= modelWindow.value * 0.9
+})
 
 /** 工具结果 / 附件正文进入模型前统一包上不可信数据标签（T-17） */
 function hardenContent(content: string): string {
@@ -690,13 +786,20 @@ function historyItems(): AiMessage[] {
 function toHistory(): AiMessage[] {
   const budget = contextBudget.value
   const summaryText = sessionSummary.value?.text?.trim()
-  // 系统提示词与摘要固定占用，先扣掉再给历史分配
-  const reserved = estimateTokens(SYSTEM_PROMPT) + (summaryText ? estimateTokens(summaryText) + 8 : 0) + 240
+  const handoffText = handoffTurn.value ? handoffBlock(handoffTurn.value) : ''
+  // 系统提示词、摘要与页面现场固定占用，先扣掉再给历史分配
+  const reserved =
+    estimateTokens(SYSTEM_PROMPT) +
+    backendPromptTokens.value +
+    (summaryText ? estimateTokens(summaryText) + 8 : 0) +
+    (handoffText ? estimateTokens(handoffText) + 8 : 0) +
+    240
   const plan = buildContext(historyItems(), Math.max(2000, budget - reserved))
   contextDropped.value = plan.dropped
   contextTokens.value = plan.tokens + reserved
   const head: AiMessage[] = [{ role: 'system', content: SYSTEM_PROMPT }]
   if (summaryText) head.push({ role: 'system', content: `${SUMMARY_PREFIX}${summaryText}` })
+  if (handoffText) head.push({ role: 'system', content: handoffText })
   if (plan.dropped > 0) {
     head.push({
       role: 'system',
@@ -780,6 +883,8 @@ async function ask(extra: AiMessage[] = []) {
         messages: history,
         temperature: activeProvider.value.temperature ?? 0.3,
         requestId: rid,
+        scene: 'agent',
+        contextWindow: modelWindow.value,
       },
       (event) => {
         // 用户已停止：后续增量、重试提示一律丢弃
@@ -788,6 +893,7 @@ async function ask(extra: AiMessage[] = []) {
           committed = true
           item.statusText = ''
           buffer += event.text
+          if (task.active) task.update({ phase: 'streaming', canStop: true })
           paint()
         } else if (event.kind === 'reasoning' && event.text) {
           reasoningBuffer += event.text
@@ -848,6 +954,7 @@ async function ask(extra: AiMessage[] = []) {
 async function stop() {
   if (!sending.value) return
   aborted.value = true
+  if (task.active) task.update({ phase: 'thinking', canStop: false, awaitingConfirm: false })
   const rid = requestId.value
   if (rid) {
     try {
@@ -1191,6 +1298,15 @@ async function execTool(
   }
   run.status = 'running'
   run.output = ''
+  if (task.active) {
+    task.update({
+      phase: 'tool',
+      round: Math.max(1, autoDepth.value),
+      tool: seg.tool,
+      canStop: true,
+      awaitingConfirm: false,
+    })
+  }
   const result = await executeTool(seg.tool, argsOverride ?? seg.args, sessionId.value, {
     round: Math.max(1, autoDepth.value),
     traceId: traceId.value,
@@ -1207,6 +1323,7 @@ async function execTool(
   run.summary = result.summary
   run.total = result.total
   run.truncated = result.truncated
+  if (task.active) task.update({ phase: 'thinking', tool: null, awaitingConfirm: false })
   return result
 }
 
@@ -1643,7 +1760,22 @@ async function runToolSegment(item: ChatItem, index: number, seg: Segment) {
   const effectiveArgs = resolveToolArgs(seg)
   // 补全后同步回工具卡，重新运行时也走完整参数（卡片详情里不再显示截断版）
   if (effectiveArgs !== seg.args) seg.args = effectiveArgs
+  const uncertainKey = `${traceId.value ?? ''}:${callKey(seg.tool, effectiveArgs)}`
   if (isWriteTool(seg.tool)) {
+    // 上一次同工具同参数已经超时但后台可能执行成功：先让用户核对，禁止自动重试
+    if (uncertainWrites.has(uncertainKey)) {
+      if (!sending.value) {
+        await ask([
+          {
+            role: 'user',
+            content:
+              `【结果未知】${seg.tool} 上一次已经超时，后台可能已完成，禁止再次自动执行。` +
+              '请先用文字告诉用户去核对结果（数据是否已导入、文件是否已生成），并询问是否需要手动重试；在用户明确确认前不要再次调用该工具。',
+          },
+        ])
+      }
+      return
+    }
     // 导出类工具：目标文件已存在时必须二次确认，避免静默覆盖
     const exportTools = new Set([
       'project_export',
@@ -1660,6 +1792,15 @@ async function runToolSegment(item: ChatItem, index: number, seg: Segment) {
     }
     // 计划类 / 测试域：先把人话预览算出来（test_run_start 会顺带查一次预检），再弹卡
     const planText = await previewArgs(seg.tool, effectiveArgs)
+    if (task.active) {
+      task.update({
+        phase: 'confirm',
+        awaitingConfirm: true,
+        canStop: false,
+        tool: seg.tool,
+        round: Math.max(1, autoDepth.value),
+      })
+    }
     const confirmed = await new Promise<boolean>((resolve) => {
       Modal.confirm({
         title: overwrite
@@ -1681,12 +1822,13 @@ async function runToolSegment(item: ChatItem, index: number, seg: Segment) {
         onCancel: () => resolve(false),
       })
     })
+    if (task.active) task.update({ phase: 'thinking', awaitingConfirm: false, tool: null })
     if (!confirmed) {
       // 确认结果也要落复盘日志：用户拒绝同样是一次 Agent 决策点
       void aiToolLogAdd({
         sessionId: sessionId.value,
         tool: seg.tool,
-        args: maskSensitive(JSON.stringify(effectiveArgs)),
+        args: maskedArgsForLog(seg.tool, effectiveArgs),
         ok: false,
         durationMs: 0,
         resultPreview: '用户取消执行（未修改任何数据）',
@@ -1706,6 +1848,8 @@ async function runToolSegment(item: ChatItem, index: number, seg: Segment) {
     }
   }
   const result = await execTool(item, index, seg, effectiveArgs)
+  // 写工具超时：后台可能已经完成，锁住同工具同参数，避免模型看到“失败”后重复执行
+  if (result.outcome === 'unknown') uncertainWrites.add(uncertainKey)
   if (aborted.value) return
   if (sending.value) return
   await ask([
@@ -1732,7 +1876,24 @@ async function ensureSession(): Promise<AiSession | null> {
 }
 
 const attachments = ref<ChatAttachment[]>([])
-const MAX_ATTACH_CHARS = 60_000
+const dropActive = ref(false)
+/** 附件总量估算：输入框下方直接展示，避免拖入多个日志后才在发送时超窗 */
+const attachTokens = computed(() =>
+  attachments.value.reduce((sum, file) => sum + estimateTokens(file.content), 0),
+)
+
+/** 统一入口：去重、单文件与总量双上限都走这里 */
+function addAttachment(name: string, path: string, raw: string) {
+  if (attachments.value.some((item) => item.path === path)) return
+  const used = attachments.value.reduce((sum, file) => sum + file.content.length, 0)
+  const plan = prepareAttachment(used, raw)
+  if (!plan.accepted) {
+    notify.warning(plan.warning ?? '附件无法加入')
+    return
+  }
+  if (plan.warning) notify.warning(`${name}：${plan.warning}`)
+  attachments.value.push({ name, path, content: plan.content })
+}
 
 async function pickAttachments() {
   try {
@@ -1752,19 +1913,43 @@ async function pickAttachments() {
     if (!picked) return
     const paths = Array.isArray(picked) ? picked : [picked]
     for (const path of paths) {
-      if (attachments.value.some((item) => item.path === path)) continue
       const content = await fileReadText(path)
-      if (content.length > MAX_ATTACH_CHARS) {
-        notify.warning(`${path} 超过 ${MAX_ATTACH_CHARS} 字符，已截断`)
-      }
-      attachments.value.push({
-        name: path.split(/[\\/]/).pop() ?? path,
-        path,
-        content: content.slice(0, MAX_ATTACH_CHARS),
-      })
+      addAttachment(path.split(/[\\/]/).pop() ?? path, path, content)
     }
   } catch (error) {
     notify.error(`读取文件失败：${String(error)}`)
+  }
+}
+
+/** 只在拖入文件时高亮，拖动输入框里的文字不受影响 */
+function onDragOverAttachments(event: DragEvent) {
+  if (!event.dataTransfer?.types.includes('Files')) return
+  event.preventDefault()
+  dropActive.value = true
+}
+
+function onDragLeaveAttachments(event: DragEvent) {
+  const related = event.relatedTarget as Node | null
+  if (related && (event.currentTarget as HTMLElement).contains(related)) return
+  dropActive.value = false
+}
+
+/** 拖拽：WebView 里拿不到本地路径，直接读 File 内容，路径用合成键去重 */
+async function onDropAttachments(event: DragEvent) {
+  const files = Array.from(event.dataTransfer?.files ?? [])
+  if (!files.length) return
+  event.preventDefault()
+  dropActive.value = false
+  for (const file of files) {
+    if (!isTextAttachment(file.name)) {
+      notify.warning(`${file.name} 不是文本文件，已跳过`)
+      continue
+    }
+    try {
+      addAttachment(file.name, `drop:${file.name}:${file.size}:${file.lastModified}`, await file.text())
+    } catch (error) {
+      notify.warning(`${file.name} 读取失败：${String(error)}`)
+    }
   }
 }
 
@@ -1810,6 +1995,7 @@ async function send() {
   turnCost.value = 0
   traceId.value = newRequestId()
   callCache.clear()
+  uncertainWrites.clear()
   const currentQuote = quote.value
   quote.value = null
   const full = compactPrompt(withAttachments(content))
@@ -1835,7 +2021,31 @@ async function send() {
     if (stored?.id) userItem.dbId = stored.id
   }
   void refreshSessions()
-  await ask()
+  // 页面现场只注入本轮：chip 立即消失，避免后续每轮重复占用上下文预算
+  handoffTurn.value = handoff.value
+  handoff.value = null
+  task.bindStop(stop)
+  task.update({
+    active: true,
+    runId: traceId.value,
+    sessionId: session?.id ?? sessionId.value,
+    sessionTitle: session?.title || '新对话',
+    phase: 'thinking',
+    round: 0,
+    tool: null,
+    startedAt: Date.now(),
+    awaitingConfirm: false,
+    canStop: true,
+    lastError: '',
+  })
+  try {
+    await ask()
+    // 离开航仔页面后任务仍在后台执行；完成提示对用户可见
+    if (!aborted.value) notify.success('航仔任务已完成')
+  } finally {
+    task.clear()
+    handoffTurn.value = null
+  }
   // 摘要异步执行、下一轮生效：本轮已经答完，压缩不占用户等待时间
   void maybeSummarize()
 }
@@ -1886,6 +2096,8 @@ async function maybeSummarize(force = false) {
           { role: 'user', content: source },
         ],
         temperature: 0.2,
+        scene: 'summary',
+        contextWindow: modelWindow.value,
       },
       (event) => {
         if (event.kind === 'delta' && event.text) summary += event.text
@@ -2022,8 +2234,10 @@ function newSession() {
   repeats.value = 0
   forcedFinal.value = false
   callCache.clear()
+  uncertainWrites.clear()
   input.value = ''
   quote.value = null
+  dropHandoff()
 }
 
 function clearMessages() {
@@ -2418,9 +2632,18 @@ const capabilities = [
 ]
 
 onMounted(async () => {
+  // 页面现场必须在首屏就绪时取走，否则切走再回来会被 TTL 清掉
+  consumeHandoff()
   // 只预取服务商与会话列表；历史消息等用户点开某条会话再加载，
   // 否则长会话会在进入页面时一次性渲染，导致明显卡顿
-  await Promise.all([reloadProviders(), refreshSessions()])
+  await Promise.all([reloadProviders(), refreshSessions(), loadContextMeta()])
+})
+
+// 被 keep-alive 缓存后重新进入：刷新会话列表并回到最新消息，任务本身不会中断
+onActivated(() => {
+  consumeHandoff()
+  void refreshSessions()
+  nextTick(() => scrollBottom(true))
 })
 </script>
 
@@ -2748,7 +2971,14 @@ onMounted(async () => {
             </div>
           </div>
 
-          <div class="composer">
+          <div
+            class="composer"
+            :class="{ 'composer-drop': dropActive }"
+            @dragover="onDragOverAttachments"
+            @dragleave="onDragLeaveAttachments"
+            @drop="onDropAttachments"
+          >
+            <div v-if="dropActive" class="drop-hint">松开以添加文本附件</div>
             <div v-if="messages.length" class="ctx-bar">
               <span :class="{ 'ctx-warn': autoDepth >= MAX_TOOL_ROUNDS - 2 }">第 {{ roundLabel }} 轮</span>
               <span v-if="turnPromptTokens || turnOutputTokens">
@@ -2768,6 +2998,18 @@ onMounted(async () => {
               <span v-else-if="sessionSummary">· 已启用摘要</span>
               <span v-if="summaryPaused" class="ctx-warn">· 自动摘要已暂停</span>
               <span class="ctx-hint">· 窗口 {{ fmtNum(modelWindow) }}</span>
+              <span v-if="contextWindowTiny" class="ctx-warn">· 窗口过小，建议换模型或精简提示词</span>
+            </div>
+            <div v-if="handoff" class="handoff-bar">
+              <div class="handoff-head">
+                <LinkOutlined />
+                <span class="handoff-tag">来自{{ handoffLabel[handoff.source] }}</span>
+                <span class="handoff-title" :title="handoff.title">{{ handoff.title }}</span>
+                <span class="handoff-age">{{ handoffAge }}</span>
+                <button type="button" class="handoff-go" @click="analyzeHandoff">直接分析</button>
+                <button type="button" class="quote-close" title="移除页面现场" @click="dropHandoff">×</button>
+              </div>
+              <div class="handoff-hint">发送时自动带上这次页面现场，仅本轮生效，不会自动发送</div>
             </div>
             <div v-if="quote" class="quote-bar">
               <div class="quote-bar-head">
@@ -2781,9 +3023,12 @@ onMounted(async () => {
               <span v-for="(file, index) in attachments" :key="file.path" class="attach-chip">
                 <PaperClipOutlined />
                 <span class="attach-name">{{ file.name }}</span>
-                <span class="attach-size">{{ fmtSize(file.content) }}</span>
+                <span class="attach-size">
+                  {{ fmtSize(file.content) }} · ≈ {{ fmtNum(estimateTokens(file.content)) }} token
+                </span>
                 <button type="button" class="attach-remove" @click="attachments.splice(index, 1)">×</button>
               </span>
+              <span class="attach-total">附件合计 ≈ {{ fmtNum(attachTokens) }} token</span>
             </div>
             <div class="composer-row">
               <a-button
@@ -3148,6 +3393,20 @@ onMounted(async () => {
             </a-form-item>
           </a-col>
         </a-row>
+        <a-form-item label="上下文窗口（token）">
+          <a-input-number
+            v-model:value="form.contextWindow"
+            :min="0"
+            :max="10000000"
+            :step="1000"
+            style="width: 100%"
+          />
+          <template #extra>
+            <span class="dialog-hint">
+              0 = 按模型名自动识别（当前按 {{ fmtNum(formWindow) }} 预留）；本地小模型或私有网关请填真实窗口，程序据此裁剪历史并预留输出
+            </span>
+          </template>
+        </a-form-item>
         <a-form-item>
           <template #label>
             <span class="label-row">
@@ -3762,6 +4021,65 @@ onMounted(async () => {
   overflow: hidden;
 }
 
+.handoff-bar {
+  border: 1px solid color-mix(in srgb, var(--fm-primary) 35%, var(--fm-border));
+  border-left: 2px solid var(--fm-primary);
+  background: color-mix(in srgb, var(--fm-primary) 7%, var(--fm-surface-alt));
+  border-radius: 6px;
+  padding: 6px 9px;
+  margin-bottom: 8px;
+}
+
+.handoff-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--fm-muted);
+}
+
+.handoff-tag {
+  flex: none;
+  color: var(--fm-primary);
+  font-weight: 600;
+}
+
+.handoff-title {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--fm-text);
+}
+
+.handoff-age {
+  flex: none;
+}
+
+.handoff-go {
+  flex: none;
+  margin-left: auto;
+  padding: 0 6px;
+  height: 20px;
+  border: 1px solid color-mix(in srgb, var(--fm-primary) 40%, transparent);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--fm-primary);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.handoff-go:hover {
+  background: color-mix(in srgb, var(--fm-primary) 10%, transparent);
+}
+
+.handoff-hint {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--fm-muted);
+}
+
 .quote-bar {
   border: 1px solid var(--fm-border);
   border-left: 2px solid color-mix(in srgb, var(--fm-primary) 55%, transparent);
@@ -4094,11 +4412,32 @@ onMounted(async () => {
 /* ---------- 输入区 ---------- */
 
 .composer {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 8px;
   padding: 10px 12px;
   border-top: 1px solid var(--fm-border);
+}
+
+.composer-drop {
+  outline: 1.5px dashed #009688;
+  outline-offset: -6px;
+  background: rgba(0, 150, 136, 0.06);
+}
+
+.drop-hint {
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  z-index: 2;
+  transform: translateX(-50%);
+  padding: 2px 10px;
+  border-radius: 10px;
+  background: rgba(0, 150, 136, 0.92);
+  color: #fff;
+  font-size: 11.5px;
+  pointer-events: none;
 }
 
 .composer-row {
@@ -4134,7 +4473,13 @@ onMounted(async () => {
 .attach-list {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: 6px;
+}
+
+.attach-total {
+  font-size: 10.5px;
+  color: var(--fm-muted);
 }
 
 .attach-chip {

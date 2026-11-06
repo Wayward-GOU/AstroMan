@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
 import { open, save as saveFile } from '@tauri-apps/plugin-dialog'
@@ -34,10 +34,13 @@ import { useProjectStore } from '@/stores/project'
 import { backOr, previousEntry } from '@/stores/navHistory'
 import { MAX_REQUEST_TABS, useTabsStore } from '@/stores/tabs'
 import { useErrorDialogStore } from '@/stores/errorDialog'
+import { useWorkspaceStore, type RequestTurnState, type RequestWorkspaceSnapshot } from '@/stores/workspace'
+import { setHandoff } from '@/stores/handoff'
 import { formatDateTime } from '@/utils/datetime'
 import { buildSnippets, type Snippet } from '@/utils/curl'
+import { formatJsonAsync } from '@/utils/formatJson'
 import { diffLines, diffStats, type DiffLine } from '@/utils/diff'
-import { rememberLastRequest } from '@/utils/lastRequest'
+import { readLastRequest, rememberLastRequest } from '@/utils/lastRequest'
 import * as api from '@/api'
 import type {
   CookieItem,
@@ -48,6 +51,7 @@ import type {
   KeyValueItem,
   RequestAuth,
   RequestRun,
+  RequestRunSummary,
   RequestSearchHit,
   SendRequestPayload,
 } from '@/types/models'
@@ -68,6 +72,7 @@ const router = useRouter()
 const store = useProjectStore()
 const tabStore = useTabsStore()
 const errorDialog = useErrorDialogStore()
+const workspace = useWorkspaceStore()
 
 const requestId = computed(() => Number(route.params.id))
 const projectId = computed(() => Number(route.query.projectId || 0))
@@ -106,8 +111,17 @@ const form = ref<HttpRequestDetail>({
 
 const loading = ref(true)
 const saving = ref(false)
-const sending = ref(false)
+/** 本组件里仍在后台执行的请求（按接口 id）：切走再切回仍显示“发送中” */
+const sendingRequestIds = reactive(new Set<number>())
 const result = ref<HttpResult | null>(null)
+/** live = 本次实时响应；run = 从运行记录有损恢复 */
+const resultSource = ref<'live' | 'run' | 'none'>('none')
+const restoredRunId = ref<number | null>(null)
+const sending = computed(() => {
+  const id = form.value.id
+  if (!id) return false
+  return sendingRequestIds.has(id) || workspace.isInflight(id)
+})
 const bodyPreEl = ref<HTMLElement | null>(null)
 const tabsScrollEl = ref<HTMLElement | null>(null)
 const activeTab = ref('params')
@@ -199,6 +213,15 @@ function onEnvsChanged(list: Environment[]) {
 /* ---------- 页面内 AI 分析 ---------- */
 const aiAssist = useAiAssistStore()
 
+/** AI 菜单分流：页面内分析抽屉 vs. 带着现场去航仔 */
+function onAiMenu(kind: string) {
+  if (kind === 'handoff') {
+    goHangzaiWithContext()
+    return
+  }
+  runAi(kind)
+}
+
 function runAi(kind: string) {
   const detail = form.value
   if (!detail.url?.trim()) {
@@ -215,14 +238,41 @@ function runAi(kind: string) {
   if (!picked) return
   void aiAssist.show({
     ...picked,
+    source: 'request',
     hint: `${detail.method} ${detail.url}${result.value ? ` · 最近响应 ${result.value.status}` : ' · 未发送过请求'}`,
   })
+}
+
+/**
+ * 5.5 页面现场交接：把当前接口 / 响应一次性交给航仔。
+ * 只做交接，不自动发送；航仔侧展示上下文条，由用户决定问什么。
+ */
+function goHangzaiWithContext() {
+  const detail = form.value
+  if (!detail.url?.trim()) {
+    message.warning('先填写接口 URL 再去航仔')
+    return
+  }
+  const note =
+    result.value && resultSource.value === 'run'
+      ? '\n\n【页面现场说明】上面的响应来自最近一次运行记录，不是本次刚发出的请求。'
+      : ''
+  setHandoff({
+    source: 'request',
+    title: `${detail.method.toUpperCase()} ${detail.url}${result.value ? ` · ${result.value.status}` : ' · 未发送'}`,
+    prompt: requestExplainPrompt(detail, result.value) + note,
+    projectId: projectId.value || undefined,
+    requestId: detail.id ?? undefined,
+  })
+  router.push('/ai')
 }
 
 /* ---------- 自动保存 ---------- */
 const autoState = ref<'saved' | 'dirty' | 'saving' | 'error'>('saved')
 let hydrating = true
-let lastSaved = ''
+/** 表单变更版本号：自动保存期间继续编辑时，用版本号判断是否还需再存一次 */
+let formVersion = 0
+let savedVersion = 0
 let saveTimer: number | undefined
 let saveQueue: Promise<boolean> = Promise.resolve(true)
 
@@ -238,18 +288,28 @@ function syncTabMeta() {
   }
 }
 
+/** Body 越大，保存往返（含 SQLite 写入）越慢，延长防抖避免输入期间反复排队 */
+function autoSaveDelay() {
+  const length = (form.value.body ?? '').length
+  if (length > 2 * 1024 * 1024) return 3000
+  if (length > 256 * 1024) return 2000
+  if (length > 64 * 1024) return 1500
+  return 900
+}
+
 function scheduleAutoSave() {
   if (saveTimer) window.clearTimeout(saveTimer)
   saveTimer = window.setTimeout(() => {
     saveTimer = undefined
     void save(false)
-  }, 900)
+  }, autoSaveDelay())
 }
 
 watch(
   form,
   () => {
     if (hydrating || !form.value.id) return
+    formVersion += 1
     autoState.value = 'dirty'
     syncTabMeta()
     scheduleAutoSave()
@@ -310,9 +370,10 @@ function resetScriptOutput() {
  */
 function resetResponseState() {
   result.value = null
+  resultSource.value = 'none'
+  restoredRunId.value = null
   wasCancelled.value = false
-  // 旧接口的在途请求不再属于当前面板，按钮状态回到空闲
-  sending.value = false
+  // 旧接口的在途请求不再属于当前面板，按钮状态按当前接口的 inflight 重新计算
   cancelling.value = false
   requestKey.value = ''
   resetScriptOutput()
@@ -326,12 +387,122 @@ function resetResponseState() {
   diffCustomText.value = ''
   diffUseCustom.value = false
   expandedRunId.value = null
+  runDetails.clear()
+  runDetailLoading.clear()
 }
 
 function resetScriptVars() {
   clearRuntimeVars()
   scriptVars.value = {}
   message.success('已清空运行时变量')
+}
+
+/* ---------- 页面现场：内存快照 ---------- */
+const RUN_BODY_CAP = 256 * 1024
+
+function captureSnapshot(): Partial<RequestWorkspaceSnapshot> {
+  const source = result.value
+    ? resultSource.value === 'run'
+      ? 'run'
+      : 'live'
+    : 'none'
+  return {
+    result: result.value,
+    turn: {
+      logs: scriptLogs.value.slice(),
+      assertions: scriptAssertions.value.slice(),
+      error: scriptError.value,
+      ms: scriptMs.value,
+    },
+    responseTab: responseTab.value,
+    bodyView: bodyView.value,
+    activeTab: activeTab.value,
+    bodyAbsPath: bodyAbsPath.value,
+    bodyPreviewError: bodyPreviewError.value,
+    expandedRunId: expandedRunId.value,
+    diffOpen: diffOpen.value,
+    diffBaseRunId: diffBaseRunId.value,
+    diffCustomText: diffCustomText.value,
+    diffUseCustom: diffUseCustom.value,
+    resultSource: source,
+    restoredRunId: source === 'run' ? restoredRunId.value ?? undefined : undefined,
+  }
+}
+
+function restoreSnapshot(snapshot: RequestWorkspaceSnapshot) {
+  result.value = snapshot.result
+  resultSource.value = snapshot.resultSource
+  restoredRunId.value = snapshot.restoredRunId ?? null
+  scriptLogs.value = snapshot.turn.logs.slice()
+  scriptAssertions.value = snapshot.turn.assertions.slice()
+  scriptError.value = snapshot.turn.error
+  scriptMs.value = snapshot.turn.ms
+  responseTab.value = snapshot.responseTab
+  bodyView.value = snapshot.bodyView
+  activeTab.value = snapshot.activeTab
+  bodyAbsPath.value = snapshot.bodyAbsPath
+  bodyPreviewError.value = snapshot.bodyPreviewError
+  expandedRunId.value = snapshot.expandedRunId
+  diffOpen.value = snapshot.diffOpen
+  diffBaseRunId.value = snapshot.diffBaseRunId
+  diffCustomText.value = snapshot.diffCustomText
+  diffUseCustom.value = snapshot.diffUseCustom
+  wasCancelled.value = snapshot.result?.cancelled === true
+}
+
+function saveSnapshot(requestId = form.value.id) {
+  if (!requestId) return
+  workspace.save(requestId, captureSnapshot())
+}
+
+function headerOf(headers: Record<string, string> | undefined, name: string): string {
+  if (!headers) return ''
+  const key = Object.keys(headers).find((item) => item.toLowerCase() === name)
+  return key ? headers[key] : ''
+}
+
+/** 从运行记录做有损恢复：只还原状态、头信息和最多 256KB 正文 */
+async function restoreRunAsResult(summary: RequestRunSummary) {
+  const run = await ensureRunDetail(summary.id)
+  const headers = run?.responseHeaders ?? {}
+  const body = run?.responseBody ?? summary.responseBodyPreview ?? ''
+  const contentType = headerOf(headers, 'content-type')
+  const binary = /^(image|audio|video|application\/octet-stream|application\/pdf)/i.test(
+    contentType,
+  )
+  result.value = {
+    status: run?.responseStatus ?? summary.responseStatus,
+    statusText: run?.responseStatusText ?? summary.responseStatusText,
+    durationMs: run?.durationMs ?? summary.durationMs,
+    sizeBytes: run?.sizeBytes ?? summary.sizeBytes,
+    headers,
+    body: binary ? '' : body,
+    truncated: summary.responseBodyTruncated || body.length >= RUN_BODY_CAP,
+    error: run?.error ?? summary.error ?? null,
+    bodyKind: binary ? 'binary' : 'text',
+    bodyFile: null,
+    bodyBytes: run?.sizeBytes ?? summary.sizeBytes,
+    rawBytes: run?.sizeBytes ?? summary.sizeBytes,
+    previewBase64: null,
+    timings: null,
+    httpVersion: '',
+    redirects: [],
+    retries: [],
+    ignoredHeaders: [],
+    cancelled: false,
+  }
+  resultSource.value = 'run'
+  restoredRunId.value = summary.id
+  wasCancelled.value = false
+}
+
+/** 只有“本次会话最后打开的接口”才做启动后有损恢复，避免打开旧接口时冒出陈年响应 */
+function shouldRestoreFromRun(id: number): boolean {
+  const last = readLastRequest(projectId.value)
+  if (last?.id !== id) return false
+  const newest = runs.value[0]
+  if (!newest) return false
+  return Date.now() - newest.createdAt < 7 * 24 * 3600_000
 }
 
 function activeEnvVars(): Record<string, string> {
@@ -441,15 +612,20 @@ function rememberBodyDraft(type: string, body: string) {
   if (!type || type === 'none' || hydrating) return
   if (bodyDrafts.value[type] === body) return
   bodyDrafts.value = { ...bodyDrafts.value, [type]: body }
-  form.value.bodyMeta = JSON.stringify(bodyDrafts.value)
 }
 
-watch(
-  () => form.value.body,
-  (body) => {
-    rememberBodyDraft(form.value.bodyType, body ?? '')
-  },
-)
+/**
+ * 保存时序列化「其它类型」的草稿。
+ * 当前类型的正文走 body 字段，不必重复存一份；这样大 Body 只在保存时序列化一次小对象，
+ * 而不是每次按键都 JSON.stringify 整份草稿。
+ */
+function bodyMetaFor(type: string): string {
+  const drafts: Record<string, string> = {}
+  for (const [key, value] of Object.entries(bodyDrafts.value)) {
+    if (key !== type) drafts[key] = value
+  }
+  return Object.keys(drafts).length ? JSON.stringify(drafts) : ''
+}
 
 /* ---------- multipart / binary / GraphQL ---------- */
 const multipartFields = computed<FormField[]>({
@@ -708,6 +884,8 @@ function applyHeaderPreset(id: number) {
 // 连续快速切标签会并发触发 loadRequest，只让最后一次加载落地，
 // 否则先发出的旧请求返回时会把上一个接口的详情写回面板
 let loadToken = 0
+/** 组件实例是否已卸载：后台请求结束时不再碰已销毁的视图 */
+let disposed = false
 
 async function loadRequest(id: number) {
   const token = ++loadToken
@@ -715,6 +893,10 @@ async function loadRequest(id: number) {
     loading.value = false
     return
   }
+  // 切走之前，把当前接口的现场存下来
+  const previousId = form.value.id
+  if (previousId && previousId !== id) saveSnapshot(previousId)
+
   loading.value = true
   hydrating = true
   // 先清响应再拉详情：切标签立即可见空白，也不会把上一条的响应带过来
@@ -730,7 +912,8 @@ async function loadRequest(id: number) {
     }
     form.value = detail
     if (detail.bodyType === 'graphql') loadGraphqlBody()
-    lastSaved = JSON.stringify(detail)
+    formVersion = 0
+    savedVersion = 0
     autoState.value = 'saved'
     tabStore.ensureProject(projectId.value)
     const opened = tabStore.open({
@@ -750,6 +933,24 @@ async function loadRequest(id: number) {
       method: detail.method,
     })
     await loadRuns()
+    if (token !== loadToken) return
+
+    // 优先恢复内存现场；没有现场时从最近一条运行记录有损恢复
+    const snapshot = workspace.get(id)
+    if (snapshot) {
+      restoreSnapshot(snapshot)
+      if (snapshot.expandedRunId) void ensureRunDetail(snapshot.expandedRunId)
+      if (snapshot.diffOpen && snapshot.diffBaseRunId && !snapshot.diffUseCustom) {
+        void ensureRunDetail(snapshot.diffBaseRunId)
+      }
+    } else if (runs.value[0] && shouldRestoreFromRun(id)) {
+      await restoreRunAsResult(runs.value[0])
+      if (token !== loadToken) return
+    }
+
+    // 在途请求属于当前接口：恢复“执行中”状态；真正的 Promise 在发起它的闭包里
+    const inflight = workspace.inflightOf(id)
+    if (inflight) requestKey.value = inflight.requestKey
   } catch (e) {
     if (token !== loadToken) return
     tabStore.close(id)
@@ -810,8 +1011,37 @@ watch(requestId, async (id, previous) => {
 })
 
 onBeforeRouteLeave(async () => {
+  saveSnapshot()
   await flushSave()
 })
+
+onBeforeUnmount(() => {
+  disposed = true
+  saveSnapshot()
+  if (bodySizeTimer) window.clearTimeout(bodySizeTimer)
+})
+
+// 页面挂载期间，后台请求完成时自动回填；本组件自己发起的请求直接改视图，不重复回填
+watch(
+  () => workspace.snapshots[requestId.value]?.stamp ?? 0,
+  (stamp, previous) => {
+    if (!stamp || stamp === previous) return
+    if (form.value.id !== requestId.value) return
+    if (sendingRequestIds.has(requestId.value)) return
+    const snapshot = workspace.get(requestId.value)
+    if (!snapshot) return
+    restoreSnapshot(snapshot)
+    void loadRuns().then(() => {
+      if (disposed || form.value.id !== requestId.value) return
+      if (snapshot.diffOpen && snapshot.diffBaseRunId && !snapshot.diffUseCustom) {
+        void ensureRunDetail(snapshot.diffBaseRunId)
+      }
+      if (!snapshot.expandedRunId) return
+      expandedRunId.value = snapshot.expandedRunId
+      void ensureRunDetail(snapshot.expandedRunId)
+    })
+  },
+)
 
 async function flushSave(): Promise<boolean> {
   if (saveTimer) {
@@ -821,20 +1051,32 @@ async function flushSave(): Promise<boolean> {
   return save(false)
 }
 
+/** 浅拷贝出参：大 Body 字符串按引用传递，不做 JSON 深拷贝 */
+function buildSavePayload(): HttpRequestDetail {
+  const current = form.value
+  return {
+    ...current,
+    headers: current.headers.map((item) => ({ ...item })),
+    params: current.params.map((item) => ({ ...item })),
+    auth: { ...(current.auth ?? emptyAuth()) },
+    bodyMeta: bodyMetaFor(current.bodyType),
+  }
+}
+
 async function persist(showToast: boolean): Promise<boolean> {
   if (!form.value.id) return true
-  const payload = JSON.parse(JSON.stringify(form.value)) as HttpRequestDetail
-  const snapshot = JSON.stringify(payload)
-  if (!showToast && snapshot === lastSaved) {
+  if (!showToast && formVersion === savedVersion) {
     autoState.value = 'saved'
     return true
   }
+  const version = formVersion
   saving.value = true
   autoState.value = 'saving'
   try {
-    await api.requestSave(payload)
-    lastSaved = snapshot
-    if (JSON.stringify(form.value) === snapshot) {
+    // 自动保存只需要「写进去」，不需要把整份详情再传回来（大 Body 往返很贵）
+    await api.requestSaveQuick(buildSavePayload())
+    savedVersion = version
+    if (formVersion === version) {
       autoState.value = 'saved'
     } else {
       autoState.value = 'dirty'
@@ -926,6 +1168,7 @@ function deleteRequest() {
     cancelText: '取消',
     async onOk() {
       await api.requestDelete(id)
+      workspace.forget(id)
       form.value.id = undefined
       tabStore.close(id)
       message.success('已删除请求')
@@ -959,14 +1202,53 @@ async function send() {
     message.warning('请填写 URL')
     return
   }
-  sending.value = true
-  result.value = null
-  wasCancelled.value = false
-  // 记住发起时的接口：中途切标签后，旧请求的结果不能再写进新接口的面板
+  // 记住发起时的接口与关键配置：中途切标签后，后台请求仍按发起时的口径完成
   const ownerId = form.value.id
+  const ownerName = form.value.name
+  const ownerAuth = form.value.auth ?? null
+  const preCode = form.value.preScript?.trim()
+  const postCode = form.value.postScript?.trim()
+  const ownerEnvId = envId.value
+  const ownerRequestKey = `req-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+  const ownerRetry = {
+    enabled: retryEnabled.value,
+    maxAttempts: retryMaxAttempts.value,
+    allowNonIdempotent: retryAllowNonIdempotent.value,
+  }
+
+  if (ownerId) sendingRequestIds.add(ownerId)
+  result.value = null
+  resultSource.value = 'none'
+  restoredRunId.value = null
+  wasCancelled.value = false
   // 每次发送一个新标识：重试/重定向都在同一标识下，取消时能一次打中
-  requestKey.value = `req-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+  requestKey.value = ownerRequestKey
+  if (ownerId) workspace.markInflight(ownerId, ownerRequestKey)
+  const turn: RequestTurnState = { logs: [], assertions: [], error: '', ms: 0 }
   resetScriptOutput()
+  // 先清掉内存现场的旧响应，避免发送过程中切回来看到上一次的结果
+  if (ownerId) {
+    workspace.save(ownerId, {
+      result: null,
+      turn: { ...turn },
+      resultSource: 'none',
+      restoredRunId: null,
+      responseTab: responseTab.value,
+      bodyView: bodyView.value,
+      activeTab: activeTab.value,
+      bodyAbsPath: bodyAbsPath.value,
+      bodyPreviewError: bodyPreviewError.value,
+    })
+  }
+
+  const commitTurn = () => {
+    if (disposed || form.value.id !== ownerId) return
+    scriptLogs.value = turn.logs.slice()
+    scriptAssertions.value = turn.assertions.slice()
+    scriptError.value = turn.error
+    scriptMs.value = turn.ms
+  }
+
   try {
     const envVars = activeEnvVars()
     const request: ScriptRequest = {
@@ -978,7 +1260,7 @@ async function send() {
       body: form.value.body ?? '',
     }
     let outgoing = request
-    const envScript = store.environments.find((item) => item.id === envId.value)?.script?.trim()
+    const envScript = store.environments.find((item) => item.id === ownerEnvId)?.script?.trim()
     if (envScript) {
       const envResult = await runScriptJob({
         phase: 'env',
@@ -987,22 +1269,27 @@ async function send() {
         env: envVars,
         vars: listRuntimeVars(),
       })
-      scriptLogs.value.push(...envResult.logs)
-      scriptMs.value += envResult.durationMs
-      scriptError.value = envResult.error ?? ''
+      turn.logs.push(...envResult.logs)
+      turn.ms += envResult.durationMs
+      turn.error = envResult.error ?? ''
+      commitTurn()
       if (envResult.error) {
-        errorDialog.show({
-          title: '环境脚本执行失败',
-          error: envResult.error,
-          context: execContext('环境脚本'),
-        })
+        if (ownerId) {
+          workspace.save(ownerId, { turn: { ...turn }, resultSource: 'none' })
+        }
+        if (!disposed && form.value.id === ownerId) {
+          errorDialog.show({
+            title: '环境脚本执行失败',
+            error: envResult.error,
+            context: execContext('环境脚本'),
+          })
+        }
         return
       }
       setRuntimeVars(envResult.vars)
       outgoing = envResult.request
     }
 
-    const preCode = form.value.preScript?.trim()
     if (preCode) {
       const preResult = await runScriptJob({
         phase: 'pre',
@@ -1011,25 +1298,30 @@ async function send() {
         env: envVars,
         vars: listRuntimeVars(),
       })
-      scriptLogs.value.push(...preResult.logs)
-      scriptMs.value += preResult.durationMs
-      scriptError.value = preResult.error ?? ''
+      turn.logs.push(...preResult.logs)
+      turn.ms += preResult.durationMs
+      turn.error = preResult.error ?? ''
+      commitTurn()
       if (preResult.error) {
-        errorDialog.show({
-          title: '前置脚本执行失败',
-          error: preResult.error,
-          context: execContext('前置脚本'),
-        })
+        if (ownerId) {
+          workspace.save(ownerId, { turn: { ...turn }, resultSource: 'none' })
+        }
+        if (!disposed && form.value.id === ownerId) {
+          errorDialog.show({
+            title: '前置脚本执行失败',
+            error: preResult.error,
+            context: execContext('前置脚本'),
+          })
+        }
         return
       }
       setRuntimeVars(preResult.vars)
       outgoing = preResult.request
     }
 
-    if (form.value.id !== ownerId) return
     const payload: SendRequestPayload = {
-      requestId: form.value.id ?? null,
-      name: form.value.name,
+      requestId: ownerId ?? null,
+      name: ownerName,
       method: outgoing.method,
       url: renderRuntimeVars(outgoing.url),
       headers: mapToItems(outgoing.headers).map((item) => ({
@@ -1042,67 +1334,99 @@ async function send() {
       })),
       bodyType: outgoing.bodyType,
       body: renderRuntimeVars(outgoing.body),
-      envId: envId.value,
+      envId: ownerEnvId,
       insecure: insecure.value,
       timeoutMs: 30000,
-      auth: form.value.auth ?? null,
+      auth: ownerAuth,
       cookieEnabled: true,
       // v1.0.8：让后端能定位到这条在途请求（「停止」按钮依赖它）
-      requestKey: requestKey.value,
+      requestKey: ownerRequestKey,
       protocol: protocol.value === 'auto' ? null : protocol.value,
       followRedirects: followRedirects.value,
-      retry: {
-        enabled: retryEnabled.value,
-        maxAttempts: retryMaxAttempts.value,
-        allowNonIdempotent: retryAllowNonIdempotent.value,
-      },
+      retry: ownerRetry,
     }
 
     const incoming = await api.sendRequest(payload)
-    // 请求返回前已切到别的接口：只保留后端运行记录，不再渲染到当前面板
-    if (form.value.id !== ownerId) return
-    result.value = incoming
-    wasCancelled.value = result.value.cancelled === true
+    const stillOwner = !disposed && form.value.id === ownerId
 
-    // 用户主动停止：不是错误，用 info 提示即可，不弹错误框
-    if (wasCancelled.value) {
-      message.info('已停止本次请求')
-    } else if (result.value.error) {
-      // 超时、DNS、TLS、连接被拒等执行期错误会放在 result.error，直接弹窗展示完整原因
-      errorDialog.show({
-        title: '请求发送失败',
-        error: result.value.error,
-        context: execContext('发送请求'),
+    // 无论用户是否还在当前接口，都先把实时响应写进内存现场
+    if (ownerId) {
+      workspace.save(ownerId, {
+        result: incoming,
+        turn: { ...turn },
+        resultSource: 'live',
+        restoredRunId: null,
+        ...(stillOwner
+          ? {
+              responseTab: responseTab.value,
+              bodyView: bodyView.value,
+              activeTab: activeTab.value,
+              bodyAbsPath: bodyAbsPath.value,
+              bodyPreviewError: bodyPreviewError.value,
+            }
+          : {}),
       })
+      workspace.clearInflight(ownerId)
     }
 
-    const postCode = form.value.postScript?.trim()
+    if (stillOwner) {
+      result.value = incoming
+      resultSource.value = 'live'
+      restoredRunId.value = null
+      wasCancelled.value = incoming.cancelled === true
+      commitTurn()
+
+      // 用户主动停止：不是错误，用 info 提示即可，不弹错误框
+      if (wasCancelled.value) {
+        message.info('已停止本次请求')
+      } else if (incoming.error) {
+        // 超时、DNS、TLS、连接被拒等执行期错误会放在 result.error，直接弹窗展示完整原因
+        errorDialog.show({
+          title: '请求发送失败',
+          error: incoming.error,
+          context: execContext('发送请求'),
+        })
+      }
+    }
+
     if (postCode) {
       const postResult = await runScriptJob({
         phase: 'post',
         code: postCode,
         request: outgoing,
-        response: result.value,
+        response: incoming,
         env: envVars,
         vars: listRuntimeVars(),
       })
       if (!postResult.error) setRuntimeVars(postResult.vars)
-      scriptLogs.value.push(...postResult.logs)
-      scriptAssertions.value = postResult.assertions
-      scriptMs.value += postResult.durationMs
-      scriptError.value = postResult.error ?? ''
-      if (postResult.error) {
-        errorDialog.show({
-          title: '后置脚本执行失败',
-          error: postResult.error,
-          context: execContext('后置脚本'),
+      turn.logs.push(...postResult.logs)
+      turn.assertions = postResult.assertions
+      turn.ms += postResult.durationMs
+      turn.error = postResult.error ?? ''
+      if (!disposed && form.value.id === ownerId) {
+        commitTurn()
+        if (postResult.error) {
+          errorDialog.show({
+            title: '后置脚本执行失败',
+            error: postResult.error,
+            context: execContext('后置脚本'),
+          })
+        }
+        if (postResult.assertions.length || postResult.error) responseTab.value = 'tests'
+      }
+      // 后置脚本的日志与断言也写进现场
+      if (ownerId) {
+        workspace.save(ownerId, {
+          turn: { ...turn },
+          ...(!disposed && form.value.id === ownerId
+            ? { responseTab: responseTab.value, bodyView: bodyView.value }
+            : {}),
         })
       }
-      if (postResult.assertions.length || postResult.error) responseTab.value = 'tests'
     }
   } catch (e) {
     // 已经切到别的接口：旧请求的错误不再打扰当前接口
-    if (form.value.id === ownerId) {
+    if (!disposed && form.value.id === ownerId) {
       errorDialog.show({
         title: '请求执行失败',
         error: e,
@@ -1110,24 +1434,30 @@ async function send() {
       })
     }
   } finally {
+    if (ownerId) {
+      sendingRequestIds.delete(ownerId)
+      workspace.clearInflight(ownerId)
+    }
     // 切标签后可能已经在新接口上发起请求，别把新请求的「发送中」状态提前关掉
-    if (form.value.id === ownerId) {
-      sending.value = false
+    if (form.value.id === ownerId && !disposed) {
       scriptVars.value = listRuntimeVars()
     }
   }
-  if (form.value.id === ownerId) await loadRuns()
+  if (!disposed && form.value.id === ownerId) await loadRuns()
 }
 
 /* ---------- v1.0.8：停止在途请求 ---------- */
 const cancelling = ref(false)
 
 async function cancelSend() {
-  if (!requestKey.value || cancelling.value) return
+  // 以当前接口的在途标识为准：切走再切回后，requestKey 可能已被别的接口覆盖
+  const id = form.value.id
+  const key = (id ? workspace.inflightOf(id)?.requestKey : '') || requestKey.value
+  if (!key || cancelling.value) return
   cancelling.value = true
   try {
     // 返回 false 说明请求刚好结束了，静默忽略即可
-    await api.httpCancel(requestKey.value)
+    await api.httpCancel(key)
   } catch (e) {
     errorDialog.show({ title: '停止请求失败', error: e, context: { 操作: 'http_cancel' } })
   } finally {
@@ -1253,6 +1583,15 @@ watch(
 async function saveBinaryBody() {
   const current = result.value
   if (!current) return
+  if (
+    resultSource.value === 'run' &&
+    !current.bodyFile &&
+    !current.previewBase64 &&
+    !current.body
+  ) {
+    message.warning('运行记录未保存二进制内容，请重新发送后再保存')
+    return
+  }
   const suggested = guessFileName(current)
   const target = await saveFile({ defaultPath: suggested })
   if (!target) return
@@ -1320,7 +1659,10 @@ async function copyBodyPath() {
   }
 }
 
-const runs = ref<RequestRun[]>([])
+const runs = ref<RequestRunSummary[]>([])
+/** 运行详情按需加载：列表只带 2KB 预览，展开某条时再取完整参数与响应 */
+const runDetails = reactive(new Map<number, RequestRun>())
+const runDetailLoading = reactive(new Set<number>())
 const runsOpen = ref(true)
 const runsLoading = ref(false)
 const expandedRunId = ref<number | null>(null)
@@ -1358,6 +1700,9 @@ async function loadRuns() {
     if (form.value.id !== id) return
     runs.value = list
     runsPage.value = 1
+    runDetails.clear()
+    runDetailLoading.clear()
+    expandedRunId.value = null
   } catch (e) {
     if (form.value.id === id) message.error(String(e))
   } finally {
@@ -1365,8 +1710,30 @@ async function loadRuns() {
   }
 }
 
-function toggleRun(run: RequestRun) {
-  expandedRunId.value = expandedRunId.value === run.id ? null : run.id
+async function ensureRunDetail(id: number): Promise<RequestRun | null> {
+  const cached = runDetails.get(id)
+  if (cached) return cached
+  if (runDetailLoading.has(id)) return null
+  runDetailLoading.add(id)
+  try {
+    const detail = await api.runGet(id)
+    runDetails.set(id, detail)
+    return detail
+  } catch (e) {
+    message.error(String(e))
+    return null
+  } finally {
+    runDetailLoading.delete(id)
+  }
+}
+
+async function toggleRun(run: RequestRunSummary) {
+  if (expandedRunId.value === run.id) {
+    expandedRunId.value = null
+    return
+  }
+  expandedRunId.value = run.id
+  await ensureRunDetail(run.id)
 }
 
 function runStatusColor(status: number) {
@@ -1380,12 +1747,53 @@ function fmtRunTime(ts: number) {
   return formatDateTime(ts)
 }
 
+/** 当前响应由哪条运行记录恢复而来 */
+const restoredRun = computed(
+  () => runs.value.find((run) => run.id === restoredRunId.value) ?? null,
+)
+
+function fmtAgo(ts: number) {
+  const diff = Math.max(0, Date.now() - ts)
+  if (diff < 60_000) return '刚刚'
+  if (diff < 3600_000) return `${Math.floor(diff / 60_000)} 分钟前`
+  if (diff < 86400_000) return `${Math.floor(diff / 3600_000)} 小时前`
+  return `${Math.floor(diff / 86400_000)} 天前`
+}
+
+const runSourceHint = computed(() => {
+  const run = restoredRun.value
+  const when = run ? ` · ${fmtAgo(run.createdAt)}` : ''
+  return run?.responseBodyTruncated
+    ? `来自运行记录${when}，记录只保存前 256KB；完整响应请查看该次运行或重新发送`
+    : `来自运行记录${when}，耗时分解、重定向等实时信息不包含在历史记录中`
+})
+
 function fmtTimeOf(ts: number) {
   return formatDateTime(ts)
 }
 
-function runHeaders(run: RequestRun) {
-  return Object.entries(run.responseHeaders ?? {})
+function runHeaders(id: number) {
+  return Object.entries(runDetails.get(id)?.responseHeaders ?? {})
+}
+
+function runParams(run: RequestRunSummary) {
+  return (runDetails.get(run.id)?.params ?? []).filter((item) => item.enabled)
+}
+
+function runRequestHeaders(run: RequestRunSummary) {
+  return runDetails.get(run.id)?.headers ?? []
+}
+
+function runBodyText(run: RequestRunSummary) {
+  return runDetails.get(run.id)?.body || run.requestBodyPreview
+}
+
+function runResponseText(run: RequestRunSummary) {
+  return runDetails.get(run.id)?.responseBody || run.responseBodyPreview
+}
+
+function runHasExtraParams(run: RequestRunSummary) {
+  return Boolean(runDetails.get(run.id)?.params?.length || runDetails.get(run.id)?.headers?.length)
 }
 
 function prettyRunBody(text: string) {
@@ -1408,8 +1816,16 @@ function clearRuns() {
     async onOk() {
       await api.runClear(id)
       runs.value = []
+      runDetails.clear()
+      runDetailLoading.clear()
       expandedRunId.value = null
       runsPage.value = 1
+      // 清空运行记录后，页面上已有的响应仍是实时结果，只去掉“来自运行记录”的来源标识
+      if (resultSource.value === 'run') {
+        resultSource.value = result.value ? 'live' : 'none'
+        restoredRunId.value = null
+        saveSnapshot(id)
+      }
       message.success('已清空')
     },
   })
@@ -1460,16 +1876,22 @@ async function saveResponseBody() {
   }
 }
 
-function openDiff() {
+async function openDiff() {
   diffUseCustom.value = runs.value.length === 0
-  diffBaseRunId.value = runs.value[0]?.id ?? null
+  const first = runs.value[0]?.id ?? null
+  diffBaseRunId.value = first
   diffCustomText.value = ''
   diffOpen.value = true
+  if (first) await ensureRunDetail(first)
 }
+
+watch(diffBaseRunId, (id) => {
+  if (!diffUseCustom.value && id) void ensureRunDetail(id)
+})
 
 const diffBaseText = computed(() => {
   if (diffUseCustom.value) return diffCustomText.value
-  const run = runs.value.find((item) => item.id === diffBaseRunId.value)
+  const run = diffBaseRunId.value ? runDetails.get(diffBaseRunId.value) : undefined
   return run ? prettyRunBody(run.responseBody) : ''
 })
 
@@ -1498,13 +1920,30 @@ async function openStress() {
   })
 }
 
+/** 超过该体量不再做 Pretty：一次 5MB 的 stringify 会明显卡住响应面板 */
+const PRETTY_MAX = 512 * 1024
+
 const prettyBody = computed(() => {
   const body = result.value?.body ?? ''
+  if (!body || body.length > PRETTY_MAX) return body
   try {
     return JSON.stringify(JSON.parse(body), null, 2)
   } catch {
     return body
   }
+})
+
+/** 行数按需缓存，避免模板在每次渲染时 split 整段响应 */
+const prettyLineCount = computed(() => {
+  const text = prettyBody.value
+  if (!text) return 0
+  let count = 1
+  let index = text.indexOf('\n')
+  while (index !== -1) {
+    count += 1
+    index = text.indexOf('\n', index + 1)
+  }
+  return count
 })
 
 const bodyView = ref<'pretty' | 'raw'>('pretty')
@@ -1516,18 +1955,53 @@ watch([result, bodyView], () => {
   })
 })
 
-const bodySize = computed(() => new Blob([form.value.body ?? '']).size)
+/* 字节数防抖：大 Body 每次按键都 new Blob 也是一笔可见开销 */
+const bodySize = ref(0)
+let bodySizeTimer: number | undefined
+
+watch(
+  () => form.value.body,
+  (body) => {
+    if (bodySizeTimer) window.clearTimeout(bodySizeTimer)
+    bodySizeTimer = window.setTimeout(() => {
+      bodySizeTimer = undefined
+      bodySize.value = new Blob([body ?? '']).size
+    }, 300)
+  },
+  { immediate: true },
+)
 
 const projectName = computed(
   () => store.projects.find((p) => p.id === projectId.value)?.name ?? '',
 )
 
-function formatBody() {
+/** 超过该字符数时格式化前先确认：大文本解析和回填会占用几百毫秒 */
+const FORMAT_CONFIRM_MAX = 2 * 1024 * 1024
+
+async function formatBody() {
+  const text = form.value.body
+  if (!text.trim()) return
+  if (text.length > FORMAT_CONFIRM_MAX) {
+    const confirmed = await new Promise<boolean>((resolve) => {
+      Modal.confirm({
+        title: 'Body 较大，格式化可能停顿片刻',
+        content: `当前 ${fmtSize(new Blob([text]).size)}，格式化会重新排版整段内容，是否继续？`,
+        okText: '开始格式化',
+        cancelText: '取消',
+        onOk: () => resolve(true),
+        onCancel: () => resolve(false),
+      })
+    })
+    if (!confirmed) return
+  }
+  const hide = message.loading('正在格式化…', 0)
   try {
-    form.value.body = JSON.stringify(JSON.parse(form.value.body), null, 2)
+    form.value.body = await formatJsonAsync(text)
     message.success('已格式化')
   } catch {
     message.error('JSON 解析失败，请检查格式')
+  } finally {
+    hide()
   }
 }
 
@@ -1746,11 +2220,13 @@ const responseHeaders = computed(() => {
               <DownOutlined class="ai-caret" />
             </a-button>
             <template #overlay>
-              <a-menu @click="(info: any) => runAi(String(info.key))">
+              <a-menu @click="(info: any) => onAiMenu(String(info.key))">
                 <a-menu-item key="explain">解释这次请求 / 响应</a-menu-item>
                 <a-menu-item key="assert">生成断言脚本</a-menu-item>
                 <a-menu-item key="post">生成后置提取脚本</a-menu-item>
                 <a-menu-item key="optimize">优化这个接口定义</a-menu-item>
+                <a-menu-divider />
+                <a-menu-item key="handoff">带这次请求去航仔</a-menu-item>
               </a-menu>
             </template>
           </a-dropdown>
@@ -2131,6 +2607,12 @@ const responseHeaders = computed(() => {
               <span class="pane-dot res" />
               Response
             </span>
+            <a-tooltip v-if="result && resultSource === 'run'" :title="runSourceHint">
+              <span class="proto-pill run-source mono">
+                来自运行记录<template v-if="restoredRun"> · {{ fmtAgo(restoredRun.createdAt) }}</template>
+                <template v-if="restoredRun?.responseBodyTruncated"> · 仅前 256KB</template>
+              </span>
+            </a-tooltip>
             <template v-if="result">
               <span class="status-pill mono" :class="{ ok: result.status > 0 && result.status < 400, bad: result.status >= 400 || !result.status }">
                 {{ result.status || 'ERR' }}{{ result.statusText ? ` ${result.statusText}` : '' }}
@@ -2203,8 +2685,8 @@ const responseHeaders = computed(() => {
                   <span class="tab-count">{{
                     isBinaryBody
                       ? fmtSize(result.bodyBytes || result.sizeBytes)
-                      : prettyBody
-                        ? `${prettyBody.split('\n').length} 行`
+                      : prettyLineCount
+                        ? `${prettyLineCount} 行`
                         : '0'
                   }}</span>
                 </template>
@@ -2221,8 +2703,13 @@ const responseHeaders = computed(() => {
                       <span class="mono binary-size">{{ fmtSize(result.bodyBytes || result.sizeBytes) }}</span>
                     </div>
                     <div class="binary-desc">
-                      该响应不是文本内容（{{ bodyKind === 'binary' ? '二进制' : bodyKind }}），
-                      已完整保存到本机，不载入编辑器以避免卡死。点「另存为」导出到你需要的位置。
+                      <template v-if="resultSource === 'run'">
+                        运行记录只保存文本正文，二进制内容无法从历史恢复；请重新发送后再查看或另存。
+                      </template>
+                      <template v-else>
+                        该响应不是文本内容（{{ bodyKind === 'binary' ? '二进制' : bodyKind }}），
+                        已完整保存到本机，不载入编辑器以避免卡死。点「另存为」导出到你需要的位置。
+                      </template>
                     </div>
                     <div v-if="result.rawBytes && result.rawBytes !== result.bodyBytes" class="binary-desc">
                       压缩传输：{{ fmtSize(result.rawBytes) }} → 解压后 {{ fmtSize(result.bodyBytes) }}
@@ -2244,7 +2731,10 @@ const responseHeaders = computed(() => {
                 </div>
 
                 <template v-else>
-                  <div v-if="result.bodyFile" class="truncate-hint">
+                  <div v-if="result.bodyOmitted" class="truncate-hint">
+                    响应较大（{{ fmtSize(result.sizeBytes) }}），切换页面时未在内存保留正文；请重新发送或查看运行记录
+                  </div>
+                  <div v-else-if="result.bodyFile" class="truncate-hint">
                     完整响应（{{ fmtSize(result.bodyBytes || result.sizeBytes) }}）已落盘到本机，编辑器只加载前 5MB；
                     点「另存为」导出的是完整文件。
                   </div>
@@ -2446,47 +2936,65 @@ const responseHeaders = computed(() => {
               </div>
 
               <div v-if="expandedRunId === run.id" class="run-detail">
-                <div class="run-col">
-                  <div class="run-col-title">请求参数</div>
-                  <div class="run-line">
-                    <span class="rk">URL</span>
-                    <span class="rv mono">{{ run.url }}</span>
-                  </div>
-                  <div v-for="p in run.params.filter((i) => i.enabled)" :key="`p-${p.key}-${p.value}`" class="run-line">
-                    <span class="rk">{{ p.key }}</span>
-                    <span class="rv mono">{{ p.value }}</span>
-                  </div>
-                  <div v-for="h in run.headers" :key="`h-${h.key}-${h.value}`" class="run-line">
-                    <span class="rk">{{ h.key }}</span>
-                    <span class="rv mono">{{ h.value }}</span>
-                  </div>
-                  <div v-if="run.body" class="run-block">
-                    <div class="run-col-title">请求 Body · {{ run.bodyType }}</div>
-                    <pre class="mono run-pre">{{ prettyRunBody(run.body) }}</pre>
-                  </div>
-                  <div v-if="!run.params.length && !run.headers.length && !run.body" class="runs-empty">
-                    该次请求没有额外参数
-                  </div>
+                <div v-if="runDetailLoading.has(run.id)" class="runs-empty run-detail-loading">
+                  正在加载运行详情…
                 </div>
-
-                <div class="run-col">
-                  <div class="run-col-title">
-                    响应
-                    <span class="mono run-col-status" :style="{ color: runStatusColor(run.responseStatus) }">
-                      {{ run.responseStatus || 'ERR' }} {{ run.responseStatusText }}
-                    </span>
-                    <span class="run-col-meta mono">{{ run.durationMs }} ms · {{ fmtSize(run.sizeBytes) }}</span>
-                  </div>
-                  <div v-if="run.error" class="run-error">{{ run.error }}</div>
-                  <template v-else>
-                    <div v-for="[k, v] in runHeaders(run)" :key="k" class="run-line">
-                      <span class="rk">{{ k }}</span>
-                      <span class="rv mono">{{ v }}</span>
+                <template v-else>
+                  <div class="run-col">
+                    <div class="run-col-title">请求参数</div>
+                    <div class="run-line">
+                      <span class="rk">URL</span>
+                      <span class="rv mono">{{ run.url }}</span>
                     </div>
-                    <pre v-if="run.responseBody" class="mono run-pre">{{ prettyRunBody(run.responseBody) }}</pre>
-                    <div v-else class="runs-empty">响应体为空</div>
-                  </template>
-                </div>
+                    <div v-for="p in runParams(run)" :key="`p-${p.key}-${p.value}`" class="run-line">
+                      <span class="rk">{{ p.key }}</span>
+                      <span class="rv mono">{{ p.value }}</span>
+                    </div>
+                    <div v-for="h in runRequestHeaders(run)" :key="`h-${h.key}-${h.value}`" class="run-line">
+                      <span class="rk">{{ h.key }}</span>
+                      <span class="rv mono">{{ h.value }}</span>
+                    </div>
+                    <div v-if="runBodyText(run)" class="run-block">
+                      <div class="run-col-title">
+                        请求 Body · {{ run.bodyType }}
+                        <span v-if="run.requestBodyTruncated" class="run-col-meta mono">
+                          已截断 · 原 {{ fmtSize(run.requestBodySize) }}
+                        </span>
+                      </div>
+                      <pre class="mono run-pre">{{ prettyRunBody(runBodyText(run)) }}</pre>
+                    </div>
+                    <div
+                      v-else-if="!runHasExtraParams(run)"
+                      class="runs-empty"
+                    >
+                      该次请求没有额外参数
+                    </div>
+                  </div>
+
+                  <div class="run-col">
+                    <div class="run-col-title">
+                      响应
+                      <span class="mono run-col-status" :style="{ color: runStatusColor(run.responseStatus) }">
+                        {{ run.responseStatus || 'ERR' }} {{ run.responseStatusText }}
+                      </span>
+                      <span class="run-col-meta mono">
+                        {{ run.durationMs }} ms · 响应体 {{ fmtSize(run.responseBodySize) }}
+                      </span>
+                    </div>
+                    <div v-if="run.error" class="run-error">{{ run.error }}</div>
+                    <template v-else>
+                      <div v-for="[k, v] in runHeaders(run.id)" :key="k" class="run-line">
+                        <span class="rk">{{ k }}</span>
+                        <span class="rv mono">{{ v }}</span>
+                      </div>
+                      <pre v-if="runResponseText(run)" class="mono run-pre">{{ prettyRunBody(runResponseText(run)) }}</pre>
+                      <div v-else class="runs-empty">响应体为空</div>
+                      <div v-if="run.responseBodyTruncated" class="runs-empty">
+                        响应体已截断存储，完整大小 {{ fmtSize(run.responseBodySize) }}
+                      </div>
+                    </template>
+                  </div>
+                </template>
               </div>
             </template>
 
@@ -4272,6 +4780,12 @@ const responseHeaders = computed(() => {
   color: #2563eb;
   border-color: rgba(37, 99, 235, 0.35);
   background: rgba(37, 99, 235, 0.08);
+}
+
+.proto-pill.run-source {
+  color: #7c3aed;
+  border-color: rgba(124, 58, 237, 0.35);
+  background: rgba(124, 58, 237, 0.08);
 }
 
 /* ---------- v1.0.8：二进制响应 ---------- */

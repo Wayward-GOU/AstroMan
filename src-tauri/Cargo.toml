@@ -1,6 +1,6 @@
 [package]
 name = "astroman"
-version = "1.0.9"
+version = "1.1.0"
 description = "AstroMan - 本地 API 调试与压测工具"
 edition = "2021"
 # 新增 astroman-cli 后仍让 `cargo run`（tauri dev 使用）默认启动桌面端

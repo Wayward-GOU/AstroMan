@@ -2,9 +2,10 @@ import { defineStore } from 'pinia'
 import { computed, reactive, ref } from 'vue'
 import { aiChat, aiProviderList } from '@/api'
 import { buildContext, estimateTokens } from '@/utils/contextBudget'
-import { contextBudgetOf } from '@/utils/modelMeta'
+import { effectiveWindow, inputBudgetOf } from '@/utils/modelMeta'
 import { compactPrompt } from '@/utils/promptText'
 import { wrapUntrusted } from '@/utils/untrusted'
+import type { HandoffSource } from '@/stores/handoff'
 import type { AiMessage, AiProvider } from '@/types/models'
 
 export interface AssistMessage {
@@ -23,7 +24,8 @@ const SYSTEM_PROMPT = `你是 AstroMan 桌面工具内置的接口分析助手�
 2. 需要给脚本时使用 \`\`\`js 代码块；脚本必须遵循 AstroMan 脚本引擎：可用 vars / env / cipher / rsa / test / assert，不能用 require / import / fetch / async-await / 定时器。
 3. 只基于用户给出的上下文推理，信息不足时明确说明缺少什么，禁止编造响应体、状态码、压测指标。
 4. 不要输出任何工具调用块、尖括号标记或特殊标记，也不要声称自己已经发送了请求或执行了压测。
-5. 涉及密钥、Token 时提醒放到环境变量里，不要明文回显。`
+5. 涉及密钥、Token 时提醒放到环境变量里，不要明文回显。
+6. 你处于「页面内分析」模式，不执行任何工具；如果用户要求修改数据、发送请求或执行压测，请告诉用户到「航仔」完整对话中操作。`
 
 const MAX_ROUNDS = 12
 
@@ -41,6 +43,10 @@ export const useAiAssistStore = defineStore('aiAssist', () => {
 
   /** 页面上下文只进入模型，不铺在对话里 */
   let context = ''
+  /** 页面快照原文：抽屉内「去航仔」时原样交接，避免重新抓一遍页面数据 */
+  const contextText = ref('')
+  /** 页面来源，交接后显示「来自接口 / 抓包 / 压测报告…」 */
+  const source = ref<HandoffSource>('request')
   /** 上下文规模，用于确认页提示耗时 */
   const contextChars = ref(0)
 
@@ -82,9 +88,10 @@ export const useAiAssistStore = defineStore('aiAssist', () => {
    * 按模型窗口动态分配：页面快照最多占 70%，剩下留给追问历史。
    * 快照同样包不可信标签（T-17），避免报告正文里藏指令。
    */
-  function payload(extra: AssistMessage[]): AiMessage[] {
-    const budget = contextBudgetOf(currentProvider.value?.model ?? '')
-    const room = Math.max(2000, budget - estimateTokens(SYSTEM_PROMPT) - 400)
+  function payload(extra: AssistMessage[], window: number): AiMessage[] {
+    // 输入预算已扣除输出预留；这里再扣自身提示词与少量安全余量
+    const budget = inputBudgetOf(window, currentProvider.value?.maxTokens)
+    const room = Math.max(1200, budget - estimateTokens(SYSTEM_PROMPT) - 400)
     const head: AiMessage[] = [{ role: 'system', content: SYSTEM_PROMPT }]
     const dialogue: AiMessage[] = []
     let left = room
@@ -109,6 +116,10 @@ export const useAiAssistStore = defineStore('aiAssist', () => {
     }
     streaming.value = true
     error.value = ''
+    const window = effectiveWindow(
+      currentProvider.value?.model ?? '',
+      currentProvider.value?.contextWindow,
+    )
     // 响应式对象：直接改原始对象不会触发视图更新，会退化成「全部生成完才渲染」
     const item = reactive<AssistMessage>({ role: 'assistant', content: '', streaming: true })
     messages.value.push(item)
@@ -127,8 +138,10 @@ export const useAiAssistStore = defineStore('aiAssist', () => {
       await aiChat(
         {
           providerId: id,
-          messages: payload(messages.value.slice(0, -1)),
+          messages: payload(messages.value.slice(0, -1), window),
           temperature: currentProvider.value?.temperature ?? 0.3,
+          scene: 'analysis',
+          contextWindow: window,
         },
         (event) => {
           if (event.kind === 'delta' && event.text) {
@@ -161,10 +174,18 @@ export const useAiAssistStore = defineStore('aiAssist', () => {
    * 打开抽屉，默认停在「待确认」状态：把上下文准备好但不发请求，
    * 由用户点「开始分析」后才真正调用模型。autoStart 仅供确实需要立即出结果的入口使用。
    */
-  async function show(options: { title: string; prompt: string; hint?: string; autoStart?: boolean }) {
+  async function show(options: {
+    title: string
+    prompt: string
+    hint?: string
+    autoStart?: boolean
+    source?: HandoffSource
+  }) {
     title.value = options.title
     hint.value = options.hint ?? ''
     context = options.prompt
+    contextText.value = options.prompt
+    source.value = options.source ?? 'request'
     contextChars.value = options.prompt.length
     messages.value = []
     error.value = ''
@@ -203,6 +224,8 @@ export const useAiAssistStore = defineStore('aiAssist', () => {
     messages.value = []
     error.value = ''
     context = ''
+    contextText.value = ''
+    source.value = 'request'
     contextChars.value = 0
     pending.value = false
   }
@@ -211,6 +234,8 @@ export const useAiAssistStore = defineStore('aiAssist', () => {
     open,
     title,
     hint,
+    contextText,
+    source,
     providers,
     providerId,
     currentProvider,

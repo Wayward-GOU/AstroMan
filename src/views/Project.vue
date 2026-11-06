@@ -63,6 +63,7 @@ async function aiAudit() {
     void aiAssist.show({
       title: '项目结构体检',
       prompt: projectAuditPrompt(store.currentProject?.name ?? '当前项目', store.tree, items),
+      source: 'project',
       hint: `${items.length} 个接口 · ${store.tree.length} 个顶层集合`,
     })
   } catch (e) {

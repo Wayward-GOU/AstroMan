@@ -124,6 +124,7 @@ function aiInsight() {
   void aiAssist.show({
     title: '工作台洞察',
     prompt: dashboardInsightPrompt(stats.value, metrics.value),
+    source: 'workspace',
     hint: stats.value
       ? `${stats.value.projectCount} 个项目 · ${stats.value.requestCount} 个接口 · ${stats.value.historyCount} 条历史`
       : '数据加载中',

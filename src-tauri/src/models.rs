@@ -386,6 +386,32 @@ pub struct CleanupResult {
     pub runs: u32,
 }
 
+/// 运行记录列表摘要：只带 2KB 预览与体积信息。
+///
+/// 列表一次最多返回 200 条，如果每条都带完整请求 / 响应正文，IPC 会卡住界面。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestRunSummary {
+    pub id: i64,
+    pub request_id: i64,
+    pub method: String,
+    pub url: String,
+    pub body_type: String,
+    pub response_status: i64,
+    pub response_status_text: String,
+    pub duration_ms: i64,
+    pub size_bytes: i64,
+    pub error: Option<String>,
+    pub origin: String,
+    pub created_at: i64,
+    pub request_body_size: i64,
+    pub response_body_size: i64,
+    pub request_body_truncated: bool,
+    pub response_body_truncated: bool,
+    pub request_body_preview: String,
+    pub response_body_preview: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RequestRun {
@@ -407,6 +433,12 @@ pub struct RequestRun {
     /// 执行来源：manual / batch / suite / cli
     pub origin: String,
     pub created_at: i64,
+    /// 原始请求 / 响应体大小（不是入库截断后的长度）
+    pub request_body_size: i64,
+    pub response_body_size: i64,
+    /// 入库时是否因超过 256KB 被截断
+    pub request_body_truncated: bool,
+    pub response_body_truncated: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -849,6 +881,9 @@ pub struct AiProvider {
     /// 是否支持图片输入（截图识别用）；默认 false
     #[serde(default)]
     pub supports_vision: bool,
+    /// 上下文窗口覆盖（token）；0 / 空 = 前端按模型名自动识别
+    #[serde(default)]
+    pub context_window: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -868,6 +903,13 @@ pub struct AiChatPayload {
     /// 在途请求标识：前端用同一个 id 调用 ai_chat_cancel 停止生成
     #[serde(default)]
     pub request_id: Option<String>,
+    /// 调用场景：agent（主对话，注入全局提示词）/ analysis（页面分析）/ summary（会话摘要）；
+    /// 旧前端不传时按 agent 处理
+    #[serde(default)]
+    pub scene: Option<String>,
+    /// 本次请求按哪个上下文窗口预留输出；由前端传入，后端据此收紧 max_tokens
+    #[serde(default)]
+    pub context_window: Option<i64>,
 }
 
 /// 流式事件：delta 增量文本 / reasoning 思考 / done 结束 / cancelled 已停止 / error 错误

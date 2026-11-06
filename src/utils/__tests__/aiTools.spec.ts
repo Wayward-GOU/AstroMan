@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import {
+  classifyToolFailure,
   isWriteTool,
   maskSensitive,
+  maskedArgsForLog,
   testCaseKindLabel,
   TOOL_CATALOG,
   toolCatalogStats,
@@ -55,6 +57,38 @@ describe('validateToolArgs', () => {
       '参数必须是 JSON 对象',
     )
   })
+
+  it('run_get 必须带 id，run_list / history_list 支持 offset 且受上限约束', () => {
+    expect(validateToolArgs('run_get', {})).toBe('缺少必填参数 id')
+    expect(validateToolArgs('run_get', { id: 12 })).toBeNull()
+    expect(validateToolArgs('run_list', { requestId: 1, offset: 10 })).toBeNull()
+    expect(validateToolArgs('run_list', { requestId: 1, offset: 500 })).toContain('不能大于 199')
+    expect(validateToolArgs('history_list', { offset: 20 })).toBeNull()
+  })
+})
+
+describe('工具目录', () => {
+  it('run_get 进入核心目录，模型无需先检索就知道能读运行详情', () => {
+    const names = toolNames()
+    expect(names).toContain('run_get')
+    expect(TOOL_CATALOG).toContain('run_get')
+  })
+
+  it('系统 / 应用 / 记事本增量工具已注册，snooze 属于写工具', () => {
+    const names = toolNames()
+    for (const tool of [
+      'system_snapshot',
+      'system_process_list',
+      'app_info',
+      'notes_counts',
+      'notes_tags',
+      'notes_snooze',
+    ]) {
+      expect(names).toContain(tool)
+    }
+    expect(isWriteTool('notes_snooze')).toBe(true)
+    expect(isWriteTool('system_process_list')).toBe(false)
+  })
 })
 
 describe('toolTimeoutOf', () => {
@@ -94,6 +128,67 @@ describe('maskSensitive', () => {
     const out = maskSensitive('https://a.com/cb?token=abcdef123456&x=1')
     expect(out).not.toContain('abcdef123456')
     expect(out).toContain('x=1')
+  })
+})
+
+describe('classifyToolFailure', () => {
+  it('写工具超时：结果未知且禁止自动重试', () => {
+    expect(classifyToolFailure('project_import', true)).toEqual({
+      outcome: 'unknown',
+      retryable: false,
+    })
+    expect(classifyToolFailure('history_export', true)).toEqual({
+      outcome: 'unknown',
+      retryable: false,
+    })
+    expect(classifyToolFailure('send_request', true)).toEqual({ outcome: 'timeout', retryable: true })
+  })
+
+  it('只读工具超时仍可重试', () => {
+    expect(classifyToolFailure('project_list', true)).toEqual({
+      outcome: 'timeout',
+      retryable: true,
+    })
+  })
+
+  it('普通失败与成功保持 error / ok', () => {
+    expect(classifyToolFailure('project_list', false)).toEqual({ outcome: 'error', retryable: true })
+    expect(classifyToolFailure('project_import', false)).toEqual({ outcome: 'error', retryable: true })
+    expect(classifyToolFailure('project_list', false, true)).toEqual({ outcome: 'ok', retryable: true })
+  })
+})
+
+describe('maskedArgsForLog', () => {
+  it('落库前打码 Header 与 Body 里的密钥', () => {
+    const out = maskedArgsForLog('send_request', {
+      method: 'POST',
+      url: 'https://a.com/login',
+      headers: { Authorization: 'Bearer abcdef123456', Cookie: 'sid=abcdef123456' },
+      body: '{"username":"demo","password":"hunter2secret"}',
+    })
+    expect(out).not.toContain('abcdef123456')
+    expect(out).not.toContain('hunter2secret')
+    expect(out).toContain('https://a.com/login')
+  })
+
+  it('环境变量值按密钥处理', () => {
+    const out = maskedArgsForLog('env_var_save', {
+      projectId: 1,
+      envId: 2,
+      variables: [{ key: 'API_TOKEN', value: 'abcdef123456' }],
+    })
+    expect(out).not.toContain('abcdef123456')
+    expect(out).toContain('API_TOKEN')
+  })
+
+  it('先脱敏再截断，避免密钥被切成半截漏出', () => {
+    const out = maskedArgsForLog('send_request', {
+      method: 'GET',
+      url: `https://a.com/cb?token=abcdef123456&pad=${'a'.repeat(3000)}`,
+    })
+    expect(out.length).toBeLessThan(2100)
+    expect(out).not.toContain('abcdef123456')
+    expect(out).toContain('已截断')
   })
 })
 

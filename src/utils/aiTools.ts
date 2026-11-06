@@ -2,6 +2,7 @@ import {
   aiExecute,
   aiToolLogAdd,
   apiImport,
+  appInfo,
   collectionCreate,
   collectionDelete,
   collectionRename,
@@ -42,6 +43,7 @@ import {
   requestOptions,
   requestSave,
   requestSearch,
+  runGet,
   runList,
   stressStart,
   stressStop,
@@ -68,6 +70,8 @@ import {
   testSuiteSave,
   toolHash,
   toolHmac,
+  winstatsProcesses,
+  winstatsSnapshot,
   workspaceStats,
 } from '@/api'
 import {
@@ -80,6 +84,7 @@ import {
   captureStatus,
   captureStop,
 } from '@/api/capture'
+import { notesCounts, notesSnooze, notesTags } from '@/api/notes'
 import type {
   CookieItem,
   DashboardMetrics,
@@ -92,7 +97,7 @@ import type {
   ReportRequestRecord,
   ReportRequestsPage,
   RequestAuth,
-  RequestRun,
+  RequestRunSummary,
   SlaTargets,
   StressConfig,
   StressReport,
@@ -160,6 +165,10 @@ export interface ToolResult {
   total?: number
   /** 结果是否被截断（true 时 total 仍然准确） */
   truncated?: boolean
+  /** ok=false 时进一步区分：普通失败 / 等待超时 / 结果未知 */
+  outcome?: 'ok' | 'error' | 'timeout' | 'unknown'
+  /** 写工具超时后的结果可能已经落库，禁止自动重试 */
+  retryable?: boolean
 }
 
 interface ToolSpec {
@@ -285,6 +294,7 @@ const SCHEMAS: Record<string, Record<string, ArgRule>> = {
   env_list: { projectId: { kind: 'number', required: true } },
   history_list: {
     limit: { kind: 'number', min: 1, max: 20000 },
+    offset: { kind: 'number', min: 0, max: 19999 },
     requestId: { kind: 'number' },
     projectId: { kind: 'number' },
   },
@@ -402,7 +412,22 @@ const SCHEMAS: Record<string, Record<string, ArgRule>> = {
   history_stats: {},
   run_list: {
     requestId: { kind: 'number', required: true },
-    limit: { kind: 'number', min: 1, max: 500 },
+    limit: { kind: 'number', min: 1, max: 200 },
+    offset: { kind: 'number', min: 0, max: 199 },
+  },
+  run_get: { id: { kind: 'number', required: true } },
+  system_snapshot: {},
+  system_process_list: {
+    keyword: { kind: 'string' },
+    limit: { kind: 'number', min: 1, max: 50 },
+    byMemory: { kind: 'boolean' },
+  },
+  app_info: {},
+  notes_counts: {},
+  notes_tags: {},
+  notes_snooze: {
+    id: { kind: 'number', required: true },
+    minutes: { kind: 'number', required: true, min: 1, max: 10_080 },
   },
   cookie_list: {},
   /* ---------------- 阶段四：工具箱（复用 src/tools/*） ---------------- */
@@ -712,6 +737,50 @@ export function maskSensitive(text: string): string {
   return out
 }
 
+const SENSITIVE_KEY =
+  /^(?:api[_-]?key|token|secret|password|authorization|cookie|private[_-]?key|appsecret|clientsecret)$/i
+
+/** 递归打码参数对象；字符串里内嵌的 JSON（典型是请求 Body）也会解析后打码 */
+function maskArgsDeep(value: unknown, maskEnvValue: boolean): unknown {
+  if (Array.isArray(value)) return value.map((item) => maskArgsDeep(item, maskEnvValue))
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {}
+    for (const [key, item] of Object.entries(value)) {
+      if (SENSITIVE_KEY.test(key) || (maskEnvValue && key === 'value')) {
+        out[key] = maskValue(item === null || item === undefined ? '' : String(item))
+      } else {
+        out[key] = maskArgsDeep(item, maskEnvValue)
+      }
+    }
+    return out
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    const looksJson =
+      (trimmed.startsWith('{') && trimmed.endsWith('}')) ||
+      (trimmed.startsWith('[') && trimmed.endsWith(']'))
+    if (looksJson) {
+      try {
+        return JSON.stringify(maskArgsDeep(JSON.parse(trimmed), maskEnvValue))
+      } catch {
+        return maskSensitive(value)
+      }
+    }
+    return maskSensitive(value)
+  }
+  return value
+}
+
+/**
+ * 工具流水落库前的参数：先脱敏再截断。
+ * 先截断会把长密钥切成半截，正则匹配不到，反而漏出明文。
+ * `env_var_save` 的变量值等价于密钥，按 `value` 字段单独打码。
+ */
+export function maskedArgsForLog(tool: string, args: ToolArgs): string {
+  const masked = maskArgsDeep(args ?? {}, tool === 'env_var_save')
+  return clip(maskSensitive(pretty(masked)), 2000)
+}
+
 /* ---------------- 参数归一化 ---------------- */
 
 function clip(text: string, limit: number): string {
@@ -750,9 +819,12 @@ function envelopeOf(
     // 发送类工具自己算好了摘要（含断言 / 脚本结果），直接采用
     if (typeof record.summary === 'string' && record.summary) {
       const total = Number(record.total)
-      return Number.isFinite(total)
-        ? { summary: record.summary, total, truncated: record.truncated === true }
-        : { summary: record.summary }
+      return {
+        summary: record.summary,
+        ...(Number.isFinite(total) ? { total } : {}),
+        // 摘要型结果（例如 run_get）也要把截断标记带到界面
+        ...(record.truncated === true ? { truncated: true } : {}),
+      }
     }
     const total = Number(record.total)
     if (Number.isFinite(total) && Array.isArray(record.items)) {
@@ -2146,17 +2218,29 @@ const SPECS: ToolSpec[] = [
   },
   {
     name: 'history_list',
-    desc: '最近的请求历史，可按接口（requestId）或项目（projectId）过滤；返回接口名、项目名与本地时间',
-    args: '{ limit?, requestId?, projectId? }',
+    desc: '请求历史，按时间倒序；可按接口（requestId）或项目（projectId）过滤，用 offset 翻页；返回接口名、项目名与本地时间',
+    args: '{ limit?, offset?, requestId?, projectId? }',
     handler: async (args) => {
-      const limit = Math.min(2000, Math.round(optionalNum(args.limit) ?? 20))
+      const limit = Math.min(2000, Math.max(1, Math.round(optionalNum(args.limit) ?? 20)))
+      const offset = Math.min(19999, Math.max(0, Math.round(optionalNum(args.offset) ?? 0)))
       const [rows, projects] = await Promise.all([
-        historyList(limit, optionalNum(args.requestId) ?? null, optionalNum(args.projectId) ?? null),
+        historyList(
+          Math.min(20000, offset + limit),
+          optionalNum(args.requestId) ?? null,
+          optionalNum(args.projectId) ?? null,
+        ),
         projectList().catch(() => []),
       ])
       const names = new Map(projects.map((item) => [item.id, item.name]))
-      const items = historyRows(rows.slice(0, 50), names)
-      return { total: rows.length, shown: items.length, items }
+      const page = rows.slice(offset, offset + limit)
+      const items = historyRows(page.slice(0, 50), names)
+      return {
+        total: rows.length,
+        shown: items.length,
+        offset,
+        说明: `本次从第 ${offset} 条开始取 ${limit} 条；total 为扫描到的记录数，单次最多展示 50 条`,
+        items,
+      }
     },
   },
   {
@@ -3216,6 +3300,122 @@ const SPECS: ToolSpec[] = [
     args: '无',
     handler: async () => dashboardDigest(await dashboardMetrics()),
   },
+  {
+    name: 'system_snapshot',
+    desc: '读取当前电脑资源概览（CPU / 内存 / 磁盘 / 网络 / GPU / 电池）；只在用户问「电脑为什么卡 / 现在占用多少」时调用一次',
+    args: '无',
+    handler: async () => {
+      const snap = await winstatsSnapshot()
+      return {
+        时间: fmtTime(snap.timestamp),
+        系统: `${snap.system.name} ${snap.system.osVersion}`,
+        主机名: snap.system.hostName,
+        运行时长: `${Math.floor(snap.system.uptimeSec / 3600)} 小时`,
+        逻辑核心: snap.system.logicalCores,
+        CPU型号: snap.cpu.brand,
+        CPU使用率: `${snap.cpu.total.toFixed(1)}%`,
+        内存: `${fmtBytes(snap.memory.used)} / ${fmtBytes(snap.memory.total)}（${snap.memory.percent.toFixed(1)}%）`,
+        交换分区: snap.swap
+          ? `${fmtBytes(snap.swap.used)} / ${fmtBytes(snap.swap.total)}（${snap.swap.percent.toFixed(1)}%）`
+          : '无',
+        磁盘: snap.disks.map((disk) => ({
+          挂载: disk.mount,
+          文件系统: disk.fileSystem,
+          总量: fmtBytes(disk.total),
+          可用: fmtBytes(disk.available),
+          使用率: `${disk.percent.toFixed(1)}%`,
+          读: `${fmtBytes(disk.readPerSec)}/s`,
+          写: `${fmtBytes(disk.writePerSec)}/s`,
+        })),
+        网络: snap.networks.map((net) => ({
+          网卡: net.name,
+          接收: `${fmtBytes(net.receivedPerSec)}/s`,
+          发送: `${fmtBytes(net.transmittedPerSec)}/s`,
+          地址: net.ipv4.join(', ') || net.ipv6.join(', '),
+        })),
+        GPU: snap.gpus.map((gpu) => ({ 型号: gpu.name, 使用率: `${gpu.usage.toFixed(1)}%` })),
+        电池: snap.battery
+          ? `${snap.battery.percent.toFixed(0)}%，${snap.battery.onAc ? '已接电源' : '电池供电'}`
+          : '无',
+      }
+    },
+  },
+  {
+    name: 'system_process_list',
+    desc: '按 CPU 或内存列出当前占用最高的进程；可按进程名关键字过滤；只读，不会结束进程',
+    args: '{ keyword?, limit?, byMemory? }',
+    handler: async (args) => {
+      const limit = Math.min(50, Math.max(1, Math.round(optionalNum(args.limit) ?? 15)))
+      const byMemory = args.byMemory === true
+      const keyword = str(args.keyword).trim().toLowerCase()
+      const list = await winstatsProcesses(limit, byMemory)
+      const filtered = keyword
+        ? list.filter((item) => item.name.toLowerCase().includes(keyword))
+        : list
+      const rows = filtered.map((item) => ({
+        PID: item.pid,
+        进程: item.name,
+        'CPU%': Number(item.cpu.toFixed(1)),
+        内存: fmtBytes(item.memory),
+        内存占比: `${item.memoryPercent.toFixed(1)}%`,
+      }))
+      return {
+        ...summarizeList(rows),
+        排序: byMemory ? '按内存占用' : '按 CPU 占用',
+        说明: '只读取占用最高的前若干进程，不会结束任何进程',
+      }
+    },
+  },
+  {
+    name: 'app_info',
+    desc: '读取 AstroMan 版本、数据目录与数据库路径；排障或回答「数据存在哪」时使用',
+    args: '无',
+    handler: async () => {
+      const info = await appInfo()
+      return {
+        版本: info.version,
+        数据目录: info.dataDir,
+        数据库: info.dbPath,
+      }
+    },
+  },
+  {
+    name: 'notes_counts',
+    desc: '读取记事本计数：待办、今日到期、逾期、已完成；回答「我还有多少事」',
+    args: '无',
+    handler: async () => {
+      const counts = await notesCounts()
+      return {
+        待办: counts.open,
+        今日到期: counts.dueToday,
+        已逾期: counts.overdue,
+        已完成: counts.done,
+      }
+    },
+  },
+  {
+    name: 'notes_tags',
+    desc: '列出现有记事本标签及各自条目数，便于按标签筛选',
+    args: '无',
+    handler: async () => summarizeList(await notesTags()),
+  },
+  {
+    name: 'notes_snooze',
+    desc: '把某个待办 / 笔记的提醒延后 N 分钟（需用户确认）',
+    args: '{ id, minutes }',
+    danger: true,
+    handler: async (args) => {
+      const id = needNum(args.id, 'id')
+      const minutes = Math.min(10_080, Math.max(1, Math.round(needNum(args.minutes, 'minutes'))))
+      const note = await notesSnooze(id, minutes)
+      return {
+        id: note.id,
+        标题: note.title,
+        延后到: note.snoozeUntil ? fmtTime(note.snoozeUntil) : `${minutes} 分钟后`,
+        summary: `已延后「${note.title}」${minutes} 分钟`,
+      }
+    },
+  },
   /* ---------------- 阶段四：业务工具补齐 ---------------- */
   {
     name: 'env_delete',
@@ -3301,29 +3501,81 @@ const SPECS: ToolSpec[] = [
   },
   {
     name: 'run_list',
-    desc: '读取某个已保存请求最近 N 次运行记录（状态码、耗时、响应片段）；需先拿到 requestId',
-    args: '{ requestId, limit? }',
+    desc: '读取某个已保存请求的运行记录摘要（状态码、耗时、响应片段）；按时间倒序，可用 offset 翻页；需先拿到 requestId',
+    args: '{ requestId, limit?, offset? }',
     handler: async (args) => {
       const requestId = needNum(args.requestId, 'requestId')
-      const limit = Math.min(500, Math.max(1, Math.round(optionalNum(args.limit) ?? 50)))
-      const runs: RequestRun[] = await runList(requestId, limit)
+      const limit = Math.min(200, Math.max(1, Math.round(optionalNum(args.limit) ?? 50)))
+      const offset = Math.min(199, Math.max(0, Math.round(optionalNum(args.offset) ?? 0)))
+      // 后端一次最多返回 200 条；先取到 offset+limit，再在本地切出当前页
+      const all: RequestRunSummary[] = await runList(requestId, Math.min(200, offset + limit))
+      const runs = all.slice(offset, offset + limit)
       const rows = runs.map((run) => ({
         id: run.id,
         状态码: run.responseStatus,
         耗时毫秒: run.durationMs,
-        响应大小: run.sizeBytes,
+        响应大小: run.responseBodySize || run.sizeBytes,
+        请求大小: run.requestBodySize,
         错误: run.error ?? '',
         时间: fmtTime(run.createdAt),
         请求方法: run.method,
         地址: run.url,
-        响应片段: clip(str(run.responseBody), 500),
+        响应截断: run.responseBodyTruncated ? '是' : '否',
+        响应片段: clip(str(run.responseBodyPreview), 500),
       }))
       return {
-        total: runs.length,
+        total: all.length,
         shown: rows.length,
-        truncated: false,
-        说明: `最多读取最近 ${limit} 次运行记录，total 为本次返回条数`,
+        truncated: all.length >= 200,
+        offset,
+        说明: `单接口最多保留最近 200 次；本次从第 ${offset} 条开始，要更早记录请增大 offset；完整正文用 run_get({ id })`,
         items: rows,
+      }
+    },
+  },
+  {
+    name: 'run_get',
+    desc: '读取单次运行记录的完整快照：请求头、查询参数、请求体、响应头、响应体、耗时与错误；id 来自 run_list',
+    args: '{ id }',
+    handler: async (args) => {
+      const run = await runGet(needNum(args.id, 'id'))
+      const requestBody = str(run.body)
+      const responseBody = str(run.responseBody)
+      const headers = Object.fromEntries(
+        (run.headers ?? [])
+          .filter((item) => item.enabled !== false)
+          .map((item) => [item.key, item.value]),
+      )
+      const params = Object.fromEntries(
+        (run.params ?? [])
+          .filter((item) => item.enabled !== false)
+          .map((item) => [item.key, item.value]),
+      )
+      const outputTruncated = requestBody.length > 4_000 || responseBody.length > 4_000
+      const truncated = run.requestBodyTruncated || run.responseBodyTruncated || outputTruncated
+      return {
+        summary: `${run.method} ${run.url} · ${run.responseStatus} · ${run.durationMs}ms`,
+        truncated,
+        说明: truncated
+          ? '正文超过单次展示上限或入库时已被 256KB 截断；只看到部分内容，不要编造剩余部分'
+          : '完整快照',
+        id: run.id,
+        请求方法: run.method,
+        地址: run.url,
+        状态码: run.responseStatus,
+        状态文本: run.responseStatusText,
+        耗时毫秒: run.durationMs,
+        请求大小: run.requestBodySize,
+        响应大小: run.responseBodySize,
+        请求头: headers,
+        查询参数: params,
+        请求体: clip(requestBody, 4_000),
+        请求体已截断: run.requestBodyTruncated ? '是' : '否',
+        响应头: run.responseHeaders ?? {},
+        响应体: clip(responseBody, 4_000),
+        响应体已截断: run.responseBodyTruncated ? '是' : '否',
+        错误: run.error ?? '',
+        时间: fmtTime(run.createdAt),
       }
     },
   },
@@ -3553,6 +3805,10 @@ const TOOL_KEYWORDS: Array<{ words: string[]; tools: string[] }> = [
   { words: ['环境', '变量', 'env'], tools: ['env_', 'environment'] },
   { words: ['报告', '压测结果', 'report'], tools: ['report_'] },
   { words: ['历史', '记录', 'history'], tools: ['history_', 'run_'] },
+  { words: ['运行详情', '响应头', '响应体', '请求体', 'run'], tools: ['run_get', 'run_list'] },
+  { words: ['电脑', '系统', 'CPU', '内存', '磁盘', '进程', '卡顿', 'system'], tools: ['system_'] },
+  { words: ['版本', '数据目录', '数据库', 'app', 'info'], tools: ['app_info'] },
+  { words: ['记事本', '待办', '笔记', '标签', '提醒', 'notes'], tools: ['notes_'] },
   { words: ['转换', '格式化', 'json', 'yaml', 'xml', 'csv'], tools: ['toolbox_'] },
   { words: ['编码', '解码', 'base64', '哈希', '加密', '签名', 'hash'], tools: ['toolbox_base64', 'toolbox_hash'] },
   { words: ['时间', '时间戳', 'timestamp'], tools: ['toolbox_timestamp'] },
@@ -3661,6 +3917,13 @@ export const TOOL_LABELS: Record<string, string> = {
   report_requests: '读取报告请求记录',
   history_stats: '请求历史统计',
   run_list: '读取运行记录',
+  run_get: '读取运行详情',
+  system_snapshot: '读取系统资源概览',
+  system_process_list: '读取高占用进程',
+  app_info: '读取应用信息',
+  notes_counts: '读取记事本计数',
+  notes_tags: '读取记事本标签',
+  notes_snooze: '延后记事本提醒',
   cookie_list: '读取 Cookie 列表',
   toolbox_json_format: '格式化 JSON',
   toolbox_json_to_entity: 'JSON 转实体类',
@@ -3735,11 +3998,29 @@ const WRITE_TOOLS = new Set([
   'api_import',
   'openapi_import',
   'openapi_export',
+  'notes_snooze',
 ])
 
 /** 需要用户先确认再执行的工具，判断统一走这里 */
 export function isWriteTool(tool: string): boolean {
   return isDangerousTool(tool) || WRITE_TOOLS.has(tool)
+}
+
+/**
+ * 失败分类：Tauri invoke 没有取消原语，超时只是前端停止等待。
+ * 写工具可能已经在后台执行完成，必须标记为「结果未知」并禁止自动重试；
+ * 只读工具超时没有副作用，可以换更小的范围重试。
+ */
+export function classifyToolFailure(
+  tool: string,
+  timedOut: boolean,
+  ok = false,
+): { outcome: NonNullable<ToolResult['outcome']>; retryable: boolean } {
+  if (ok) return { outcome: 'ok', retryable: true }
+  if (!timedOut) return { outcome: 'error', retryable: true }
+  return isWriteTool(tool)
+    ? { outcome: 'unknown', retryable: false }
+    : { outcome: 'timeout', retryable: true }
 }
 
 export function toolLabel(tool: string): string {
@@ -3769,6 +4050,7 @@ const CORE_TOOL_NAMES = new Set([
   'curl_import',
   'send_request',
   'run_batch',
+  'run_get',
   'env_list',
   'history_list',
   'history_export',
@@ -3911,7 +4193,12 @@ export async function executeTool(
         ok = false
         if (error instanceof ToolTimeoutError) {
           timedOut = true
-          output = error.message
+          if (classifyToolFailure(tool, true).outcome === 'unknown') {
+            output =
+              '工具等待超时，但后台可能已经执行完成，结果未知。禁止自动重试；请先让用户核对目标数据或文件，再由用户决定是否重试。'
+          } else {
+            output = '工具等待超时，任务未完成。可以换用更小的范围重试。'
+          }
         } else {
           output = `工具执行失败：${error instanceof Error ? error.message : String(error)}`
         }
@@ -3920,6 +4207,8 @@ export async function executeTool(
     // 硬规则 6：结果进入模型上下文前做脱敏
     output = maskSensitive(output)
   }
+
+  const { outcome, retryable } = classifyToolFailure(tool, timedOut, ok)
 
   const durationMs = Math.round(
     (typeof performance !== 'undefined' ? performance.now() : Date.now()) - started,
@@ -3930,7 +4219,7 @@ export async function executeTool(
     await aiToolLogAdd({
       sessionId,
       tool,
-      args: clip(pretty(args ?? {}), 2000),
+      args: maskedArgsForLog(tool, args ?? {}),
       ok,
       durationMs,
       resultPreview: clip(output, 2000),
@@ -3942,5 +4231,5 @@ export async function executeTool(
     // 流水写入失败不影响主流程
   }
 
-  return { ok, output, raw, durationMs, ...envelope }
+  return { ok, output, raw, durationMs, outcome, retryable, ...envelope }
 }

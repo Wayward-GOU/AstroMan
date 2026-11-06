@@ -1,6 +1,7 @@
 import { Channel, invoke } from '@tauri-apps/api/core'
 import type {
   AiChatPayload,
+  AiContextMeta,
   AiProvider,
   AiSession,
   AiStoredMessage,
@@ -34,6 +35,7 @@ import type {
   ReportRequestsPage,
   RequestRun,
   RequestSearchHit,
+  RequestRunSummary,
   RequestSummary,
   SecretStatus,
   SendRequestPayload,
@@ -96,6 +98,10 @@ export const requestOptions = (projectId: number) =>
 export const requestSave = (request: HttpRequestDetail) =>
   invoke<HttpRequestDetail>('request_save', { request })
 
+/** 自动保存：只写库不回读整份详情，避免大 Body 双向往返 */
+export const requestSaveQuick = (request: HttpRequestDetail) =>
+  invoke<void>('request_save_quick', { request })
+
 export const requestDelete = (id: number) => invoke<void>('request_delete', { id })
 
 /** 拖拽排序：按 ids 的顺序重排某集合下的请求 */
@@ -104,7 +110,10 @@ export const requestReorder = (collectionId: number, ids: number[]) =>
 
 // 单接口运行记录
 export const runList = (requestId: number, limit = 200) =>
-  invoke<RequestRun[]>('run_list', { requestId, limit })
+  invoke<RequestRunSummary[]>('run_list', { requestId, limit })
+
+/** 展开某条运行记录时再取完整请求 / 响应内容 */
+export const runGet = (id: number) => invoke<RequestRun>('run_get', { id })
 
 export const runClear = (requestId: number) => invoke<void>('run_clear', { requestId })
 
@@ -309,6 +318,8 @@ export const toolHmac = (text: string, key: string, algorithm: string) =>
   invoke<string>('tool_hmac', { text, key, algorithm })
 
 // AI 助手
+export const aiContextMeta = () => invoke<AiContextMeta>('ai_context_meta')
+
 export const aiProviderList = () => invoke<AiProvider[]>('ai_provider_list')
 
 export const aiProviderSave = (provider: AiProvider) =>

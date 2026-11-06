@@ -60,3 +60,23 @@ export function contextWindowOf(model: string): number {
 export function contextBudgetOf(model: string): number {
   return Math.max(2_000, Math.floor(contextWindowOf(model) * CONTEXT_BUDGET_RATIO))
 }
+
+/** 实际窗口：用户显式配置优先，否则按模型名识别 */
+export function effectiveWindow(model: string, override?: number | null): number {
+  if (override && override > 0) return Math.floor(override)
+  return contextWindowOf(model)
+}
+
+/**
+ * 输出预留：至少 512，最多不超过窗口一半（否则小窗口模型只剩很少输入空间）。
+ * 注意后端还会按真实提示词再收紧一次 max_tokens，这里只用于前端预算展示与裁剪。
+ */
+export function outputReserveOf(window: number, maxTokens?: number | null): number {
+  const desired = maxTokens && maxTokens > 0 ? maxTokens : 4096
+  return Math.min(Math.max(512, desired), Math.max(1024, Math.floor(window * 0.5)))
+}
+
+/** 输入侧可用额度：窗口扣除输出预留后，至少留 1500 给系统提示词与历史 */
+export function inputBudgetOf(window: number, maxTokens?: number | null): number {
+  return Math.max(1500, window - outputReserveOf(window, maxTokens))
+}

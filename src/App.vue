@@ -29,15 +29,18 @@ import AstroBuddyIcon from '@/components/AstroBuddyIcon.vue'
 import AiAssistDrawer from '@/components/AiAssistDrawer.vue'
 import ErrorDialog from '@/components/ErrorDialog.vue'
 import NotesReminderHost from '@/components/notes/NotesReminderHost.vue'
+import HangzaiTaskDock from '@/components/HangzaiTaskDock.vue'
 import { currentTheme, currentThemeId, setTheme, themes } from '@/stores/theme'
 import { canGoBack, previousEntry, stepBack } from '@/stores/navHistory'
 import { isMac, shortcutText } from '@/utils/platform'
 import { checkForUpdates, isAutoUpdateEnabled } from '@/utils/updater'
 import { useNotesStore } from '@/stores/notes'
+import { useHangzaiTaskStore } from '@/stores/hangzaiTask'
 
 const route = useRoute()
 const router = useRouter()
 const notesStore = useNotesStore()
+const hangzaiTask = useHangzaiTaskStore()
 const isBare = computed(() => Boolean(route.meta.bare))
 
 let notesTicker: number | undefined
@@ -513,6 +516,11 @@ const theme = computed(() => {
               <span v-if="item.key === 'notes' && notesStore.badge" class="nav-badge">
                 {{ notesStore.badge }}
               </span>
+              <span
+                v-if="item.key === 'ai' && hangzaiTask.active"
+                class="nav-live"
+                :title="hangzaiTask.phaseText"
+              />
               <span class="nav-indicator" />
             </router-link>
           </div>
@@ -557,7 +565,11 @@ const theme = computed(() => {
       </aside>
 
       <main class="main">
-        <router-view />
+        <router-view v-slot="{ Component }">
+          <keep-alive :include="['AiAssistant']">
+            <component :is="Component" />
+          </keep-alive>
+        </router-view>
       </main>
 
       <transition name="zoom-fade">
@@ -565,6 +577,7 @@ const theme = computed(() => {
       </transition>
 
       <AstroBuddy v-if="!route.path.startsWith('/ai')" @open="go('/ai')" />
+      <HangzaiTaskDock v-if="!route.path.startsWith('/ai')" @open="go('/ai')" />
 
       <a-modal
         v-model:open="paletteOpen"
@@ -927,6 +940,35 @@ const theme = computed(() => {
 
 .sider.collapsed .nav-badge {
   display: none;
+}
+
+.nav-live {
+  margin-left: auto;
+  width: 7px;
+  height: 7px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: var(--fm-primary);
+  animation: nav-live-pulse 1.4s ease-in-out infinite;
+}
+
+.sider.collapsed .nav-live {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  margin-left: 0;
+}
+
+@keyframes nav-live-pulse {
+  0%,
+  100% {
+    opacity: 0.4;
+    transform: scale(0.85);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.1);
+  }
 }
 
 .nav-item.active .nav-hint {

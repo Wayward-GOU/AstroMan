@@ -208,6 +208,10 @@ CREATE TABLE IF NOT EXISTS request_runs (
     response_status_text TEXT,
     response_headers  TEXT,
     response_body     TEXT,
+    request_body_size INTEGER NOT NULL DEFAULT 0,
+    response_body_size INTEGER NOT NULL DEFAULT 0,
+    request_body_truncated INTEGER NOT NULL DEFAULT 0,
+    response_body_truncated INTEGER NOT NULL DEFAULT 0,
     duration_ms       INTEGER DEFAULT 0,
     size_bytes        INTEGER DEFAULT 0,
     error             TEXT,
@@ -400,6 +404,8 @@ CREATE TABLE IF NOT EXISTS ai_providers (
     is_default    INTEGER DEFAULT 0,
     enabled       INTEGER DEFAULT 1,
     supports_vision INTEGER NOT NULL DEFAULT 0,
+    -- 上下文窗口覆盖（token）；0 = 前端按模型名自动识别
+    context_window INTEGER NOT NULL DEFAULT 0,
     created_at    INTEGER NOT NULL,
     updated_at    INTEGER NOT NULL
 );

@@ -236,6 +236,8 @@ export interface HttpResult {
   headers: Record<string, string>
   body: string
   truncated: boolean
+  /** 现场缓存因正文过大未保留内容（仅内存快照使用） */
+  bodyOmitted?: boolean
   error?: string | null
   bodyKind: BodyKind
   /** 落盘后的相对路径（相对数据目录），用 responseFilePath 换绝对路径 */
@@ -409,6 +411,14 @@ export interface AiProvider {
   /** 是否支持图片输入（记事本截图识别） */
   supportsVision?: boolean
   isDefault?: boolean
+  /** 上下文窗口覆盖（token）；0 / 空 = 按模型名自动识别 */
+  contextWindow?: number | null
+}
+
+/** 后端注入的航仔提示词元信息：前端预算据此扣减，避免猜错 */
+export interface AiContextMeta {
+  systemPromptChars: number
+  defaultMaxTokens: number
 }
 
 export interface AiMessage {
@@ -422,6 +432,13 @@ export interface AiChatPayload {
   temperature?: number | null
   /** 在途请求标识，配合 ai_chat_cancel 停止生成 */
   requestId?: string | null
+  /**
+   * 调用场景：agent（主对话，后端注入全局提示词）/ analysis（页面分析）/
+   * summary（会话摘要）；不传等同 agent
+   */
+  scene?: 'agent' | 'analysis' | 'summary' | (string & {})
+  /** 本次请求的上下文窗口（token），后端据此收紧输出上限 */
+  contextWindow?: number | null
 }
 
 /** 流式事件：delta 增量文本 / reasoning 思考 / retry 重试提示 / done 结束 / cancelled 已停止 / error 错误 */
@@ -563,6 +580,28 @@ export interface AiUsageStats {
   daily: AiUsageDay[]
 }
 
+/** 运行记录列表摘要：只带 2KB 预览，大 Body 在展开时调用 runGet 再取 */
+export interface RequestRunSummary {
+  id: number
+  requestId: number
+  method: string
+  url: string
+  bodyType: string
+  responseStatus: number
+  responseStatusText: string
+  durationMs: number
+  sizeBytes: number
+  error?: string | null
+  origin?: string
+  createdAt: number
+  requestBodySize: number
+  responseBodySize: number
+  requestBodyTruncated: boolean
+  responseBodyTruncated: boolean
+  requestBodyPreview: string
+  responseBodyPreview: string
+}
+
 export interface RequestRun {
   id: number
   requestId: number
@@ -580,6 +619,11 @@ export interface RequestRun {
   sizeBytes: number
   error?: string | null
   createdAt: number
+  /** 原始请求 / 响应体大小（不是 256KB 入库截断后的长度） */
+  requestBodySize: number
+  responseBodySize: number
+  requestBodyTruncated: boolean
+  responseBodyTruncated: boolean
 }
 
 export interface StressStage {

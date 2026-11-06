@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 const props = withDefaults(
   defineProps<{
@@ -34,23 +34,165 @@ const highlightRef = ref<HTMLElement | null>(null)
 const composing = ref(false)
 
 const LINE_HEIGHT = 20
+/** 小于该字符数：逐键同步着色（成本低，体验最好） */
+const LIVE_MAX = 64 * 1024
+/** 大于该字符数：默认关闭着色，需用户手动开启 */
+const MANUAL_MAX = 256 * 1024
+/** 超过该字符数：不再着色，只保留纯文本编辑 */
+const HIGHLIGHT_MAX = 2 * 1024 * 1024
+/** 大文本停止输入后延迟着色，避免每次按键都重算整段 HTML */
+const DEFER_DELAY = 200
+/** 行数超过该值时行号改为虚拟滚动，避免几万个 DOM 节点 */
+const VIRTUAL_LINES = 300
 
-const lineCount = computed(() => {
-  const text = props.modelValue
-  if (!text) return 1
-  return text.split('\n').length
+const textLength = computed(() => props.modelValue.length)
+
+/* ---------- 着色模式：按体量分层，内容再大也不阻塞输入 ---------- */
+const manualHighlight = ref(false)
+
+type HighlightMode = 'live' | 'defer' | 'manual' | 'off'
+
+const highlightMode = computed<HighlightMode>(() => {
+  if (props.language !== 'json' || !props.modelValue) return 'off'
+  const length = textLength.value
+  if (length > HIGHLIGHT_MAX) return 'off'
+  if (length > MANUAL_MAX) return manualHighlight.value ? 'defer' : 'manual'
+  if (length > LIVE_MAX) return 'defer'
+  return 'live'
 })
 
-const lineNumbers = computed(() =>
-  Array.from({ length: lineCount.value }, (_, i) => i + 1),
+const showHighlightToggle = computed(
+  () =>
+    props.language === 'json' &&
+    textLength.value > MANUAL_MAX &&
+    textLength.value <= HIGHLIGHT_MAX,
 )
+
+const showTooLargeNote = computed(
+  () => props.language === 'json' && textLength.value > HIGHLIGHT_MAX,
+)
+
+function toggleHighlight() {
+  manualHighlight.value = !manualHighlight.value
+  refreshHighlight(true)
+}
+
+/* ---------- 着色源与原文解耦：输入期间可以先显示纯文本 ---------- */
+const highlightSource = ref('')
+let highlightTimer: number | undefined
+
+function cancelHighlightTimer() {
+  if (highlightTimer) {
+    window.clearTimeout(highlightTimer)
+    highlightTimer = undefined
+  }
+}
+
+function refreshHighlight(immediate = false) {
+  cancelHighlightTimer()
+  const mode = highlightMode.value
+  if (mode === 'live') {
+    highlightSource.value = props.modelValue
+    return
+  }
+  if (mode === 'defer') {
+    if (immediate) {
+      highlightSource.value = props.modelValue
+      return
+    }
+    highlightTimer = window.setTimeout(() => {
+      highlightTimer = undefined
+      highlightSource.value = props.modelValue
+    }, DEFER_DELAY)
+    return
+  }
+  // manual / off：清空着色层，输入框直接显示原文
+  highlightSource.value = ''
+}
+
+// 内容或模式变化时刷新着色源；live 模式同步完成，不会出现闪烁
+watch(
+  () => [props.modelValue, highlightMode.value],
+  () => refreshHighlight(),
+)
+
+/* ---------- 行号：大文本延迟统计 + 虚拟滚动 ---------- */
+const lineCount = ref(1)
+let lineTimer: number | undefined
+
+function countLines(text: string) {
+  if (!text) return 1
+  let count = 1
+  let index = text.indexOf('\n')
+  while (index !== -1) {
+    count += 1
+    index = text.indexOf('\n', index + 1)
+  }
+  return count
+}
+
+function refreshLineCount(immediate: boolean) {
+  if (lineTimer) {
+    window.clearTimeout(lineTimer)
+    lineTimer = undefined
+  }
+  const apply = () => {
+    lineCount.value = countLines(props.modelValue)
+  }
+  if (immediate || textLength.value <= LIVE_MAX) {
+    apply()
+    return
+  }
+  lineTimer = window.setTimeout(() => {
+    lineTimer = undefined
+    apply()
+  }, DEFER_DELAY)
+}
+
+const lineNumbers = computed(() => Array.from({ length: lineCount.value }, (_, i) => i + 1))
+
+const virtualGutter = computed(() => lineCount.value > VIRTUAL_LINES)
 
 const gutterWidth = computed(() => Math.max(2, String(lineCount.value).length) * 8 + 18)
 
+const gutterScrollTop = ref(0)
+const gutterViewHeight = ref(0)
+/** textarea 横向滚动条占用的高度；着色层没有滚动条，需要补同样的底部内边距 */
+const scrollbarHeight = ref(0)
+
+const gutterInnerStyle = computed(() =>
+  virtualGutter.value
+    ? { height: `${lineCount.value * LINE_HEIGHT}px` }
+    : { transform: `translateY(${-gutterScrollTop.value}px)` },
+)
+
+const highlightStyle = computed(() => ({
+  paddingBottom: `${10 + scrollbarHeight.value}px`,
+}))
+
+const visibleLineNumbers = computed(() => {
+  if (!virtualGutter.value) return lineNumbers.value
+  const height = gutterViewHeight.value || 400
+  const start = Math.max(0, Math.floor(gutterScrollTop.value / LINE_HEIGHT) - 2)
+  const end = Math.min(lineCount.value, start + Math.ceil(height / LINE_HEIGHT) + 6)
+  const out: number[] = []
+  for (let n = start + 1; n <= end; n += 1) out.push(n)
+  return out
+})
+
+function lineTop(n: number) {
+  return (n - 1) * LINE_HEIGHT - gutterScrollTop.value
+}
+
 const boxHeight = computed(() => props.rows * LINE_HEIGHT + 20)
 
+/** 只有着色层与当前内容一致时才叠加显示，避免滞后内容重影 */
+const freshHighlight = computed(
+  () => highlightSource.value !== '' && highlightSource.value === props.modelValue,
+)
+
 const highlighted = computed(() =>
-  props.language === 'json' ? highlightJson(props.modelValue) : null,
+  highlightSource.value ? highlightJson(highlightSource.value) : '',
 )
 
 function escapeHtml(text: string) {
@@ -71,95 +213,182 @@ function wrapVars(text: string) {
   return out + escapeHtml(text.slice(last))
 }
 
-/** JSON 着色：注释 / 字段名 / 字符串 / 数字 / {{变量}} 各一种颜色 */
-function highlightJson(text: string) {
-  let out = ''
-  let index = 0
-  while (index < text.length) {
-    const current = text[index]
+function isDigit(text: string, index: number) {
+  const code = text.charCodeAt(index)
+  return index < text.length && code >= 48 && code <= 57
+}
 
-    if (current === '"') {
+/**
+ * JSON 着色：注释 / 字段名 / 字符串 / 数字 / {{变量}} 各一种颜色。
+ *
+ * 按「普通片段 + 命中片段」收集后一次性 join，避免逐字符 `out +=`；
+ * 字段名判断不再对剩余全文 slice，数字扫描也不再对剩余全文跑正则。
+ */
+function highlightJson(text: string) {
+  const parts: string[] = []
+  const length = text.length
+  let index = 0
+  let plainStart = 0
+
+  const flushPlain = (end: number) => {
+    if (end > plainStart) parts.push(escapeHtml(text.slice(plainStart, end)))
+  }
+
+  const pushToken = (className: string, start: number, end: number, vars = false) => {
+    flushPlain(start)
+    const raw = text.slice(start, end)
+    parts.push(`<span class="${className}">${vars ? wrapVars(raw) : escapeHtml(raw)}</span>`)
+    plainStart = end
+    index = end
+  }
+
+  while (index < length) {
+    const code = text.charCodeAt(index)
+
+    // 双引号字符串 / 字段名
+    if (code === 34) {
       let end = index + 1
-      while (end < text.length) {
-        if (text[end] === '\\') {
+      while (end < length) {
+        const next = text.charCodeAt(end)
+        if (next === 92) {
           end += 2
           continue
         }
-        if (text[end] === '"') {
+        if (next === 34) {
           end += 1
           break
         }
         end += 1
       }
-      const raw = text.slice(index, end)
-      const isKey = /^\s*:/.test(text.slice(end))
-      out += `<span class="${isKey ? 'tok-key' : 'tok-string'}">${wrapVars(raw)}</span>`
-      index = end
+      // 跳过空白后看是否紧跟冒号，判断是不是字段名
+      let probe = end
+      while (probe < length) {
+        const next = text.charCodeAt(probe)
+        if (next === 32 || next === 9 || next === 10 || next === 13) {
+          probe += 1
+          continue
+        }
+        break
+      }
+      const isKey = probe < length && text.charCodeAt(probe) === 58
+      pushToken(isKey ? 'tok-key' : 'tok-string', index, end, true)
       continue
     }
 
-    if (current === '/' && text[index + 1] === '/') {
+    // 行注释
+    if (code === 47 && text.charCodeAt(index + 1) === 47) {
       let end = text.indexOf('\n', index)
-      if (end === -1) end = text.length
-      out += `<span class="tok-comment">${escapeHtml(text.slice(index, end))}</span>`
-      index = end
+      if (end === -1) end = length
+      pushToken('tok-comment', index, end)
       continue
     }
 
-    if (current === '/' && text[index + 1] === '*') {
+    // 块注释
+    if (code === 47 && text.charCodeAt(index + 1) === 42) {
       const close = text.indexOf('*/', index + 2)
-      const end = close === -1 ? text.length : close + 2
-      out += `<span class="tok-comment">${escapeHtml(text.slice(index, end))}</span>`
-      index = end
+      const end = close === -1 ? length : close + 2
+      pushToken('tok-comment', index, end)
       continue
     }
 
-    if (current === '{' && text[index + 1] === '{') {
+    // {{变量}}
+    if (code === 123 && text.charCodeAt(index + 1) === 123) {
       const close = text.indexOf('}}', index + 2)
       if (close !== -1) {
-        out += `<span class="tok-var">${escapeHtml(text.slice(index, close + 2))}</span>`
-        index = close + 2
+        pushToken('tok-var', index, close + 2)
         continue
       }
     }
 
-    if (current === '-' || (current >= '0' && current <= '9')) {
-      const number = /^-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/.exec(text.slice(index))
-      if (number) {
-        out += `<span class="tok-number">${escapeHtml(number[0])}</span>`
-        index += number[0].length
+    // 数字（含小数与科学计数法）
+    if (code === 45 || (code >= 48 && code <= 57)) {
+      let end = index
+      if (text.charCodeAt(end) === 45) end += 1
+      const digitsStart = end
+      while (isDigit(text, end)) end += 1
+      if (end > digitsStart) {
+        if (text.charCodeAt(end) === 46 && isDigit(text, end + 1)) {
+          end += 1
+          while (isDigit(text, end)) end += 1
+        }
+        const exponent = text.charCodeAt(end)
+        if (exponent === 101 || exponent === 69) {
+          let expEnd = end + 1
+          const sign = text.charCodeAt(expEnd)
+          if (sign === 43 || sign === 45) expEnd += 1
+          const expDigits = expEnd
+          while (isDigit(text, expEnd)) expEnd += 1
+          if (expEnd > expDigits) end = expEnd
+        }
+        pushToken('tok-number', index, end)
         continue
       }
     }
 
-    if ('{}[],:'.includes(current)) {
-      out += `<span class="tok-punct">${escapeHtml(current)}</span>`
-      index += 1
+    // 标点
+    if (
+      code === 123 ||
+      code === 125 ||
+      code === 91 ||
+      code === 93 ||
+      code === 44 ||
+      code === 58
+    ) {
+      pushToken('tok-punct', index, index + 1)
       continue
     }
 
-    out += escapeHtml(current)
     index += 1
   }
-  return out
+
+  flushPlain(length)
+  return parts.join('')
 }
 
-function onScroll() {
+/* ---------- 滚动同步：滚动事件合并到一帧，避免高频写 DOM ---------- */
+let scrollRaf = 0
+
+function applyScroll() {
   const el = textareaRef.value
   if (!el) return
-  if (gutterRef.value) {
-    gutterRef.value.scrollTop = el.scrollTop
+  // 横向滚动条会压缩 textarea 的可视高度；着色层没有滚动条，必须补相同的底部空间，
+  // 否则滚到底部时着色层会被提前限制 scrollTop，出现“文字比光标高一行”的错位。
+  const hbar = Math.max(0, el.offsetHeight - el.clientHeight)
+  if (hbar !== scrollbarHeight.value) {
+    scrollbarHeight.value = hbar
+    // 补内边距要等下一次 DOM 更新生效，届时再对齐一次滚动位置
+    nextTick(applyScroll)
   }
   if (highlightRef.value) {
     highlightRef.value.scrollTop = el.scrollTop
     highlightRef.value.scrollLeft = el.scrollLeft
   }
+  gutterScrollTop.value = el.scrollTop
+  if (!gutterViewHeight.value && gutterRef.value) {
+    gutterViewHeight.value = Math.max(0, gutterRef.value.clientHeight - 20)
+  }
 }
 
-// 切换接口 / 格式化后内容整体变化时，重新对齐着色层
+function onScroll() {
+  if (scrollRaf) return
+  scrollRaf = requestAnimationFrame(() => {
+    scrollRaf = 0
+    applyScroll()
+  })
+}
+
+// 延迟着色完成、着色层重新挂载时，先把滚动位置对齐，避免大文件停在顶部错位
+watch(freshHighlight, (fresh) => {
+  if (fresh) nextTick(applyScroll)
+})
+
+// 切换接口 / 格式化后内容整体变化时，重新对齐着色层与行号
 watch(
   () => props.modelValue,
-  () => nextTick(onScroll),
+  () => {
+    refreshLineCount(false)
+    nextTick(applyScroll)
+  },
 )
 
 function onInput(e: Event) {
@@ -231,6 +460,35 @@ function toggleComment(el: HTMLTextAreaElement) {
   })
 }
 
+let resizeObserver: ResizeObserver | undefined
+
+onMounted(() => {
+  refreshHighlight(true)
+  refreshLineCount(true)
+  applyScroll()
+  if (gutterRef.value) {
+    gutterViewHeight.value = Math.max(0, gutterRef.value.clientHeight - 20)
+    if (typeof ResizeObserver !== 'undefined') {
+      resizeObserver = new ResizeObserver(() => {
+        if (gutterRef.value) {
+          gutterViewHeight.value = Math.max(0, gutterRef.value.clientHeight - 20)
+        }
+        // 尺寸变化可能让横向滚动条出现 / 消失，需要重新测量着色层补偿高度
+        applyScroll()
+      })
+      resizeObserver.observe(gutterRef.value)
+      if (textareaRef.value) resizeObserver.observe(textareaRef.value)
+    }
+  }
+})
+
+onBeforeUnmount(() => {
+  cancelHighlightTimer()
+  if (lineTimer) window.clearTimeout(lineTimer)
+  if (scrollRaf) cancelAnimationFrame(scrollRaf)
+  resizeObserver?.disconnect()
+})
+
 defineExpose({
   focus: () => textareaRef.value?.focus(),
 })
@@ -244,14 +502,34 @@ defineExpose({
       :style="{ width: `${gutterWidth}px` }"
       aria-hidden="true"
     >
-      <div v-for="n in lineNumbers" :key="n" class="gutter-line">{{ n }}</div>
+      <div class="gutter-inner" :style="gutterInnerStyle">
+        <template v-if="virtualGutter">
+          <div
+            v-for="n in visibleLineNumbers"
+            :key="n"
+            class="gutter-line gutter-line-abs"
+            :style="{ top: `${lineTop(n)}px` }"
+          >
+            {{ n }}
+          </div>
+        </template>
+        <template v-else>
+          <div v-for="n in lineNumbers" :key="n" class="gutter-line">{{ n }}</div>
+        </template>
+      </div>
     </div>
     <div class="editor-wrap">
-      <pre v-if="highlighted !== null" ref="highlightRef" class="highlight" aria-hidden="true"><code v-html="highlighted" /></pre>
+      <pre
+        v-if="freshHighlight"
+        ref="highlightRef"
+        class="highlight"
+        :style="highlightStyle"
+        aria-hidden="true"
+      ><code v-html="highlighted" /></pre>
       <textarea
         ref="textareaRef"
         class="editor"
-        :class="{ overlay: highlighted !== null && !composing }"
+        :class="{ overlay: freshHighlight && !composing }"
         :value="modelValue"
         :readonly="readonly"
         :placeholder="placeholder"
@@ -263,6 +541,13 @@ defineExpose({
         @compositionstart="composing = true"
         @compositionend="composing = false"
       />
+      <div v-if="showHighlightToggle" class="hl-hint">
+        <button v-if="highlightMode === 'defer'" class="hl-btn" @click="toggleHighlight">
+          关闭着色
+        </button>
+        <button v-else class="hl-btn" @click="toggleHighlight">开启着色</button>
+      </div>
+      <div v-else-if="showTooLargeNote" class="hl-hint hl-note">内容过大，已关闭着色</div>
     </div>
   </div>
 </template>
@@ -302,8 +587,18 @@ defineExpose({
   line-height: 20px;
 }
 
+.gutter-inner {
+  position: relative;
+}
+
 .gutter-line {
   padding: 0 8px 0 10px;
+}
+
+.gutter-line-abs {
+  position: absolute;
+  left: 0;
+  right: 0;
 }
 
 .editor-wrap {
@@ -394,6 +689,33 @@ defineExpose({
 .editor[readonly] {
   color: var(--fm-text-2);
   cursor: default;
+}
+
+.hl-hint {
+  position: absolute;
+  right: 10px;
+  bottom: 6px;
+  z-index: 2;
+  font-size: 11px;
+  color: var(--fm-muted);
+  background: color-mix(in srgb, var(--fm-code-bg) 88%, transparent);
+  border: 1px solid var(--fm-border);
+  border-radius: 999px;
+  padding: 1px 8px;
+  pointer-events: auto;
+}
+
+.hl-btn {
+  border: none;
+  background: transparent;
+  color: var(--fm-primary);
+  font-size: 11px;
+  cursor: pointer;
+  padding: 0;
+}
+
+.hl-note {
+  padding: 1px 8px;
 }
 
 @media (max-width: 640px) {

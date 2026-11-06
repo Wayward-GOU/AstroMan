@@ -12,6 +12,7 @@ import type {
   StressStage,
   WorkspaceStats,
 } from '@/types/models'
+import type { CaptureBody, CaptureFlowDetail, CaptureHeader } from '@/types/capture'
 import { qpsOverview } from './reportAnalytics'
 
 function clip(text: string, max = 8000): string {
@@ -283,6 +284,74 @@ SLA：${settings.slaEnabled ? `P95 ≤ ${settings.slaP95}ms，P99 ≤ ${settings
 3. 风险与止损策略（错误率、超时、下游依赖）；
 4. 观察指标与判定标准；
 5. 最后给出一段可直接使用的参数（JSON，字段名用 concurrent / durationSec / rampUpSec / thinkTimeMs / targetRps / stages / sla）。`
+}
+
+/* ---------------- 抓包流量 ---------------- */
+
+const SENSITIVE_HEADER = /^(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|api-key)$/i
+
+/** 抓包正文 / 头里常见的令牌先打码，再交给模型 */
+function maskSecrets(text: string): string {
+  return text
+    .replace(
+      /((?:Bearer|Basic)\s+)([A-Za-z0-9._~+/=-]{6,})/gi,
+      (_match, head: string, value: string) => `${head}${value.slice(0, 4)}******`,
+    )
+    .replace(
+      /("[^"]*(?:api[_-]?key|token|secret|password|authorization|cookie)[^"]*"\s*:\s*)"([^"]*)"/gi,
+      (_match, head: string) => `${head}"******"`,
+    )
+}
+
+function headerLines(headers: CaptureHeader[]): string {
+  if (!headers.length) return '（无）'
+  return headers
+    .map((item) => `${item.name}: ${SENSITIVE_HEADER.test(item.name) ? '******' : maskSecrets(item.value)}`)
+    .join('\n')
+}
+
+function captureBodyBlock(body: CaptureBody): string {
+  if (!body.size) return '（空）'
+  if (body.binary || body.text === null) {
+    return `（二进制内容 ${body.size} 字节，未包含正文）`
+  }
+  const text = clip(maskSecrets(body.text), 6000)
+  return body.truncated ? `${text}\n…（原始正文较大，仅捕获了前缀）` : text
+}
+
+export function captureFlowPrompt(detail: CaptureFlowDetail): string {
+  const url = `${detail.scheme}://${detail.host}${detail.path}`
+  return `请分析下面这条抓包流量。
+
+【基本信息】
+方法：${detail.method}
+URL：${url}
+状态码：${detail.status ?? '无响应 / 错误'}
+HTTP 版本：${detail.httpVersion || '未知'}
+耗时：${detail.durationMs} ms
+请求大小：${detail.requestSize} 字节，响应大小：${detail.responseSize} 字节
+开始时间：${new Date(detail.startedAt).toISOString()}
+客户端：${detail.clientAddr || '未知'}
+标记：本地映射 ${detail.mapped ? '是' : '否'}；远程映射 ${detail.remote || '否'}；断点改包 ${detail.modified ? '是' : '否'}
+错误：${detail.error || '无'}
+
+【请求头】
+${headerLines(detail.requestHeaders)}
+
+【请求体】（${detail.requestBody.contentType || '未知类型'}）
+${captureBodyBlock(detail.requestBody)}
+
+【响应头】
+${headerLines(detail.responseHeaders)}
+
+【响应体】（${detail.responseBody.contentType || '未知类型'}）
+${captureBodyBlock(detail.responseBody)}
+
+请输出：
+1. 结论：这条流量是否正常，状态码与耗时的含义；
+2. 请求 / 响应关键字段与业务含义（有 JSON 时按结构说明）；
+3. 可疑点：鉴权、签名、敏感信息、异常耗时、缓存或代理问题；
+4. 下一步建议（最多 3 条，需要复现时说明怎么构造请求）。`
 }
 
 /* ---------------- 环境变量 ---------------- */

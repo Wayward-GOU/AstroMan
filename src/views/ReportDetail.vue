@@ -170,6 +170,7 @@ function aiReview() {
   void aiAssist.show({
     title: '压测报告解读',
     prompt: reportReviewPrompt(detail.value),
+    source: 'report',
     hint: `${current.planName} · ${current.concurrency} 并发 · ${current.totalRequests} 次请求 · 错误率 ${((current.errorRate ?? 0) * 100).toFixed(2)}%`,
   })
 }

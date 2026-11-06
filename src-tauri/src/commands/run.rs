@@ -154,7 +154,9 @@ pub fn run_list(
                 request_id: row.get(1)?,
                 method: row.get(2)?,
                 url: row.get(3)?,
-                body_type: row.get::<_, Option<String>>(4)?.unwrap_or_else(|| "none".into()),
+                body_type: row
+                    .get::<_, Option<String>>(4)?
+                    .unwrap_or_else(|| "none".into()),
                 response_status: row.get(5)?,
                 response_status_text: row.get(6)?,
                 duration_ms: row.get(7)?,
@@ -189,32 +191,33 @@ pub fn run_get(state: State<'_, AppState>, id: i64) -> Result<RequestRun, String
              FROM request_runs WHERE id = ?1",
         )
         .map_err(err)?;
-    let mut rows = stmt.query_map(params![id], |row| {
-        Ok(RequestRun {
-            id: row.get(0)?,
-            request_id: row.get(1)?,
-            method: row.get(2)?,
-            url: row.get(3)?,
-            headers: parse_items(row.get::<_, Option<String>>(4)?),
-            params: parse_items(row.get::<_, Option<String>>(5)?),
-            body_type: row.get(6)?,
-            body: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
-            response_status: row.get(8)?,
-            response_status_text: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
-            response_headers: parse_headers(row.get::<_, Option<String>>(10)?),
-            response_body: row.get::<_, Option<String>>(11)?.unwrap_or_default(),
-            duration_ms: row.get(12)?,
-            size_bytes: row.get(13)?,
-            error: row.get(14)?,
-            origin: row.get(15).unwrap_or_default(),
-            created_at: row.get(16)?,
-            request_body_size: row.get(17)?,
-            response_body_size: row.get(18)?,
-            request_body_truncated: row.get(19)?,
-            response_body_truncated: row.get(20)?,
+    let mut rows = stmt
+        .query_map(params![id], |row| {
+            Ok(RequestRun {
+                id: row.get(0)?,
+                request_id: row.get(1)?,
+                method: row.get(2)?,
+                url: row.get(3)?,
+                headers: parse_items(row.get::<_, Option<String>>(4)?),
+                params: parse_items(row.get::<_, Option<String>>(5)?),
+                body_type: row.get(6)?,
+                body: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                response_status: row.get(8)?,
+                response_status_text: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+                response_headers: parse_headers(row.get::<_, Option<String>>(10)?),
+                response_body: row.get::<_, Option<String>>(11)?.unwrap_or_default(),
+                duration_ms: row.get(12)?,
+                size_bytes: row.get(13)?,
+                error: row.get(14)?,
+                origin: row.get(15).unwrap_or_default(),
+                created_at: row.get(16)?,
+                request_body_size: row.get(17)?,
+                response_body_size: row.get(18)?,
+                request_body_truncated: row.get(19)?,
+                response_body_truncated: row.get(20)?,
+            })
         })
-    })
-    .map_err(err)?;
+        .map_err(err)?;
 
     rows.next()
         .transpose()

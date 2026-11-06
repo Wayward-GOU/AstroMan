@@ -160,55 +160,81 @@ pub fn request_get(state: State<'_, AppState>, id: i64) -> Result<HttpRequestDet
     find_request(&conn, id)
 }
 
-#[tauri::command]
-pub fn request_save(
-    state: State<'_, AppState>,
-    request: HttpRequestDetail,
-) -> Result<HttpRequestDetail, String> {
+/// 保存前统一整理字段：名称兜底、列表序列化、凭据加密
+struct SaveFields {
+    name: String,
+    headers: String,
+    params: String,
+    auth: String,
+}
+
+fn save_fields(request: &HttpRequestDetail) -> Result<SaveFields, String> {
     let name = request.name.trim();
     let name = if name.is_empty() {
         "未命名请求"
     } else {
         name
     };
-    let headers = serde_json::to_string(&request.headers).map_err(err)?;
-    let query = serde_json::to_string(&request.params).map_err(err)?;
-    let auth =
-        crate::secret::encrypt_auth_json(&serde_json::to_string(&request.auth).map_err(err)?)?;
-    let now = now_ms();
+    Ok(SaveFields {
+        name: name.to_string(),
+        headers: serde_json::to_string(&request.headers).map_err(err)?,
+        params: serde_json::to_string(&request.params).map_err(err)?,
+        auth: crate::secret::encrypt_auth_json(
+            &serde_json::to_string(&request.auth).map_err(err)?,
+        )?,
+    })
+}
 
+fn update_existing(
+    conn: &Connection,
+    id: i64,
+    request: &HttpRequestDetail,
+    fields: &SaveFields,
+    now: i64,
+) -> Result<(), String> {
+    let affected = conn
+        .execute(
+            "UPDATE requests SET name = ?1, method = ?2, url = ?3, headers = ?4,
+                params = ?5, body_type = ?6, body = ?7, pre_script = ?8,
+                post_script = ?9, assertions = ?10, auth = ?11, body_meta = ?12,
+                updated_at = ?13
+             WHERE id = ?14",
+            params![
+                fields.name,
+                request.method,
+                request.url,
+                fields.headers,
+                fields.params,
+                request.body_type,
+                request.body,
+                request.pre_script,
+                request.post_script,
+                request.assertions,
+                fields.auth,
+                request.body_meta,
+                now,
+                id
+            ],
+        )
+        .map_err(err)?;
+    if affected == 0 {
+        return Err("请求不存在".to_string());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn request_save(
+    state: State<'_, AppState>,
+    request: HttpRequestDetail,
+) -> Result<HttpRequestDetail, String> {
+    let fields = save_fields(&request)?;
+    let now = now_ms();
     let conn = state.pool.get().map_err(err)?;
 
     match request.id {
         Some(id) => {
-            let affected = conn
-                .execute(
-                    "UPDATE requests SET name = ?1, method = ?2, url = ?3, headers = ?4,
-                        params = ?5, body_type = ?6, body = ?7, pre_script = ?8,
-                        post_script = ?9, assertions = ?10, auth = ?11, body_meta = ?12,
-                        updated_at = ?13
-                     WHERE id = ?14",
-                    params![
-                        name,
-                        request.method,
-                        request.url,
-                        headers,
-                        query,
-                        request.body_type,
-                        request.body,
-                        request.pre_script,
-                        request.post_script,
-                        request.assertions,
-                        auth,
-                        request.body_meta,
-                        now,
-                        id
-                    ],
-                )
-                .map_err(err)?;
-            if affected == 0 {
-                return Err("请求不存在".to_string());
-            }
+            update_existing(&conn, id, &request, &fields, now)?;
             find_request(&conn, id)
         }
         None => {
@@ -219,18 +245,18 @@ pub fn request_save(
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0, ?14, ?14)",
                 params![
                     request.collection_id,
-                    name,
+                    fields.name,
                     request.method,
                     request.url,
-                    headers,
-                    query,
+                    fields.headers,
+                    fields.params,
                     request.body_type,
                     request.body,
                     request.body_meta,
                     request.pre_script,
                     request.post_script,
                     request.assertions,
-                    auth,
+                    fields.auth,
                     now
                 ],
             )
@@ -238,6 +264,20 @@ pub fn request_save(
             find_request(&conn, conn.last_insert_rowid())
         }
     }
+}
+
+/// 自动保存专用：只写库，不把整份详情（含大 Body）再传回前端
+#[tauri::command]
+pub fn request_save_quick(
+    state: State<'_, AppState>,
+    request: HttpRequestDetail,
+) -> Result<(), String> {
+    let id = request
+        .id
+        .ok_or_else(|| "请求尚未保存，无法自动保存".to_string())?;
+    let fields = save_fields(&request)?;
+    let conn = state.pool.get().map_err(err)?;
+    update_existing(&conn, id, &request, &fields, now_ms())
 }
 
 #[tauri::command]

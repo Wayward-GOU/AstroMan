@@ -36,6 +36,7 @@ function aiAudit() {
   void aiAssist.show({
     title: '环境变量体检',
     prompt: envAuditPrompt(current.value, variables.value),
+    source: 'environment',
     hint: `${current.value.name} · ${variables.value.length} 个变量 · 密钥值不会发送明文`,
   })
 }

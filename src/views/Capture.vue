@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
+import { useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
 import { save as saveDialog } from '@tauri-apps/plugin-dialog'
 import {
@@ -13,11 +14,13 @@ import {
   DownloadOutlined,
   DeleteOutlined,
   FileZipOutlined,
+  FolderOutlined,
   GlobalOutlined,
   PlayCircleOutlined,
   PlusOutlined,
   ReloadOutlined,
   RightOutlined,
+  RobotOutlined,
   SafetyCertificateOutlined,
   SearchOutlined,
   SendOutlined,
@@ -36,21 +39,29 @@ import type {
   InterceptView,
   PendingBreakpoint,
 } from '@/types/capture'
+import { captureFlowPrompt } from '@/utils/aiScenarios'
+import { setHandoff } from '@/stores/handoff'
 import { formatDateTime } from '@/utils/datetime'
+import {
+  buildCaptureTree,
+  captureFlowLabel,
+  captureTreeKeys,
+  type CaptureHostTree,
+  type CaptureTreeNode,
+} from '@/utils/captureTree'
 import CaptureInterceptDrawer from '@/components/CaptureInterceptDrawer.vue'
 import CaptureBreakpointModal from '@/components/CaptureBreakpointModal.vue'
 
-interface HostGroup {
-  host: string
-  flows: CaptureFlow[]
-  firstId: number
-  errors: number
-  lastStatus: number | null
-}
+/** 树形列表的扁平化行：域名根 / 路径目录 / 请求叶子 */
+type TreeRow =
+  | { kind: 'host'; key: string; depth: number; group: CaptureHostTree }
+  | { kind: 'folder'; key: string; depth: number; node: CaptureTreeNode }
+  | { kind: 'flow'; key: string; depth: number; flow: CaptureFlow }
 
 interface GroupMenu {
   x: number
   y: number
+  key: string
   host: string
   ids: number[]
 }
@@ -115,7 +126,8 @@ const repeatSkipHeaders = new Set([
   'content-encoding',
 ])
 const exporting = ref(false)
-const collapsedHosts = ref<Set<string>>(new Set())
+/** 折叠的域名 / 目录节点键（h:域名、d:域名:/路径） */
+const collapsedNodes = ref<Set<string>>(new Set())
 const groupMenu = ref<GroupMenu | null>(null)
 const requestPretty = ref(true)
 const responsePretty = ref(true)
@@ -354,25 +366,32 @@ const visibleFlows = computed(() => {
   })
 })
 
-const groups = computed<HostGroup[]>(() => {
-  const map = new Map<string, HostGroup>()
-  for (const flow of visibleFlows.value) {
-    let group = map.get(flow.host)
-    if (!group) {
-      group = {
-        host: flow.host,
-        flows: [],
-        firstId: flow.id,
-        errors: 0,
-        lastStatus: null,
+/** 域名 → 路径分段树；过滤只改树的内容，不改抓包本身 */
+const hostTree = computed(() => buildCaptureTree(visibleFlows.value))
+
+/** 把树按当前折叠状态拍平成可渲染的行，避免递归组件与深层响应式开销 */
+const treeRows = computed<TreeRow[]>(() => {
+  const rows: TreeRow[] = []
+  const walk = (nodes: CaptureTreeNode[], depth: number) => {
+    for (const node of nodes) {
+      rows.push({ kind: 'folder', key: node.key, depth, node })
+      if (isCollapsed(node.key)) continue
+      walk(node.children, depth + 1)
+      for (const flow of node.flows) {
+        rows.push({ kind: 'flow', key: `f:${flow.id}`, depth: depth + 1, flow })
       }
-      map.set(flow.host, group)
     }
-    group.flows.push(flow)
-    if (flow.error || (flow.status ?? 0) >= 500) group.errors += 1
-    group.lastStatus = flow.status
   }
-  return [...map.values()].sort((a, b) => a.firstId - b.firstId)
+  for (const group of hostTree.value) {
+    rows.push({ kind: 'host', key: group.key, depth: 0, group })
+    if (isCollapsed(group.key)) continue
+    walk(group.children, 1)
+    // 根路径请求直接挂在域名下
+    for (const flow of group.flows) {
+      rows.push({ kind: 'flow', key: `f:${flow.id}`, depth: 1, flow })
+    }
+  }
+  return rows
 })
 
 const errorCount = computed(() => flows.value.filter((flow) => flow.error).length)
@@ -384,19 +403,34 @@ const responseCookies = computed(() =>
   detail.value ? cookieRows(detail.value.responseHeaders, 'response') : [],
 )
 
-function isCollapsed(host: string) {
+function isCollapsed(key: string) {
+  // 过滤时强制展开，确保命中的请求一眼可见
   if (filterActive.value) return false
-  return collapsedHosts.value.has(host)
+  return collapsedNodes.value.has(key)
 }
 
-function toggleHost(host: string) {
-  const next = new Set(collapsedHosts.value)
-  if (next.has(host)) next.delete(host)
-  else next.add(host)
-  collapsedHosts.value = next
+function toggleNode(key: string) {
+  const next = new Set(collapsedNodes.value)
+  if (next.has(key)) next.delete(key)
+  else next.add(key)
+  collapsedNodes.value = next
 }
 
-function openGroupMenu(event: MouseEvent, group: HostGroup) {
+/** 该域名下所有层级的请求 ID，供右键菜单导出 / 删除使用 */
+function flowIdsOf(group: CaptureHostTree): number[] {
+  const ids: number[] = []
+  const walk = (nodes: CaptureTreeNode[]) => {
+    for (const node of nodes) {
+      for (const flow of node.flows) ids.push(flow.id)
+      walk(node.children)
+    }
+  }
+  for (const flow of group.flows) ids.push(flow.id)
+  walk(group.children)
+  return ids
+}
+
+function openGroupMenu(event: MouseEvent, group: CaptureHostTree) {
   closeGroupMenu()
   // 菜单宽约 230、高约 190，贴边时向内收，避免被窗口裁掉
   const x = Math.max(8, Math.min(event.clientX, window.innerWidth - 238))
@@ -404,8 +438,10 @@ function openGroupMenu(event: MouseEvent, group: HostGroup) {
   groupMenu.value = {
     x,
     y,
+    key: group.key,
     host: group.host,
-    ids: group.flows.map((flow) => flow.id),
+    // 右键菜单的导出 / 删除要求该域名下所有层级的流量
+    ids: flowIdsOf(group),
   }
 }
 
@@ -414,11 +450,11 @@ function closeGroupMenu() {
 }
 
 function expandAll() {
-  collapsedHosts.value = new Set()
+  collapsedNodes.value = new Set()
 }
 
 function collapseAll() {
-  collapsedHosts.value = new Set(groups.value.map((group) => group.host))
+  collapsedNodes.value = new Set(captureTreeKeys(hostTree.value))
 }
 
 function methodClass(method: string) {
@@ -734,6 +770,20 @@ function onListScroll() {
   const element = flowList.value
   if (!element) return
   autoScroll.value = element.scrollHeight - element.scrollTop - element.clientHeight < 40
+}
+
+const router = useRouter()
+
+/** 5.5 页面现场交接：把当前流量摘要交给航仔，不自动发送 */
+function askHangzai() {
+  const flow = detail.value
+  if (!flow) return
+  setHandoff({
+    source: 'capture',
+    title: `${flow.method} ${flow.host}${flow.path}${flow.status ? ` · ${flow.status}` : ''}`,
+    prompt: captureFlowPrompt(flow),
+  })
+  router.push('/ai')
 }
 
 async function selectFlow(flow: CaptureFlow) {
@@ -1260,7 +1310,7 @@ watch(settingsOpen, (open) => {
           <div class="pane-title">
             <span>会话</span>
             <span class="count">{{ visibleFlows.length }}</span>
-            <span class="sub">{{ groups.length }} 个域名</span>
+            <span class="sub">{{ hostTree.length }} 个域名</span>
             <span v-if="errorCount" class="error-count">{{ errorCount }} 错误</span>
           </div>
           <div class="pane-tools">
@@ -1393,56 +1443,79 @@ watch(settingsOpen, (open) => {
         </div>
 
         <div v-else ref="flowList" class="tree" @scroll="onListScroll">
-          <div v-for="group in groups" :key="group.host" class="host-group">
+          <template v-for="row in treeRows" :key="row.key">
+            <div v-if="row.kind === 'host'" class="host-group">
+              <button
+                type="button"
+                class="host-row"
+                @click="toggleNode(row.group.key)"
+                @contextmenu.prevent="openGroupMenu($event, row.group)"
+              >
+                <RightOutlined v-if="isCollapsed(row.group.key)" class="caret" />
+                <DownOutlined v-else class="caret" />
+                <GlobalOutlined class="host-icon" />
+                <span class="host-name" :title="row.group.host">{{ row.group.host }}</span>
+                <span class="host-count">{{ row.group.count }}</span>
+                <span v-if="row.group.errors" class="host-errors">
+                  {{ row.group.errors }} 错误
+                </span>
+                <span class="host-last" :class="statusTone(row.group.lastStatus)">
+                  {{ row.group.lastStatus ?? 'ERR' }}
+                </span>
+              </button>
+            </div>
+
             <button
+              v-else-if="row.kind === 'folder'"
               type="button"
-              class="host-row"
-              @click="toggleHost(group.host)"
-              @contextmenu.prevent="openGroupMenu($event, group)"
+              class="folder-row"
+              :style="{ paddingLeft: `${10 + row.depth * 16}px` }"
+              :title="row.node.path"
+              @click="toggleNode(row.node.key)"
             >
-              <RightOutlined v-if="isCollapsed(group.host)" class="caret" />
+              <RightOutlined v-if="isCollapsed(row.node.key)" class="caret" />
               <DownOutlined v-else class="caret" />
-              <GlobalOutlined class="host-icon" />
-              <span class="host-name" :title="group.host">{{ group.host }}</span>
-              <span class="host-count">{{ group.flows.length }}</span>
-              <span v-if="group.errors" class="host-errors">{{ group.errors }} 错误</span>
-              <span class="host-last" :class="statusTone(group.lastStatus)">
-                {{ group.lastStatus ?? 'ERR' }}
-              </span>
+              <FolderOutlined class="folder-icon" />
+              <span class="folder-name">{{ row.node.name }}</span>
+              <span class="host-count">{{ row.node.count }}</span>
+              <span v-if="row.node.errors" class="host-errors">{{ row.node.errors }} 错误</span>
             </button>
 
-            <template v-if="!isCollapsed(group.host)">
-              <button
-                v-for="flow in group.flows"
-                :key="flow.id"
-                type="button"
-                class="flow-row"
-                :class="{ active: selectedId === flow.id, failed: !!flow.error }"
-                @click="selectFlow(flow)"
+            <button
+              v-else
+              type="button"
+              class="flow-row"
+              :class="{ active: selectedId === row.flow.id, failed: !!row.flow.error }"
+              :style="{ paddingLeft: `${24 + row.depth * 16}px` }"
+              @click="selectFlow(row.flow)"
+            >
+              <span class="method-tag flow-method" :class="methodClass(row.flow.method)">
+                {{ row.flow.method }}
+              </span>
+              <span
+                class="flow-path"
+                :title="`${row.flow.path}\n${row.flow.status ?? 'ERR'} · ${formatDuration(row.flow.durationMs)}`"
               >
-                <span class="method-tag flow-method" :class="methodClass(flow.method)">
-                  {{ flow.method }}
+                {{ captureFlowLabel(row.flow) }}
+              </span>
+              <span class="flow-state">
+                <span class="flow-status" :class="statusClass(row.flow)">
+                  {{ row.flow.status ?? 'ERR' }}
                 </span>
-                <span class="flow-path" :title="`${flow.path}\n${flow.status ?? 'ERR'} · ${formatDuration(flow.durationMs)}`">
-                  {{ flow.path }}
+                <span v-if="row.flow.mapped" class="flow-flag mapped" title="本地映射直接返回">本地</span>
+                <span
+                  v-if="row.flow.remote"
+                  class="flow-flag remote"
+                  :title="`远程映射到 ${row.flow.remote}`"
+                >远程</span>
+                <span v-if="row.flow.modified" class="flow-flag modified" title="断点修改过请求或响应">
+                  已改
                 </span>
-                <span class="flow-state">
-                  <span class="flow-status" :class="statusClass(flow)">
-                    {{ flow.status ?? 'ERR' }}
-                  </span>
-                  <span v-if="flow.mapped" class="flow-flag mapped" title="本地映射直接返回">本地</span>
-                  <span
-                    v-if="flow.remote"
-                    class="flow-flag remote"
-                    :title="`远程映射到 ${flow.remote}`"
-                  >远程</span>
-                  <span v-if="flow.modified" class="flow-flag modified" title="断点修改过请求或响应">已改</span>
-                </span>
-                <span class="flow-time">{{ formatDuration(flow.durationMs) }}</span>
-                <span class="flow-size">{{ formatBytes(flow.responseSize) }}</span>
-              </button>
-            </template>
-          </div>
+              </span>
+              <span class="flow-time">{{ formatDuration(row.flow.durationMs) }}</span>
+              <span class="flow-size">{{ formatBytes(row.flow.responseSize) }}</span>
+            </button>
+          </template>
         </div>
 
         <div class="pane-foot">
@@ -1471,6 +1544,10 @@ watch(settingsOpen, (open) => {
               <a-tag v-if="detail.remote" color="cyan" class="detail-flag">远程映射</a-tag>
               <a-tag v-if="detail.modified" color="orange" class="detail-flag">断点改包</a-tag>
               <div class="detail-actions">
+                <a-button size="small" @click="askHangzai">
+                  <RobotOutlined />
+                  问航仔
+                </a-button>
                 <a-button size="small" :loading="repeatBusy" @click="openRepeat">
                   <SendOutlined />
                   重发
@@ -1738,7 +1815,7 @@ watch(settingsOpen, (open) => {
       </span>
       <span>端口 {{ status.port || '—' }}</span>
       <span>请求 {{ status.flowCount }}</span>
-      <span>域名 {{ groups.length }}</span>
+      <span>域名 {{ hostTree.length }}</span>
       <span v-if="status.dropped">丢弃 {{ status.dropped }}</span>
       <span v-if="interceptView.breakpointsActive" :class="{ 'status-warn': pendingCount }">
         断点 {{ pendingCount ? `挂起 ${pendingCount}` : '已启用' }}
@@ -1969,10 +2046,10 @@ watch(settingsOpen, (open) => {
           复制域名
         </button>
         <div class="context-sep" />
-        <button type="button" @click="toggleHost(groupMenu.host)">
-          <RightOutlined v-if="isCollapsed(groupMenu.host)" />
+        <button type="button" @click="toggleNode(groupMenu.key)">
+          <RightOutlined v-if="isCollapsed(groupMenu.key)" />
           <DownOutlined v-else />
-          {{ isCollapsed(groupMenu.host) ? '展开该分组' : '折叠该分组' }}
+          {{ isCollapsed(groupMenu.key) ? '展开该分组' : '折叠该分组' }}
         </button>
       </div>
     </Teleport>
@@ -2470,6 +2547,41 @@ watch(settingsOpen, (open) => {
 
 .host-row:hover {
   background: var(--fm-sidebar-hover);
+}
+
+/* 域名下的路径目录：比域名行轻，比请求行略重，形成层级 */
+.folder-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  height: 25px;
+  padding: 0 9px;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  font-family: inherit;
+  font-size: 11px;
+  color: var(--fm-text-2);
+  cursor: pointer;
+}
+
+.folder-row:hover {
+  background: var(--fm-sidebar-hover);
+}
+
+.folder-icon {
+  flex: none;
+  font-size: 10.5px;
+  color: var(--fm-muted);
+}
+
+.folder-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 550;
 }
 
 .capture-context-menu {

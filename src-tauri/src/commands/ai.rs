@@ -80,6 +80,7 @@ fn row_to_provider(row: &Row) -> rusqlite::Result<AiProvider> {
         timeout_secs: Some(row.get::<_, i64>(8)?),
         is_default: row.get::<_, i64>(9)? != 0,
         supports_vision: row.get::<_, i64>(10)? != 0,
+        context_window: Some(row.get::<_, i64>(11)?),
     })
 }
 
@@ -101,13 +102,24 @@ fn row_to_provider_plain(row: &Row) -> rusqlite::Result<AiProvider> {
         timeout_secs: Some(row.get::<_, i64>(8)?),
         is_default: row.get::<_, i64>(9)? != 0,
         supports_vision: row.get::<_, i64>(10)? != 0,
+        context_window: Some(row.get::<_, i64>(11)?),
     })
 }
 
 const PROVIDER_COLUMNS: &str = "id, name, COALESCE(kind, 'openai'), base_url, model,
                                 COALESCE(api_key_enc, ''), COALESCE(temperature, 0.3),
                                 COALESCE(max_tokens, 0), COALESCE(timeout_secs, 300),
-                                COALESCE(is_default, 0), COALESCE(supports_vision, 0)";
+                                COALESCE(is_default, 0), COALESCE(supports_vision, 0),
+                                COALESCE(context_window, 0)";
+
+/// 后端注入的航仔系统提示词规模：前端预算据此扣除，不再靠猜
+#[tauri::command]
+pub fn ai_context_meta() -> serde_json::Value {
+    serde_json::json!({
+        "systemPromptChars": HANGZAI_SYSTEM_PROMPT.chars().count(),
+        "defaultMaxTokens": 4096,
+    })
+}
 
 #[tauri::command]
 pub fn ai_provider_list(state: State<'_, AppState>) -> Result<Vec<AiProvider>, String> {
@@ -149,6 +161,8 @@ pub fn ai_provider_save(
         0 => AI_TIMEOUT_SECS as i64,
         value => value.clamp(10, 3600),
     };
+    // 0 = 继续按模型名自动识别；上限只防误填，正常模型远小于 1000 万
+    let context_window = provider.context_window.unwrap_or(0).clamp(0, 10_000_000);
     let key_enc = encrypt_key(&provider.api_key)?;
 
     if provider.is_default {
@@ -165,8 +179,8 @@ pub fn ai_provider_save(
                      SET name = ?1, kind = ?2, base_url = ?3, model = ?4,
                          temperature = ?5, is_default = ?6, max_tokens = ?7,
                          timeout_secs = ?8, enabled = 1, updated_at = ?9,
-                         supports_vision = ?10
-                     WHERE id = ?11",
+                         supports_vision = ?10, context_window = ?11
+                     WHERE id = ?12",
                     params![
                         provider.name.trim(),
                         kind,
@@ -178,6 +192,7 @@ pub fn ai_provider_save(
                         timeout_secs,
                         now,
                         provider.supports_vision as i64,
+                        context_window,
                         id
                     ],
                 )
@@ -188,8 +203,8 @@ pub fn ai_provider_save(
                      SET name = ?1, kind = ?2, base_url = ?3, model = ?4, api_key_enc = ?5,
                          temperature = ?6, is_default = ?7, max_tokens = ?8,
                          timeout_secs = ?9, enabled = 1, updated_at = ?10,
-                         supports_vision = ?11
-                     WHERE id = ?12",
+                         supports_vision = ?11, context_window = ?12
+                     WHERE id = ?13",
                     params![
                         provider.name.trim(),
                         kind,
@@ -202,6 +217,7 @@ pub fn ai_provider_save(
                         timeout_secs,
                         now,
                         provider.supports_vision as i64,
+                        context_window,
                         id
                     ],
                 )
@@ -213,8 +229,9 @@ pub fn ai_provider_save(
             conn.execute(
                 "INSERT INTO ai_providers
                    (name, kind, base_url, model, api_key_enc, temperature, max_tokens,
-                    timeout_secs, is_default, enabled, supports_vision, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?11)",
+                    timeout_secs, is_default, enabled, supports_vision, context_window,
+                    created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?12, ?12)",
                 params![
                     provider.name.trim(),
                     kind,
@@ -226,6 +243,7 @@ pub fn ai_provider_save(
                     timeout_secs,
                     provider.is_default as i64,
                     provider.supports_vision as i64,
+                    context_window,
                     now
                 ],
             )
@@ -261,6 +279,7 @@ pub fn ai_provider_save(
         timeout_secs: Some(timeout_secs),
         is_default: provider.is_default,
         supports_vision: provider.supports_vision,
+        context_window: Some(context_window),
     })
 }
 
@@ -297,12 +316,48 @@ pub(crate) fn default_base(kind: &str) -> &'static str {
     }
 }
 
+/// 已知上下文窗口时，按提示词真实占用收紧输出上限：
+/// 宁可少生成，也不要服务端因为 input + max_tokens 超窗直接 400。
+fn clamp_output_tokens(
+    provider: &AiProvider,
+    messages: &[AiMessage],
+    desired: i64,
+) -> Result<i64, String> {
+    let window = provider.context_window.unwrap_or(0);
+    if window <= 0 {
+        return Ok(desired.max(1));
+    }
+    let prompt: i64 = messages
+        .iter()
+        .map(|message| estimate_tokens(&message.content))
+        .sum();
+    // 消息边界 / 角色开销的保守余量
+    let room = window - prompt - 64;
+    if room < 256 {
+        return Err(format!(
+            "提示词约 {prompt} token，已接近或超过模型窗口 {window}；请减少历史、调小附件或更换模型"
+        ));
+    }
+    Ok(desired.max(1).min(room))
+}
+
 fn prepare(
     provider: &AiProvider,
     messages: &[AiMessage],
     temperature: f64,
     stream: bool,
 ) -> Result<Prepared, String> {
+    let configured_max = provider.max_tokens.filter(|value| *value > 0);
+    // 只有用户配置了输出上限或上下文窗口时才主动收紧；否则维持各协议原有默认行为
+    let output_tokens = if configured_max.is_some() || provider.context_window.unwrap_or(0) > 0 {
+        Some(clamp_output_tokens(
+            provider,
+            messages,
+            configured_max.unwrap_or(4096),
+        )?)
+    } else {
+        None
+    };
     let base = if provider.base_url.trim().is_empty() {
         default_base(&provider.kind).to_string()
     } else {
@@ -329,7 +384,7 @@ fn prepare(
                 .collect();
             let mut body = serde_json::json!({
                 "model": provider.model,
-                "max_tokens": provider.max_tokens.filter(|value| *value > 0).unwrap_or(4096),
+                "max_tokens": output_tokens.unwrap_or(4096),
                 "temperature": temperature,
                 "stream": stream,
                 "messages": chat,
@@ -366,7 +421,7 @@ fn prepare(
                 "contents": contents,
                 "generationConfig": { "temperature": temperature },
             });
-            if let Some(max) = provider.max_tokens.filter(|value| *value > 0) {
+            if let Some(max) = output_tokens {
                 body["generationConfig"]["maxOutputTokens"] = serde_json::json!(max);
             }
             if !system.is_empty() {
@@ -408,7 +463,7 @@ fn prepare(
                 "messages": chat,
             });
             // 不配置时不传，交给服务商默认值，避免部分网关拒绝未知字段
-            if let Some(max) = provider.max_tokens.filter(|value| *value > 0) {
+            if let Some(max) = output_tokens {
                 body["max_tokens"] = serde_json::json!(max);
             }
             Ok(Prepared {
@@ -778,6 +833,8 @@ pub(crate) fn record_usage(
     error: Option<&str>,
     request_preview: &str,
 ) {
+    // 请求预览是用户真实输入，可能在 Header / Body 里带密钥；落库前统一脱敏
+    let request_preview = mask_sensitive(request_preview);
     let Ok(conn) = state.pool.get() else {
         return;
     };
@@ -802,6 +859,69 @@ pub(crate) fn record_usage(
             now_ms(),
         ],
     );
+}
+
+/// 与前端 `maskSensitive` 同口径：保留首 4 / 尾 2，其余打码
+fn mask_value(value: &str) -> String {
+    if value.is_empty() {
+        return String::new();
+    }
+    let count = value.chars().count();
+    if count <= 6 {
+        return "******".to_string();
+    }
+    let head: String = value.chars().take(4).collect();
+    let tail: String = value.chars().skip(count - 2).collect();
+    format!("{head}******{tail}")
+}
+
+/// 用量流水里的请求预览，落库前统一脱敏（Header / JSON 字段 / key=value）
+fn mask_sensitive(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    let bearer =
+        regex::Regex::new(r"(?i)((?:Bearer|Basic)\s+)([A-Za-z0-9._~+/=-]{6,})").expect("bearer");
+    let mut out = bearer
+        .replace_all(text, |caps: &regex::Captures| {
+            if caps[2].contains("******") {
+                caps[0].to_string()
+            } else {
+                format!("{}{}", &caps[1], mask_value(&caps[2]))
+            }
+        })
+        .into_owned();
+
+    let json = regex::Regex::new(
+        r#"(?i)("[^"]*(?:api[_-]?key|token|secret|password|authorization|cookie|private[_-]?key)[^"]*"\s*:\s*)"([^"]*)""#,
+    )
+    .expect("json");
+    out = json
+        .replace_all(&out, |caps: &regex::Captures| {
+            if caps[2].contains("******") {
+                caps[0].to_string()
+            } else {
+                format!("{}\"{}\"", &caps[1], mask_value(&caps[2]))
+            }
+        })
+        .into_owned();
+
+    let kv = regex::Regex::new(
+        r#"(?i)((?:api[_-]?key|token|secret|password|appsecret|clientsecret|authorization|cookie)\s*[:=]\s*)([^\s,;}\]"'&]+)"#,
+    )
+    .expect("kv");
+    kv.replace_all(&out, |caps: &regex::Captures| {
+        let value = &caps[2];
+        if value.contains("******")
+            || value.eq_ignore_ascii_case("bearer")
+            || value.eq_ignore_ascii_case("basic")
+        {
+            caps[0].to_string()
+        } else {
+            format!("{}{}", &caps[1], mask_value(value))
+        }
+    })
+    .into_owned()
 }
 
 fn clip_chars(text: &str, limit: usize) -> String {
@@ -833,6 +953,24 @@ fn request_preview(messages: &[AiMessage]) -> String {
         clip_chars(first_text, 400),
         clip_chars(last_text, 1500)
     )
+}
+
+/// 按场景准备消息：只有 agent（缺省）注入全局 Agent 提示词；
+/// analysis / summary 只使用前端自带的场景提示词。
+fn apply_scene_prompt(scene: &str, mut messages: Vec<AiMessage>) -> Vec<AiMessage> {
+    if scene.is_empty() || scene == "agent" {
+        messages.retain(|message| {
+            message.role != "system" || message.content.trim() != HANGZAI_SYSTEM_PROMPT.trim()
+        });
+        messages.insert(
+            0,
+            AiMessage {
+                role: "system".to_string(),
+                content: HANGZAI_SYSTEM_PROMPT.to_string(),
+            },
+        );
+    }
+    messages
 }
 
 /// 请求结束时释放取消登记（无论成功 / 失败 / 被停止）
@@ -873,7 +1011,11 @@ pub async fn ai_chat(
     if payload.messages.is_empty() {
         return Err("消息不能为空".to_string());
     }
-    let provider = load_provider(state.inner(), payload.provider_id)?;
+    let mut provider = load_provider(state.inner(), payload.provider_id)?;
+    // 前端已按模型名识别出窗口（或用户显式覆盖）：优先用它收紧本次输出上限
+    if let Some(window) = payload.context_window.filter(|value| *value > 0) {
+        provider.context_window = Some(window);
+    }
     let temperature = payload
         .temperature
         .or(provider.temperature)
@@ -898,19 +1040,10 @@ pub async fn ai_chat(
         id: request_id.as_deref(),
     };
 
-    // 航仔 的系统提示词由后端统一注入（编译期嵌入），客户端无法覆盖或移除；
-    // 前端追加的 system 消息只承载工具协议，排在其后。
-    let mut messages = payload.messages.clone();
-    messages.retain(|message| {
-        message.role != "system" || message.content.trim() != HANGZAI_SYSTEM_PROMPT.trim()
-    });
-    messages.insert(
-        0,
-        AiMessage {
-            role: "system".to_string(),
-            content: HANGZAI_SYSTEM_PROMPT.to_string(),
-        },
-    );
+    // 只有航仔主对话（agent）才注入全局 Agent 提示词；摘要 / 页面分析各用各的提示词，
+    // 避免白付约 3.8k token，也避免它们被“可以调用工具”的规则干扰。
+    let scene = payload.scene.as_deref().unwrap_or("agent");
+    let messages = apply_scene_prompt(scene, payload.messages.clone());
     // 本次调用实际「问了什么」，随用量流水一起落库
     let preview = request_preview(&messages);
 
@@ -2234,5 +2367,87 @@ mod tests {
         headers.insert(reqwest::header::RETRY_AFTER, "3".parse().unwrap());
         assert_eq!(retry_after_secs(&headers), Some(3));
         assert_eq!(retry_after_secs(&reqwest::header::HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn scene_agent_injects_system_prompt_once() {
+        let messages = vec![
+            AiMessage {
+                role: "system".into(),
+                content: HANGZAI_SYSTEM_PROMPT.into(),
+            },
+            AiMessage {
+                role: "system".into(),
+                content: "工具协议".into(),
+            },
+            AiMessage {
+                role: "user".into(),
+                content: "你好".into(),
+            },
+        ];
+        let out = apply_scene_prompt("agent", messages);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].role, "system");
+        assert_eq!(out[0].content, HANGZAI_SYSTEM_PROMPT);
+        assert_eq!(out[1].content, "工具协议");
+        assert_eq!(out[2].content, "你好");
+    }
+
+    #[test]
+    fn scene_agent_skips_blank_system_prompt() {
+        let out = apply_scene_prompt(
+            "agent",
+            vec![AiMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].content, HANGZAI_SYSTEM_PROMPT);
+    }
+
+    #[test]
+    fn scene_analysis_and_summary_skip_agent_prompt() {
+        for scene in ["analysis", "summary"] {
+            let out = apply_scene_prompt(
+                scene,
+                vec![AiMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+            );
+            assert_eq!(out.len(), 1, "scene={scene}");
+            assert_eq!(out[0].content, "hi");
+        }
+    }
+
+    #[test]
+    fn scene_missing_defaults_to_agent() {
+        let out = apply_scene_prompt("", vec![]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].content, HANGZAI_SYSTEM_PROMPT);
+    }
+
+    #[test]
+    fn mask_sensitive_covers_header_and_json_secrets() {
+        let header = mask_sensitive("Authorization: Bearer abcdef123456");
+        assert!(!header.contains("abcdef123456"), "{header}");
+        assert!(header.contains("******"), "{header}");
+
+        let json = mask_sensitive(r#"{"api_key":"sk-1234567890abcdef","name":"demo"}"#);
+        assert!(!json.contains("1234567890abcdef"), "{json}");
+        assert!(json.contains(r#""name":"demo""#), "{json}");
+
+        let query = mask_sensitive("https://a.com/cb?token=abcdef123456&x=1");
+        assert!(!query.contains("abcdef123456"), "{query}");
+        assert!(query.contains("x=1"), "{query}");
+    }
+
+    #[test]
+    fn mask_sensitive_is_idempotent_and_keeps_plain_text() {
+        let once = mask_sensitive("token=abcdef123456");
+        assert_eq!(mask_sensitive(&once), once);
+        assert_eq!(mask_sensitive("普通文本，没有密钥"), "普通文本，没有密钥");
+        assert_eq!(mask_sensitive(""), "");
     }
 }

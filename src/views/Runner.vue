@@ -220,6 +220,7 @@ function aiAnalyzeResults() {
   void aiAssist.show({
     title: '批量执行结果分析',
     prompt: runnerAnalyzePrompt({ ...summary.value }, results.value),
+    source: 'test-run',
     hint: `共 ${summary.value.total} 次执行，失败 ${summary.value.failed} 次，断言失败 ${summary.value.assertionFailed} 条`,
   })
 }

@@ -138,6 +138,7 @@ function aiPlan() {
   void aiAssist.show({
     title: '压测计划建议',
     prompt: stressPlanPrompt(request.value, settings, stages.value),
+    source: 'request',
     hint: `${request.value.method} ${request.value.url} · 当前 ${settings.concurrent} 并发 × ${settings.durationSec}s`,
   })
 }

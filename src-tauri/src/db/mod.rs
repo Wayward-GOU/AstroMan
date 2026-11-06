@@ -10,7 +10,9 @@ mod seed;
 /// 4 = 请求级凭据字段加密（无新列）+ 补齐 schema.sql 缺失的 requests.net_json
 /// 5 = 记事本（notes.done_at / deleted_at / deleted_from_status、note_files、ai_providers.supports_vision）
 /// 6 = 记事本类型（notes.kind：todo / note / idea / reference）
-pub const DB_VERSION: i64 = 6;
+/// 7 = 运行记录瘦身（请求 / 响应体积与截断标记）
+/// 8 = 模型上下文窗口覆盖（ai_providers.context_window）
+pub const DB_VERSION: i64 = 8;
 
 /// 打开库时发现库版本高于本程序：说明用户降级了应用。
 /// 直接返回错误而不是继续写，避免旧代码用旧结构写坏新数据。
@@ -132,6 +134,27 @@ const COLUMN_MIGRATIONS: &[(&str, &str, &str)] = &[
         "TEXT NOT NULL DEFAULT 'manual'",
     ),
     ("request_runs", "origin", "TEXT NOT NULL DEFAULT 'manual'"),
+    // v1.1.0：运行记录列表只返回摘要，体积与截断标记用于详情提示
+    (
+        "request_runs",
+        "request_body_size",
+        "INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "request_runs",
+        "response_body_size",
+        "INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "request_runs",
+        "request_body_truncated",
+        "INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "request_runs",
+        "response_body_truncated",
+        "INTEGER NOT NULL DEFAULT 0",
+    ),
     // v1.0.8：耗时分解、响应体类型、按请求网络配置
     ("request_history", "timings_json", "TEXT"),
     ("request_history", "body_kind", "TEXT"),
@@ -146,6 +169,12 @@ const COLUMN_MIGRATIONS: &[(&str, &str, &str)] = &[
     (
         "ai_providers",
         "supports_vision",
+        "INTEGER NOT NULL DEFAULT 0",
+    ),
+    // v1.1.1：用户显式覆盖模型上下文窗口，0 = 自动识别
+    (
+        "ai_providers",
+        "context_window",
         "INTEGER NOT NULL DEFAULT 0",
     ),
 ];
@@ -359,6 +388,17 @@ mod tests {
 
         assert!(has_column(&pool, "request_history", "origin"));
         assert!(has_column(&pool, "request_runs", "origin"));
+        for column in [
+            "request_body_size",
+            "response_body_size",
+            "request_body_truncated",
+            "response_body_truncated",
+        ] {
+            assert!(
+                has_column(&pool, "request_runs", column),
+                "运行记录缺少列 {column}"
+            );
+        }
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();

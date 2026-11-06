@@ -82,6 +82,7 @@ function aiAnalyze() {
   void aiAssist.show({
     title: '历史记录分析',
     prompt: historyDiagnosePrompt(rows.value, stats.value),
+    source: 'history',
     hint: `当前筛选结果 ${rows.value.length} 条，失败 ${summary.value.failed} 条，平均耗时 ${summary.value.avg.toFixed(0)}ms`,
   })
 }

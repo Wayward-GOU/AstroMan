@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest'
 import { buildContext, clipToTokens, estimateTokens } from '@/utils/contextBudget'
-import { DEFAULT_CONTEXT_WINDOW, contextBudgetOf, contextWindowOf } from '@/utils/modelMeta'
+import {
+  DEFAULT_CONTEXT_WINDOW,
+  contextBudgetOf,
+  contextWindowOf,
+  effectiveWindow,
+  inputBudgetOf,
+  outputReserveOf,
+} from '@/utils/modelMeta'
 import type { AiMessage } from '@/types/models'
 
 const msg = (role: AiMessage['role'], content: string): AiMessage => ({ role, content })
@@ -28,6 +35,27 @@ describe('contextWindowOf', () => {
 
   it('预算为窗口的 60%', () => {
     expect(contextBudgetOf('gpt-4o')).toBe(76_800)
+  })
+})
+
+describe('effectiveWindow', () => {
+  it('用户显式配置优先，0 / 空回退模型名识别', () => {
+    expect(effectiveWindow('gpt-4o', 8_000)).toBe(8_000)
+    expect(effectiveWindow('gpt-4o', 0)).toBe(128_000)
+    expect(effectiveWindow('gpt-4o')).toBe(128_000)
+  })
+})
+
+describe('outputReserveOf / inputBudgetOf', () => {
+  it('输出预留跟随 maxTokens，但不吞掉一半以上窗口', () => {
+    expect(outputReserveOf(128_000, 8_192)).toBe(8_192)
+    expect(outputReserveOf(8_000, 8_192)).toBe(4_000)
+    expect(outputReserveOf(128_000)).toBe(4_096)
+  })
+
+  it('输入预算 = 窗口 - 输出预留，最低保留 1500', () => {
+    expect(inputBudgetOf(128_000, 8_192)).toBe(119_808)
+    expect(inputBudgetOf(2_000, 4_096)).toBe(1_500)
   })
 })
 

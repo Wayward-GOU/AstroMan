@@ -10,6 +10,7 @@ import {
 } from '@ant-design/icons-vue'
 import AstroBuddyIcon from '@/components/AstroBuddyIcon.vue'
 import { useAiAssistStore } from '@/stores/aiAssist'
+import { setHandoff } from '@/stores/handoff'
 import { renderMarkdown } from '@/utils/markdown'
 
 const store = useAiAssistStore()
@@ -79,7 +80,12 @@ async function copyLast() {
   }
 }
 
+/** 把抽屉里已经准备好的页面快照原样交给航仔，不再让用户重新抓一次 */
 function goChat() {
+  const prompt = store.contextText.trim()
+  if (prompt) {
+    setHandoff({ source: store.source, title: store.title, prompt })
+  }
   store.close()
   router.push('/ai')
 }
@@ -207,7 +213,7 @@ function goChat() {
           <template #icon><CopyOutlined /></template>
           复制回答
         </a-button>
-        <a-button size="small" type="text" @click="goChat">在航仔 中继续</a-button>
+        <a-button size="small" type="text" @click="goChat">带着现场去航仔</a-button>
         <span class="flex-spacer" />
         <a-button
           type="primary"

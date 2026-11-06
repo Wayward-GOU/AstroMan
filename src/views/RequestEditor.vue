@@ -4132,6 +4132,28 @@ const responseHeaders = computed(() => {
   gap: 10px;
   background: var(--fm-surface-alt);
   border-bottom: 1px solid var(--fm-border);
+  overflow: hidden;
+}
+
+/* 指标与操作按钮必须保持单行；空间不够时只压缩来源标签 */
+.res-head > * {
+  flex-shrink: 0;
+}
+
+.res-head > .proto-pill.run-source {
+  flex-shrink: 1;
+  min-width: 0;
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.res-head .status-pill,
+.res-head .meta,
+.res-head .assert-pill,
+.res-head .proto-pill {
+  white-space: nowrap;
 }
 
 .status-pill {

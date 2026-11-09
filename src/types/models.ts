@@ -74,6 +74,8 @@ export interface HttpRequestDetail {
   collectionId: number
   name: string
   method: string
+  /** 请求类型：http | graphql | sse | websocket（与发送时的 HTTP 版本无关） */
+  protocol?: string
   url: string
   headers: KeyValueItem[]
   params: KeyValueItem[]
@@ -85,6 +87,84 @@ export interface HttpRequestDetail {
   postScript: string
   assertions: string
   auth?: RequestAuth
+  /** 请求实体（字段树 JSON，仅本接口使用）；不传表示保存时保持原值 */
+  requestEntity?: string | null
+  /** 返回实体（字段树 JSON，仅本接口使用）；不传表示保存时保持原值 */
+  responseEntity?: string | null
+}
+
+/** 实时调试会话状态（G-09） */
+export interface RealtimeStatus {
+  sessionId: string
+  protocol: string
+  /** connecting | open | closed | error */
+  state: string
+  url: string
+  messageCount: number
+  bytes: number
+  lastEventId?: string | null
+  error?: string | null
+  closeReason?: string | null
+}
+
+export interface RealtimeConnectPayload {
+  sessionId?: string | null
+  protocol: 'sse' | 'websocket'
+  url: string
+  headers?: KeyValueItem[]
+  envId?: number | null
+  autoReconnect?: boolean
+  pingIntervalMs?: number
+}
+
+/** 实时事件流（Tauri 事件 `realtime:event` 的 payload） */
+export interface RealtimeEvent {
+  sessionId: string
+  protocol: string
+  /** message | reconnect | notice | connecting | open | closed | error | sent */
+  type: string
+  event?: string | null
+  id?: string | null
+  retry?: number | null
+  data?: unknown
+  messageType?: string
+  message?: string
+  attempt?: number
+  reason?: string
+  error?: string | null
+  closeReason?: string | null
+  ts: number
+}
+
+export interface RealtimeSendPayload {
+  sessionId: string
+  data: string
+  kind?: 'text' | 'binary'
+}
+
+/** GraphQL Schema 缓存（G-10） */
+export interface GraphqlSchemaEntry {
+  id: number
+  projectId: number
+  endpoint: string
+  schemaJson: string
+  fetchedAt: number
+}
+
+export interface GraphqlSchemaMeta {
+  id: number
+  projectId: number
+  endpoint: string
+  fetchedAt: number
+  bytes: number
+}
+
+export interface GraphqlIntrospectPayload {
+  projectId: number
+  endpoint: string
+  headers?: KeyValueItem[]
+  envId?: number | null
+  timeoutMs?: number
 }
 
 /** multipart/form-data 的表单字段 */
@@ -117,6 +197,74 @@ export interface AppSettings {
   pythonPath?: string
   /** 是否允许执行本地 Python 脚本（测试场景的钩子与 Python 用例） */
   pythonEnabled?: boolean
+  /** 性能模式：auto / low / standard（P-05） */
+  performanceMode?: string
+  /** AI 权限模式：readonly / confirm_write / trusted（AI-01） */
+  aiPermissionMode?: string
+  /** 摘要专用 provider id；0 表示沿用主 provider（AI-07） */
+  summaryProviderId?: number
+  /** 月度预算（美元）；0 表示不限制（AI-06） */
+  monthlyBudget?: number
+  /** 预算达到 80% 时提醒 */
+  budgetAlert?: boolean
+  /** 预算用尽后硬停止（默认只提醒） */
+  budgetHardStop?: boolean
+  /** 失败回退链：逗号分隔的 provider id；空 = 关闭（AI-12） */
+  aiFallbackIds?: string
+}
+
+/** 企业策略（policy.json / W4-2） */
+export interface EnterprisePolicy {
+  disableAi: boolean
+  /** 只允许本地 AI 模型，拒绝非回环地址（AI-13） */
+  disableCloudAi: boolean
+  disableLanServices: boolean
+  disableTelemetry: boolean
+  forceEncryptBackup: boolean
+  /** 允许的导入格式；空数组表示不限制 */
+  allowedImportFormats: string[]
+  /** 请求历史保留天数；0 表示只按条数上限 */
+  retentionDays: number
+}
+
+/** policy_get / policy_reload 的返回 */
+export interface PolicySnapshot {
+  policy: EnterprisePolicy
+  path: string
+  /** 文件格式错误时的提示；正常为 null */
+  error: string | null
+}
+
+/** 审计日志（P-07）：只追加，默认保留 90 天 */
+export interface AuditLog {
+  id: number
+  createdAt: number
+  /** docs_export / ca_install / ai_write_confirm ... */
+  action: string
+  target?: string | null
+  /** ok / failed / denied */
+  result: string
+  detail?: unknown
+  traceId?: string | null
+  actor: string
+}
+
+/** 抓包与响应体预算（P-05） */
+export interface CaptureLimits {
+  maxFlows: number
+  maxBodyBytes: number
+  maxResponseBytes: number
+  /** 低内存档：前端据此关闭图片预览、减少自动格式化 */
+  lowMemory: boolean
+}
+
+/** 当前运行档位（performance_profile） */
+export interface PerformanceProfile {
+  requested: string
+  tier: 'low' | 'standard' | 'high'
+  limits: CaptureLimits
+  totalMemoryBytes: number | null
+  description: string
 }
 
 /** Python 解释器探测结果（python_check） */
@@ -266,6 +414,8 @@ export interface Environment {
   isActive: boolean
   /** 环境脚本：每次发送请求前执行，可用 vars.set() 生成运行时变量 */
   script: string
+  /** 生产环境：AI 无论哪种权限模式都强制确认（AI-01） */
+  isProd?: boolean
   variables: EnvVariable[]
 }
 
@@ -316,6 +466,10 @@ export interface AppInfo {
   version: string
   dataDir: string
   dbPath: string
+  /** WebView2 / WebKit 版本 */
+  webviewVersion?: string | null
+  /** 数据目录风险提示 */
+  dataDirRisks?: string[]
 }
 
 export interface WorkspaceStats {
@@ -413,6 +567,13 @@ export interface AiProvider {
   isDefault?: boolean
   /** 上下文窗口覆盖（token）；0 / 空 = 按模型名自动识别 */
   contextWindow?: number | null
+  /** 原生 function calling：-1 自动 / 0 关闭 / 1 开启（AI-04） */
+  nativeTools?: number | null
+  /** 输入单价覆盖（每百万 token）；0 = 使用内置价格表（AI-06） */
+  inputPrice?: number | null
+  outputPrice?: number | null
+  /** 计价币种：USD / CNY */
+  currency?: string | null
 }
 
 /** 后端注入的航仔提示词元信息：前端预算据此扣减，避免猜错 */
@@ -421,9 +582,28 @@ export interface AiContextMeta {
   defaultMaxTokens: number
 }
 
+export interface AiToolCall {
+  id: string
+  name: string
+  /** JSON 文本，与 OpenAI arguments 一致 */
+  arguments: string
+}
+
+export interface AiToolDef {
+  name: string
+  description: string
+  parameters: Record<string, unknown>
+}
+
 export interface AiMessage {
-  role: 'system' | 'user' | 'assistant'
+  role: 'system' | 'user' | 'assistant' | 'tool'
   content: string
+  /** 原生 function calling：assistant 消息携带的工具调用（AI-04） */
+  toolCalls?: AiToolCall[]
+  /** 工具结果消息对应的调用 id */
+  toolCallId?: string
+  /** 工具结果消息对应的工具名（Anthropic / Gemini 需要） */
+  name?: string
 }
 
 export interface AiChatPayload {
@@ -439,11 +619,27 @@ export interface AiChatPayload {
   scene?: 'agent' | 'analysis' | 'summary' | (string & {})
   /** 本次请求的上下文窗口（token），后端据此收紧输出上限 */
   contextWindow?: number | null
+  /** 当前轮图片：最多 3 张，只随本次请求发送（AI-03） */
+  images?: Array<{ mime: string; data: string }>
+  /** 原生 function calling 工具定义；为空时走文本 fbin-tool 协议（AI-04） */
+  tools?: AiToolDef[]
 }
 
-/** 流式事件：delta 增量文本 / reasoning 思考 / retry 重试提示 / done 结束 / cancelled 已停止 / error 错误 */
+/**
+ * 流式事件：delta 增量文本 / reasoning 思考 / retry 重试提示 / fallback 已切换备用模型 /
+ * tool_call 原生工具调用 / done 结束 / cancelled 已停止 / error 错误
+ */
 export interface AiStreamEvent {
-  kind: 'delta' | 'reasoning' | 'retry' | 'done' | 'cancelled' | 'error' | string
+  kind:
+    | 'delta'
+    | 'reasoning'
+    | 'retry'
+    | 'fallback'
+    | 'tool_call'
+    | 'done'
+    | 'cancelled'
+    | 'error'
+    | string
   text: string
 }
 
@@ -960,6 +1156,13 @@ export interface UpdateInfo {
   /** API 资源地址（api.github.com），github.com 直连受限时优先使用 */
   assetApiUrl?: string | null
   assetSize?: number | null
+  /** 安装包 SHA-256，下载后强制校验 */
+  assetSha256?: string | null
+  /** stable / beta / 企业清单自定义 */
+  channel?: string
+  /** 灰度比例与当前设备命中的桶（0-99） */
+  rolloutPercent?: number
+  rolloutBucket?: number
 }
 
 export interface MonitorBattery {
@@ -1266,6 +1469,140 @@ export interface CheckResult {
   schemaVersion: number
 }
 
+/* ---------- W2：异地备份目标（G-06） ---------- */
+
+export type BackupTargetKind = 'local' | 'webdav'
+
+export interface BackupTarget {
+  id: number
+  name: string
+  kind: BackupTargetKind | string
+  kindLabel: string
+  url: string
+  username: string
+  dir: string
+  enabled: boolean
+  /** 只表示是否存过密码，密文 / 明文都不会下发 */
+  hasPassword: boolean
+  lastRunAt?: number | null
+  lastStatus?: string | null
+  createdAt: number
+}
+
+export interface BackupTargetInput {
+  id?: number
+  name: string
+  kind: BackupTargetKind | string
+  url?: string
+  username?: string
+  /** 留空表示保留原密码 */
+  password?: string
+  dir?: string
+  enabled?: boolean
+}
+
+export interface BackupTargetTestReport {
+  ok: boolean
+  detail: string
+  checkedAt: number
+}
+
+export interface RemoteBackup {
+  name: string
+  size: number
+  modifiedAt?: number | null
+  kind: string
+}
+
+export interface BackupUploadResult {
+  targetId: number
+  targetName: string
+  kind: string
+  remoteName: string
+  encryptedPath: string
+  encryptedSize: number
+  uploadedAt: number
+  detail: string
+  snapshot: BackupItem
+}
+
+/* ---------- W2：本地 Mock Server（G-04） ---------- */
+
+export interface MockRoute {
+  id: number
+  projectId: number
+  requestId?: number | null
+  name: string
+  method: string
+  path: string
+  statusCode: number
+  headers: KeyValueItem[]
+  /** auto = 回放最近一次运行 / 实体骨架 */
+  bodyType: string
+  body: string
+  delayMs: number
+  enabled: boolean
+  sortOrder: number
+  updatedAt: number
+  /** 只读：与同 method + path 的其它启用路由冲突 */
+  conflict?: boolean
+}
+
+export type MockRouteInput = Partial<MockRoute> & {
+  projectId: number
+  method: string
+  path: string
+}
+
+export interface MockStartPayload {
+  projectId: number
+  /** 省略或 0 时自动分配 */
+  port?: number
+  host?: string
+}
+
+export interface MockStatus {
+  running: boolean
+  projectId?: number | null
+  url: string
+  host: string
+  port: number
+  lan: boolean
+  token?: string | null
+  routeCount: number
+  startedAt: number
+  requests: number
+}
+
+export interface MockLog {
+  id: number
+  at: number
+  method: string
+  path: string
+  status: number
+  durationMs: number
+  source: string
+  routeId?: number | null
+  generated: boolean
+  error?: string | null
+}
+
+/* ---------- W2：导入导出补齐（G-07） ---------- */
+
+export interface PostmanExportReport {
+  requests: number
+  collections: number
+  skipped: string[]
+}
+
+export interface OpenApiSource {
+  id: number
+  projectId: number
+  url: string
+  headers: KeyValueItem[]
+  updatedAt: number
+}
+
 /* ---------- 密钥与主密钥（v1.0.8） ---------- */
 
 /** 主密钥来源：系统钥匙串 / 降级文件 / 口令 */
@@ -1300,3 +1637,37 @@ export interface KeyPack {
   createdAt: number
   source: string
 }
+
+/* ---------- 接口实体（v1.1.2） ---------- */
+
+/** 实体字段树节点，与后端 entity::model::EntityNode 对应 */
+export interface EntityNode {
+  name: string
+  type: string
+  itemType: string
+  required: boolean
+  description: string
+  /** 用户手动添加的字段：合并时不被自动刷新删除 */
+  manual: boolean
+  /** 最近一次发送未出现（保留字段，提示用户确认） */
+  stale: boolean
+  children: EntityNode[]
+}
+
+/** 一份实体文档（某个方向的请求 / 返回），与后端 entity::model::EntityDoc 对应 */
+export interface EntityDoc {
+  version: number
+  updatedAt: number
+  hiddenPaths: string[]
+  root: EntityNode
+}
+
+/** request_entities_get / request_entity_generate 的返回 */
+export interface RequestEntities {
+  requestEntity?: EntityDoc | null
+  responseEntity?: EntityDoc | null
+  warnings: string[]
+}
+
+/** 实体方向 */
+export type EntityTarget = 'request' | 'response'

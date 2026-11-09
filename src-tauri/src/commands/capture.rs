@@ -129,7 +129,23 @@ pub fn capture_ca_generate(
 
 #[tauri::command]
 pub fn capture_ca_install(state: tauri::State<'_, AppState>) -> Result<CaInfo, String> {
-    ca::install(state.capture.data_dir())
+    let outcome = ca::install(state.capture.data_dir());
+    // 安装根证书是系统级写入：无论成功失败都留审计（P-07）
+    if let Ok(conn) = state.pool.get() {
+        let (result, detail) = match &outcome {
+            Ok(info) => (
+                "ok",
+                serde_json::json!({ "installed": info.installed, "fingerprint": info.fingerprint }),
+            ),
+            Err(error) => ("failed", serde_json::json!({ "error": error })),
+        };
+        if let Err(error) =
+            crate::services::audit::write(&conn, "ca_install", None, result, Some(&detail), None)
+        {
+            log::warn!("审计写入失败：{error}");
+        }
+    }
+    outcome
 }
 
 #[tauri::command(async)]
@@ -336,15 +352,21 @@ pub fn capture_export_har(
     state: tauri::State<'_, AppState>,
     path: String,
     ids: Option<Vec<u64>>,
+    metadata_only: Option<bool>,
 ) -> Result<(), String> {
     if path.trim().is_empty() {
         return Err("E_ARG: 导出路径不能为空".into());
     }
+    let metadata_only = metadata_only.unwrap_or(false);
     match ids {
-        Some(ids) if !ids.is_empty() => state
+        Some(ids) if !ids.is_empty() => {
+            state
+                .capture
+                .export_har_ids(std::path::Path::new(&path), &ids, metadata_only)
+        }
+        _ => state
             .capture
-            .export_har_ids(std::path::Path::new(&path), &ids),
-        _ => state.capture.export_har(std::path::Path::new(&path)),
+            .export_har(std::path::Path::new(&path), metadata_only),
     }
 }
 

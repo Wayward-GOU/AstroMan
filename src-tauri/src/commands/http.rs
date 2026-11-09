@@ -28,8 +28,7 @@ use crate::secret::{self, AAD_ENV};
 use crate::state::AppState;
 use crate::util::{err, now_ms, render, strip_json_comments};
 
-/// 正文入内存上限：超出即截断（4.0.4）
-const MAX_BODY: usize = 5 * 1024 * 1024;
+/// 正文入内存上限由运行档位决定（P-05），超出即截断（4.0.4）
 /// 超过该阈值同时流式落盘，供「保存完整响应」使用
 const SPILL_THRESHOLD: u64 = 2 * 1024 * 1024;
 /// 落盘时保留的预览片段
@@ -475,6 +474,44 @@ fn finish_record(
             result,
             &record.origin,
         );
+
+        // 实体自动同步：只处理手工发送，best-effort，不影响请求结果
+        if record.origin == "manual" {
+            if let Some(request_id) = payload.request_id {
+                let entity_body = match &plan.body {
+                    PlannedBody::None => String::new(),
+                    PlannedBody::Bytes(_) => body_text.clone(),
+                    PlannedBody::Multipart(parts) => {
+                        let fields: Vec<FormField> = parts
+                            .iter()
+                            .map(|part| FormField {
+                                key: part.key.clone(),
+                                value: if part.filename.is_some() {
+                                    String::new()
+                                } else {
+                                    String::from_utf8_lossy(&part.bytes).into_owned()
+                                },
+                                enabled: true,
+                                kind: if part.filename.is_some() {
+                                    "file".to_string()
+                                } else {
+                                    "text".to_string()
+                                },
+                            })
+                            .collect();
+                        serde_json::to_string(&fields).unwrap_or_default()
+                    }
+                };
+                let _ = crate::entity::sync_after_send(
+                    &state.pool,
+                    request_id,
+                    &record.origin,
+                    &entity_body,
+                    &payload.body_type,
+                    result,
+                );
+            }
+        }
     }
 }
 
@@ -781,7 +818,13 @@ async fn send_chain(
         let retry_after = headers.get("retry-after").cloned();
         let mut response = response;
         let download_start = Instant::now();
-        let body = read_body(&mut response, &headers, &state.data_dir).await;
+        let body = read_body(
+            &mut response,
+            &headers,
+            &state.data_dir,
+            state.profile().limits.max_response_bytes,
+        )
+        .await;
         let download = download_start.elapsed();
         return Ok(ChainOutcome {
             status: status.as_u16(),
@@ -1030,6 +1073,7 @@ async fn read_body(
     response: &mut reqwest::Response,
     headers: &HashMap<String, String>,
     data_dir: &Path,
+    max_body: usize,
 ) -> BodyOutcome {
     let content_type = headers
         .get("content-type")
@@ -1072,7 +1116,16 @@ async fn read_body(
             .await
         }
         BodyClass::Text => {
-            collect_text(response, head, ended, data_dir, &content_type, raw_bytes).await
+            collect_text(
+                response,
+                head,
+                ended,
+                data_dir,
+                &content_type,
+                raw_bytes,
+                max_body,
+            )
+            .await
         }
     }
 }
@@ -1148,6 +1201,7 @@ async fn collect_text(
     data_dir: &Path,
     content_type: &str,
     raw_bytes: u64,
+    max_body: usize,
 ) -> BodyOutcome {
     let mut buffer = head;
     let mut bytes = buffer.len() as u64;
@@ -1179,8 +1233,8 @@ async fn collect_text(
                         log::warn!("写入响应文件失败：{error}");
                     }
                 }
-                if buffer.len() < MAX_BODY {
-                    let remain = MAX_BODY - buffer.len();
+                if buffer.len() < max_body {
+                    let remain = max_body - buffer.len();
                     if chunk.len() <= remain {
                         buffer.extend_from_slice(&chunk);
                     } else {
@@ -1368,6 +1422,14 @@ fn record_history(state: &AppState, payload: &SendRequestPayload, url: &str, res
             "DELETE FROM request_history
              WHERE id IN (SELECT id FROM request_history ORDER BY id ASC LIMIT ?1)",
             params![count - MAX_HISTORY],
+        );
+    }
+    // 企业策略 retentionDays：按时间清理更早的记录（0 表示不启用）
+    if let Some(days) = state.policy().retention_days() {
+        let cutoff = crate::util::now_ms() - days * 86_400_000;
+        let _ = conn.execute(
+            "DELETE FROM request_history WHERE created_at < ?1",
+            params![cutoff],
         );
     }
 }

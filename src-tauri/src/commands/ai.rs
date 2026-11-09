@@ -7,9 +7,9 @@ use tauri::ipc::Channel;
 use tauri::State;
 
 use crate::models::{
-    AiChatPayload, AiMessage, AiProvider, AiSession, AiStoredMessage, AiStreamEvent, AiToolDayStat,
-    AiToolLog, AiToolLogPage, AiToolLogStats, AiToolUsageStat, AiUsageDay, AiUsageLog, AiUsagePage,
-    AiUsageStat, AiUsageStats, HttpResult, SendRequestPayload,
+    AiChatPayload, AiImage, AiMessage, AiProvider, AiSession, AiStoredMessage, AiStreamEvent,
+    AiToolDayStat, AiToolLog, AiToolLogPage, AiToolLogStats, AiToolUsageStat, AiUsageDay,
+    AiUsageLog, AiUsagePage, AiUsageStat, AiUsageStats, HttpResult, SendRequestPayload,
 };
 use crate::prompts::HANGZAI_SYSTEM_PROMPT;
 use crate::state::AppState;
@@ -81,6 +81,10 @@ fn row_to_provider(row: &Row) -> rusqlite::Result<AiProvider> {
         is_default: row.get::<_, i64>(9)? != 0,
         supports_vision: row.get::<_, i64>(10)? != 0,
         context_window: Some(row.get::<_, i64>(11)?),
+        native_tools: Some(row.get::<_, i64>(12)?),
+        input_price: Some(row.get::<_, f64>(13)?),
+        output_price: Some(row.get::<_, f64>(14)?),
+        currency: Some(row.get::<_, String>(15)?),
     })
 }
 
@@ -103,6 +107,10 @@ fn row_to_provider_plain(row: &Row) -> rusqlite::Result<AiProvider> {
         is_default: row.get::<_, i64>(9)? != 0,
         supports_vision: row.get::<_, i64>(10)? != 0,
         context_window: Some(row.get::<_, i64>(11)?),
+        native_tools: Some(row.get::<_, i64>(12)?),
+        input_price: Some(row.get::<_, f64>(13)?),
+        output_price: Some(row.get::<_, f64>(14)?),
+        currency: Some(row.get::<_, String>(15)?),
     })
 }
 
@@ -110,7 +118,9 @@ const PROVIDER_COLUMNS: &str = "id, name, COALESCE(kind, 'openai'), base_url, mo
                                 COALESCE(api_key_enc, ''), COALESCE(temperature, 0.3),
                                 COALESCE(max_tokens, 0), COALESCE(timeout_secs, 300),
                                 COALESCE(is_default, 0), COALESCE(supports_vision, 0),
-                                COALESCE(context_window, 0)";
+                                COALESCE(context_window, 0), COALESCE(native_tools, -1),
+                                COALESCE(input_price, 0), COALESCE(output_price, 0),
+                                COALESCE(currency, 'USD')";
 
 /// 后端注入的航仔系统提示词规模：前端预算据此扣除，不再靠猜
 #[tauri::command]
@@ -163,6 +173,16 @@ pub fn ai_provider_save(
     };
     // 0 = 继续按模型名自动识别；上限只防误填，正常模型远小于 1000 万
     let context_window = provider.context_window.unwrap_or(0).clamp(0, 10_000_000);
+    // -1 自动 / 0 关闭 / 1 开启；单价 0 表示沿用内置价格表
+    let native_tools = provider.native_tools.unwrap_or(-1).clamp(-1, 1);
+    let input_price = provider.input_price.unwrap_or(0.0).max(0.0);
+    let output_price = provider.output_price.unwrap_or(0.0).max(0.0);
+    let currency = if provider.currency.as_deref() == Some("CNY") {
+        "CNY"
+    } else {
+        "USD"
+    }
+    .to_string();
     let key_enc = encrypt_key(&provider.api_key)?;
 
     if provider.is_default {
@@ -179,8 +199,10 @@ pub fn ai_provider_save(
                      SET name = ?1, kind = ?2, base_url = ?3, model = ?4,
                          temperature = ?5, is_default = ?6, max_tokens = ?7,
                          timeout_secs = ?8, enabled = 1, updated_at = ?9,
-                         supports_vision = ?10, context_window = ?11
-                     WHERE id = ?12",
+                         supports_vision = ?10, context_window = ?11,
+                         native_tools = ?12, input_price = ?13, output_price = ?14,
+                         currency = ?15
+                     WHERE id = ?16",
                     params![
                         provider.name.trim(),
                         kind,
@@ -193,6 +215,10 @@ pub fn ai_provider_save(
                         now,
                         provider.supports_vision as i64,
                         context_window,
+                        native_tools,
+                        input_price,
+                        output_price,
+                        currency,
                         id
                     ],
                 )
@@ -203,8 +229,10 @@ pub fn ai_provider_save(
                      SET name = ?1, kind = ?2, base_url = ?3, model = ?4, api_key_enc = ?5,
                          temperature = ?6, is_default = ?7, max_tokens = ?8,
                          timeout_secs = ?9, enabled = 1, updated_at = ?10,
-                         supports_vision = ?11, context_window = ?12
-                     WHERE id = ?13",
+                         supports_vision = ?11, context_window = ?12,
+                         native_tools = ?13, input_price = ?14, output_price = ?15,
+                         currency = ?16
+                     WHERE id = ?17",
                     params![
                         provider.name.trim(),
                         kind,
@@ -218,6 +246,10 @@ pub fn ai_provider_save(
                         now,
                         provider.supports_vision as i64,
                         context_window,
+                        native_tools,
+                        input_price,
+                        output_price,
+                        currency,
                         id
                     ],
                 )
@@ -230,8 +262,10 @@ pub fn ai_provider_save(
                 "INSERT INTO ai_providers
                    (name, kind, base_url, model, api_key_enc, temperature, max_tokens,
                     timeout_secs, is_default, enabled, supports_vision, context_window,
+                    native_tools, input_price, output_price, currency,
                     created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?12, ?12)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?12, ?13,
+                         ?14, ?15, ?16, ?16)",
                 params![
                     provider.name.trim(),
                     kind,
@@ -244,6 +278,10 @@ pub fn ai_provider_save(
                     provider.is_default as i64,
                     provider.supports_vision as i64,
                     context_window,
+                    native_tools,
+                    input_price,
+                    output_price,
+                    currency,
                     now
                 ],
             )
@@ -280,6 +318,10 @@ pub fn ai_provider_save(
         is_default: provider.is_default,
         supports_vision: provider.supports_vision,
         context_window: Some(context_window),
+        native_tools: Some(native_tools),
+        input_price: Some(input_price),
+        output_price: Some(output_price),
+        currency: Some(currency),
     })
 }
 
@@ -302,6 +344,7 @@ pub(crate) fn load_provider(state: &AppState, id: i64) -> Result<AiProvider, Str
 }
 
 /// 三种协议统一映射成「URL + 头 + JSON Body」
+#[derive(Debug)]
 struct Prepared {
     url: String,
     headers: Vec<(String, String)>,
@@ -321,6 +364,7 @@ pub(crate) fn default_base(kind: &str) -> &'static str {
 fn clamp_output_tokens(
     provider: &AiProvider,
     messages: &[AiMessage],
+    extra_tokens: i64,
     desired: i64,
 ) -> Result<i64, String> {
     let window = provider.context_window.unwrap_or(0);
@@ -330,7 +374,8 @@ fn clamp_output_tokens(
     let prompt: i64 = messages
         .iter()
         .map(|message| estimate_tokens(&message.content))
-        .sum();
+        .sum::<i64>()
+        + extra_tokens;
     // 消息边界 / 角色开销的保守余量
     let room = window - prompt - 64;
     if room < 256 {
@@ -341,22 +386,76 @@ fn clamp_output_tokens(
     Ok(desired.max(1).min(room))
 }
 
+/// 视觉输入上限：一次最多 3 张，每张 base64 约 ≤1.4MB（原图压缩后 1MB）
+const MAX_IMAGES: usize = 3;
+const MAX_IMAGE_BASE64: usize = 1_500_000;
+/// 每张图片按 800 token 估算（与设计文档一致）
+const IMAGE_TOKEN_ESTIMATE: i64 = 800;
+
+fn validate_images(images: &[AiImage]) -> Result<(), String> {
+    if images.len() > MAX_IMAGES {
+        return Err(format!("一次最多发送 {MAX_IMAGES} 张图片"));
+    }
+    for image in images {
+        let mime = image.mime.trim().to_ascii_lowercase();
+        if !matches!(mime.as_str(), "image/jpeg" | "image/png" | "image/webp") {
+            return Err(format!("不支持的图片格式：{}", image.mime));
+        }
+        if image.data.is_empty() {
+            return Err("图片内容为空".to_string());
+        }
+        if image.data.len() > MAX_IMAGE_BASE64 {
+            return Err("单张图片压缩后仍超过 1MB，请换一张或降低分辨率".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// 工具入参的 JSON Schema：前端由单一定义源派生，缺失时给空对象避免网关拒绝
+fn tool_parameters(tool: &crate::models::AiToolDef) -> serde_json::Value {
+    if tool.parameters.is_null() {
+        serde_json::json!({ "type": "object", "properties": {} })
+    } else {
+        tool.parameters.clone()
+    }
+}
+
+/// 工具调用参数统一是 JSON 文本；空串按空对象处理
+fn tool_args_value(raw: &str) -> serde_json::Value {
+    let text = raw.trim();
+    if text.is_empty() {
+        return serde_json::json!({});
+    }
+    serde_json::from_str(text).unwrap_or_else(|_| serde_json::json!({}))
+}
+
 fn prepare(
     provider: &AiProvider,
     messages: &[AiMessage],
+    images: &[AiImage],
+    tools: &[crate::models::AiToolDef],
     temperature: f64,
     stream: bool,
 ) -> Result<Prepared, String> {
+    validate_images(images)?;
+    let image_tokens = images.len() as i64 * IMAGE_TOKEN_ESTIMATE;
     let configured_max = provider.max_tokens.filter(|value| *value > 0);
     // 只有用户配置了输出上限或上下文窗口时才主动收紧；否则维持各协议原有默认行为
     let output_tokens = if configured_max.is_some() || provider.context_window.unwrap_or(0) > 0 {
         Some(clamp_output_tokens(
             provider,
             messages,
+            image_tokens,
             configured_max.unwrap_or(4096),
         )?)
     } else {
         None
+    };
+    // 图片只挂到本轮最后一条用户消息上：历史轮次不重复发送
+    let image_target = if images.is_empty() {
+        None
+    } else {
+        messages.iter().rposition(|message| message.role == "user")
     };
     let base = if provider.base_url.trim().is_empty() {
         default_base(&provider.kind).to_string()
@@ -372,16 +471,73 @@ fn prepare(
                 .filter(|m| m.role == "system")
                 .map(|m| m.content.clone())
                 .collect();
-            let chat: Vec<serde_json::Value> = messages
+            // Anthropic 要求工具结果放在 user 消息里；连续多个结果合并成一条，避免角色不交替
+            let mut chat: Vec<serde_json::Value> = Vec::new();
+            let mut tool_results: Vec<serde_json::Value> = Vec::new();
+            for (index, m) in messages
                 .iter()
-                .filter(|m| m.role != "system")
-                .map(|m| {
-                    serde_json::json!({
+                .enumerate()
+                .filter(|(_, m)| m.role != "system")
+            {
+                if m.role == "tool" {
+                    tool_results.push(serde_json::json!({
+                        "type": "tool_result",
+                        "tool_use_id": m.tool_call_id.clone().unwrap_or_default(),
+                        "content": m.content,
+                    }));
+                    continue;
+                }
+                if !tool_results.is_empty() {
+                    chat.push(serde_json::json!({
+                        "role": "user",
+                        "content": std::mem::take(&mut tool_results),
+                    }));
+                }
+                if m.role == "assistant" && !m.tool_calls.is_empty() {
+                    let mut parts: Vec<serde_json::Value> = Vec::new();
+                    if !m.content.trim().is_empty() {
+                        parts.push(serde_json::json!({ "type": "text", "text": m.content }));
+                    }
+                    for call in &m.tool_calls {
+                        parts.push(serde_json::json!({
+                            "type": "tool_use",
+                            "id": call.id,
+                            "name": call.name,
+                            "input": tool_args_value(&call.arguments),
+                        }));
+                    }
+                    chat.push(serde_json::json!({ "role": "assistant", "content": parts }));
+                    continue;
+                }
+                if Some(index) == image_target {
+                    let mut parts = vec![serde_json::json!({
+                        "type": "text",
+                        "text": m.content,
+                    })];
+                    for image in images {
+                        parts.push(serde_json::json!({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": image.mime.trim().to_ascii_lowercase(),
+                                "data": image.data,
+                            }
+                        }));
+                    }
+                    chat.push(serde_json::json!({
+                        "role": if m.role == "assistant" { "assistant" } else { "user" },
+                        "content": parts,
+                    }));
+                } else {
+                    chat.push(serde_json::json!({
                         "role": if m.role == "assistant" { "assistant" } else { "user" },
                         "content": m.content,
-                    })
-                })
-                .collect();
+                    }));
+                }
+            }
+            if !tool_results.is_empty() {
+                chat.push(serde_json::json!({ "role": "user", "content": tool_results }));
+            }
             let mut body = serde_json::json!({
                 "model": provider.model,
                 "max_tokens": output_tokens.unwrap_or(4096),
@@ -389,8 +545,30 @@ fn prepare(
                 "stream": stream,
                 "messages": chat,
             });
+            // AI-05：system 与工具定义每轮原样重发，标记 cache_control 让 Anthropic 复用前缀缓存
             if !system.is_empty() {
-                body["system"] = serde_json::Value::String(system.join("\n\n"));
+                body["system"] = serde_json::json!([{
+                    "type": "text",
+                    "text": system.join("\n\n"),
+                    "cache_control": { "type": "ephemeral" },
+                }]);
+            }
+            if !tools.is_empty() {
+                let mut defs: Vec<serde_json::Value> = tools
+                    .iter()
+                    .map(|tool| {
+                        serde_json::json!({
+                            "name": tool.name,
+                            "description": tool.description,
+                            "input_schema": tool_parameters(tool),
+                        })
+                    })
+                    .collect();
+                // 缓存断点放在最后一条工具定义上，system + tools 整段前缀一起命中
+                if let Some(last) = defs.last_mut() {
+                    last["cache_control"] = serde_json::json!({ "type": "ephemeral" });
+                }
+                body["tools"] = serde_json::Value::Array(defs);
             }
             Ok(Prepared {
                 url: format!("{base}/v1/messages"),
@@ -407,16 +585,66 @@ fn prepare(
                 .filter(|m| m.role == "system")
                 .map(|m| m.content.clone())
                 .collect();
-            let contents: Vec<serde_json::Value> = messages
+            // Gemini 的工具结果用 functionResponse 回灌，连续结果合并到同一条 user 内容
+            let mut contents: Vec<serde_json::Value> = Vec::new();
+            let mut tool_parts: Vec<serde_json::Value> = Vec::new();
+            for (index, m) in messages
                 .iter()
-                .filter(|m| m.role != "system")
-                .map(|m| {
-                    serde_json::json!({
-                        "role": if m.role == "assistant" { "model" } else { "user" },
-                        "parts": [{ "text": m.content }],
-                    })
-                })
-                .collect();
+                .enumerate()
+                .filter(|(_, m)| m.role != "system")
+            {
+                if m.role == "tool" {
+                    let payload = serde_json::from_str::<serde_json::Value>(&m.content)
+                        .unwrap_or_else(|_| serde_json::json!({ "result": m.content }));
+                    tool_parts.push(serde_json::json!({
+                        "functionResponse": {
+                            "name": m.name.clone().unwrap_or_default(),
+                            "response": payload,
+                        }
+                    }));
+                    continue;
+                }
+                if !tool_parts.is_empty() {
+                    contents.push(serde_json::json!({
+                        "role": "user",
+                        "parts": std::mem::take(&mut tool_parts),
+                    }));
+                }
+                if m.role == "assistant" && !m.tool_calls.is_empty() {
+                    let mut parts: Vec<serde_json::Value> = Vec::new();
+                    if !m.content.trim().is_empty() {
+                        parts.push(serde_json::json!({ "text": m.content }));
+                    }
+                    for call in &m.tool_calls {
+                        parts.push(serde_json::json!({
+                            "functionCall": {
+                                "name": call.name,
+                                "args": tool_args_value(&call.arguments),
+                            }
+                        }));
+                    }
+                    contents.push(serde_json::json!({ "role": "model", "parts": parts }));
+                    continue;
+                }
+                let mut parts = vec![serde_json::json!({ "text": m.content })];
+                if Some(index) == image_target {
+                    for image in images {
+                        parts.push(serde_json::json!({
+                            "inlineData": {
+                                "mimeType": image.mime.trim().to_ascii_lowercase(),
+                                "data": image.data,
+                            }
+                        }));
+                    }
+                }
+                contents.push(serde_json::json!({
+                    "role": if m.role == "assistant" { "model" } else { "user" },
+                    "parts": parts,
+                }));
+            }
+            if !tool_parts.is_empty() {
+                contents.push(serde_json::json!({ "role": "user", "parts": tool_parts }));
+            }
             let mut body = serde_json::json!({
                 "contents": contents,
                 "generationConfig": { "temperature": temperature },
@@ -428,6 +656,18 @@ fn prepare(
                 body["systemInstruction"] = serde_json::json!({
                     "parts": [{ "text": system.join("\n\n") }]
                 });
+            }
+            if !tools.is_empty() {
+                body["tools"] = serde_json::json!([{
+                    "functionDeclarations": tools
+                        .iter()
+                        .map(|tool| serde_json::json!({
+                            "name": tool.name,
+                            "description": tool.description,
+                            "parameters": tool_parameters(tool),
+                        }))
+                        .collect::<Vec<_>>(),
+                }]);
             }
             let action = if stream {
                 "streamGenerateContent"
@@ -447,13 +687,70 @@ fn prepare(
         _ => {
             let chat: Vec<serde_json::Value> = messages
                 .iter()
-                .map(|m| {
+                .enumerate()
+                .map(|(index, m)| {
                     let role = match m.role.as_str() {
                         "system" => "system",
                         "assistant" => "assistant",
+                        "tool" => "tool",
                         _ => "user",
                     };
-                    serde_json::json!({ "role": role, "content": m.content })
+                    if m.role == "tool" {
+                        return serde_json::json!({
+                            "role": "tool",
+                            "tool_call_id": m.tool_call_id.clone().unwrap_or_default(),
+                            "content": m.content,
+                        });
+                    }
+                    if m.role == "assistant" && !m.tool_calls.is_empty() {
+                        let calls: Vec<serde_json::Value> = m
+                            .tool_calls
+                            .iter()
+                            .map(|call| {
+                                let arguments = if call.arguments.trim().is_empty() {
+                                    "{}".to_string()
+                                } else {
+                                    call.arguments.clone()
+                                };
+                                serde_json::json!({
+                                    "id": call.id,
+                                    "type": "function",
+                                    "function": { "name": call.name, "arguments": arguments },
+                                })
+                            })
+                            .collect();
+                        let content = if m.content.trim().is_empty() {
+                            serde_json::Value::Null
+                        } else {
+                            serde_json::Value::String(m.content.clone())
+                        };
+                        return serde_json::json!({
+                            "role": "assistant",
+                            "content": content,
+                            "tool_calls": calls,
+                        });
+                    }
+                    if Some(index) == image_target {
+                        let mut parts = vec![serde_json::json!({
+                            "type": "text",
+                            "text": m.content,
+                        })];
+                        for image in images {
+                            parts.push(serde_json::json!({
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": format!(
+                                        "data:{};base64,{}",
+                                        image.mime.trim().to_ascii_lowercase(),
+                                        image.data
+                                    )
+                                }
+                            }));
+                        }
+                        serde_json::json!({ "role": role, "content": parts })
+                    } else {
+                        serde_json::json!({ "role": role, "content": m.content })
+                    }
                 })
                 .collect();
             let mut body = serde_json::json!({
@@ -465,6 +762,24 @@ fn prepare(
             // 不配置时不传，交给服务商默认值，避免部分网关拒绝未知字段
             if let Some(max) = output_tokens {
                 body["max_tokens"] = serde_json::json!(max);
+            }
+            if !tools.is_empty() {
+                body["tools"] = serde_json::Value::Array(
+                    tools
+                        .iter()
+                        .map(|tool| {
+                            serde_json::json!({
+                                "type": "function",
+                                "function": {
+                                    "name": tool.name,
+                                    "description": tool.description,
+                                    "parameters": tool_parameters(tool),
+                                }
+                            })
+                        })
+                        .collect(),
+                );
+                body["tool_choice"] = serde_json::json!("auto");
             }
             Ok(Prepared {
                 url: format!("{base}/chat/completions"),
@@ -645,9 +960,31 @@ pub(crate) fn parse_full_text(kind: &str, raw: &str) -> Result<String, String> {
 enum SseOutcome {
     Text(String),
     Reasoning(String),
-    Usage { prompt: i64, completion: i64 },
+    Usage {
+        prompt: i64,
+        completion: i64,
+    },
     Done,
     Ignore,
+    /// 原生 function calling 的分片（AI-04）
+    Tool(Vec<ToolChunk>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ToolChunk {
+    /// OpenAI / Anthropic：一次调用的 id 与工具名
+    Start {
+        index: usize,
+        id: String,
+        name: String,
+    },
+    /// OpenAI / Anthropic：参数 JSON 分片
+    Args { index: usize, partial: String },
+    /// Gemini：一次性给出完整调用
+    Full {
+        name: String,
+        arguments: serde_json::Value,
+    },
 }
 
 fn num(value: Option<&serde_json::Value>) -> i64 {
@@ -730,8 +1067,39 @@ fn parse_sse(kind: &str, line: &str) -> Result<SseOutcome, String> {
 
     match kind {
         "anthropic" => match json.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+            "content_block_start" => {
+                let block = json.get("content_block");
+                if block.and_then(|b| b.get("type")).and_then(|t| t.as_str()) == Some("tool_use") {
+                    return Ok(SseOutcome::Tool(vec![ToolChunk::Start {
+                        index: num(json.get("index")) as usize,
+                        id: block
+                            .and_then(|b| b.get("id"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        name: block
+                            .and_then(|b| b.get("name"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                    }]));
+                }
+                Ok(SseOutcome::Ignore)
+            }
             "content_block_delta" => {
                 let delta = json.get("delta");
+                if delta.and_then(|d| d.get("type")).and_then(|t| t.as_str())
+                    == Some("input_json_delta")
+                {
+                    return Ok(SseOutcome::Tool(vec![ToolChunk::Args {
+                        index: num(json.get("index")) as usize,
+                        partial: delta
+                            .and_then(|d| d.get("partial_json"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                    }]));
+                }
                 let thinking = delta
                     .and_then(|d| d.get("thinking"))
                     .and_then(|t| t.as_str())
@@ -763,6 +1131,29 @@ fn parse_sse(kind: &str, line: &str) -> Result<SseOutcome, String> {
                 .and_then(|c| c.get("content"))
                 .and_then(|c| c.get("parts"))
                 .and_then(|p| p.as_array());
+            // 原生 functionCall 一次性到达，直接交给上层执行
+            let calls: Vec<ToolChunk> = parts
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .filter_map(|p| p.get("functionCall"))
+                        .map(|call| ToolChunk::Full {
+                            name: call
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                            arguments: call
+                                .get("args")
+                                .cloned()
+                                .unwrap_or_else(|| serde_json::json!({})),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !calls.is_empty() {
+                return Ok(SseOutcome::Tool(calls));
+            }
             let collect = |thought: bool| {
                 parts
                     .map(|parts| {
@@ -801,6 +1192,42 @@ fn parse_sse(kind: &str, line: &str) -> Result<SseOutcome, String> {
             if !reasoning.is_empty() {
                 return Ok(SseOutcome::Reasoning(reasoning.to_string()));
             }
+            // OpenAI 流式工具调用：id / name 只在首片出现，arguments 逐片拼接
+            if let Some(calls) = delta
+                .and_then(|d| d.get("tool_calls"))
+                .and_then(|c| c.as_array())
+            {
+                let mut chunks: Vec<ToolChunk> = Vec::new();
+                for call in calls {
+                    let index = num(call.get("index")) as usize;
+                    let id = call
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let name = call
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let partial = call
+                        .get("function")
+                        .and_then(|f| f.get("arguments"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    if !name.is_empty() || !id.is_empty() {
+                        chunks.push(ToolChunk::Start { index, id, name });
+                    }
+                    if !partial.is_empty() {
+                        chunks.push(ToolChunk::Args { index, partial });
+                    }
+                }
+                if !chunks.is_empty() {
+                    return Ok(SseOutcome::Tool(chunks));
+                }
+            }
             let text = delta
                 .and_then(|d| d.get("content"))
                 .and_then(|c| c.as_str())
@@ -819,6 +1246,179 @@ fn emit(channel: &Channel<AiStreamEvent>, kind: &str, text: impl Into<String>) {
         kind: kind.to_string(),
         text: text.into(),
     });
+}
+
+/// 原生工具调用的流式累加器：OpenAI / Anthropic 分片拼参数，Gemini 一次给全
+#[derive(Debug, Default, Clone)]
+struct NativeCallAcc {
+    id: String,
+    name: String,
+    args: String,
+}
+
+fn apply_tool_chunks(
+    calls: &mut std::collections::BTreeMap<usize, NativeCallAcc>,
+    next_index: &mut usize,
+    chunks: &[ToolChunk],
+) {
+    for chunk in chunks {
+        match chunk {
+            ToolChunk::Start { index, id, name } => {
+                let entry = calls.entry(*index).or_default();
+                if !id.is_empty() {
+                    entry.id = id.clone();
+                }
+                if !name.is_empty() {
+                    entry.name = name.clone();
+                }
+            }
+            ToolChunk::Args { index, partial } => {
+                calls.entry(*index).or_default().args.push_str(partial);
+            }
+            ToolChunk::Full { name, arguments } => {
+                // Gemini 一次给全：索引与分片模式互不冲突
+                let mut index = *next_index;
+                while calls.contains_key(&index) {
+                    index += 1;
+                }
+                *next_index = index + 1;
+                calls.insert(
+                    index,
+                    NativeCallAcc {
+                        id: format!("call_{index}"),
+                        name: name.clone(),
+                        args: arguments.to_string(),
+                    },
+                );
+            }
+        }
+    }
+}
+
+fn flush_native_calls(
+    calls: &std::collections::BTreeMap<usize, NativeCallAcc>,
+    channel: &Channel<AiStreamEvent>,
+) {
+    for (index, call) in calls {
+        if call.name.trim().is_empty() {
+            continue;
+        }
+        let id = if call.id.is_empty() {
+            format!("call_{index}")
+        } else {
+            call.id.clone()
+        };
+        let arguments = if call.args.trim().is_empty() {
+            "{}".to_string()
+        } else {
+            call.args.clone()
+        };
+        emit(
+            channel,
+            "tool_call",
+            serde_json::json!({ "id": id, "name": call.name, "arguments": arguments }).to_string(),
+        );
+    }
+}
+
+/// 非流式整包响应里的原生工具调用（部分网关忽略 stream 参数）
+fn native_calls_of(kind: &str, json: &serde_json::Value) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    let mut push = |id: String, name: String, arguments: serde_json::Value| {
+        if name.trim().is_empty() {
+            return;
+        }
+        let args = if arguments.is_null() {
+            "{}".to_string()
+        } else if let Some(text) = arguments.as_str() {
+            text.to_string()
+        } else {
+            arguments.to_string()
+        };
+        out.push((id, name, args));
+    };
+    match kind {
+        "anthropic" => {
+            if let Some(blocks) = json.get("content").and_then(|v| v.as_array()) {
+                for block in blocks {
+                    if block.get("type").and_then(|v| v.as_str()) != Some("tool_use") {
+                        continue;
+                    }
+                    push(
+                        block
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        block
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        block
+                            .get("input")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!({})),
+                    );
+                }
+            }
+        }
+        "gemini" => {
+            if let Some(parts) = json
+                .get("candidates")
+                .and_then(|c| c.get(0))
+                .and_then(|c| c.get("content"))
+                .and_then(|c| c.get("parts"))
+                .and_then(|p| p.as_array())
+            {
+                let mut seq = 0usize;
+                for part in parts {
+                    let Some(call) = part.get("functionCall") else {
+                        continue;
+                    };
+                    seq += 1;
+                    push(
+                        format!("call_{seq}"),
+                        call.get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        call.get("args")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!({})),
+                    );
+                }
+            }
+        }
+        _ => {
+            if let Some(calls) = json
+                .get("choices")
+                .and_then(|c| c.get(0))
+                .and_then(|c| c.get("message"))
+                .and_then(|m| m.get("tool_calls"))
+                .and_then(|t| t.as_array())
+            {
+                for call in calls {
+                    push(
+                        call.get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        call.get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        call.get("function")
+                            .and_then(|f| f.get("arguments"))
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!("{}")),
+                    );
+                }
+            }
+        }
+    }
+    out
 }
 
 /// 记录一次模型调用的 token 与成败，供「模型统计」使用
@@ -967,6 +1567,7 @@ fn apply_scene_prompt(scene: &str, mut messages: Vec<AiMessage>) -> Vec<AiMessag
             AiMessage {
                 role: "system".to_string(),
                 content: HANGZAI_SYSTEM_PROMPT.to_string(),
+                ..Default::default()
             },
         );
     }
@@ -1002,29 +1603,97 @@ fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<u64> {
         .map(|value| value.min(30))
 }
 
+enum SendOutcome {
+    Response(reqwest::Response),
+    Cancelled,
+    Failed(String),
+}
+
+/// 首 delta 之前允许自动重试（429 / 5xx / 网络错误），最多 2 次；
+/// 一旦给用户吐出内容就不再静默重试，否则会出现半句话后整段重来。
+async fn send_with_retry(
+    request: reqwest::RequestBuilder,
+    on_event: &Channel<AiStreamEvent>,
+    is_cancelled: &(dyn Fn() -> bool + Send + Sync),
+) -> SendOutcome {
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let Some(attempt_request) = request.try_clone() else {
+            return SendOutcome::Failed("请求体无法复用，已停止重试".to_string());
+        };
+        match attempt_request.send().await {
+            Ok(response) => {
+                let status = response.status();
+                let retryable = status.as_u16() == 429 || status.is_server_error();
+                if retryable && attempt <= 2 {
+                    let wait = retry_after_secs(response.headers()).unwrap_or(if attempt == 1 {
+                        1
+                    } else {
+                        3
+                    });
+                    emit(
+                        on_event,
+                        "retry",
+                        format!(
+                            "服务{}，{wait} 秒后重试（{attempt}/2）",
+                            if status.as_u16() == 429 {
+                                "限流"
+                            } else {
+                                "繁忙"
+                            }
+                        ),
+                    );
+                    tokio::time::sleep(Duration::from_secs(wait)).await;
+                    if is_cancelled() {
+                        return SendOutcome::Cancelled;
+                    }
+                    continue;
+                }
+                return SendOutcome::Response(response);
+            }
+            Err(error) => {
+                if attempt <= 2 {
+                    let wait = if attempt == 1 { 1 } else { 3 };
+                    emit(
+                        on_event,
+                        "retry",
+                        format!("网络异常，{wait} 秒后重试（{attempt}/2）"),
+                    );
+                    tokio::time::sleep(Duration::from_secs(wait)).await;
+                    if is_cancelled() {
+                        return SendOutcome::Cancelled;
+                    }
+                    continue;
+                }
+                return SendOutcome::Failed(humanize_network_error(&error.to_string()));
+            }
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn ai_chat(
     state: State<'_, AppState>,
     payload: AiChatPayload,
     on_event: Channel<AiStreamEvent>,
 ) -> Result<(), String> {
+    state.policy().ensure_ai()?;
     if payload.messages.is_empty() {
         return Err("消息不能为空".to_string());
     }
-    let mut provider = load_provider(state.inner(), payload.provider_id)?;
-    // 前端已按模型名识别出窗口（或用户显式覆盖）：优先用它收紧本次输出上限
-    if let Some(window) = payload.context_window.filter(|value| *value > 0) {
-        provider.context_window = Some(window);
+    let primary = load_provider(state.inner(), payload.provider_id)?;
+    // AI-12：失败回退链默认关闭（设置里为空）；只保留已启用、id 不重复的服务
+    let mut candidates = vec![primary];
+    for id in state.ai_fallback_ids() {
+        if candidates.iter().any(|item| item.id == Some(id)) {
+            continue;
+        }
+        if let Ok(item) = load_provider(state.inner(), id) {
+            candidates.push(item);
+        }
     }
-    let temperature = payload
-        .temperature
-        .or(provider.temperature)
-        .unwrap_or(0.3)
-        .clamp(0.0, 2.0);
-    let timeout_secs = provider
-        .timeout_secs
-        .unwrap_or(AI_TIMEOUT_SECS as i64)
-        .clamp(10, 3600) as u64;
+    let candidate_count = candidates.len();
 
     // 停止生成：requestId 登记后，前端可随时调用 ai_chat_cancel 置位
     let request_id = payload.request_id.clone();
@@ -1047,87 +1716,112 @@ pub async fn ai_chat(
     // 本次调用实际「问了什么」，随用量流水一起落库
     let preview = request_preview(&messages);
 
-    let prepared = prepare(&provider, &messages, temperature, true)?;
-
-    // 本地估算兜底：部分网关不回 usage
-    let prompt_chars: i64 = messages
-        .iter()
-        .map(|message| estimate_tokens(&message.content))
-        .sum();
-    let started = std::time::Instant::now();
-    let mut prompt_tokens = 0i64;
-    let mut completion_tokens = 0i64;
-    let mut reply = String::new();
-
-    let mut request = state
-        .client(false)
-        .post(&prepared.url)
-        .timeout(Duration::from_secs(timeout_secs))
-        .header("Content-Type", "application/json")
-        .json(&prepared.body);
-    for (key, value) in &prepared.headers {
-        request = request.header(key, value);
-    }
-
-    if is_cancelled() {
-        emit(&on_event, "cancelled", "");
-        return Ok(());
-    }
-
-    // 首 delta 之前允许自动重试（429 / 5xx / 网络错误），最多 2 次；
-    // 一旦给用户吐出内容就不再静默重试，否则会出现半句话后整段重来
-    let mut attempt = 0u32;
-    let response =
-        loop {
-            attempt += 1;
-            let attempt_request = request
-                .try_clone()
-                .ok_or_else(|| "请求体无法复用，已停止重试".to_string())?;
-            match attempt_request.send().await {
-                Ok(response) => {
-                    let status = response.status();
-                    let retryable = status.as_u16() == 429 || status.is_server_error();
-                    if retryable && attempt <= 2 {
-                        let wait = retry_after_secs(response.headers())
-                            .unwrap_or(if attempt == 1 { 1 } else { 3 });
-                        emit(
-                            &on_event,
-                            "retry",
-                            format!(
-                                "服务{}，{wait} 秒后重试（{attempt}/2）",
-                                if status.as_u16() == 429 {
-                                    "限流"
-                                } else {
-                                    "繁忙"
-                                }
-                            ),
-                        );
-                        tokio::time::sleep(Duration::from_secs(wait)).await;
-                        if is_cancelled() {
-                            emit(&on_event, "cancelled", "");
-                            return Ok(());
-                        }
-                        continue;
-                    }
-                    break response;
+    // 逐家尝试：任何一家在首个 delta 前失败（网络 / 429 / 5xx / 4xx / 配置错误）
+    // 都切换到下一家；一旦开始流式输出就不再切换，避免半句话 + 换模型重来
+    let mut selected: Option<(AiProvider, reqwest::Response, i64, std::time::Instant)> = None;
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        let last = index + 1 == candidate_count;
+        if is_cancelled() {
+            emit(&on_event, "cancelled", "");
+            return Ok(());
+        }
+        if let Err(message) = state.policy().ensure_cloud_ai(&candidate.base_url) {
+            if last {
+                return Err(message);
+            }
+            emit(
+                &on_event,
+                "retry",
+                format!("模型 {} 被企业策略禁用，已跳过", candidate.name),
+            );
+            continue;
+        }
+        let mut provider = candidate;
+        // 前端已按主模型名识别出窗口（或用户显式覆盖）：只对主模型生效
+        if Some(payload.provider_id) == provider.id {
+            if let Some(window) = payload.context_window.filter(|value| *value > 0) {
+                provider.context_window = Some(window);
+            }
+        }
+        let temperature = payload
+            .temperature
+            .or(provider.temperature)
+            .unwrap_or(0.3)
+            .clamp(0.0, 2.0);
+        let timeout_secs = provider
+            .timeout_secs
+            .unwrap_or(AI_TIMEOUT_SECS as i64)
+            .clamp(10, 3600) as u64;
+        // 原生工具：provider 显式关闭时忽略前端传入的定义（AI-04）
+        let tools = if matches!(provider.native_tools, Some(0)) {
+            Vec::new()
+        } else {
+            payload.tools.clone()
+        };
+        let prepared = match prepare(
+            &provider,
+            &messages,
+            &payload.images,
+            &tools,
+            temperature,
+            true,
+        ) {
+            Ok(value) => value,
+            Err(message) => {
+                if last {
+                    return Err(message);
                 }
-                Err(error) => {
-                    if attempt <= 2 {
-                        let wait = if attempt == 1 { 1 } else { 3 };
-                        emit(
-                            &on_event,
-                            "retry",
-                            format!("网络异常，{wait} 秒后重试（{attempt}/2）"),
-                        );
-                        tokio::time::sleep(Duration::from_secs(wait)).await;
-                        if is_cancelled() {
-                            emit(&on_event, "cancelled", "");
-                            return Ok(());
-                        }
-                        continue;
-                    }
-                    let text = humanize_network_error(&error.to_string());
-                    emit(&on_event, "error", text.clone());
+                emit(
+                    &on_event,
+                    "retry",
+                    format!("模型 {} 配置不可用：{}，已跳过", provider.name, message),
+                );
+                continue;
+            }
+        };
+
+        // 本地估算兜底：部分网关不回 usage；图片按每张 800 token 计入，工具定义也占前缀
+        let tool_tokens: i64 = tools
+            .iter()
+            .map(|tool| {
+                estimate_tokens(&tool.name)
+                    + estimate_tokens(&tool.description)
+                    + estimate_tokens(&tool.parameters.to_string())
+            })
+            .sum();
+        let prompt_chars: i64 = messages
+            .iter()
+            .map(|message| estimate_tokens(&message.content))
+            .sum::<i64>()
+            + payload.images.len() as i64 * IMAGE_TOKEN_ESTIMATE
+            + tool_tokens;
+        let started = std::time::Instant::now();
+
+        let mut request = state
+            .client(false)
+            .post(&prepared.url)
+            .timeout(Duration::from_secs(timeout_secs))
+            .header("Content-Type", "application/json")
+            .json(&prepared.body);
+        for (key, value) in &prepared.headers {
+            request = request.header(key, value);
+        }
+        if index > 0 {
+            emit(
+                &on_event,
+                "retry",
+                format!("正在尝试备用模型 {} · {}…", provider.name, provider.model),
+            );
+        }
+
+        match send_with_retry(request, &on_event, &is_cancelled).await {
+            SendOutcome::Cancelled => {
+                emit(&on_event, "cancelled", "");
+                return Ok(());
+            }
+            SendOutcome::Failed(message) => {
+                if last {
+                    emit(&on_event, "error", message.clone());
                     record_usage(
                         state.inner(),
                         &provider,
@@ -1135,35 +1829,77 @@ pub async fn ai_chat(
                         0,
                         false,
                         started.elapsed().as_millis() as i64,
-                        Some(&text),
+                        Some(&message),
                         &preview,
                     );
-                    return Err(text);
+                    return Err(message);
                 }
+                emit(
+                    &on_event,
+                    "retry",
+                    format!("{} 不可用：{}，尝试下一个备用模型", provider.name, message),
+                );
+                continue;
             }
-        };
-
-    let status = response.status();
-    if !status.is_success() {
-        let raw = response.text().await.unwrap_or_default();
-        let text = format!(
-            "AI 服务返回 {}：{}",
-            status.as_u16(),
-            humanize_api_error(status.as_u16(), &extract_api_error(&raw))
-        );
-        emit(&on_event, "error", text.clone());
-        record_usage(
-            state.inner(),
-            &provider,
-            prompt_chars,
-            0,
-            false,
-            started.elapsed().as_millis() as i64,
-            Some(&text),
-            &preview,
-        );
-        return Err(text);
+            SendOutcome::Response(response) => {
+                let status = response.status();
+                if !status.is_success() {
+                    let raw = response.text().await.unwrap_or_default();
+                    let text = format!(
+                        "AI 服务返回 {}：{}",
+                        status.as_u16(),
+                        humanize_api_error(status.as_u16(), &extract_api_error(&raw))
+                    );
+                    if last {
+                        emit(&on_event, "error", text.clone());
+                        record_usage(
+                            state.inner(),
+                            &provider,
+                            prompt_chars,
+                            0,
+                            false,
+                            started.elapsed().as_millis() as i64,
+                            Some(&text),
+                            &preview,
+                        );
+                        return Err(text);
+                    }
+                    emit(
+                        &on_event,
+                        "retry",
+                        format!(
+                            "{} 返回 {}，尝试下一个备用模型",
+                            provider.name,
+                            status.as_u16()
+                        ),
+                    );
+                    continue;
+                }
+                if index > 0 {
+                    // 前端据此按实际模型计价，并提示本次已切换（AI-12）
+                    emit(
+                        &on_event,
+                        "fallback",
+                        serde_json::json!({
+                            "providerId": provider.id,
+                            "name": provider.name,
+                            "model": provider.model,
+                        })
+                        .to_string(),
+                    );
+                }
+                selected = Some((provider, response, prompt_chars, started));
+                break;
+            }
+        }
     }
+    let Some((provider, response, prompt_chars, started)) = selected else {
+        return Err("没有可用的 AI 服务，请检查模型配置".to_string());
+    };
+
+    let mut prompt_tokens = 0i64;
+    let mut completion_tokens = 0i64;
+    let mut reply = String::new();
 
     let is_sse = response
         .headers()
@@ -1179,11 +1915,35 @@ pub async fn ai_chat(
             emit(&on_event, "cancelled", "");
             return Ok(());
         }
-        let (prompt, completion) = usage_of(
-            &provider.kind,
-            &serde_json::from_str(&raw).unwrap_or_default(),
-        )
-        .unwrap_or((prompt_chars, 0));
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+        let (prompt, completion) = usage_of(&provider.kind, &parsed).unwrap_or((prompt_chars, 0));
+        let native_calls = native_calls_of(&provider.kind, &parsed);
+        if !native_calls.is_empty() {
+            // 纯工具调用响应没有正文，按成功处理；正文存在时照常先展示
+            if let Ok(text) = parse_full_text(&provider.kind, &raw) {
+                emit(&on_event, "delta", &text);
+            }
+            for (id, name, arguments) in &native_calls {
+                emit(
+                    &on_event,
+                    "tool_call",
+                    serde_json::json!({ "id": id, "name": name, "arguments": arguments })
+                        .to_string(),
+                );
+            }
+            emit(&on_event, "done", "");
+            record_usage(
+                state.inner(),
+                &provider,
+                prompt,
+                completion.max(0),
+                true,
+                started.elapsed().as_millis() as i64,
+                None,
+                &preview,
+            );
+            return Ok(());
+        }
         return match parse_full_text(&provider.kind, &raw) {
             Ok(text) => {
                 emit(&on_event, "delta", &text);
@@ -1224,6 +1984,9 @@ pub async fn ai_chat(
 
     let mut stream = response.bytes_stream();
     let mut buffer: Vec<u8> = Vec::new();
+    let mut native_calls: std::collections::BTreeMap<usize, NativeCallAcc> =
+        std::collections::BTreeMap::new();
+    let mut native_next = 0usize;
     // 成功路径统一收尾：补齐估算值并落库
     macro_rules! finish {
         ($ok:expr, $err:expr) => {{
@@ -1290,7 +2053,11 @@ pub async fn ai_chat(
                         completion_tokens = completion;
                     }
                 }
+                Ok(SseOutcome::Tool(chunks)) => {
+                    apply_tool_chunks(&mut native_calls, &mut native_next, &chunks);
+                }
                 Ok(SseOutcome::Done) => {
+                    flush_native_calls(&native_calls, &on_event);
                     emit(&on_event, "done", "");
                     finish!(true, None);
                     return Ok(());
@@ -1304,6 +2071,7 @@ pub async fn ai_chat(
             }
         }
     }
+    flush_native_calls(&native_calls, &on_event);
     emit(&on_event, "done", "");
     finish!(true, None);
     Ok(())
@@ -1312,12 +2080,15 @@ pub async fn ai_chat(
 /// 测试连通性：发一条极短的问候，返回模型原文
 #[tauri::command]
 pub async fn ai_provider_test(state: State<'_, AppState>, id: i64) -> Result<String, String> {
+    state.policy().ensure_ai()?;
     let provider = load_provider(state.inner(), id)?;
+    state.policy().ensure_cloud_ai(&provider.base_url)?;
     let messages = vec![AiMessage {
         role: "user".to_string(),
         content: "只回复两个字：可用".to_string(),
+        ..Default::default()
     }];
-    let prepared = prepare(&provider, &messages, 0.0, false)?;
+    let prepared = prepare(&provider, &messages, &[], &[], 0.0, false)?;
 
     let mut request = state
         .client(false)
@@ -1356,7 +2127,9 @@ pub async fn ai_models_list(
     state: State<'_, AppState>,
     provider_id: i64,
 ) -> Result<Vec<String>, String> {
+    state.policy().ensure_ai()?;
     let provider = load_provider(state.inner(), provider_id)?;
+    state.policy().ensure_cloud_ai(&provider.base_url)?;
     let base = if provider.base_url.trim().is_empty() {
         default_base(&provider.kind).to_string()
     } else {
@@ -1425,12 +2198,134 @@ pub async fn ai_models_list(
     Ok(models)
 }
 
-/// AI 生成的请求执行入口：与手动发送共用同一实现（历史、Cookie、快照一致）
+/// 环境是否已标记为生产；查不到按非生产处理
+fn env_is_prod(state: &AppState, env_id: Option<i64>) -> bool {
+    let Some(id) = env_id else {
+        return false;
+    };
+    let Ok(conn) = state.pool.get() else {
+        return false;
+    };
+    conn.query_row(
+        "SELECT COALESCE(is_prod, 0) FROM environments WHERE id = ?1",
+        [id],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|value| value != 0)
+    .unwrap_or(false)
+}
+
+/// AI 发送操作的审计：放行、待确认、拒绝都留痕，URL 先脱敏
+fn audit_ai_send(
+    state: &AppState,
+    payload: &SendRequestPayload,
+    mode: &str,
+    is_prod: bool,
+    decision: crate::services::ai_policy::Decision,
+    confirmed: bool,
+    trace_id: Option<&str>,
+) {
+    let Ok(conn) = state.pool.get() else {
+        return;
+    };
+    let url = crate::logging::redact(payload.url.trim());
+    let detail = serde_json::json!({
+        "kind": "send",
+        "method": payload.method.trim().to_ascii_uppercase(),
+        "url": url,
+        "envId": payload.env_id,
+        "isProd": is_prod,
+        "mode": crate::services::ai_policy::normalize_mode(mode),
+        "decision": decision.as_str(),
+        "confirmed": confirmed,
+    });
+    let denied = decision == crate::services::ai_policy::Decision::Deny
+        || (decision.needs_confirm() && !confirmed);
+    if let Err(error) = crate::services::audit::write(
+        &conn,
+        "ai_write_confirm",
+        Some(&url),
+        if denied { "denied" } else { "ok" },
+        Some(&detail),
+        trace_id,
+    ) {
+        log::warn!("AI 发送审计写入失败：{error}");
+    }
+}
+
+/// 前端确认写工具 / 发送后的审计落库（AI-01）
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiConfirmAuditPayload {
+    pub tool: String,
+    #[serde(default)]
+    pub target: Option<String>,
+    pub allowed: bool,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub trace_id: Option<String>,
+}
+
+#[tauri::command]
+pub fn ai_confirm_audit(
+    state: State<'_, AppState>,
+    payload: AiConfirmAuditPayload,
+) -> Result<(), String> {
+    let conn = state.pool.get().map_err(err)?;
+    let mode = crate::services::ai_policy::normalize_mode(payload.mode.as_deref().unwrap_or(""));
+    let detail = serde_json::json!({
+        "kind": "write",
+        "tool": payload.tool,
+        "mode": mode,
+        "allowed": payload.allowed,
+    });
+    crate::services::audit::write(
+        &conn,
+        "ai_write_confirm",
+        payload.target.as_deref(),
+        if payload.allowed { "ok" } else { "denied" },
+        Some(&detail),
+        payload.trace_id.as_deref(),
+    )
+}
+
+/// AI 生成的请求执行入口：与手动发送共用同一实现（历史、Cookie、快照一致）。
+///
+/// AI-01：命令层再判一次权限，前端确认只是体验层，不能替代这里的拦截。
 #[tauri::command]
 pub async fn ai_execute(
     state: State<'_, AppState>,
     payload: SendRequestPayload,
+    confirmed: Option<bool>,
+    trace_id: Option<String>,
 ) -> Result<HttpResult, String> {
+    use crate::services::ai_policy::{decide_send, deny_reason, Decision};
+
+    state.policy().ensure_ai()?;
+    let mode = state.settings().ai_permission_mode;
+    let is_prod = env_is_prod(state.inner(), payload.env_id);
+    let decision = decide_send(&mode, &payload.method, is_prod);
+    let confirmed = confirmed.unwrap_or(false);
+    audit_ai_send(
+        state.inner(),
+        &payload,
+        &mode,
+        is_prod,
+        decision,
+        confirmed,
+        trace_id.as_deref(),
+    );
+
+    if decision == Decision::Deny {
+        return Err(format!(
+            "E_AI_DENY: {}",
+            deny_reason(&mode, &payload.method)
+        ));
+    }
+    if decision == Decision::Confirm && !confirmed {
+        return Err("E_AI_CONFIRM: 该请求需要用户确认后才能由 AI 发送".to_string());
+    }
     crate::commands::http::execute(state.inner(), payload).await
 }
 
@@ -1976,15 +2871,17 @@ pub fn ai_tool_log_clear(
     Ok(affected)
 }
 
-/// 模型用量统计：按服务商/模型聚合调用次数、成功率、token、耗时，以及该模型会话下的工具成功率
+/// 模型用量统计：按服务商/模型聚合调用次数、成功率、token、耗时，以及该模型会话下的工具成功率。
+/// `since_ms` 可选：用于「本月预算」这类自然月窗口，传了就优先于 `days`。
 #[tauri::command]
 pub fn ai_usage_stats(
     state: State<'_, AppState>,
     days: Option<i64>,
+    since_ms: Option<i64>,
 ) -> Result<AiUsageStats, String> {
     let conn = state.pool.get().map_err(err)?;
     let days = days.unwrap_or(30).clamp(1, 365);
-    let since = now_ms() - days * DAY_MS;
+    let since = since_ms.unwrap_or_else(|| now_ms() - days * DAY_MS);
 
     let mut stmt = conn
         .prepare(
@@ -2375,14 +3272,17 @@ mod tests {
             AiMessage {
                 role: "system".into(),
                 content: HANGZAI_SYSTEM_PROMPT.into(),
+                ..Default::default()
             },
             AiMessage {
                 role: "system".into(),
                 content: "工具协议".into(),
+                ..Default::default()
             },
             AiMessage {
                 role: "user".into(),
                 content: "你好".into(),
+                ..Default::default()
             },
         ];
         let out = apply_scene_prompt("agent", messages);
@@ -2400,6 +3300,7 @@ mod tests {
             vec![AiMessage {
                 role: "user".into(),
                 content: "hi".into(),
+                ..Default::default()
             }],
         );
         assert_eq!(out.len(), 2);
@@ -2414,6 +3315,7 @@ mod tests {
                 vec![AiMessage {
                     role: "user".into(),
                     content: "hi".into(),
+                    ..Default::default()
                 }],
             );
             assert_eq!(out.len(), 1, "scene={scene}");
@@ -2449,5 +3351,398 @@ mod tests {
         assert_eq!(mask_sensitive(&once), once);
         assert_eq!(mask_sensitive("普通文本，没有密钥"), "普通文本，没有密钥");
         assert_eq!(mask_sensitive(""), "");
+    }
+
+    fn test_provider(kind: &str) -> AiProvider {
+        AiProvider {
+            id: Some(1),
+            name: "测试".into(),
+            kind: kind.into(),
+            base_url: String::new(),
+            model: "test-model".into(),
+            api_key: "sk-test".into(),
+            api_key_masked: String::new(),
+            has_key: true,
+            temperature: Some(0.3),
+            max_tokens: None,
+            timeout_secs: Some(300),
+            is_default: false,
+            supports_vision: true,
+            context_window: None,
+            native_tools: Some(-1),
+            input_price: Some(0.0),
+            output_price: Some(0.0),
+            currency: Some("USD".into()),
+        }
+    }
+
+    #[test]
+    fn prepare_attaches_images_to_last_user_message() {
+        let provider = test_provider("openai");
+        let messages = vec![
+            AiMessage {
+                role: "system".into(),
+                content: "sys".into(),
+                ..Default::default()
+            },
+            AiMessage {
+                role: "user".into(),
+                content: "older".into(),
+                ..Default::default()
+            },
+            AiMessage {
+                role: "assistant".into(),
+                content: "older-reply".into(),
+                ..Default::default()
+            },
+            AiMessage {
+                role: "user".into(),
+                content: "看看这张图".into(),
+                ..Default::default()
+            },
+        ];
+        let images = vec![AiImage {
+            mime: "image/png".into(),
+            data: "AAAA".into(),
+        }];
+        let prepared = prepare(&provider, &messages, &images, &[], 0.3, true).expect("prepare");
+        let chat = prepared.body["messages"].as_array().expect("messages");
+        assert_eq!(chat.len(), 4);
+        // 历史轮次仍是纯文本
+        assert_eq!(chat[1]["content"], "older");
+        // 最后一条用户消息变成多段内容
+        let parts = chat[3]["content"].as_array().expect("parts");
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert!(parts[1]["image_url"]["url"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn prepare_uses_protocol_specific_image_blocks() {
+        let messages = vec![AiMessage {
+            role: "user".into(),
+            content: "看图".into(),
+            ..Default::default()
+        }];
+        let images = vec![AiImage {
+            mime: "image/jpeg".into(),
+            data: "BBBB".into(),
+        }];
+
+        let anthropic = prepare(
+            &test_provider("anthropic"),
+            &messages,
+            &images,
+            &[],
+            0.3,
+            true,
+        )
+        .expect("anthropic");
+        let parts = anthropic.body["messages"][0]["content"]
+            .as_array()
+            .expect("anthropic parts");
+        assert_eq!(parts[1]["type"], "image");
+        assert_eq!(parts[1]["source"]["media_type"], "image/jpeg");
+
+        let gemini =
+            prepare(&test_provider("gemini"), &messages, &images, &[], 0.3, true).expect("gemini");
+        let parts = gemini.body["contents"][0]["parts"]
+            .as_array()
+            .expect("gemini parts");
+        assert_eq!(parts[1]["inlineData"]["mimeType"], "image/jpeg");
+        assert_eq!(parts[1]["inlineData"]["data"], "BBBB");
+    }
+
+    #[test]
+    fn image_limits_reject_unsupported_and_oversized() {
+        let provider = test_provider("openai");
+        let messages = vec![AiMessage {
+            role: "user".into(),
+            content: "x".into(),
+            ..Default::default()
+        }];
+        let too_many = vec![
+            AiImage {
+                mime: "image/png".into(),
+                data: "A".into(),
+            };
+            4
+        ];
+        assert!(prepare(&provider, &messages, &too_many, &[], 0.3, true)
+            .unwrap_err()
+            .contains("最多"));
+        let bad_mime = vec![AiImage {
+            mime: "image/gif".into(),
+            data: "A".into(),
+        }];
+        assert!(prepare(&provider, &messages, &bad_mime, &[], 0.3, true)
+            .unwrap_err()
+            .contains("不支持"));
+        let huge = vec![AiImage {
+            mime: "image/png".into(),
+            data: "A".repeat(MAX_IMAGE_BASE64 + 1),
+        }];
+        assert!(prepare(&provider, &messages, &huge, &[], 0.3, true)
+            .unwrap_err()
+            .contains("1MB"));
+    }
+
+    fn sample_tools() -> Vec<crate::models::AiToolDef> {
+        vec![crate::models::AiToolDef {
+            name: "project_list".into(),
+            description: "列出项目".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": { "limit": { "type": "number" } },
+                "required": ["limit"]
+            }),
+        }]
+    }
+
+    #[test]
+    fn prepare_includes_tools_in_protocol_shape() {
+        let messages = vec![AiMessage {
+            role: "user".into(),
+            content: "hi".into(),
+            ..Default::default()
+        }];
+        let tools = sample_tools();
+
+        let openai =
+            prepare(&test_provider("openai"), &messages, &[], &tools, 0.3, true).expect("openai");
+        assert_eq!(openai.body["tools"][0]["type"], "function");
+        assert_eq!(openai.body["tools"][0]["function"]["name"], "project_list");
+        assert_eq!(openai.body["tool_choice"], "auto");
+
+        let anthropic = prepare(
+            &test_provider("anthropic"),
+            &messages,
+            &[],
+            &tools,
+            0.3,
+            true,
+        )
+        .expect("anthropic");
+        assert_eq!(anthropic.body["tools"][0]["name"], "project_list");
+        assert_eq!(anthropic.body["tools"][0]["input_schema"]["type"], "object");
+
+        let gemini =
+            prepare(&test_provider("gemini"), &messages, &[], &tools, 0.3, true).expect("gemini");
+        assert_eq!(
+            gemini.body["tools"][0]["functionDeclarations"][0]["name"],
+            "project_list"
+        );
+    }
+
+    #[test]
+    fn prepare_marks_anthropic_cache_breakpoints() {
+        let messages = vec![
+            AiMessage {
+                role: "system".into(),
+                content: "你是航仔".into(),
+                ..Default::default()
+            },
+            AiMessage {
+                role: "user".into(),
+                content: "hi".into(),
+                ..Default::default()
+            },
+        ];
+        let anthropic = prepare(
+            &test_provider("anthropic"),
+            &messages,
+            &[],
+            &sample_tools(),
+            0.3,
+            true,
+        )
+        .expect("anthropic");
+        // AI-05：system 与工具定义都带缓存断点，长对话重复前缀由服务端复用
+        assert_eq!(anthropic.body["system"][0]["type"], "text");
+        assert_eq!(anthropic.body["system"][0]["text"], "你是航仔");
+        assert_eq!(
+            anthropic.body["system"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert_eq!(
+            anthropic.body["tools"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+    }
+
+    #[test]
+    fn prepare_maps_native_tool_history() {
+        let messages = vec![
+            AiMessage {
+                role: "user".into(),
+                content: "看项目".into(),
+                ..Default::default()
+            },
+            AiMessage {
+                role: "assistant".into(),
+                content: String::new(),
+                tool_calls: vec![crate::models::AiToolCall {
+                    id: "call_1".into(),
+                    name: "project_list".into(),
+                    arguments: "{}".into(),
+                }],
+                ..Default::default()
+            },
+            AiMessage {
+                role: "tool".into(),
+                content: "[]".into(),
+                tool_call_id: Some("call_1".into()),
+                name: Some("project_list".into()),
+                ..Default::default()
+            },
+        ];
+
+        let openai =
+            prepare(&test_provider("openai"), &messages, &[], &[], 0.3, true).expect("openai");
+        assert_eq!(openai.body["messages"][1]["tool_calls"][0]["id"], "call_1");
+        assert!(openai.body["messages"][1]["content"].is_null());
+        assert_eq!(openai.body["messages"][2]["role"], "tool");
+        assert_eq!(openai.body["messages"][2]["tool_call_id"], "call_1");
+
+        let anthropic = prepare(&test_provider("anthropic"), &messages, &[], &[], 0.3, true)
+            .expect("anthropic");
+        assert_eq!(
+            anthropic.body["messages"][1]["content"][0]["type"],
+            "tool_use"
+        );
+        assert_eq!(
+            anthropic.body["messages"][2]["content"][0]["type"],
+            "tool_result"
+        );
+
+        let gemini =
+            prepare(&test_provider("gemini"), &messages, &[], &[], 0.3, true).expect("gemini");
+        assert_eq!(
+            gemini.body["contents"][1]["parts"][0]["functionCall"]["name"],
+            "project_list"
+        );
+        assert_eq!(
+            gemini.body["contents"][2]["parts"][0]["functionResponse"]["name"],
+            "project_list"
+        );
+    }
+
+    #[test]
+    fn sse_parses_native_tool_calls_in_three_protocols() {
+        let openai = parse_sse(
+            "openai",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"project_list\",\"arguments\":\"{\\\"a\\\":\"}}]}}]}",
+        )
+        .expect("openai");
+        assert!(matches!(openai, SseOutcome::Tool(_)));
+
+        let anthropic = parse_sse(
+            "anthropic",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"project_list\"}}",
+        )
+        .expect("anthropic start");
+        assert_eq!(
+            anthropic,
+            SseOutcome::Tool(vec![ToolChunk::Start {
+                index: 1,
+                id: "toolu_1".into(),
+                name: "project_list".into(),
+            }])
+        );
+        let anthropic = parse_sse(
+            "anthropic",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"a\\\":1}\"}}",
+        )
+        .expect("anthropic delta");
+        assert_eq!(
+            anthropic,
+            SseOutcome::Tool(vec![ToolChunk::Args {
+                index: 1,
+                partial: "{\"a\":1}".into(),
+            }])
+        );
+
+        let gemini = parse_sse(
+            "gemini",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"project_list\",\"args\":{}}}]}}]}",
+        )
+        .expect("gemini");
+        assert_eq!(
+            gemini,
+            SseOutcome::Tool(vec![ToolChunk::Full {
+                name: "project_list".into(),
+                arguments: serde_json::json!({}),
+            }])
+        );
+    }
+
+    #[test]
+    fn accumulate_and_flush_native_calls() {
+        let mut calls: std::collections::BTreeMap<usize, NativeCallAcc> =
+            std::collections::BTreeMap::new();
+        let mut next = 0usize;
+        apply_tool_chunks(
+            &mut calls,
+            &mut next,
+            &[
+                ToolChunk::Start {
+                    index: 0,
+                    id: "call_1".into(),
+                    name: "project_list".into(),
+                },
+                ToolChunk::Args {
+                    index: 0,
+                    partial: "{\"a\":".into(),
+                },
+                ToolChunk::Args {
+                    index: 0,
+                    partial: "1}".into(),
+                },
+                ToolChunk::Full {
+                    name: "project_get".into(),
+                    arguments: serde_json::json!({ "id": 3 }),
+                },
+            ],
+        );
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[&0].args, "{\"a\":1}");
+        assert_eq!(calls[&1].id, "call_1");
+        assert_eq!(calls[&1].name, "project_get");
+    }
+
+    #[test]
+    fn native_calls_of_reads_full_responses() {
+        let openai = serde_json::json!({
+            "choices": [{ "message": { "content": null, "tool_calls": [
+                { "id": "call_1", "function": { "name": "project_list", "arguments": "{\"x\":1}" } }
+            ]}}]
+        });
+        assert_eq!(
+            native_calls_of("openai", &openai),
+            vec![(
+                "call_1".to_string(),
+                "project_list".to_string(),
+                "{\"x\":1}".to_string()
+            )]
+        );
+
+        let anthropic = serde_json::json!({
+            "content": [{ "type": "tool_use", "id": "toolu_1", "name": "project_list", "input": { "x": 1 } }]
+        });
+        let calls = native_calls_of("anthropic", &anthropic);
+        assert_eq!(calls[0].0, "toolu_1");
+        assert_eq!(calls[0].2, "{\"x\":1}");
+
+        let gemini = serde_json::json!({
+            "candidates": [{ "content": { "parts": [
+                { "functionCall": { "name": "project_list", "args": { "x": 1 } } }
+            ]}}]
+        });
+        let calls = native_calls_of("gemini", &gemini);
+        assert_eq!(calls[0].0, "call_1");
+        assert_eq!(calls[0].1, "project_list");
     }
 }

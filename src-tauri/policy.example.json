@@ -1,0 +1,9 @@
+{
+  "disableAi": false,
+  "disableCloudAi": false,
+  "disableLanServices": false,
+  "disableTelemetry": false,
+  "forceEncryptBackup": false,
+  "allowedImportFormats": [],
+  "retentionDays": 0
+}

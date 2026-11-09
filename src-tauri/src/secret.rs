@@ -59,6 +59,8 @@ pub const AAD_ENV: &str = "env_variables:value";
 pub const AAD_AI: &str = "ai_providers:api_key";
 /// 请求级认证配置的加密上下文
 pub const AAD_REQUEST_AUTH: &str = "requests:auth";
+/// 异地备份目标（WebDAV）密码的加密上下文
+pub const AAD_BACKUP: &str = "backup_targets:password";
 
 /// 认证 JSON 中需要加密的字段：其余字段（kind / username / addTo 等）保持明文，
 /// 便于列表与表单直接展示，不要求每次读取都解密整块配置

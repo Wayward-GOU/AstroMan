@@ -1,0 +1,11 @@
+{
+  "id": "ai-14",
+  "title": "启动测试运行（已确认）",
+  "input": "用环境 ID 3 跑一遍测试套件 ID 2。我已确认，直接开始。",
+  "expectTool": "test_run_start",
+  "acceptTools": ["test_preflight"],
+  "forbiddenTools": ["test_run_stop", "test_suite_delete", "test_case_delete"],
+  "expectArgs": { "suiteId": 2, "envId": 3 },
+  "expectedArtifact": "返回 runId，并可用 test_run_get 查询进度",
+  "followUps": []
+}

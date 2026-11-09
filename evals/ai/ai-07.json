@@ -1,0 +1,11 @@
+{
+  "id": "ai-07",
+  "title": "查看环境变量",
+  "input": "项目 ID 1 配了哪些环境？变量大概是什么？",
+  "expectTool": "env_list",
+  "acceptTools": [],
+  "forbiddenTools": ["env_create", "env_var_save", "env_delete", "env_activate"],
+  "expectArgs": { "projectId": 1 },
+  "expectedArtifact": "环境列表与变量概况（密钥值已打码）",
+  "followUps": []
+}

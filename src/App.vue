@@ -21,6 +21,7 @@ import {
   MenuFoldOutlined,
   MenuUnfoldOutlined,
   ArrowLeftOutlined,
+  CloseOutlined,
   ScheduleOutlined,
 } from '@ant-design/icons-vue'
 import AppLogo from '@/components/AppLogo.vue'
@@ -161,6 +162,8 @@ const navGroups = computed(() => {
 /* ---------- 侧边栏折叠 ---------- */
 const SIDEBAR_KEY = 'astroman:sidebar-collapsed'
 const NARROW_BREAKPOINT = 1180
+/** 低于此宽度侧边栏改为抽屉，主内容独占整屏（1366×768@150% 也能放下） */
+const DRAWER_BREAKPOINT = 1024
 
 const sidebarPinned = ref(false)
 try {
@@ -169,13 +172,48 @@ try {
   // localStorage 不可用时使用默认展开态
 }
 const windowNarrow = ref(false)
-const sidebarCollapsed = computed(() => windowNarrow.value || sidebarPinned.value)
+const windowDrawer = ref(false)
+const sidebarDrawerOpen = ref(false)
+const sidebarCollapsed = computed(
+  () => !windowDrawer.value && (windowNarrow.value || sidebarPinned.value),
+)
 
 function syncSidebarWidth() {
-  windowNarrow.value = window.innerWidth < NARROW_BREAKPOINT
+  const width = window.innerWidth
+  windowDrawer.value = width < DRAWER_BREAKPOINT
+  windowNarrow.value = width < NARROW_BREAKPOINT
+  if (!windowDrawer.value) sidebarDrawerOpen.value = false
 }
 
+function openSidebarDrawer() {
+  sidebarDrawerOpen.value = true
+}
+
+function closeSidebarDrawer() {
+  sidebarDrawerOpen.value = false
+}
+
+/** 全局动效开关：localStorage 里记 off 时关掉所有非必要动画 */
+function applyMotionPreference() {
+  let off = false
+  try {
+    off = localStorage.getItem('fm-motion') === 'off'
+  } catch {
+    // localStorage 不可用时跟随系统 prefers-reduced-motion
+  }
+  document.documentElement.dataset.motion = off ? 'off' : 'on'
+}
+
+watch(
+  () => route.fullPath,
+  () => closeSidebarDrawer(),
+)
+
 function toggleSidebar() {
+  if (windowDrawer.value) {
+    closeSidebarDrawer()
+    return
+  }
   if (windowNarrow.value) {
     // 窄窗口下强制展开会把内容挤没，先让窗口变宽再展开
     windowNarrow.value = false
@@ -346,6 +384,7 @@ function groupPalette(items: PaletteItem[]) {
 }
 
 onMounted(() => {
+  applyMotionPreference()
   if (isBare.value) return
   const stored = Number(localStorage.getItem(ZOOM_KEY) ?? '1')
   applyZoom(Number.isFinite(stored) && stored > 0 ? stored : 1, false)
@@ -462,7 +501,34 @@ const theme = computed(() => {
   <a-config-provider :theme="theme">
     <router-view v-if="isBare" />
     <div v-else class="shell">
-      <aside class="sider" :class="{ collapsed: sidebarCollapsed }">
+      <button
+        v-if="windowDrawer"
+        class="sider-fab"
+        type="button"
+        aria-label="打开导航菜单"
+        @click="openSidebarDrawer"
+      >
+        <MenuUnfoldOutlined />
+      </button>
+      <div
+        v-if="windowDrawer && sidebarDrawerOpen"
+        class="sider-backdrop"
+        @click="closeSidebarDrawer"
+      />
+      <aside
+        class="sider"
+        :class="{ collapsed: sidebarCollapsed, drawer: windowDrawer, 'drawer-open': sidebarDrawerOpen }"
+        :aria-hidden="windowDrawer && !sidebarDrawerOpen ? 'true' : undefined"
+      >
+        <button
+          v-if="windowDrawer"
+          class="sider-drawer-close"
+          type="button"
+          aria-label="关闭导航菜单"
+          @click="closeSidebarDrawer"
+        >
+          <CloseOutlined />
+        </button>
         <div class="brand">
           <AppLogo :size="34" />
           <div class="brand-text">
@@ -650,6 +716,82 @@ const theme = computed(() => {
 .sider.collapsed {
   width: 64px;
   padding: 14px 8px 12px;
+}
+
+/* ---------- 窄窗口抽屉导航（<1024） ---------- */
+.sider-fab,
+.sider-backdrop,
+.sider-drawer-close {
+  display: none;
+}
+
+@media (max-width: 1023px) {
+  .sider-fab {
+    position: fixed;
+    left: 10px;
+    top: 9px;
+    z-index: 70;
+    width: 32px;
+    height: 32px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--fm-border);
+    border-radius: 8px;
+    background: var(--fm-surface);
+    color: var(--fm-text-2);
+    box-shadow: var(--fm-shadow-sm);
+    cursor: pointer;
+  }
+
+  .sider-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 80;
+    display: block;
+    background: rgba(15, 23, 42, 0.38);
+  }
+
+  .sider.drawer {
+    position: fixed;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    z-index: 90;
+    width: 244px;
+    padding: 14px 10px 12px;
+    transform: translateX(-100%);
+    transition: transform 0.18s ease;
+    box-shadow: var(--fm-shadow-lg);
+  }
+
+  .sider.drawer.drawer-open {
+    transform: translateX(0);
+  }
+
+  .sider-drawer-close {
+    position: absolute;
+    right: 8px;
+    top: 10px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 26px;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--fm-sidebar-text);
+    cursor: pointer;
+  }
+
+  .sider-drawer-close:hover {
+    background: var(--fm-sidebar-hover);
+  }
+
+  .main {
+    width: 100%;
+  }
 }
 
 .brand {

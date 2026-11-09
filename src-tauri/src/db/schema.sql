@@ -35,6 +35,8 @@ CREATE TABLE IF NOT EXISTS requests (
     collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
     name          TEXT NOT NULL,
     method        TEXT NOT NULL DEFAULT 'GET',
+    -- 请求类型：http | graphql | sse | websocket（v12）
+    protocol      TEXT NOT NULL DEFAULT 'http',
     url           TEXT NOT NULL,
     headers       TEXT,
     params        TEXT,
@@ -47,6 +49,8 @@ CREATE TABLE IF NOT EXISTS requests (
     auth          TEXT,
     sort_order    INTEGER DEFAULT 0,
     net_json      TEXT,
+    request_entity  TEXT,
+    response_entity TEXT,
     created_at    INTEGER NOT NULL,
     updated_at    INTEGER NOT NULL
 );
@@ -58,6 +62,7 @@ CREATE TABLE IF NOT EXISTS environments (
     name        TEXT NOT NULL,
     is_active   INTEGER DEFAULT 0,
     script      TEXT,
+    is_prod     INTEGER NOT NULL DEFAULT 0,
     created_at  INTEGER NOT NULL
 );
 
@@ -216,6 +221,30 @@ CREATE TABLE IF NOT EXISTS request_runs (
     size_bytes        INTEGER DEFAULT 0,
     error             TEXT,
     created_at        INTEGER NOT NULL
+);
+
+-- 请求版本历史（每次保存追加一条快照；保留 50 条 / 180 天，见 commands/revision.rs）
+CREATE TABLE IF NOT EXISTS request_revisions (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id    INTEGER NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
+    revision      INTEGER NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    source        TEXT NOT NULL DEFAULT 'save',
+    truncated     INTEGER NOT NULL DEFAULT 0,
+    created_at    INTEGER NOT NULL,
+    trace_id      TEXT
+);
+
+-- 契约快照（项目级 OpenAPI 基线；按节点中的实体树生成 schema）
+CREATE TABLE IF NOT EXISTS contract_snapshots (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id    INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    label         TEXT NOT NULL DEFAULT '',
+    spec_json     TEXT NOT NULL,
+    request_count INTEGER NOT NULL DEFAULT 0,
+    source        TEXT NOT NULL DEFAULT 'project',
+    digest        TEXT NOT NULL DEFAULT '',
+    created_at    INTEGER NOT NULL
 );
 
 -- 测试套件（v1.0.8 自动化测试场景）
@@ -406,6 +435,13 @@ CREATE TABLE IF NOT EXISTS ai_providers (
     supports_vision INTEGER NOT NULL DEFAULT 0,
     -- 上下文窗口覆盖（token）；0 = 前端按模型名自动识别
     context_window INTEGER NOT NULL DEFAULT 0,
+    -- 原生 function calling：-1 自动（按协议默认）、0 关闭、1 开启（AI-04）
+    native_tools  INTEGER NOT NULL DEFAULT -1,
+    -- 单价覆盖（每百万 token）；0 = 使用内置价格表（AI-06）
+    input_price   REAL NOT NULL DEFAULT 0,
+    output_price  REAL NOT NULL DEFAULT 0,
+    -- 计价币种：USD（默认）/ CNY
+    currency      TEXT NOT NULL DEFAULT 'USD',
     created_at    INTEGER NOT NULL,
     updated_at    INTEGER NOT NULL
 );
@@ -513,6 +549,81 @@ CREATE INDEX IF NOT EXISTS idx_notes_due ON notes(status, remind_at);
 CREATE INDEX IF NOT EXISTS idx_notes_ref ON notes(ref_type, ref_id);
 CREATE INDEX IF NOT EXISTS idx_notes_project ON notes(project_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_notes_status_due ON notes(status, due_at);
+CREATE INDEX IF NOT EXISTS idx_revisions_request ON request_revisions(request_id, revision DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_revisions_request_rev ON request_revisions(request_id, revision);
+-- 老库 trace_id 列由 COLUMN_MIGRATIONS 补齐，索引放在 migrate() 中创建
+
+CREATE INDEX IF NOT EXISTS idx_contract_snapshots_project ON contract_snapshots(project_id, id DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_note_files_sha ON note_files(sha256);
 CREATE INDEX IF NOT EXISTS idx_note_file_links_file ON note_file_links(file_id);
 -- idx_plans_project 依赖 updated_at 列，老库需先补列，因此放在 migrate() 中创建
+
+-- 审计日志（P-07 / AI-01）：只追加，默认保留 90 天
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at INTEGER NOT NULL,
+    action     TEXT NOT NULL,
+    target     TEXT,
+    result     TEXT NOT NULL DEFAULT 'ok',
+    detail     TEXT,
+    trace_id   TEXT,
+    actor      TEXT NOT NULL DEFAULT 'local'
+);
+CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_trace ON audit_logs(trace_id);
+
+-- Mock 路由（G-04）：随项目删除；body_type = 'auto' 时回放运行记录 / 实体骨架
+CREATE TABLE IF NOT EXISTS mock_routes (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    request_id  INTEGER REFERENCES requests(id) ON DELETE CASCADE,
+    name        TEXT    NOT NULL,
+    method      TEXT    NOT NULL,
+    path        TEXT    NOT NULL,
+    status_code INTEGER NOT NULL DEFAULT 200,
+    headers_json TEXT   NOT NULL DEFAULT '[]',
+    body_type   TEXT    NOT NULL DEFAULT 'auto',
+    body        TEXT    NOT NULL DEFAULT '',
+    delay_ms    INTEGER NOT NULL DEFAULT 0,
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    sort_order  INTEGER NOT NULL DEFAULT 0,
+    updated_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mock_project ON mock_routes(project_id, enabled);
+
+-- 异地备份目标（G-06）：口令不落库，WebDAV 密码复用 secrets 模块加密
+CREATE TABLE IF NOT EXISTS backup_targets (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    name          TEXT    NOT NULL,
+    kind          TEXT    NOT NULL,
+    url           TEXT    NOT NULL DEFAULT '',
+    username      TEXT    NOT NULL DEFAULT '',
+    password_enc  TEXT    NOT NULL DEFAULT '',
+    dir           TEXT    NOT NULL DEFAULT '',
+    enabled       INTEGER NOT NULL DEFAULT 1,
+    last_run_at   INTEGER,
+    last_status   TEXT,
+    created_at    INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_backup_target_name ON backup_targets(name);
+
+-- OpenAPI URL 来源（G-07）：保存拉取地址以便后续刷新
+CREATE TABLE IF NOT EXISTS openapi_sources (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id   INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    url          TEXT    NOT NULL,
+    headers_json TEXT    NOT NULL DEFAULT '[]',
+    updated_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_openapi_sources_project ON openapi_sources(project_id, id DESC);
+
+-- GraphQL introspection 结果（G-10）：敏感 Header 不入库，只保存 schema 原文
+CREATE TABLE IF NOT EXISTS graphql_schemas (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    endpoint    TEXT    NOT NULL,
+    schema_json TEXT    NOT NULL,
+    fetched_at  INTEGER NOT NULL,
+    UNIQUE(project_id, endpoint)
+);
+CREATE INDEX IF NOT EXISTS idx_graphql_schemas_project ON graphql_schemas(project_id, fetched_at DESC);

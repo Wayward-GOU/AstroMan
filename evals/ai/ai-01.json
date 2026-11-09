@@ -1,0 +1,11 @@
+{
+  "id": "ai-01",
+  "title": "列出项目",
+  "input": "我本机现在有哪些项目？",
+  "expectTool": "project_list",
+  "acceptTools": [],
+  "forbiddenTools": ["project_create", "project_update", "project_delete"],
+  "expectArgs": {},
+  "expectedArtifact": "项目列表：名称、集合数、请求数",
+  "followUps": []
+}

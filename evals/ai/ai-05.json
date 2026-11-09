@@ -1,0 +1,11 @@
+{
+  "id": "ai-05",
+  "title": "读取接口详情",
+  "input": "读一下请求 ID 12 的完整定义。",
+  "expectTool": "request_get",
+  "acceptTools": [],
+  "forbiddenTools": ["request_update", "request_delete", "send_request"],
+  "expectArgs": { "id": 12 },
+  "expectedArtifact": "该请求的方法、URL、请求头、参数、Body 与脚本配置",
+  "followUps": []
+}

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Duration;
 
 use rusqlite::{params, OptionalExtension, Transaction};
 use serde_json::Value;
@@ -17,6 +18,7 @@ struct ParsedCollection {
     children: Vec<ParsedCollection>,
 }
 
+#[derive(Default)]
 struct ParsedRequest {
     name: String,
     method: String,
@@ -25,6 +27,9 @@ struct ParsedRequest {
     params: Vec<KeyValueItem>,
     body_type: String,
     body: String,
+    /// OpenAPI 导入时由 schema 直接转成的实体；其它格式保持为空
+    request_entity: Option<String>,
+    response_entity: Option<String>,
 }
 
 #[derive(Default)]
@@ -43,18 +48,29 @@ pub fn api_import(
     path: String,
     project_id: Option<i64>,
 ) -> Result<Project, String> {
+    let path = crate::services::paths::prepare_read(&path)?;
     let content = std::fs::read_to_string(&path).map_err(|e| format!("读取文件失败：{e}"))?;
     let content = content.trim_start_matches('\u{feff}');
     let root: Value = serde_json::from_str(content).map_err(|e| format!("JSON 解析失败：{e}"))?;
+    let format = crate::services::policy::import_format_from_json(&root);
+    state.policy().ensure_import(format)?;
     let mut parsed = parse_import(&root)?;
     // HAR 本身没有项目名，用文件名兜底
     if parsed.name.trim().is_empty() {
-        parsed.name = Path::new(&path)
+        parsed.name = path
             .file_stem()
             .map(|stem| stem.to_string_lossy().to_string())
             .unwrap_or_default();
     }
+    import_parsed(state.inner(), parsed, project_id)
+}
 
+/// 已解析的导入结果写入数据库（多个入口共用：文件、URL、Bruno 目录）
+fn import_parsed(
+    state: &AppState,
+    parsed: ParsedImport,
+    project_id: Option<i64>,
+) -> Result<Project, String> {
     let mut conn = state.pool.get().map_err(err)?;
     let now = now_ms();
     let tx = conn.transaction().map_err(err)?;
@@ -126,6 +142,9 @@ fn parse_import(root: &Value) -> Result<ParsedImport, String> {
     {
         return parse_har(root);
     }
+    if root.get("_type").and_then(|v| v.as_str()) == Some("export") {
+        return parse_insomnia(root);
+    }
     if root.get("info").is_some() && root.get("item").and_then(|v| v.as_array()).is_some() {
         return parse_postman(root);
     }
@@ -137,7 +156,7 @@ fn parse_import(root: &Value) -> Result<ParsedImport, String> {
             "暂不支持 Postman v1 格式，请在 Postman 中重新导出为 Collection v2.1".to_string(),
         );
     }
-    Err("无法识别文件格式：请选择 Postman Collection v2.0/v2.1、Apifox 导出的 OpenAPI JSON，或浏览器 / Charles 导出的 HAR".to_string())
+    Err("无法识别文件格式：请选择 Postman Collection v2.0/v2.1、Insomnia v4 导出、Apifox 导出的 OpenAPI JSON，或浏览器 / Charles 导出的 HAR".to_string())
 }
 
 // ---------- 通用工具 ----------
@@ -261,6 +280,7 @@ fn parse_postman_request(name: &str, request: &Value) -> ParsedRequest {
             params: Vec::new(),
             body_type: "none".to_string(),
             body: String::new(),
+            ..Default::default()
         };
     }
 
@@ -302,6 +322,7 @@ fn parse_postman_request(name: &str, request: &Value) -> ParsedRequest {
         params,
         body_type,
         body,
+        ..Default::default()
     }
 }
 
@@ -516,6 +537,7 @@ fn parse_har(root: &Value) -> Result<ParsedImport, String> {
             params,
             body_type,
             body,
+            ..Default::default()
         };
 
         let index = match indexes.get(&host) {
@@ -693,6 +715,610 @@ fn parse_har_body(post: Option<&Value>) -> (String, String) {
         return ("json".to_string(), text);
     }
     ("raw".to_string(), text)
+}
+
+// ---------- Insomnia v4 ----------
+
+/// 解析 Insomnia v4 导出（`{"_type":"export","resources":[...]}`）：
+/// workspace / request_group / request / environment 四类资源映射到集合树。
+fn parse_insomnia(root: &Value) -> Result<ParsedImport, String> {
+    let resources = root
+        .get("resources")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "Insomnia 导出文件缺少 resources 数组".to_string())?;
+
+    let mut workspace_name = String::new();
+    let mut workspace_id = String::new();
+    let mut groups: Vec<(String, Option<String>, String)> = Vec::new();
+    let mut requests: Vec<(String, Option<String>, ParsedRequest)> = Vec::new();
+    let mut variables: Vec<(String, String)> = Vec::new();
+
+    for resource in resources {
+        match resource.get("_type").and_then(|v| v.as_str()).unwrap_or("") {
+            "workspace" => {
+                workspace_name = optional_text(resource.get("name")).unwrap_or_default();
+                workspace_id = optional_text(resource.get("_id")).unwrap_or_default();
+            }
+            "request_group" => {
+                let id = optional_text(resource.get("_id")).unwrap_or_default();
+                let parent = optional_text(resource.get("parentId"));
+                let name =
+                    optional_text(resource.get("name")).unwrap_or_else(|| "未命名分组".to_string());
+                groups.push((id, parent, name));
+            }
+            "request" => {
+                let id = optional_text(resource.get("_id")).unwrap_or_default();
+                let parent = optional_text(resource.get("parentId"));
+                requests.push((id, parent, parse_insomnia_request(resource)));
+            }
+            "environment" => {
+                if let Some(data) = resource.get("data").and_then(|v| v.as_object()) {
+                    for (key, value) in data {
+                        let text = match value {
+                            Value::Object(_) => {
+                                value.get("value").map(value_text).unwrap_or_default()
+                            }
+                            other => value_text(other),
+                        };
+                        variables.push((key.clone(), text));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let name = if workspace_name.trim().is_empty() {
+        "Insomnia 导入".to_string()
+    } else {
+        workspace_name
+    };
+    let root_parent = if workspace_id.is_empty() {
+        None
+    } else {
+        Some(workspace_id)
+    };
+
+    let mut collections = build_insomnia_groups(&groups, &requests, None, root_parent.as_deref());
+    // 直接挂在 workspace 根下的请求收进同名集合
+    let loose: Vec<&(String, Option<String>, ParsedRequest)> = requests
+        .iter()
+        .filter(|(_, parent, _)| parent.is_none() || parent.as_deref() == root_parent.as_deref())
+        .collect();
+    if !loose.is_empty() {
+        collections.push(ParsedCollection {
+            name: name.clone(),
+            requests: loose.iter().map(|(_, _, req)| clone_request(req)).collect(),
+            children: Vec::new(),
+        });
+    }
+    if collections.is_empty() {
+        return Err("Insomnia 文件中没有可导入的接口".to_string());
+    }
+    Ok(ParsedImport {
+        name,
+        description: None,
+        collections,
+        variables,
+    })
+}
+
+fn build_insomnia_groups(
+    groups: &[(String, Option<String>, String)],
+    requests: &[(String, Option<String>, ParsedRequest)],
+    parent: Option<&str>,
+    root_parent: Option<&str>,
+) -> Vec<ParsedCollection> {
+    let mut result = Vec::new();
+    for (id, group_parent, name) in groups {
+        let matches = match (parent, group_parent.as_deref()) {
+            (None, Some(value)) => Some(value) == root_parent,
+            (None, None) => false,
+            (Some(parent), Some(value)) => value == parent,
+            (Some(_), None) => false,
+        };
+        if !matches {
+            continue;
+        }
+        let direct: Vec<ParsedRequest> = requests
+            .iter()
+            .filter(|(_, request_parent, _)| request_parent.as_deref() == Some(id.as_str()))
+            .map(|(_, _, request)| clone_request(request))
+            .collect();
+        result.push(ParsedCollection {
+            name: name.clone(),
+            requests: direct,
+            children: build_insomnia_groups(groups, requests, Some(id), root_parent),
+        });
+    }
+    result
+}
+
+fn clone_request(request: &ParsedRequest) -> ParsedRequest {
+    ParsedRequest {
+        name: request.name.clone(),
+        method: request.method.clone(),
+        url: request.url.clone(),
+        headers: request
+            .headers
+            .iter()
+            .map(|header| KeyValueItem {
+                key: header.key.clone(),
+                value: header.value.clone(),
+                enabled: header.enabled,
+            })
+            .collect(),
+        params: request
+            .params
+            .iter()
+            .map(|param| KeyValueItem {
+                key: param.key.clone(),
+                value: param.value.clone(),
+                enabled: param.enabled,
+            })
+            .collect(),
+        body_type: request.body_type.clone(),
+        body: request.body.clone(),
+        request_entity: None,
+        response_entity: None,
+    }
+}
+
+fn parse_insomnia_request(resource: &Value) -> ParsedRequest {
+    let mut headers = Vec::new();
+    if let Some(list) = resource.get("headers").and_then(|v| v.as_array()) {
+        for item in list {
+            let key = optional_text(item.get("name")).unwrap_or_default();
+            if key.is_empty() {
+                continue;
+            }
+            headers.push(KeyValueItem {
+                key,
+                value: item.get("value").map(value_text).unwrap_or_default(),
+                enabled: !item
+                    .get("disabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            });
+        }
+    }
+    if let Some(header) =
+        insomnia_auth_header(resource.get("authentication").unwrap_or(&Value::Null))
+    {
+        headers.push(header);
+    }
+
+    let mut params = Vec::new();
+    if let Some(list) = resource.get("parameters").and_then(|v| v.as_array()) {
+        for item in list {
+            let key = optional_text(item.get("name")).unwrap_or_default();
+            if key.is_empty() {
+                continue;
+            }
+            params.push(KeyValueItem {
+                key,
+                value: item.get("value").map(value_text).unwrap_or_default(),
+                enabled: !item
+                    .get("disabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            });
+        }
+    }
+
+    let (body_type, body) = resource
+        .get("body")
+        .map(parse_insomnia_body)
+        .unwrap_or_else(|| ("none".to_string(), String::new()));
+    ParsedRequest {
+        name: optional_text(resource.get("name")).unwrap_or_else(|| "未命名".to_string()),
+        method: optional_text(resource.get("method"))
+            .unwrap_or_else(|| "GET".to_string())
+            .to_uppercase(),
+        url: optional_text(resource.get("url")).unwrap_or_default(),
+        headers,
+        params,
+        body_type,
+        body,
+        request_entity: None,
+        response_entity: None,
+    }
+}
+
+fn insomnia_auth_header(auth: &Value) -> Option<KeyValueItem> {
+    let kind = auth.get("type").and_then(|v| v.as_str()).unwrap_or("none");
+    match kind {
+        "bearer" => {
+            let token = auth.get("token").map(value_text).unwrap_or_default();
+            if token.trim().is_empty() {
+                return None;
+            }
+            Some(KeyValueItem {
+                key: "Authorization".to_string(),
+                value: format!("Bearer {token}"),
+                enabled: true,
+            })
+        }
+        "basic" => {
+            let username = auth.get("username").map(value_text).unwrap_or_default();
+            let password = auth.get("password").map(value_text).unwrap_or_default();
+            if username.is_empty() && password.is_empty() {
+                return None;
+            }
+            Some(KeyValueItem {
+                key: "Authorization".to_string(),
+                value: format!(
+                    "Basic {}",
+                    base64_encode(format!("{username}:{password}").as_bytes())
+                ),
+                enabled: true,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn parse_insomnia_body(body: &Value) -> (String, String) {
+    let mime = body
+        .get("mimeType")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let text = body
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let params = body.get("params").and_then(|v| v.as_array());
+    if mime.contains("multipart") {
+        let fields: Vec<FormField> = params
+            .map(|list| {
+                list.iter()
+                    .filter_map(|item| {
+                        let key = optional_text(item.get("name"))?;
+                        let is_file = item.get("type").and_then(|v| v.as_str()) == Some("file");
+                        Some(FormField {
+                            key,
+                            value: item.get("value").map(value_text).unwrap_or_default(),
+                            enabled: !item
+                                .get("disabled")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false)
+                                && !is_file,
+                            kind: if is_file { "file" } else { "text" }.to_string(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !fields.is_empty() {
+            return (
+                "multipart".to_string(),
+                serde_json::to_string(&fields).unwrap_or_else(|_| "[]".to_string()),
+            );
+        }
+    }
+    if mime.contains("x-www-form-urlencoded") {
+        let pairs: Vec<String> = params
+            .map(|list| {
+                list.iter()
+                    .filter_map(|item| {
+                        let key = optional_text(item.get("name"))?;
+                        Some(format!(
+                            "{key}={}",
+                            item.get("value").map(value_text).unwrap_or_default()
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !pairs.is_empty() {
+            return ("form".to_string(), pairs.join("&"));
+        }
+    }
+    if text.trim().is_empty() {
+        return ("none".to_string(), String::new());
+    }
+    if mime.contains("json") || looks_like_json(&text) {
+        ("json".to_string(), text)
+    } else {
+        ("text".to_string(), text)
+    }
+}
+
+/// 小工具：Basic 认证头需要 base64，避免为一次导入引入新依赖
+fn base64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let value = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((value >> 18) & 63) as usize] as char);
+        out.push(TABLE[((value >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((value >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(value & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+// ---------- Bruno（.bru 目录） ----------
+
+/// 解析 Bruno 工作目录：目录结构映射成集合树，每个 `.bru` 文件是一个请求。
+#[tauri::command]
+pub fn bruno_import(
+    state: State<'_, AppState>,
+    path: String,
+    project_id: Option<i64>,
+) -> Result<Project, String> {
+    state.policy().ensure_import("bruno")?;
+    let root = crate::services::paths::prepare_existing_dir(&path)?;
+    let name = root
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|| "Bruno 导入".to_string());
+    let mut count = 0usize;
+    let requests = scan_bru_dir(&root, &mut count)?;
+    if requests.is_empty() {
+        return Err("目录中没有可导入的 .bru 文件".to_string());
+    }
+    let collections = vec![ParsedCollection {
+        name: name.clone(),
+        requests: Vec::new(),
+        children: requests,
+    }];
+    let parsed = ParsedImport {
+        name,
+        description: None,
+        collections,
+        variables: Vec::new(),
+    };
+    import_parsed(state.inner(), parsed, project_id)
+}
+
+/// 返回本目录下的子集合；本目录自己的请求放进第一个集合（同名目录）
+fn scan_bru_dir(dir: &Path, count: &mut usize) -> Result<Vec<ParsedCollection>, String> {
+    let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .map_err(|error| format!("读取目录失败（{}）：{error}", dir.display()))?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.starts_with('.'))
+                .unwrap_or(false)
+        })
+        .collect();
+    entries.sort();
+
+    let mut collections = Vec::new();
+    let mut requests = Vec::new();
+    for path in entries {
+        if path.is_dir() {
+            let name = path
+                .file_name()
+                .map(|value| value.to_string_lossy().to_string())
+                .unwrap_or_else(|| "分组".to_string());
+            let children = scan_bru_dir(&path, count)?;
+            if !children.is_empty() {
+                collections.push(ParsedCollection {
+                    name,
+                    requests: Vec::new(),
+                    children,
+                });
+            }
+        } else if path.extension().and_then(|value| value.to_str()) == Some("bru") {
+            if let Some(request) = parse_bru_file(&path) {
+                requests.push(request);
+                *count += 1;
+            }
+        }
+    }
+    if !requests.is_empty() {
+        let name = dir
+            .file_name()
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Bruno".to_string());
+        collections.insert(
+            0,
+            ParsedCollection {
+                name,
+                requests,
+                children: Vec::new(),
+            },
+        );
+    }
+    Ok(collections)
+}
+
+fn parse_bru_file(path: &Path) -> Option<ParsedRequest> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let blocks = bru_blocks(&text);
+    let mut name = path
+        .file_stem()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|| "请求".to_string());
+    let mut method = "GET".to_string();
+    let mut url = String::new();
+    let mut headers = Vec::new();
+    let mut params = Vec::new();
+    let mut body_type = "none".to_string();
+    let mut body = String::new();
+
+    for (block, content) in blocks {
+        match block.as_str() {
+            "meta" => {
+                if let Some(value) = bru_field(&content, "name") {
+                    if !value.is_empty() {
+                        name = value;
+                    }
+                }
+            }
+            "headers" => headers.extend(bru_pairs(&content)),
+            "params:query" => params.extend(bru_pairs(&content)),
+            "body:json" => {
+                if !content.trim().is_empty() {
+                    body = content.trim().to_string();
+                    body_type = "json".to_string();
+                }
+            }
+            "body:text" => {
+                if !content.trim().is_empty() {
+                    body = content.trim().to_string();
+                    body_type = "text".to_string();
+                }
+            }
+            "body:form-urlencoded" => {
+                let pairs: Vec<String> = bru_pairs(&content)
+                    .into_iter()
+                    .filter(|item| item.enabled)
+                    .map(|item| format!("{}={}", item.key, item.value))
+                    .collect();
+                if !pairs.is_empty() {
+                    body = pairs.join("&");
+                    body_type = "form".to_string();
+                }
+            }
+            "body:multipart-form" => {
+                let fields: Vec<FormField> = bru_pairs(&content)
+                    .into_iter()
+                    .map(|item| FormField {
+                        key: item.key,
+                        value: item.value,
+                        enabled: item.enabled,
+                        kind: "text".to_string(),
+                    })
+                    .collect();
+                if !fields.is_empty() {
+                    body = serde_json::to_string(&fields).unwrap_or_else(|_| "[]".to_string());
+                    body_type = "multipart".to_string();
+                }
+            }
+            "auth:bearer" => {
+                if let Some(token) = bru_field(&content, "token") {
+                    if !token.is_empty() {
+                        headers.push(KeyValueItem {
+                            key: "Authorization".to_string(),
+                            value: format!("Bearer {token}"),
+                            enabled: true,
+                        });
+                    }
+                }
+            }
+            other
+                if ["get", "post", "put", "patch", "delete", "head", "options"]
+                    .contains(&other) =>
+            {
+                method = other.to_uppercase();
+                if let Some(value) = bru_field(&content, "url") {
+                    url = value;
+                }
+            }
+            _ => {}
+        }
+    }
+    if url.trim().is_empty() {
+        return None;
+    }
+    Some(ParsedRequest {
+        name,
+        method,
+        url,
+        headers,
+        params,
+        body_type,
+        body,
+        request_entity: None,
+        response_entity: None,
+    })
+}
+
+/// 拆分 Bruno 的 `name { ... }` 块，按花括号深度找结束位置
+fn bru_blocks(text: &str) -> Vec<(String, String)> {
+    let mut blocks = Vec::new();
+    let mut current: Option<(String, String, i32)> = None;
+    for line in text.lines() {
+        match &mut current {
+            None => {
+                if let Some(open) = line.trim().strip_suffix('{') {
+                    let name = open.trim();
+                    if !name.is_empty()
+                        && !name.contains(' ')
+                        && name
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == ':' || c == '-' || c == '_')
+                    {
+                        current = Some((name.to_string(), String::new(), 1));
+                    }
+                }
+            }
+            Some((_, content, depth)) => {
+                let opens = line.matches('{').count() as i32;
+                let closes = line.matches('}').count() as i32;
+                *depth += opens - closes;
+                if *depth <= 0 {
+                    let (name, body, _) = current.take().unwrap();
+                    blocks.push((name, body));
+                } else {
+                    content.push_str(line);
+                    content.push('\n');
+                }
+            }
+        }
+    }
+    blocks
+}
+
+fn bru_field(content: &str, key: &str) -> Option<String> {
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            if name.trim() == key {
+                return Some(value.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+fn bru_pairs(content: &str) -> Vec<KeyValueItem> {
+    let mut items = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (disabled, line) = match line.strip_prefix('~') {
+            Some(rest) => (true, rest.trim()),
+            None => (false, line),
+        };
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        items.push(KeyValueItem {
+            key: key.to_string(),
+            value: value.trim().to_string(),
+            enabled: !disabled,
+        });
+    }
+    items
 }
 
 // ---------- OpenAPI / Apifox ----------
@@ -909,6 +1535,9 @@ fn parse_openapi_operation(
         format!("{{{{base_url}}}}/{path}")
     };
 
+    // G-07：schema 直接转实体，说明一并带入（其它格式没有实体结构）
+    let (request_entity, response_entity) = openapi_entities(root, operation, is_v3);
+
     ParsedRequest {
         name,
         method: method.to_uppercase(),
@@ -917,7 +1546,68 @@ fn parse_openapi_operation(
         params,
         body_type,
         body,
+        request_entity,
+        response_entity,
     }
+}
+
+/// 从 OpenAPI 操作里取出请求 / 响应 schema 并转成实体
+fn openapi_entities(
+    root: &Value,
+    operation: &Value,
+    is_v3: bool,
+) -> (Option<String>, Option<String>) {
+    let resolve = |value: &Value| resolve_schema(root, value).clone();
+    let encode = |schema: Option<&Value>| {
+        schema
+            .and_then(|schema| crate::entity::schema::entity_from_schema(schema, &resolve))
+            .and_then(|doc| doc.encode().ok())
+    };
+
+    let request_schema = if is_v3 {
+        operation.get("requestBody").and_then(json_content_schema)
+    } else {
+        operation
+            .get("parameters")
+            .and_then(|v| v.as_array())
+            .and_then(|list| {
+                list.iter()
+                    .find(|param| param.get("in").and_then(|v| v.as_str()) == Some("body"))
+            })
+            .and_then(|param| param.get("schema"))
+    };
+
+    let response_schema = operation
+        .get("responses")
+        .and_then(|v| v.as_object())
+        .and_then(|map| {
+            map.get("200").or_else(|| map.get("201")).or_else(|| {
+                map.iter()
+                    .find(|(code, _)| code.starts_with('2'))
+                    .map(|(_, value)| value)
+            })
+        })
+        .and_then(|response| {
+            if is_v3 {
+                json_content_schema(response)
+            } else {
+                response.get("schema")
+            }
+        });
+
+    (encode(request_schema), encode(response_schema))
+}
+
+/// 从 content 节点里找 JSON media 的 schema（优先 application/json）
+fn json_content_schema(node: &Value) -> Option<&Value> {
+    let content = node.get("content")?.as_object()?;
+    if let Some(media) = content.get("application/json") {
+        return media.get("schema");
+    }
+    content
+        .iter()
+        .find(|(name, _)| name.to_ascii_lowercase().contains("json"))
+        .and_then(|(_, media)| media.get("schema"))
 }
 
 fn param_value(root: &Value, parameter: &Value) -> String {
@@ -1111,8 +1801,9 @@ fn insert_collection(
         tx.execute(
             "INSERT INTO requests
                 (collection_id, name, method, url, headers, params, body_type, body,
-                 pre_script, post_script, assertions, sort_order, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)",
+                 pre_script, post_script, assertions, request_entity, response_entity,
+                 sort_order, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)",
             params![
                 collection_id,
                 request.name,
@@ -1125,11 +1816,14 @@ fn insert_collection(
                 "",
                 "",
                 "",
+                request.request_entity.as_deref().unwrap_or(""),
+                request.response_entity.as_deref().unwrap_or(""),
                 index as i64,
                 now,
             ],
         )
         .map_err(err)?;
+        crate::services::revision::record_in_tx(tx, tx.last_insert_rowid(), "import", None)?;
     }
 
     for (index, child) in collection.children.iter().enumerate() {
@@ -1208,6 +1902,174 @@ fn apply_variables(
     }
 
     Ok(())
+}
+
+// ---------- OpenAPI URL 拉取（G-07） ----------
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenApiUrlPayload {
+    pub url: String,
+    #[serde(default)]
+    pub headers: Vec<KeyValueItem>,
+    #[serde(default)]
+    pub project_id: Option<i64>,
+    /// 保存来源，便于后续刷新（写入 openapi_sources）
+    #[serde(default)]
+    pub save: bool,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenApiSource {
+    pub id: i64,
+    pub project_id: i64,
+    pub url: String,
+    pub headers: Vec<KeyValueItem>,
+    pub updated_at: i64,
+}
+
+/// 拉取 OpenAPI 地址并导入；保存来源时记录 URL 与 Header 供刷新
+#[tauri::command]
+pub async fn openapi_import_url(
+    state: State<'_, AppState>,
+    payload: OpenApiUrlPayload,
+) -> Result<Project, String> {
+    state.policy().ensure_import("openapi")?;
+    let root = fetch_openapi(state.inner(), &payload.url, &payload.headers).await?;
+    let parsed = parse_openapi(&root)?;
+    let project = import_parsed(state.inner(), parsed, payload.project_id)?;
+    if payload.save {
+        let conn = state.pool.get().map_err(err)?;
+        conn.execute(
+            "INSERT INTO openapi_sources (project_id, url, headers_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                project.id,
+                payload.url.trim(),
+                serde_json::to_string(&payload.headers).map_err(err)?,
+                now_ms()
+            ],
+        )
+        .map_err(err)?;
+    }
+    Ok(project)
+}
+
+#[tauri::command]
+pub fn openapi_source_list(
+    state: State<'_, AppState>,
+    project_id: i64,
+) -> Result<Vec<OpenApiSource>, String> {
+    let conn = state.pool.get().map_err(err)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, project_id, url, headers_json, updated_at
+               FROM openapi_sources WHERE project_id = ?1 ORDER BY id DESC",
+        )
+        .map_err(err)?;
+    let rows = stmt
+        .query_map(params![project_id], |row| {
+            let raw: Option<String> = row.get(3)?;
+            Ok(OpenApiSource {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                url: row.get(2)?,
+                headers: raw
+                    .and_then(|text| serde_json::from_str(&text).ok())
+                    .unwrap_or_default(),
+                updated_at: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+            })
+        })
+        .map_err(err)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(err)?;
+    Ok(rows)
+}
+
+#[tauri::command]
+pub fn openapi_source_delete(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    let conn = state.pool.get().map_err(err)?;
+    conn.execute("DELETE FROM openapi_sources WHERE id = ?1", params![id])
+        .map_err(err)?;
+    Ok(())
+}
+
+/// 按保存的来源重新拉取并导入同一项目（生成的请求会追加到现有集合）
+#[tauri::command]
+pub async fn openapi_source_refresh(
+    state: State<'_, AppState>,
+    id: i64,
+) -> Result<Project, String> {
+    state.policy().ensure_import("openapi")?;
+    let (project_id, url, headers) = {
+        let conn = state.pool.get().map_err(err)?;
+        conn.query_row(
+            "SELECT project_id, url, headers_json FROM openapi_sources WHERE id = ?1",
+            params![id],
+            |row| {
+                let raw: Option<String> = row.get(2)?;
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    raw.and_then(|text| serde_json::from_str::<Vec<KeyValueItem>>(&text).ok())
+                        .unwrap_or_default(),
+                ))
+            },
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => "来源不存在".to_string(),
+            other => err(other),
+        })?
+    };
+
+    let root = fetch_openapi(state.inner(), &url, &headers).await?;
+    let parsed = parse_openapi(&root)?;
+    let project = import_parsed(state.inner(), parsed, Some(project_id))?;
+    let conn = state.pool.get().map_err(err)?;
+    conn.execute(
+        "UPDATE openapi_sources SET updated_at = ?1 WHERE id = ?2",
+        params![now_ms(), id],
+    )
+    .map_err(err)?;
+    Ok(project)
+}
+
+async fn fetch_openapi(
+    state: &AppState,
+    url: &str,
+    headers: &[KeyValueItem],
+) -> Result<Value, String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err("OpenAPI 地址为空".to_string());
+    }
+    let mut request = state
+        .client(false)
+        .get(url)
+        .timeout(Duration::from_secs(30));
+    for header in headers.iter().filter(|header| header.enabled) {
+        if header.key.trim().is_empty() {
+            continue;
+        }
+        request = request.header(header.key.trim(), header.value.as_str());
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("拉取 OpenAPI 失败：{error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("拉取 OpenAPI 失败：HTTP {}", status.as_u16()));
+    }
+    let text = response
+        .text()
+        .await
+        .map_err(|error| format!("读取 OpenAPI 响应失败：{error}"))?;
+    let text = text.trim_start_matches('\u{feff}');
+    serde_json::from_str(text).map_err(|error| {
+        format!("仅支持 JSON 格式的 OpenAPI / Swagger 文档（YAML 请先转换为 JSON）：{error}")
+    })
 }
 
 #[cfg(test)]
@@ -1298,6 +2160,54 @@ mod tests {
     }
 
     #[test]
+    fn import_records_revision_with_import_source() {
+        use r2d2_sqlite::SqliteConnectionManager;
+
+        let dir = crate::util::test_dir("importer-revision");
+        let manager = SqliteConnectionManager::file(dir.join("astroman.db"));
+        let pool = r2d2::Pool::builder().max_size(2).build(manager).unwrap();
+        crate::db::init(&pool).unwrap();
+        let mut conn = pool.get().unwrap();
+        let now = now_ms();
+        conn.execute(
+            "INSERT INTO projects (name, created_at, updated_at) VALUES ('P', ?1, ?1)",
+            params![now],
+        )
+        .unwrap();
+        let project = conn.last_insert_rowid();
+
+        let collection = ParsedCollection {
+            name: "导入集合".into(),
+            requests: vec![ParsedRequest {
+                name: "详情".into(),
+                method: "GET".into(),
+                url: "https://api.example.com/users/{id}".into(),
+                headers: Vec::new(),
+                params: Vec::new(),
+                body_type: "none".into(),
+                body: String::new(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let tx = conn.transaction().unwrap();
+        insert_collection(&tx, project, None, &collection, 0, now).unwrap();
+        tx.commit().unwrap();
+
+        let (source, count): (String, i64) = conn
+            .query_row(
+                "SELECT source, (SELECT COUNT(*) FROM request_revisions)
+                   FROM request_revisions LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(source, "import");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
     fn har_form_and_multipart_bodies() {
         let form = json!({
             "mimeType": "application/x-www-form-urlencoded",
@@ -1331,6 +2241,194 @@ mod tests {
                 && field.kind == "file"
                 && field.value == "report.pdf"
         }));
+    }
+
+    #[test]
+    fn insomnia_maps_groups_requests_and_auth() {
+        let root = json!({
+            "_type": "export",
+            "resources": [
+                {"_type": "workspace", "_id": "wrk_1", "name": "演示工作区"},
+                {"_type": "request_group", "_id": "fld_1", "parentId": "wrk_1", "name": "用户"},
+                {
+                    "_type": "request", "_id": "req_1", "parentId": "fld_1",
+                    "name": "创建用户", "method": "POST",
+                    "url": "https://api.example.com/users",
+                    "headers": [{"name": "Content-Type", "value": "application/json"}],
+                    "parameters": [{"name": "debug", "value": "1"}],
+                    "body": {"mimeType": "application/json", "text": "{\"name\":\"张三\"}"},
+                    "authentication": {"type": "bearer", "token": "t-1"}
+                },
+                {
+                    "_type": "request", "_id": "req_2", "parentId": "wrk_1",
+                    "name": "列表", "method": "GET",
+                    "url": "https://api.example.com/users",
+                    "headers": [], "parameters": []
+                },
+                {
+                    "_type": "environment", "_id": "env_1", "parentId": "wrk_1",
+                    "data": {"base_url": {"value": "https://api.example.com"}, "page": "1"}
+                }
+            ]
+        });
+
+        let parsed = parse_import(&root).unwrap();
+        assert_eq!(parsed.name, "演示工作区");
+        assert_eq!(parsed.variables.len(), 2);
+        let group = parsed
+            .collections
+            .iter()
+            .find(|collection| collection.name == "用户")
+            .unwrap();
+        assert_eq!(group.requests.len(), 1);
+        let request = &group.requests[0];
+        assert_eq!(request.name, "创建用户");
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.body_type, "json");
+        assert!(request.body.contains("张三"));
+        assert!(request
+            .headers
+            .iter()
+            .any(|header| header.key == "Authorization" && header.value == "Bearer t-1"));
+
+        let loose = parsed
+            .collections
+            .iter()
+            .find(|collection| collection.name == "演示工作区")
+            .unwrap();
+        assert_eq!(loose.requests[0].name, "列表");
+    }
+
+    #[test]
+    fn bruno_blocks_and_request_are_parsed() {
+        let text = r#"
+meta {
+  name: 创建用户
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{base_url}}/users
+  body: json
+  auth: bearer
+}
+
+headers {
+  Content-Type: application/json
+}
+
+params:query {
+  page: 2
+  ~debug: 1
+}
+
+body:json {
+  {
+    "name": "张三"
+  }
+}
+
+auth:bearer {
+  token: abc
+}
+"#;
+        let blocks = bru_blocks(text);
+        assert!(blocks.iter().any(|(name, _)| name == "body:json"));
+        assert!(blocks.iter().any(|(name, _)| name == "post"));
+
+        let dir = crate::util::test_dir("bruno-parse");
+        let file = dir.join("create.bru");
+        std::fs::write(&file, text).unwrap();
+        let request = parse_bru_file(&file).unwrap();
+        assert_eq!(request.name, "创建用户");
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.url, "{{base_url}}/users");
+        assert_eq!(request.body_type, "json");
+        assert!(request.body.contains("\"name\": \"张三\""));
+        assert!(request
+            .params
+            .iter()
+            .any(|param| param.key == "page" && param.enabled));
+        assert!(request
+            .params
+            .iter()
+            .any(|param| param.key == "debug" && !param.enabled));
+        assert!(request
+            .headers
+            .iter()
+            .any(|header| header.key == "Authorization" && header.value == "Bearer abc"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn openapi_import_carries_entity_descriptions() {
+        let spec = json!({
+            "openapi": "3.0.0",
+            "info": {"title": "实体说明"},
+            "paths": {
+                "/users": {
+                    "post": {
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/User"}
+                                }
+                            }
+                        },
+                        "responses": {
+                            "200": {
+                                "content": {
+                                    "application/json": {
+                                        "schema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "id": {"type": "integer", "description": "用户编号"}
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "components": {
+                "schemas": {
+                    "User": {
+                        "type": "object",
+                        "required": ["name"],
+                        "properties": {
+                            "name": {"type": "string", "description": "昵称"}
+                        }
+                    }
+                }
+            }
+        });
+
+        let parsed = parse_import(&spec).unwrap();
+        let request = &parsed.collections[0].requests[0];
+        let request_doc =
+            crate::entity::model::EntityDoc::decode(request.request_entity.as_deref().unwrap())
+                .unwrap();
+        let name = request_doc
+            .flatten()
+            .into_iter()
+            .find(|field| field.path == "name")
+            .unwrap();
+        assert_eq!(name.type_name, "string");
+        assert!(name.required);
+        assert_eq!(name.description, "昵称");
+
+        let response_doc =
+            crate::entity::model::EntityDoc::decode(request.response_entity.as_deref().unwrap())
+                .unwrap();
+        let id = response_doc
+            .flatten()
+            .into_iter()
+            .find(|field| field.path == "id")
+            .unwrap();
+        assert_eq!(id.description, "用户编号");
     }
 
     #[test]

@@ -340,7 +340,8 @@ pub fn report_requests(
 /// 将前端生成的报告内容（HTML 文本或 XLSX 字节）写入指定路径。
 #[tauri::command]
 pub fn report_write_file(path: String, data: Vec<u8>) -> Result<(), String> {
-    std::fs::write(&path, data).map_err(|e| format!("写入文件失败：{e}"))?;
+    let path = crate::services::paths::prepare_write(&path)?;
+    std::fs::write(&path, data).map_err(|e| format!("写入文件失败（{}）：{e}", path.display()))?;
     Ok(())
 }
 

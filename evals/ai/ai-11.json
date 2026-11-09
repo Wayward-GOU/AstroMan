@@ -1,0 +1,11 @@
+{
+  "id": "ai-11",
+  "title": "保存压测计划（已确认）",
+  "input": "给请求 ID 12（属于项目 ID 1）保存压测计划，名称「登录接口压测」，固定并发 50、60 秒、P95 300ms、错误率 1%。我已确认保存。",
+  "expectTool": "plan_save",
+  "acceptTools": [],
+  "forbiddenTools": ["plan_delete", "stress_start", "stress_stop"],
+  "expectArgs": { "projectId": 1, "requestId": 12 },
+  "expectedArtifact": "项目 1 下新增压测计划「登录接口压测」，固定并发 50 × 60 秒，SLA P95 300ms / 错误率 1%",
+  "followUps": []
+}

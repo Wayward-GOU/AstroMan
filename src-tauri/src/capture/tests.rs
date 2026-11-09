@@ -122,20 +122,41 @@ fn proxy_forwards_http_and_ca_is_stable() {
 
     // HAR 导出：写入临时目录并确认包含这条流量
     let har_path = data_dir.join("session.har");
-    manager.export_har(&har_path).expect("export har");
+    manager.export_har(&har_path, false).expect("export har");
     let har = std::fs::read_to_string(&har_path).expect("read har");
     assert!(har.contains("\"entries\""));
     assert!(har.contains("hello-from-upstream"));
 
+    // 仅元数据导出：只保留大小与头部，不写请求/响应正文
+    let meta_path = data_dir.join("session-meta.har");
+    manager
+        .export_har(&meta_path, true)
+        .expect("export meta har");
+    let meta = std::fs::read_to_string(&meta_path).expect("read meta har");
+    assert!(meta.contains("\"entries\""));
+    assert!(!meta.contains("hello-from-upstream"));
+    let meta_json: serde_json::Value = serde_json::from_str(&meta).expect("meta har json");
+    let meta_entry = &meta_json["log"]["entries"][0];
+    assert_eq!(
+        meta_entry["response"]["content"]["size"],
+        "hello-from-upstream".len()
+    );
+    assert!(meta_entry["response"]["content"].get("text").is_none());
+    assert!(meta_entry["request"]["postData"].get("text").is_none());
+
     // 按 id 导出（域名分组右键导出）：只写选中的流量
     let group_path = data_dir.join("group.har");
     manager
-        .export_har_ids(&group_path, &[flow.id])
+        .export_har_ids(&group_path, &[flow.id], false)
         .expect("export group har");
     let group_har = std::fs::read_to_string(&group_path).expect("read group har");
     assert!(group_har.contains("hello-from-upstream"));
-    assert!(manager.export_har_ids(&group_path, &[]).is_err());
-    assert!(manager.export_har_ids(&group_path, &[u64::MAX]).is_err());
+    assert!(manager.export_har_ids(&group_path, &[], false).is_err());
+    assert!(manager
+        .export_har_ids(&group_path, &[u64::MAX], false)
+        .is_err());
+    // 被淘汰的分组不能留下半成品文件
+    assert!(!group_path.exists());
 
     // ZIP 导出：索引页、HAR、汇总与按域名分组的流量目录都要有
     let zip_path = data_dir.join("session.zip");

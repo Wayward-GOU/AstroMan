@@ -1,66 +1,15 @@
-use crate::models::{HttpRequestDetail, KeyValueItem, RequestSearchHit, RequestSummary};
+//! 请求命令薄壳：核心读写已下沉到 `services::request`。
+//!
+//! 保留原命令签名与 `find_request` / `map_detail` / `save_detail` 的导出，
+//! 让文档构建、测试运行等旧调用方无需改动。
+
+pub(crate) use crate::services::request::{find_request, map_detail, save_detail};
+
+use crate::models::{HttpRequestDetail, RequestSearchHit, RequestSummary};
+use crate::services::request;
 use crate::state::AppState;
-use crate::util::{err, now_ms};
-use rusqlite::{params, Connection, Row};
+use crate::util::err;
 use tauri::State;
-
-fn decode_list(raw: Option<String>) -> Vec<KeyValueItem> {
-    raw.and_then(|s| serde_json::from_str::<Vec<KeyValueItem>>(&s).ok())
-        .unwrap_or_default()
-}
-
-fn map_summary(row: &Row<'_>) -> rusqlite::Result<RequestSummary> {
-    Ok(RequestSummary {
-        id: row.get(0)?,
-        collection_id: row.get(1)?,
-        name: row.get(2)?,
-        method: row.get(3)?,
-        url: row.get(4)?,
-        sort_order: row.get(5)?,
-        updated_at: row.get(6)?,
-    })
-}
-
-fn map_detail(row: &Row<'_>) -> rusqlite::Result<HttpRequestDetail> {
-    let headers: Option<String> = row.get(5)?;
-    let query: Option<String> = row.get(6)?;
-    let auth: Option<String> = row.get(12)?;
-    Ok(HttpRequestDetail {
-        id: Some(row.get(0)?),
-        collection_id: row.get(1)?,
-        name: row.get(2)?,
-        method: row.get(3)?,
-        url: row.get(4)?,
-        headers: decode_list(headers),
-        params: decode_list(query),
-        body_type: row
-            .get::<_, Option<String>>(7)?
-            .unwrap_or_else(|| "none".into()),
-        body: row.get::<_, Option<String>>(8)?.unwrap_or_default(),
-        body_meta: row.get::<_, Option<String>>(13)?.unwrap_or_default(),
-        pre_script: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
-        post_script: row.get::<_, Option<String>>(10)?.unwrap_or_default(),
-        assertions: row.get::<_, Option<String>>(11)?.unwrap_or_default(),
-        auth: auth
-            .map(|text| crate::secret::decrypt_auth_json(&text))
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default(),
-    })
-}
-
-pub(crate) fn find_request(conn: &Connection, id: i64) -> Result<HttpRequestDetail, String> {
-    conn.query_row(
-        "SELECT id, collection_id, name, method, url, headers, params,
-                body_type, body, pre_script, post_script, assertions, auth, body_meta
-         FROM requests WHERE id = ?1",
-        params![id],
-        map_detail,
-    )
-    .map_err(|e| match e {
-        rusqlite::Error::QueryReturnedNoRows => "请求不存在".to_string(),
-        other => err(other),
-    })
-}
 
 #[tauri::command]
 pub fn request_list(
@@ -68,16 +17,7 @@ pub fn request_list(
     collection_id: i64,
 ) -> Result<Vec<RequestSummary>, String> {
     let conn = state.pool.get().map_err(err)?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, collection_id, name, method, url, sort_order, updated_at
-             FROM requests WHERE collection_id = ?1 ORDER BY sort_order ASC, id ASC",
-        )
-        .map_err(err)?;
-    let rows = stmt
-        .query_map(params![collection_id], map_summary)
-        .map_err(err)?;
-    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(err)
+    request::list_requests(&conn, collection_id)
 }
 
 #[tauri::command]
@@ -86,41 +26,8 @@ pub fn request_search(
     project_id: i64,
     keyword: String,
 ) -> Result<Vec<RequestSearchHit>, String> {
-    let keyword = keyword.trim();
-    if keyword.is_empty() {
-        return Ok(Vec::new());
-    }
-    let escaped = keyword
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_");
-    let pattern = format!("%{escaped}%");
     let conn = state.pool.get().map_err(err)?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT r.id, r.collection_id, c.name, r.name, r.method, r.url, r.updated_at
-             FROM requests r
-             JOIN collections c ON c.id = r.collection_id
-             WHERE c.project_id = ?1
-               AND (r.name LIKE ?2 ESCAPE '\\' OR r.url LIKE ?2 ESCAPE '\\')
-             ORDER BY r.updated_at DESC, r.id DESC
-             LIMIT 100",
-        )
-        .map_err(err)?;
-    let rows = stmt
-        .query_map(params![project_id, pattern], |row| {
-            Ok(RequestSearchHit {
-                id: row.get(0)?,
-                collection_id: row.get(1)?,
-                collection_name: row.get(2)?,
-                name: row.get(3)?,
-                method: row.get(4)?,
-                url: row.get(5)?,
-                updated_at: row.get(6)?,
-            })
-        })
-        .map_err(err)?;
-    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(err)
+    request::search_requests(&conn, project_id, &keyword)
 }
 
 #[tauri::command]
@@ -129,29 +36,7 @@ pub fn request_options(
     project_id: i64,
 ) -> Result<Vec<RequestSearchHit>, String> {
     let conn = state.pool.get().map_err(err)?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT r.id, r.collection_id, c.name, r.name, r.method, r.url, r.updated_at
-             FROM requests r
-             JOIN collections c ON c.id = r.collection_id
-             WHERE c.project_id = ?1
-             ORDER BY c.sort_order ASC, c.id ASC, r.sort_order ASC, r.id ASC",
-        )
-        .map_err(err)?;
-    let rows = stmt
-        .query_map(params![project_id], |row| {
-            Ok(RequestSearchHit {
-                id: row.get(0)?,
-                collection_id: row.get(1)?,
-                collection_name: row.get(2)?,
-                name: row.get(3)?,
-                method: row.get(4)?,
-                url: row.get(5)?,
-                updated_at: row.get(6)?,
-            })
-        })
-        .map_err(err)?;
-    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(err)
+    request::request_options(&conn, project_id)
 }
 
 #[tauri::command]
@@ -160,110 +45,13 @@ pub fn request_get(state: State<'_, AppState>, id: i64) -> Result<HttpRequestDet
     find_request(&conn, id)
 }
 
-/// 保存前统一整理字段：名称兜底、列表序列化、凭据加密
-struct SaveFields {
-    name: String,
-    headers: String,
-    params: String,
-    auth: String,
-}
-
-fn save_fields(request: &HttpRequestDetail) -> Result<SaveFields, String> {
-    let name = request.name.trim();
-    let name = if name.is_empty() {
-        "未命名请求"
-    } else {
-        name
-    };
-    Ok(SaveFields {
-        name: name.to_string(),
-        headers: serde_json::to_string(&request.headers).map_err(err)?,
-        params: serde_json::to_string(&request.params).map_err(err)?,
-        auth: crate::secret::encrypt_auth_json(
-            &serde_json::to_string(&request.auth).map_err(err)?,
-        )?,
-    })
-}
-
-fn update_existing(
-    conn: &Connection,
-    id: i64,
-    request: &HttpRequestDetail,
-    fields: &SaveFields,
-    now: i64,
-) -> Result<(), String> {
-    let affected = conn
-        .execute(
-            "UPDATE requests SET name = ?1, method = ?2, url = ?3, headers = ?4,
-                params = ?5, body_type = ?6, body = ?7, pre_script = ?8,
-                post_script = ?9, assertions = ?10, auth = ?11, body_meta = ?12,
-                updated_at = ?13
-             WHERE id = ?14",
-            params![
-                fields.name,
-                request.method,
-                request.url,
-                fields.headers,
-                fields.params,
-                request.body_type,
-                request.body,
-                request.pre_script,
-                request.post_script,
-                request.assertions,
-                fields.auth,
-                request.body_meta,
-                now,
-                id
-            ],
-        )
-        .map_err(err)?;
-    if affected == 0 {
-        return Err("请求不存在".to_string());
-    }
-    Ok(())
-}
-
 #[tauri::command]
 pub fn request_save(
     state: State<'_, AppState>,
     request: HttpRequestDetail,
 ) -> Result<HttpRequestDetail, String> {
-    let fields = save_fields(&request)?;
-    let now = now_ms();
     let conn = state.pool.get().map_err(err)?;
-
-    match request.id {
-        Some(id) => {
-            update_existing(&conn, id, &request, &fields, now)?;
-            find_request(&conn, id)
-        }
-        None => {
-            conn.execute(
-                "INSERT INTO requests
-                    (collection_id, name, method, url, headers, params, body_type, body, body_meta,
-                     pre_script, post_script, assertions, auth, sort_order, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0, ?14, ?14)",
-                params![
-                    request.collection_id,
-                    fields.name,
-                    request.method,
-                    request.url,
-                    fields.headers,
-                    fields.params,
-                    request.body_type,
-                    request.body,
-                    request.body_meta,
-                    request.pre_script,
-                    request.post_script,
-                    request.assertions,
-                    fields.auth,
-                    now
-                ],
-            )
-            .map_err(err)?;
-            find_request(&conn, conn.last_insert_rowid())
-        }
-    }
+    save_detail(&conn, &request, "save", false)
 }
 
 /// 自动保存专用：只写库，不把整份详情（含大 Body）再传回前端
@@ -272,20 +60,18 @@ pub fn request_save_quick(
     state: State<'_, AppState>,
     request: HttpRequestDetail,
 ) -> Result<(), String> {
-    let id = request
-        .id
-        .ok_or_else(|| "请求尚未保存，无法自动保存".to_string())?;
-    let fields = save_fields(&request)?;
+    if request.id.is_none() {
+        return Err("请求尚未保存，无法自动保存".to_string());
+    }
     let conn = state.pool.get().map_err(err)?;
-    update_existing(&conn, id, &request, &fields, now_ms())
+    save_detail(&conn, &request, "save", false)?;
+    Ok(())
 }
 
 #[tauri::command]
 pub fn request_delete(state: State<'_, AppState>, id: i64) -> Result<(), String> {
     let conn = state.pool.get().map_err(err)?;
-    conn.execute("DELETE FROM requests WHERE id = ?1", params![id])
-        .map_err(err)?;
-    Ok(())
+    request::delete_request(&conn, id)
 }
 
 /// 按给定顺序重排某集合下的请求（拖拽排序）。
@@ -295,19 +81,6 @@ pub fn request_reorder(
     collection_id: i64,
     ids: Vec<i64>,
 ) -> Result<(), String> {
-    if ids.is_empty() {
-        return Err("排序列表为空".to_string());
-    }
     let mut conn = state.pool.get().map_err(err)?;
-    let tx = conn.transaction().map_err(err)?;
-    for (index, id) in ids.iter().enumerate() {
-        tx.execute(
-            "UPDATE requests SET sort_order = ?1, updated_at = ?2
-             WHERE id = ?3 AND collection_id = ?4",
-            params![index as i64, now_ms(), id, collection_id],
-        )
-        .map_err(err)?;
-    }
-    tx.commit().map_err(err)?;
-    Ok(())
+    request::reorder_requests(&mut conn, collection_id, &ids)
 }

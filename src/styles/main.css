@@ -63,6 +63,34 @@
   box-sizing: border-box;
 }
 
+/* ---------- 键盘可达性 / 动效偏好 ---------- */
+/* Ant Design 的 .ant-input:focus 会把 outline 置空，键盘焦点会完全看不见；
+   这里用 !important 保证键盘用户在任何控件上都能看到焦点描边。 */
+:focus-visible {
+  outline: 2px solid var(--fm-primary) !important;
+  outline-offset: 2px !important;
+}
+
+html[data-motion='off'] *,
+html[data-motion='off'] *::before,
+html[data-motion='off'] *::after {
+  animation-duration: 0.001ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.001ms !important;
+  scroll-behavior: auto !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
 html,
 body,
 #app {

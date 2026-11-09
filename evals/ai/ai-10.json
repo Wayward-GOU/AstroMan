@@ -1,0 +1,11 @@
+{
+  "id": "ai-10",
+  "title": "压测报告详情",
+  "input": "看一下报告 ID 7 的 P95 和错误率。",
+  "expectTool": "report_get",
+  "acceptTools": [],
+  "forbiddenTools": ["report_delete", "report_export", "report_list"],
+  "expectArgs": { "id": 7 },
+  "expectedArtifact": "报告 7 的 P95、P99、错误率与阶段摘要",
+  "followUps": []
+}

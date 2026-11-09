@@ -11,10 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// 内存里最多保留的流量条数，超出后淘汰最旧的一条。
-pub const MAX_FLOWS: usize = 5_000;
-/// body 总预算，避免 5000 条大响应把内存吃满。
-pub const MAX_BODY_BYTES: u64 = 128 * 1024 * 1024;
+/// HAR 流式导出时每批深拷贝的条数
+pub const EXPORT_BATCH: usize = 200;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -113,6 +111,7 @@ impl FlowRecord {
 struct Inner {
     flows: VecDeque<FlowRecord>,
     body_bytes: u64,
+    limits: crate::services::profile::CaptureLimits,
 }
 
 pub struct CaptureStore {
@@ -124,14 +123,34 @@ pub struct CaptureStore {
 
 impl CaptureStore {
     pub fn new() -> Self {
+        Self::new_with_limits(crate::services::profile::CaptureLimits::default())
+    }
+
+    pub fn new_with_limits(limits: crate::services::profile::CaptureLimits) -> Self {
         Self {
             inner: Mutex::new(Inner {
                 flows: VecDeque::with_capacity(256),
                 body_bytes: 0,
+                limits,
             }),
             next_id: AtomicU64::new(1),
             total: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
+        }
+    }
+
+    /// 运行中切换档位：立即按新预算裁剪已有流量。
+    pub fn set_limits(&self, limits: crate::services::profile::CaptureLimits) {
+        let mut inner = self.inner.lock();
+        inner.limits = limits;
+        while (inner.flows.len() > inner.limits.max_flows
+            || inner.body_bytes > inner.limits.max_body_bytes)
+            && !inner.flows.is_empty()
+        {
+            if let Some(old) = inner.flows.pop_front() {
+                inner.body_bytes = inner.body_bytes.saturating_sub(old.body_bytes());
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -142,7 +161,7 @@ impl CaptureStore {
     pub fn record(&self, record: FlowRecord) {
         let added = record.body_bytes();
         let mut inner = self.inner.lock();
-        if inner.flows.len() >= MAX_FLOWS {
+        if inner.flows.len() >= inner.limits.max_flows {
             if let Some(old) = inner.flows.pop_front() {
                 inner.body_bytes = inner.body_bytes.saturating_sub(old.body_bytes());
                 self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -153,7 +172,7 @@ impl CaptureStore {
         self.total.fetch_add(1, Ordering::Relaxed);
 
         // body 总预算超限：从最旧一条开始淘汰，直到回到预算内
-        while inner.body_bytes > MAX_BODY_BYTES && inner.flows.len() > 1 {
+        while inner.body_bytes > inner.limits.max_body_bytes && inner.flows.len() > 1 {
             if let Some(old) = inner.flows.pop_front() {
                 inner.body_bytes = inner.body_bytes.saturating_sub(old.body_bytes());
                 self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -188,6 +207,62 @@ impl CaptureStore {
     pub fn details(&self) -> Vec<FlowDetail> {
         let inner = self.inner.lock();
         inner.flows.iter().map(to_detail).collect()
+    }
+
+    /// 分批遍历全部流量：每次只深拷贝 `batch` 条，避免满载时一次性复制全部 body。
+    pub fn for_each_detail<F>(&self, batch: usize, f: F) -> Result<(), String>
+    where
+        F: FnMut(&FlowDetail) -> Result<(), String>,
+    {
+        let ids: Vec<u64> = self
+            .inner
+            .lock()
+            .flows
+            .iter()
+            .map(|record| record.brief.id)
+            .collect();
+        self.for_each_detail_ids(&ids, batch, f)
+    }
+
+    /// 按 id 分批遍历（分组导出），被淘汰的 id 自动跳过，顺序仍是时间正序。
+    pub fn for_each_detail_ids<F>(&self, ids: &[u64], batch: usize, mut f: F) -> Result<(), String>
+    where
+        F: FnMut(&FlowDetail) -> Result<(), String>,
+    {
+        let batch = batch.max(1);
+        for chunk in ids.chunks(batch) {
+            let wanted: HashSet<u64> = chunk.iter().copied().collect();
+            let details: Vec<FlowDetail> = {
+                let inner = self.inner.lock();
+                inner
+                    .flows
+                    .iter()
+                    .filter(|record| wanted.contains(&record.brief.id))
+                    .map(to_detail)
+                    .collect()
+            };
+            for detail in &details {
+                f(detail)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 现存 body 字节数；`ids` 为空表示全部流量，用于导出前的体积提示。
+    pub fn body_bytes(&self, ids: Option<&[u64]>) -> u64 {
+        let inner = self.inner.lock();
+        match ids {
+            Some(ids) => {
+                let wanted: HashSet<u64> = ids.iter().copied().collect();
+                inner
+                    .flows
+                    .iter()
+                    .filter(|record| wanted.contains(&record.brief.id))
+                    .map(FlowRecord::body_bytes)
+                    .sum()
+            }
+            None => inner.body_bytes,
+        }
     }
 
     /// 按 id 导出（例如某个域名分组），忽略已淘汰的 id，保持时间正序。

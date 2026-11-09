@@ -41,20 +41,61 @@ pub fn clear_secrets() {
     }
 }
 
-/// 把文本里出现的敏感值替换为掩码
+/// 把文本里出现的敏感值替换为掩码。
+///
+/// 除了运行期登记的密钥，还要按「字段名」兜底：Authorization / Cookie /
+/// token / api_key / password 这类内容经常从请求头、URL、错误信息里顺带进日志，
+/// 不可能每个调用点都记得登记。
 pub fn redact(text: &str) -> String {
-    let guard = SECRETS.read();
-    let Some(set) = guard.as_ref() else {
-        return text.to_string();
-    };
-    if set.is_empty() || text.is_empty() {
-        return text.to_string();
+    if text.is_empty() {
+        return String::new();
     }
     let mut out = text.to_string();
-    for secret in set.iter() {
-        if out.contains(secret.as_str()) {
-            out = out.replace(secret.as_str(), "••••••");
+    {
+        let guard = SECRETS.read();
+        if let Some(set) = guard.as_ref() {
+            for secret in set.iter() {
+                if out.contains(secret.as_str()) {
+                    out = out.replace(secret.as_str(), "••••••");
+                }
+            }
         }
+    }
+    apply_patterns(&out)
+}
+
+fn apply_patterns(text: &str) -> String {
+    use std::sync::OnceLock;
+    static PATTERNS: OnceLock<Vec<(regex::Regex, &'static str)>> = OnceLock::new();
+    let patterns = PATTERNS.get_or_init(|| {
+        vec![
+            (
+                regex::Regex::new(
+                    r#"(?i)(authorization\s*[:=]\s*)(?:bearer\s+)?[^\s",}\]]+"#,
+                )
+                .unwrap(),
+                "${1}••••••",
+            ),
+            (
+                regex::Regex::new(r#"(?i)(cookie\s*[:=]\s*)[^\r\n"]+"#).unwrap(),
+                "${1}••••••",
+            ),
+            (
+                regex::Regex::new(
+                    r#"(?i)((?:access[_-]?token|refresh[_-]?token|api[_-]?key|apikey|secret|password|passwd|pwd|token)\s*["']?\s*[:=]\s*["']?)([^"'\s,}&\]}]+)"#,
+                )
+                .unwrap(),
+                "${1}••••••",
+            ),
+            (
+                regex::Regex::new(r"(?i)(https?://[^:/\s@]+:)([^/\s]+)(@)").unwrap(),
+                "${1}••••••${3}",
+            ),
+        ]
+    });
+    let mut out = text.to_string();
+    for (pattern, replacement) in patterns {
+        out = pattern.replace_all(&out, *replacement).into_owned();
     }
     out
 }
@@ -156,6 +197,68 @@ fn prune(dir: &Path, keep: usize) {
     }
 }
 
+/// 结构化日志行：一行一个 JSON，方便 grep 与诊断包解析。
+///
+/// 脱敏在序列化之前做，避免密钥里带引号时转义后匹配不到。
+pub fn format_json(buf: &mut dyn Write, record: &log::Record<'_>) -> io::Result<()> {
+    let entry = serde_json::json!({
+        "ts": chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        "level": record.level().as_str().to_ascii_lowercase(),
+        "target": record.target(),
+        "msg": redact(&record.args().to_string()),
+    });
+    writeln!(buf, "{entry}")
+}
+
+/// 记录 panic 到独立文件并保留默认 stderr 输出。
+///
+/// 不经过 log 宏：panic 可能发生在持有日志锁的时刻，再走一遍日志会死锁。
+pub fn install_panic_hook(data_dir: &Path) {
+    let dir = data_dir.join("logs");
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|value| value.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "未知 panic".to_string());
+        let location = info
+            .location()
+            .map(|value| format!("{}:{}:{}", value.file(), value.line(), value.column()))
+            .unwrap_or_else(|| "unknown".to_string());
+        let thread = std::thread::current();
+        let line = panic_line(thread.name().unwrap_or("unnamed"), &location, &payload);
+        if let Err(error) = append_panic(&dir, &line) {
+            eprintln!("panic 日志写入失败（{error}）");
+        }
+        // 保留默认行为：dev 下仍能在控制台看到完整堆栈
+        previous(info);
+    }));
+}
+
+fn panic_line(thread: &str, location: &str, payload: &str) -> String {
+    let entry = serde_json::json!({
+        "ts": chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        "level": "panic",
+        "thread": thread,
+        "location": location,
+        "msg": redact(payload),
+    });
+    format!("{entry}\n")
+}
+
+fn append_panic(dir: &Path, line: &str) -> io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let day = chrono::Local::now().format("%Y%m%d").to_string();
+    let path = dir.join(format!("panic-{day}.log"));
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    file.write_all(line.as_bytes())
+}
+
 /// 给诊断包用：最近 N 行日志
 pub fn tail(dir: &Path, lines: usize) -> String {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -207,5 +310,58 @@ mod tests {
         register_secret("abc");
         assert_eq!(redact("abc"), "abc");
         clear_secrets();
+    }
+
+    #[test]
+    fn redacts_headers_and_url_credentials() {
+        clear_secrets();
+        let text = "Authorization: Bearer abc.def.ghi\nCookie: sid=topsecret; theme=light\n\
+https://alice:p@ssw0rd@example.com/v1?token=xyz&q=1";
+        let masked = redact(text);
+        assert!(!masked.contains("abc.def.ghi"));
+        assert!(!masked.contains("topsecret"));
+        assert!(!masked.contains("p@ssw0rd"));
+        assert!(!masked.contains("token=xyz"));
+        assert!(masked.contains("Authorization: ••••••"));
+        assert!(masked.contains("https://alice:••••••@example.com"));
+    }
+
+    #[test]
+    fn redacts_json_fields() {
+        clear_secrets();
+        let masked = redact(r#"{"api_key":"sk-live-123","password":"hunter2","note":"ok"}"#);
+        assert!(!masked.contains("sk-live-123"));
+        assert!(!masked.contains("hunter2"));
+        assert!(masked.contains("\"note\":\"ok\""));
+    }
+
+    #[test]
+    fn json_lines_are_parseable_and_redacted() {
+        clear_secrets();
+        register_secret("sk-json-secret");
+        let record = log::Record::builder()
+            .args(format_args!("发送失败 token=sk-json-secret"))
+            .level(log::Level::Warn)
+            .target("astroman::test")
+            .build();
+        let mut buffer: Vec<u8> = Vec::new();
+        format_json(&mut buffer, &record).unwrap();
+        let text = String::from_utf8(buffer).unwrap();
+        assert!(!text.contains("sk-json-secret"));
+        let value: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(value["level"], "warn");
+        assert_eq!(value["target"], "astroman::test");
+        assert!(value["ts"].as_str().unwrap().contains('T'));
+        clear_secrets();
+    }
+
+    #[test]
+    fn panic_line_contains_thread_and_location() {
+        let line = panic_line("main", "src/lib.rs:10:2", "boom");
+        let value: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(value["level"], "panic");
+        assert_eq!(value["thread"], "main");
+        assert_eq!(value["location"], "src/lib.rs:10:2");
+        assert_eq!(value["msg"], "boom");
     }
 }

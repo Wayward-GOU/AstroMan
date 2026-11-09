@@ -1,0 +1,11 @@
+{
+  "id": "ai-15",
+  "title": "导出执行记录",
+  "input": "把请求 ID 12 最近 50 条执行记录导成 CSV，保存到 D:\\temp\\history.csv。",
+  "expectTool": "history_export",
+  "acceptTools": [],
+  "forbiddenTools": ["history_list", "history_stats", "request_delete"],
+  "expectArgs": { "requestId": 12, "limit": 50 },
+  "expectedArtifact": "生成 D:\\temp\\history.csv，含接口名称、方法、URL、状态码、耗时、时间",
+  "followUps": []
+}

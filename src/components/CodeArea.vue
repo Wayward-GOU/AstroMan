@@ -489,8 +489,26 @@ onBeforeUnmount(() => {
   resizeObserver?.disconnect()
 })
 
+/** 在光标处插入文本（Schema 浏览器点击字段时用），保留光标位置 */
+function insertText(text: string) {
+  const el = textareaRef.value
+  if (!el) {
+    emit('update:modelValue', props.modelValue + text)
+    return
+  }
+  const start = el.selectionStart ?? props.modelValue.length
+  const end = el.selectionEnd ?? start
+  emit('update:modelValue', props.modelValue.slice(0, start) + text + props.modelValue.slice(end))
+  nextTick(() => {
+    el.focus()
+    const pos = start + text.length
+    el.setSelectionRange(pos, pos)
+  })
+}
+
 defineExpose({
   focus: () => textareaRef.value?.focus(),
+  insertText,
 })
 </script>
 

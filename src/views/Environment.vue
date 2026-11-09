@@ -129,6 +129,16 @@ async function activate(id: number) {
   }
 }
 
+async function toggleProd(env: Environment) {
+  try {
+    await api.envSetProd(env.id, !env.isProd)
+    await load()
+    message.success(env.isProd ? '已取消生产标记' : '已标记为生产：AI 发请求会强制确认')
+  } catch (e) {
+    message.error(String(e))
+  }
+}
+
 function removeEnv(env: Environment) {
   Modal.confirm({
     title: `删除环境「${env.name}」？`,
@@ -175,10 +185,12 @@ function removeEnv(env: Environment) {
           <div class="env-name">
             <span class="env-dot" :class="{ on: env.isActive }" />
             <span class="env-text">{{ env.name }}</span>
+            <span v-if="env.isProd" class="prod-pill">生产</span>
             <CheckCircleFilled v-if="env.isActive" class="active-icon" />
           </div>
           <div class="env-op-row">
             <a v-if="!env.isActive" @click.stop="activate(env.id)">设为当前</a>
+            <a @click.stop="toggleProd(env)">{{ env.isProd ? '取消生产' : '标记为生产' }}</a>
             <a class="danger" @click.stop="removeEnv(env)">删除</a>
           </div>
         </div>
@@ -584,6 +596,15 @@ test('业务码为 0', () => assert(data.code === 0, `code=${data.code}`))</pre>
   color: var(--fm-success);
   background: var(--fm-success-soft);
   padding: 1px 8px;
+  border-radius: 999px;
+}
+
+.prod-pill {
+  font-size: 9px;
+  font-weight: 500;
+  color: var(--fm-danger, #d4380d);
+  background: rgba(212, 56, 13, 0.1);
+  padding: 1px 6px;
   border-radius: 999px;
 }
 

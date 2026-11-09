@@ -1,0 +1,11 @@
+{
+  "id": "ai-17",
+  "title": "筛选抓包流量",
+  "input": "刚才抓到的流量里有没有状态码 500 的请求？",
+  "expectTool": "capture_flow_list",
+  "acceptTools": ["capture_status"],
+  "forbiddenTools": ["capture_start", "capture_stop", "capture_export"],
+  "expectArgs": { "status": 500 },
+  "expectedArtifact": "状态码 500 的流量列表与条数",
+  "followUps": []
+}

@@ -27,7 +27,7 @@ pub struct StorageConfig {
 }
 
 /// 全局网络与安全设置（保存在系统配置目录，不随数据目录移动）
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AppSettings {
     pub proxy_enabled: bool,
@@ -39,6 +39,41 @@ pub struct AppSettings {
     pub python_path: String,
     /// 是否允许执行本地 Python 脚本（首次使用需显式授权）
     pub python_enabled: bool,
+    /// 性能模式：auto / low / standard（P-05），空串按 auto 处理
+    pub performance_mode: String,
+    /// AI 权限模式：readonly / confirm_write / trusted（AI-01），空串按 confirm_write 处理
+    pub ai_permission_mode: String,
+    /// 摘要专用 provider id；0 = 沿用主 provider（AI-07）
+    pub summary_provider_id: i64,
+    /// 月度预算（美元）；0 = 不限制（AI-06）
+    pub monthly_budget: f64,
+    /// 预算达到 80% 时提醒；默认开启
+    pub budget_alert: bool,
+    /// 预算用尽后硬停止（默认只提醒，不阻断）
+    pub budget_hard_stop: bool,
+    /// 失败回退链：逗号分隔的 provider id，按顺序尝试；空 = 关闭（AI-12）
+    pub ai_fallback_ids: String,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            proxy_enabled: false,
+            proxy_url: String::new(),
+            cert_path: String::new(),
+            cert_password: String::new(),
+            python_path: String::new(),
+            python_enabled: false,
+            performance_mode: String::new(),
+            ai_permission_mode: String::new(),
+            summary_provider_id: 0,
+            monthly_budget: 0.0,
+            // 预算提醒默认开启：旧版设置文件没有该字段时也按开启处理
+            budget_alert: true,
+            budget_hard_stop: false,
+            ai_fallback_ids: String::new(),
+        }
+    }
 }
 
 struct HttpClients {
@@ -46,6 +81,13 @@ struct HttpClients {
     insecure: reqwest::Client,
     /// 建连探针：用来判断本次请求是「新建连接」还是「复用连接」
     probe: std::sync::Arc<crate::net_probe::ConnectorProbe>,
+}
+
+/// 企业策略运行态：解析失败时保留错误信息，设置页 / 诊断包可展示
+#[derive(Debug, Clone)]
+pub struct PolicyState {
+    pub policy: crate::services::policy::Policy,
+    pub error: Option<String>,
 }
 
 pub struct AppState {
@@ -75,6 +117,18 @@ pub struct AppState {
     pub heavy_ops: Arc<parking_lot::Mutex<()>>,
     /// 抓包代理管理器：独立 runtime，空闲时不占资源
     pub capture: crate::capture::CaptureManager,
+    /// 接口文档草稿缓存：draft_id → IR（TTL / LRU）
+    pub docs_cache: crate::docs::cache::DocsCache,
+    /// 只读文档站：进程内最多一个实例，空闲时不占资源
+    pub docs_site: crate::services::docs_site::DocsSite,
+    /// 本地 Mock Server：最多 3 个项目实例，空闲时不占资源
+    pub mock: crate::services::mock::server::MockServer,
+    /// SSE / WebSocket 实时会话（G-09）
+    pub realtime: crate::services::realtime::RealtimeManager,
+    /// 启动时固定的性能档位（P-05），运行中不随内存变化
+    pub profile: parking_lot::RwLock<crate::services::profile::ActiveProfile>,
+    /// 企业策略（policy.json），管理员改文件后可热加载
+    pub policy: parking_lot::RwLock<PolicyState>,
 }
 
 impl AppState {
@@ -147,8 +201,11 @@ impl AppState {
         let settings_file = config_dir.join("settings.json");
         let settings = read_settings(&settings_file);
         let clients = build_clients(&settings)?;
+        let profile = crate::services::profile::active(&settings.performance_mode);
+        let policy = crate::services::policy::load(&data_dir);
 
-        let capture = crate::capture::CaptureManager::new(data_dir.clone());
+        let capture =
+            crate::capture::CaptureManager::new_with_limits(data_dir.clone(), profile.limits);
         Ok(Self {
             pool,
             data_dir,
@@ -166,6 +223,15 @@ impl AppState {
             http_cancels: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             heavy_ops: Arc::new(parking_lot::Mutex::new(())),
             capture,
+            docs_cache: crate::docs::cache::DocsCache::new(),
+            docs_site: crate::services::docs_site::DocsSite::default(),
+            mock: crate::services::mock::server::MockServer::default(),
+            realtime: crate::services::realtime::RealtimeManager::default(),
+            profile: parking_lot::RwLock::new(profile),
+            policy: parking_lot::RwLock::new(PolicyState {
+                policy: policy.policy,
+                error: policy.error,
+            }),
         })
     }
 
@@ -190,9 +256,12 @@ impl AppState {
         let settings_file = config_dir.join("settings.json");
         let settings = read_settings(&settings_file);
         let clients = build_clients(&settings)?;
+        let profile = crate::services::profile::active(&settings.performance_mode);
         let secrets = crate::secret::SecretStore::bootstrap(&data_dir, &pool)?;
         crate::secret::install(secrets);
-        let capture = crate::capture::CaptureManager::new(data_dir.clone());
+        let policy = crate::services::policy::load(&data_dir);
+        let capture =
+            crate::capture::CaptureManager::new_with_limits(data_dir.clone(), profile.limits);
         Ok(Self {
             pool,
             db_path,
@@ -210,6 +279,15 @@ impl AppState {
             http_cancels: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             heavy_ops: Arc::new(parking_lot::Mutex::new(())),
             capture,
+            docs_cache: crate::docs::cache::DocsCache::new(),
+            docs_site: crate::services::docs_site::DocsSite::default(),
+            mock: crate::services::mock::server::MockServer::default(),
+            realtime: crate::services::realtime::RealtimeManager::default(),
+            profile: parking_lot::RwLock::new(profile),
+            policy: parking_lot::RwLock::new(PolicyState {
+                policy: policy.policy,
+                error: policy.error,
+            }),
         })
     }
 
@@ -262,6 +340,35 @@ impl AppState {
         self.settings.read().clone()
     }
 
+    /// 当前性能档位（启动时固定，切换设置后立即重算）
+    pub fn profile(&self) -> crate::services::profile::ActiveProfile {
+        *self.profile.read()
+    }
+
+    /// 当前生效的企业策略（克隆，避免长期持锁）
+    pub fn policy(&self) -> crate::services::policy::Policy {
+        self.policy.read().policy.clone()
+    }
+
+    /// 策略文件解析错误（没有错误时为 None）
+    pub fn policy_error(&self) -> Option<String> {
+        self.policy.read().error.clone()
+    }
+
+    /// 策略文件位置
+    pub fn policy_path(&self) -> PathBuf {
+        crate::services::policy::policy_path(&self.data_dir)
+    }
+
+    /// 重新读取 policy.json（管理员改完文件后无需重启）
+    pub fn reload_policy(&self) {
+        let loaded = crate::services::policy::load(&self.data_dir);
+        *self.policy.write() = PolicyState {
+            policy: loaded.policy,
+            error: loaded.error,
+        };
+    }
+
     /// 构建带自定义连接参数的客户端（压测等场景），代理与证书配置沿用应用设置
     ///
     /// `pool_max_idle` 为空时沿用默认的空闲连接上限；压测需按峰值并发放开，
@@ -286,12 +393,46 @@ impl AppState {
 
     /// 应用新的网络设置：先重建客户端，成功后再落盘，避免配置与运行态不一致
     pub fn update_settings(&self, next: AppSettings) -> Result<AppSettings, String> {
+        let mut next = next;
+        next.performance_mode =
+            crate::services::profile::normalize_mode(&next.performance_mode).to_string();
+        next.ai_permission_mode =
+            crate::services::ai_policy::normalize_mode(&next.ai_permission_mode).to_string();
+        // 预算与回退链归一化：负数 / NaN 归零，回退链只保留数字 id 并去重
+        if !next.monthly_budget.is_finite() || next.monthly_budget < 0.0 {
+            next.monthly_budget = 0.0;
+        }
+        next.summary_provider_id = next.summary_provider_id.max(0);
+        let mut seen = std::collections::HashSet::new();
+        next.ai_fallback_ids = next
+            .ai_fallback_ids
+            .split(',')
+            .filter_map(|item| item.trim().parse::<i64>().ok())
+            .filter(|id| *id > 0 && seen.insert(*id))
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         let clients = build_clients(&next)?;
+        let profile = crate::services::profile::active(&next.performance_mode);
         let text = serde_json::to_string_pretty(&next).map_err(crate::util::err)?;
         std::fs::write(&self.settings_file, text).map_err(|e| format!("保存网络设置失败：{e}"))?;
         *self.clients.write() = clients;
+        // 档位切换立即生效：抓包预算与单响应上限同步更新
+        self.capture.set_limits(profile.limits);
+        *self.profile.write() = profile;
         *self.settings.write() = next.clone();
         Ok(next)
+    }
+
+    /// AI-12：失败回退链（已归一化，空 = 关闭）
+    pub fn ai_fallback_ids(&self) -> Vec<i64> {
+        self.settings
+            .read()
+            .ai_fallback_ids
+            .split(',')
+            .filter_map(|item| item.trim().parse::<i64>().ok())
+            .filter(|id| *id > 0)
+            .collect()
     }
 
     /// 登记一个在途 AI 请求，返回它的取消标记
@@ -470,13 +611,8 @@ fn open_pool(data_dir: &Path) -> Result<DbPool, String> {
             }
         }
     }
-    let manager = SqliteConnectionManager::file(&db_path).with_init(|conn| {
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA foreign_keys = ON;
-             PRAGMA busy_timeout = 5000;",
-        )
-    });
+    let manager = SqliteConnectionManager::file(&db_path)
+        .with_init(|conn| conn.execute_batch(&crate::db::connection_pragmas()));
     let pool = Pool::builder()
         .max_size(8)
         .build(manager)
@@ -496,13 +632,8 @@ fn open_pool_path(db_path: &Path) -> Result<DbPool, String> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent).map_err(crate::util::err)?;
     }
-    let manager = SqliteConnectionManager::file(db_path).with_init(|conn| {
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA foreign_keys = ON;
-             PRAGMA busy_timeout = 5000;",
-        )
-    });
+    let manager = SqliteConnectionManager::file(db_path)
+        .with_init(|conn| conn.execute_batch(&crate::db::connection_pragmas()));
     let pool = Pool::builder()
         .max_size(8)
         .build(manager)

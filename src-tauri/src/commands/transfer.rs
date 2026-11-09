@@ -1,9 +1,13 @@
-use rusqlite::{params, Connection, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value};
+
+#[cfg(test)]
+use serde_json::json;
 use tauri::State;
 
 use crate::models::{KeyValueItem, Project};
+use crate::services::openapi::build_openapi_spec;
 use crate::state::AppState;
 use crate::util::{err, now_ms};
 
@@ -53,6 +57,9 @@ struct ExportCollection {
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ExportRequest {
+    /// 仅导出时用于查最近一次响应对应，不进入项目包 JSON
+    #[serde(skip)]
+    id: i64,
     name: String,
     #[serde(default = "default_method")]
     method: String,
@@ -72,6 +79,11 @@ struct ExportRequest {
     post_script: Option<String>,
     #[serde(default)]
     assertions: Option<String>,
+    /// 实体列随项目包迁移；旧包缺列时按空实体处理
+    #[serde(default)]
+    request_entity: Option<String>,
+    #[serde(default)]
+    response_entity: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -115,7 +127,8 @@ fn parse_items(raw: Option<String>) -> Vec<KeyValueItem> {
 fn read_requests(conn: &Connection, collection_id: i64) -> Result<Vec<ExportRequest>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT name, method, url, headers, params, body_type, body, pre_script, post_script, assertions
+            "SELECT id, name, method, url, headers, params, body_type, body, pre_script, post_script,
+                    assertions, request_entity, response_entity
              FROM requests WHERE collection_id = ?1
              ORDER BY sort_order ASC, id ASC",
         )
@@ -123,18 +136,21 @@ fn read_requests(conn: &Connection, collection_id: i64) -> Result<Vec<ExportRequ
     let rows = stmt
         .query_map(params![collection_id], |row| {
             Ok(ExportRequest {
-                name: row.get(0)?,
-                method: row.get(1)?,
-                url: row.get(2)?,
-                headers: parse_items(row.get(3)?),
-                params: parse_items(row.get(4)?),
+                id: row.get(0)?,
+                name: row.get(1)?,
+                method: row.get(2)?,
+                url: row.get(3)?,
+                headers: parse_items(row.get(4)?),
+                params: parse_items(row.get(5)?),
                 body_type: row
-                    .get::<_, Option<String>>(5)?
+                    .get::<_, Option<String>>(6)?
                     .unwrap_or_else(default_body_type),
-                body: row.get(6)?,
-                pre_script: row.get(7)?,
-                post_script: row.get(8)?,
-                assertions: row.get(9)?,
+                body: row.get(7)?,
+                pre_script: row.get(8)?,
+                post_script: row.get(9)?,
+                assertions: row.get(10)?,
+                request_entity: row.get(11)?,
+                response_entity: row.get(12)?,
             })
         })
         .map_err(err)?;
@@ -274,7 +290,8 @@ pub fn project_export(
     };
 
     let json = serde_json::to_string_pretty(&bundle).map_err(err)?;
-    std::fs::write(&path, json).map_err(|e| format!("写入文件失败：{e}"))?;
+    let path = crate::services::paths::prepare_write(&path)?;
+    std::fs::write(&path, json).map_err(|e| format!("写入文件失败（{}）：{e}", path.display()))?;
     Ok(())
 }
 
@@ -326,8 +343,9 @@ fn insert_collection(
         tx.execute(
             "INSERT INTO requests
                 (collection_id, name, method, url, headers, params, body_type, body,
-                 pre_script, post_script, assertions, sort_order, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)",
+                 pre_script, post_script, assertions, request_entity, response_entity,
+                 sort_order, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)",
             params![
                 collection_id,
                 request.name,
@@ -340,6 +358,8 @@ fn insert_collection(
                 request.pre_script,
                 request.post_script,
                 request.assertions,
+                request.request_entity.as_deref().unwrap_or(""),
+                request.response_entity.as_deref().unwrap_or(""),
                 index as i64,
                 now,
             ],
@@ -356,7 +376,9 @@ fn insert_collection(
 
 #[tauri::command]
 pub fn project_import(state: State<'_, AppState>, path: String) -> Result<Project, String> {
-    let content = std::fs::read_to_string(&path).map_err(|e| format!("读取文件失败：{e}"))?;
+    let path = crate::services::paths::prepare_read(&path)?;
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("读取文件失败（{}）：{e}", path.display()))?;
     let bundle: ExportBundle =
         serde_json::from_str(&content).map_err(|e| format!("文件格式不正确：{e}"))?;
 
@@ -452,209 +474,388 @@ pub fn project_import(state: State<'_, AppState>, path: String) -> Result<Projec
     })
 }
 
-// ---------- OpenAPI 3.0 导出 ----------
+// ---------- Postman Collection v2.1 导出 ----------
 
-/// 从完整 URL 中提取 path 部分，尽量保留 {{变量}} 前缀之后的路径。
-fn openapi_path(url: &str) -> String {
-    let trimmed = url.trim();
-    if trimmed.is_empty() {
-        return "/".to_string();
-    }
-    let after_scheme = match trimmed.find("://") {
-        Some(pos) => &trimmed[pos + 3..],
-        None => trimmed,
-    };
-    let path = match after_scheme.find('/') {
-        Some(pos) => &after_scheme[pos..],
-        None => "/",
-    };
-    let path = path.split('?').next().unwrap_or("/");
-    if path.starts_with('/') {
-        path.to_string()
-    } else {
-        format!("/{path}")
-    }
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostmanExportReport {
+    pub requests: usize,
+    pub collections: usize,
+    /// 导不出的内容（脚本、文件字段等），导回后需要手工补
+    pub skipped: Vec<String>,
 }
 
-fn openapi_body(body_type: &str, body: &str) -> Option<(&'static str, Value)> {
-    let raw = body.trim();
-    Some(match body_type {
-        "json" | "graphql" => {
-            let example = serde_json::from_str::<Value>(raw)
-                .unwrap_or_else(|_| Value::String(raw.to_string()));
-            ("application/json", json!({ "example": example }))
-        }
-        "form" | "multipart" => {
-            let mut props = Map::new();
-            if let Ok(fields) = serde_json::from_str::<Vec<KeyValueItem>>(raw) {
-                for field in fields
-                    .iter()
-                    .filter(|f| f.enabled && !f.key.trim().is_empty())
-                {
-                    props.insert(field.key.trim().to_string(), json!({ "type": "string" }));
-                }
-            }
-            let mime = if body_type == "multipart" {
-                "multipart/form-data"
-            } else {
-                "application/x-www-form-urlencoded"
-            };
-            (
-                mime,
-                json!({ "schema": { "type": "object", "properties": Value::Object(props) } }),
+/// 导出 Postman Collection v2.1：集合树、变量、请求头 / 查询 / Body 与最近一次
+/// 响应对应保留。字段说明来自实体，写进 request.description。
+/// 响应体与敏感头按导出脱敏规则处理，不输出真实凭据。
+#[tauri::command]
+pub fn postman_export(
+    state: State<'_, AppState>,
+    project_id: i64,
+    path: String,
+) -> Result<PostmanExportReport, String> {
+    let conn = state.pool.get().map_err(err)?;
+    let (project_name, project_description) = conn
+        .query_row(
+            "SELECT name, description FROM projects WHERE id = ?1",
+            params![project_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => "项目不存在".to_string(),
+            other => err(other),
+        })?;
+
+    let mut collection_rows: Vec<(i64, Option<i64>, String, i64)> = conn
+        .prepare(
+            "SELECT id, parent_id, name, sort_order FROM collections
+             WHERE project_id = ?1 ORDER BY sort_order ASC, id ASC",
+        )
+        .map_err(err)?
+        .query_map(params![project_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .map_err(err)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(err)?;
+    collection_rows.sort_by_key(|(id, parent, _, sort)| (parent.unwrap_or(0), *sort, *id));
+
+    let mut secrets = crate::docs::masking::SecretSet::default();
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT v.value FROM env_variables v
+                   JOIN environments e ON e.id = v.env_id
+                  WHERE e.project_id = ?1 AND v.is_secret = 1",
             )
+            .map_err(err)?;
+        let values = stmt
+            .query_map(params![project_id], |row| row.get::<_, Option<String>>(0))
+            .map_err(err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(err)?;
+        for stored in values.into_iter().flatten() {
+            let plain = crate::secret::decrypt(crate::secret::AAD_ENV, &stored);
+            if !plain.is_empty() {
+                secrets.add(&plain);
+            }
         }
-        "binary" => (
-            "application/octet-stream",
-            json!({ "schema": { "type": "string", "format": "binary" } }),
-        ),
-        "raw" => ("text/plain", json!({ "example": raw })),
-        _ => return None,
-    })
+    }
+
+    let mut report = PostmanExportReport {
+        requests: 0,
+        collections: collection_rows.len(),
+        skipped: Vec::new(),
+    };
+    let items = postman_items(&conn, &collection_rows, None, &secrets, &mut report)?;
+    let variables = postman_variables(&conn, project_id)?;
+
+    let collection = serde_json::json!({
+        "info": {
+            "name": project_name,
+            "description": project_description.unwrap_or_default(),
+            "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+        },
+        "item": items,
+        "variable": variables,
+    });
+    let text = serde_json::to_string_pretty(&collection).map_err(err)?;
+    let path = crate::services::paths::prepare_write(&path)?;
+    std::fs::write(&path, text).map_err(|e| format!("写入文件失败（{}）：{e}", path.display()))?;
+    Ok(report)
 }
 
-// 对应 OpenAPI 一个 operation 的各个字段，本身就是扁平的
-#[allow(clippy::too_many_arguments)]
-fn openapi_operation(
-    name: &str,
-    method: &str,
-    url: &str,
-    headers: &[KeyValueItem],
-    params: &[KeyValueItem],
-    body_type: &str,
-    body: &str,
-    tag: &str,
-) -> (String, Value) {
-    let mut parameters: Vec<Value> = Vec::new();
-    for item in params
-        .iter()
-        .filter(|i| i.enabled && !i.key.trim().is_empty())
-    {
-        parameters.push(json!({
-            "name": item.key.trim(),
-            "in": "query",
-            "required": false,
-            "schema": { "type": "string" }
-        }));
-    }
-    const SKIP: [&str; 6] = [
-        "content-type",
-        "authorization",
-        "cookie",
-        "host",
-        "content-length",
-        "accept-encoding",
-    ];
-    for item in headers
-        .iter()
-        .filter(|i| i.enabled && !i.key.trim().is_empty())
-    {
-        let key = item.key.trim().to_lowercase();
-        if SKIP.contains(&key.as_str()) {
-            continue;
-        }
-        parameters.push(json!({
-            "name": item.key.trim(),
-            "in": "header",
-            "required": false,
-            "schema": { "type": "string" }
-        }));
-    }
-
-    let mut operation = Map::new();
-    operation.insert("tags".to_string(), json!([tag]));
-    operation.insert("summary".to_string(), json!(name));
-    operation.insert("description".to_string(), json!(format!("{method} {url}")));
-    if !parameters.is_empty() {
-        operation.insert("parameters".to_string(), Value::Array(parameters));
-    }
-    if let Some((mime, content)) = openapi_body(body_type, body) {
-        let mut content_map = Map::new();
-        content_map.insert(mime.to_string(), content);
-        operation.insert(
-            "requestBody".to_string(),
-            json!({ "content": Value::Object(content_map) }),
-        );
-    }
-    operation.insert(
-        "responses".to_string(),
-        json!({ "200": { "description": "OK" } }),
-    );
-    (method.to_lowercase(), Value::Object(operation))
-}
-
-fn collect_openapi_paths(
+fn postman_items(
     conn: &Connection,
     rows: &[(i64, Option<i64>, String, i64)],
     parent: Option<i64>,
-    prefix: &str,
-    paths: &mut Map<String, Value>,
-) -> Result<(), String> {
+    secrets: &crate::docs::masking::SecretSet,
+    report: &mut PostmanExportReport,
+) -> Result<Vec<Value>, String> {
+    let mut items = Vec::new();
     for (id, parent_id, name, _) in rows {
         if *parent_id != parent {
             continue;
         }
-        let tag = if prefix.is_empty() {
-            name.clone()
-        } else {
-            format!("{prefix} / {name}")
-        };
+        let mut item = serde_json::json!({ "name": name });
+        let children = postman_items(conn, rows, Some(*id), secrets, report)?;
+        if !children.is_empty() {
+            item["item"] = Value::Array(children);
+        }
+        let requests = read_requests(conn, *id)?;
+        if !requests.is_empty() {
+            let mut list = Vec::new();
+            for request in &requests {
+                list.push(postman_request(conn, request, secrets, report)?);
+            }
+            item["item"] = Value::Array(list);
+        }
+        items.push(item);
+    }
+    Ok(items)
+}
 
-        let mut stmt = conn
-            .prepare(
-                "SELECT name, method, url, headers, params, body_type, body
-                 FROM requests WHERE collection_id = ?1 ORDER BY sort_order ASC, id ASC",
-            )
-            .map_err(err)?;
-        let requests = stmt
-            .query_map(params![id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                ))
-            })
-            .map_err(err)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(err)?;
+fn postman_request(
+    conn: &Connection,
+    request: &ExportRequest,
+    secrets: &crate::docs::masking::SecretSet,
+    report: &mut PostmanExportReport,
+) -> Result<Value, String> {
+    report.requests += 1;
+    let headers: Vec<Value> = request
+        .headers
+        .iter()
+        .map(|header| {
+            let mut item = serde_json::json!({
+                "key": header.key,
+                "value": header.value,
+            });
+            if !header.enabled {
+                item["disabled"] = Value::Bool(true);
+            }
+            item
+        })
+        .collect();
 
-        for (req_name, method, url, headers, query, body_type, body) in requests {
-            let (verb, operation) = openapi_operation(
-                &req_name,
-                &method,
-                &url,
-                &parse_items(headers),
-                &parse_items(query),
-                &body_type.unwrap_or_default(),
-                &body.unwrap_or_default(),
-                &tag,
-            );
-            let base = openapi_path(&url);
-            let mut candidate = base.clone();
-            let mut index = 2;
-            loop {
-                let entry = paths
-                    .entry(candidate.clone())
-                    .or_insert_with(|| Value::Object(Map::new()));
-                if let Value::Object(map) = entry {
-                    if !map.contains_key(&verb) {
-                        map.insert(verb.clone(), operation);
-                        break;
-                    }
+    let mut url = serde_json::json!({ "raw": request.url });
+    if !request.params.is_empty() {
+        let query: Vec<Value> = request
+            .params
+            .iter()
+            .map(|param| {
+                let mut item = serde_json::json!({
+                    "key": param.key,
+                    "value": param.value,
+                });
+                if !param.enabled {
+                    item["disabled"] = Value::Bool(true);
                 }
-                candidate = format!("{base}-{index}");
-                index += 1;
+                item
+            })
+            .collect();
+        url["query"] = Value::Array(query);
+        let enabled: Vec<String> = request
+            .params
+            .iter()
+            .filter(|param| param.enabled)
+            .map(|param| format!("{}={}", param.key, param.value))
+            .collect();
+        if !enabled.is_empty() && !request.url.contains('?') {
+            url["raw"] = Value::String(format!(
+                "{}?{}",
+                request.url.trim_end_matches('&'),
+                enabled.join("&")
+            ));
+        }
+    }
+
+    let mut entry = serde_json::json!({
+        "name": request.name,
+        "request": {
+            "method": request.method,
+            "header": headers,
+            "url": url,
+        },
+    });
+    if let Some(body) = postman_body(request, report) {
+        entry["request"]["body"] = body;
+    }
+    let description = entity_description(
+        request.request_entity.as_deref(),
+        request.response_entity.as_deref(),
+    );
+    if !description.is_empty() {
+        entry["request"]["description"] = Value::String(description);
+    }
+    let has_script =
+        |script: Option<&str>| script.map(|text| !text.trim().is_empty()).unwrap_or(false);
+    if has_script(request.pre_script.as_deref()) || has_script(request.post_script.as_deref()) {
+        report
+            .skipped
+            .push(format!("{}：前置 / 后置脚本未导出", request.name));
+    }
+    if let Some(response) = postman_response(conn, request, secrets)? {
+        entry["response"] = Value::Array(vec![response]);
+    }
+    Ok(entry)
+}
+
+fn postman_body(request: &ExportRequest, report: &mut PostmanExportReport) -> Option<Value> {
+    let body = request.body.as_deref().unwrap_or("").trim();
+    match request.body_type.as_str() {
+        "json" if !body.is_empty() => Some(serde_json::json!({
+            "mode": "raw",
+            "raw": body,
+            "options": { "raw": { "language": "json" } },
+        })),
+        "text" | "raw" if !body.is_empty() => Some(serde_json::json!({
+            "mode": "raw",
+            "raw": body,
+            "options": { "raw": { "language": "text" } },
+        })),
+        "form" if !body.is_empty() => {
+            let fields: Vec<Value> = body
+                .split('&')
+                .filter(|pair| !pair.is_empty())
+                .map(|pair| {
+                    let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                    serde_json::json!({ "key": key, "value": value })
+                })
+                .collect();
+            Some(serde_json::json!({ "mode": "urlencoded", "urlencoded": fields }))
+        }
+        "multipart" if !body.is_empty() => {
+            let fields: Vec<crate::models::FormField> =
+                serde_json::from_str(body).unwrap_or_default();
+            let mut list = Vec::new();
+            for field in fields {
+                if field.kind == "file" {
+                    report
+                        .skipped
+                        .push(format!("{}：文件字段 {} 未导出", request.name, field.key));
+                    continue;
+                }
+                list.push(serde_json::json!({ "key": field.key, "value": field.value }));
+            }
+            if list.is_empty() {
+                None
+            } else {
+                Some(serde_json::json!({ "mode": "formdata", "formdata": list }))
             }
         }
-
-        collect_openapi_paths(conn, rows, Some(*id), &tag, paths)?;
+        _ => None,
     }
-    Ok(())
 }
+
+/// 最近一次成功 / 失败的运行记录转成 Postman 示例，先脱敏再写出
+fn postman_response(
+    conn: &Connection,
+    request: &ExportRequest,
+    secrets: &crate::docs::masking::SecretSet,
+) -> Result<Option<Value>, String> {
+    if request.id <= 0 {
+        return Ok(None);
+    }
+    let row = conn
+        .query_row(
+            "SELECT response_status, response_status_text, response_headers, response_body
+               FROM request_runs
+              WHERE request_id = ?1 AND response_status > 0
+              ORDER BY id DESC LIMIT 1",
+            params![request.id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                    row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                ))
+            },
+        )
+        .optional()
+        .map_err(err)?;
+    let Some((status, status_text, raw_headers, raw_body)) = row else {
+        return Ok(None);
+    };
+    if status <= 0 {
+        return Ok(None);
+    }
+    let headers: Vec<Value> = parse_items(Some(raw_headers))
+        .into_iter()
+        .map(|header| {
+            let value = if crate::docs::masking::is_sensitive_name(&header.key) {
+                crate::docs::model::MASK.to_string()
+            } else {
+                header.value
+            };
+            serde_json::json!({ "key": header.key, "value": value })
+        })
+        .collect();
+    let body = if raw_body.trim().is_empty() {
+        String::new()
+    } else {
+        secrets.mask_json(&raw_body)
+    };
+    Ok(Some(serde_json::json!({
+        "name": format!("示例响应 {status}"),
+        "status": status_text,
+        "code": status,
+        "header": headers,
+        "body": body,
+        "_postman_previewlanguage": "json",
+    })))
+}
+
+fn postman_variables(conn: &Connection, project_id: i64) -> Result<Vec<Value>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT v.\"key\", v.value, v.is_secret FROM env_variables v
+               JOIN environments e ON e.id = v.env_id
+              WHERE e.project_id = ?1
+              ORDER BY e.is_active DESC, v.sort_order ASC, v.id ASC",
+        )
+        .map_err(err)?;
+    let rows = stmt
+        .query_map(params![project_id], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                row.get::<_, Option<i64>>(2)?.unwrap_or(0) == 1,
+            ))
+        })
+        .map_err(err)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(err)?;
+    let mut seen = std::collections::HashSet::new();
+    let mut values = Vec::new();
+    for (key, stored, is_secret) in rows {
+        if key.is_empty() || !seen.insert(key.clone()) {
+            continue;
+        }
+        let value = if is_secret {
+            crate::secret::decrypt(crate::secret::AAD_ENV, &stored)
+        } else {
+            stored
+        };
+        values.push(serde_json::json!({ "key": key, "value": value }));
+    }
+    Ok(values)
+}
+
+fn entity_description(request_entity: Option<&str>, response_entity: Option<&str>) -> String {
+    fn section(title: &str, raw: Option<&str>) -> String {
+        let Some(doc) = raw
+            .and_then(|raw| crate::entity::model::EntityDoc::decode(raw).ok())
+            .filter(|doc| !doc.is_empty())
+        else {
+            return String::new();
+        };
+        let lines: Vec<String> = doc
+            .flatten()
+            .into_iter()
+            .filter(|field| !field.description.trim().is_empty() && !field.stale)
+            .map(|field| format!("{}：{}", field.path, field.description.trim()))
+            .collect();
+        if lines.is_empty() {
+            String::new()
+        } else {
+            format!("{title}\n{}", lines.join("\n"))
+        }
+    }
+    let parts = [
+        section("请求字段", request_entity),
+        section("响应字段", response_entity),
+    ];
+    let joined = parts
+        .iter()
+        .filter(|part| !part.is_empty())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    joined
+}
+
+// ---------- OpenAPI 3.0 导出 ----------
 
 #[tauri::command]
 pub fn openapi_export(
@@ -663,51 +864,10 @@ pub fn openapi_export(
     path: String,
 ) -> Result<(), String> {
     let conn = state.pool.get().map_err(err)?;
-    let (name, description): (String, Option<String>) = conn
-        .query_row(
-            "SELECT name, description FROM projects WHERE id = ?1",
-            params![project_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => "项目不存在".to_string(),
-            other => err(other),
-        })?;
-
-    let rows = conn
-        .prepare(
-            "SELECT id, parent_id, name, sort_order FROM collections
-             WHERE project_id = ?1 ORDER BY sort_order ASC, id ASC",
-        )
-        .map_err(err)?
-        .query_map(params![project_id], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Option<i64>>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<i64>>(3)?.unwrap_or(0),
-            ))
-        })
-        .map_err(err)?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(err)?;
-
-    let mut paths = Map::new();
-    collect_openapi_paths(&conn, &rows, None, "", &mut paths)?;
-
-    let spec = json!({
-        "openapi": "3.0.3",
-        "info": {
-            "title": name,
-            "version": "1.0.0",
-            "description": description.unwrap_or_default(),
-        },
-        "servers": [{ "url": "http://localhost" }],
-        "paths": Value::Object(paths),
-    });
-
+    let spec = build_openapi_spec(&conn, project_id)?;
     let text = serde_json::to_string_pretty(&spec).map_err(err)?;
-    std::fs::write(&path, text).map_err(|e| format!("写入文件失败：{e}"))?;
+    let path = crate::services::paths::prepare_write(&path)?;
+    std::fs::write(&path, text).map_err(|e| format!("写入文件失败（{}）：{e}", path.display()))?;
     Ok(())
 }
 
@@ -844,7 +1004,10 @@ pub fn openapi_import(
     path: String,
     project_id: Option<i64>,
 ) -> Result<Project, String> {
-    let content = std::fs::read_to_string(&path).map_err(|e| format!("读取文件失败：{e}"))?;
+    state.policy().ensure_import("openapi")?;
+    let path = crate::services::paths::prepare_read(&path)?;
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("读取文件失败（{}）：{e}", path.display()))?;
     let spec: Value =
         serde_json::from_str(&content).map_err(|e| format!("文件不是有效的 JSON：{e}"))?;
 
@@ -1065,4 +1228,200 @@ pub fn openapi_import(
         created_at: now,
         updated_at: now,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db;
+    use crate::entity::model::{EntityDoc, EntityNode};
+    use r2d2_sqlite::SqliteConnectionManager;
+
+    fn pool(tag: &str) -> crate::state::DbPool {
+        let dir = crate::util::test_dir(tag);
+        let manager = SqliteConnectionManager::file(dir.join("astroman.db"));
+        let pool = r2d2::Pool::builder().max_size(2).build(manager).unwrap();
+        db::init(&pool).unwrap();
+        pool
+    }
+
+    fn node(name: &str, type_name: &str) -> EntityNode {
+        EntityNode {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            ..EntityNode::default()
+        }
+    }
+
+    fn entity(children: Vec<EntityNode>) -> String {
+        let root = EntityNode {
+            children,
+            ..EntityNode::new_root("object")
+        };
+        EntityDoc::new(root, 0).encode().unwrap()
+    }
+
+    #[test]
+    fn openapi_includes_entity_schemas_and_keeps_examples() {
+        let pool = pool("openapi-entity");
+        let conn = pool.get().unwrap();
+        let now = now_ms();
+        conn.execute(
+            "INSERT INTO projects (name, created_at, updated_at) VALUES ('P', ?1, ?1)",
+            params![now],
+        )
+        .unwrap();
+        let project = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO collections (project_id, name, created_at, updated_at)
+             VALUES (?1, 'C', ?2, ?2)",
+            params![project, now],
+        )
+        .unwrap();
+        let collection = conn.last_insert_rowid();
+        let mut title = node("title", "string");
+        title.required = true;
+        title.description = "标题".into();
+        let mut data = node("data", "string");
+        data.description = "返回数据".into();
+        let request_entity = entity(vec![title]);
+        let response_entity = entity(vec![data]);
+        conn.execute(
+            "INSERT INTO requests
+               (collection_id, name, method, url, body_type, body,
+                request_entity, response_entity, created_at, updated_at)
+             VALUES (?1, '创建', 'POST', 'https://api.example.com/users',
+                     'json', '{\"title\":\"x\"}', ?2, ?3, ?4, ?4)",
+            params![collection, request_entity, response_entity, now],
+        )
+        .unwrap();
+        // 无实体的接口：响应侧退回 description-only
+        conn.execute(
+            "INSERT INTO requests (collection_id, name, method, url, created_at, updated_at)
+             VALUES (?1, '列表', 'GET', 'https://api.example.com/users', ?2, ?2)",
+            params![collection, now],
+        )
+        .unwrap();
+
+        let spec = build_openapi_spec(&conn, project).unwrap();
+        let post = &spec["paths"]["/users"]["post"];
+        let body_schema = &post["requestBody"]["content"]["application/json"]["schema"];
+        assert_eq!(body_schema["properties"]["title"]["type"], "string");
+        assert_eq!(body_schema["properties"]["title"]["description"], "标题");
+        assert_eq!(body_schema["required"], json!(["title"]));
+        assert_eq!(
+            post["requestBody"]["content"]["application/json"]["example"],
+            json!({"title":"x"})
+        );
+        let response_schema = &post["responses"]["200"]["content"]["application/json"]["schema"];
+        assert_eq!(
+            response_schema["properties"]["data"]["description"],
+            "返回数据"
+        );
+
+        let get = &spec["paths"]["/users"]["get"];
+        assert!(get["responses"]["200"].get("content").is_none());
+    }
+
+    #[test]
+    fn postman_export_maps_request_and_masks_response_secrets() {
+        let pool = pool("postman-export");
+        let conn = pool.get().unwrap();
+        let now = now_ms();
+        conn.execute(
+            "INSERT INTO projects (name, created_at, updated_at) VALUES ('P', ?1, ?1)",
+            params![now],
+        )
+        .unwrap();
+        let project = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO collections (project_id, name, created_at, updated_at)
+             VALUES (?1, '用户', ?2, ?2)",
+            params![project, now],
+        )
+        .unwrap();
+        let collection = conn.last_insert_rowid();
+
+        let mut title = node("title", "string");
+        title.required = true;
+        title.description = "标题".into();
+        let request_entity = entity(vec![title]);
+        let params_json = serde_json::to_string(&vec![KeyValueItem {
+            key: "debug".into(),
+            value: "1".into(),
+            enabled: true,
+        }])
+        .unwrap();
+        conn.execute(
+            "INSERT INTO requests
+               (collection_id, name, method, url, headers, params, body_type, body,
+                request_entity, created_at, updated_at)
+             VALUES (?1, '创建', 'POST', 'https://api.example.com/users', '[]', ?2,
+                     'json', '{\"title\":\"x\"}', ?3, ?4, ?4)",
+            params![collection, params_json, request_entity, now],
+        )
+        .unwrap();
+        let request_id = conn.last_insert_rowid();
+        let headers = serde_json::to_string(&vec![KeyValueItem {
+            key: "Set-Cookie".into(),
+            value: "sid=s3cr3t".into(),
+            enabled: true,
+        }])
+        .unwrap();
+        conn.execute(
+            "INSERT INTO request_runs
+               (request_id, method, url, response_status, response_status_text,
+                response_headers, response_body, created_at)
+             VALUES (?1, 'POST', 'https://api.example.com/users', 201, 'Created', ?2, ?3, ?4)",
+            params![
+                request_id,
+                headers,
+                "{\"token\":\"s3cr3t\",\"ok\":true}",
+                now
+            ],
+        )
+        .unwrap();
+
+        let requests = read_requests(&conn, collection).unwrap();
+        let mut secrets = crate::docs::masking::SecretSet::default();
+        secrets.add("s3cr3t");
+        let mut report = PostmanExportReport {
+            requests: 0,
+            collections: 1,
+            skipped: Vec::new(),
+        };
+        let entry = postman_request(&conn, &requests[0], &secrets, &mut report).unwrap();
+        assert_eq!(entry["request"]["method"], "POST");
+        assert!(entry["request"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("标题"));
+        assert_eq!(entry["request"]["url"]["query"][0]["key"], "debug");
+        assert_eq!(entry["request"]["body"]["mode"], "raw");
+        assert_eq!(entry["response"][0]["code"], 201);
+        assert_eq!(
+            entry["response"][0]["header"][0]["value"],
+            crate::docs::model::MASK
+        );
+        assert!(!entry["response"][0]["body"]
+            .as_str()
+            .unwrap()
+            .contains("s3cr3t"));
+    }
+
+    #[test]
+    fn project_bundle_without_entity_columns_is_accepted() {
+        let raw = r#"{
+            "format": "astroman.project",
+            "version": 1,
+            "exportedAt": 0,
+            "project": {"name": "旧包"},
+            "collections": [{"name": "C", "requests": [{"name": "R", "method": "GET", "url": "https://x"}]}],
+            "environments": []
+        }"#;
+        let bundle: ExportBundle = serde_json::from_str(raw).unwrap();
+        let request = &bundle.collections[0].requests[0];
+        assert!(request.request_entity.is_none());
+        assert!(request.response_entity.is_none());
+    }
 }

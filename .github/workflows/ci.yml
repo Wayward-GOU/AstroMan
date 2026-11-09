@@ -24,12 +24,73 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      # 生产依赖漏洞阻断；开发依赖不进入安装包，只随流水线存在
+      - name: 依赖安全审计
+        run: npm audit --omit=dev --audit-level=high
       # 版本号在 package.json / tauri.conf.json / Cargo.toml 各存一份，漏改一处就会
       # 出现「关于页显示的版本和安装包不一致」，这里先拦住
       - name: 版本号一致性
         run: npm run version:check
       - run: npm run test
       - run: npm run build
+      # W4 / A-21：release 包不得开启 DevTools，CSP 基础指令必须完整
+      - name: release 安全断言
+        run: npm run security:check
+      # W4 / A-22：每次 CI 生成 CycloneDX SBOM，便于审计依赖来源
+      - name: 生成 SBOM
+        run: npm run sbom
+      - name: 上传 SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: dist/sbom.cdx.json
+      # 体积基线：当前约 5MB；超过 8MB 说明引入了未评估的大依赖或资源
+      - name: 前端产物体积门禁
+        run: |
+          node -e "
+          const fs = require('fs');
+          const path = require('path');
+          let total = 0;
+          const walk = (dir) => {
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              const file = path.join(dir, entry.name);
+              if (entry.isDirectory()) walk(file);
+              else total += fs.statSync(file).size;
+            }
+          };
+          walk('dist');
+          const mb = total / 1024 / 1024;
+          console.log('dist 总大小：' + mb.toFixed(2) + ' MB');
+          if (mb > 8) {
+            console.error('前端产物超过 8MB 门禁，请评估新增依赖或资源');
+            process.exit(1);
+          }
+          "
+
+  e2e:
+    name: 端到端冒烟（Playwright）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: 安装 Chromium
+        run: npx playwright install --with-deps chromium
+      # 视觉基线在 Windows + Chrome 上维护（字体光栅化不同），CI 只跑六条冒烟
+      - name: 冒烟六条
+        run: npx playwright test --project=smoke
+      - name: 上传失败现场
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-results
+          path: |
+            test-results/
+            playwright-report/
+          if-no-files-found: ignore
 
   rust:
     name: Rust 测试（Windows）
@@ -62,7 +123,19 @@ jobs:
         run: cargo clippy --lib --all-targets -- -D warnings
         working-directory: src-tauri
 
+      # Rust 依赖漏洞审计；发现 advisory 直接阻断
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: cargo audit
+        run: cargo audit
+        working-directory: src-tauri
+
       - run: cargo test --lib
+        working-directory: src-tauri
+      # 基准示例默认不参与 --all-targets（required-features = bench），单独编译防漂移
+      - name: cargo check 基准示例
+        run: cargo check --features bench --example baseline
         working-directory: src-tauri
       - run: cargo build --bin astroman-cli
         working-directory: src-tauri

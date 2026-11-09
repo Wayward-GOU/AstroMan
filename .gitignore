@@ -131,8 +131,16 @@ src-tauri/binaries/
 *.profraw
 *.profdata
 
+# Playwright 失败现场与报告（视觉基线 e2e/visual.spec.ts-snapshots 需要入库）
+test-results/
+playwright-report/
+
 # 单元测试临时目录（util::test_dir 落在 target/test-tmp 下的残留）
 src-tauri/target/test-tmp/
 
-# ---------------- 本地 AI 会话与工作记忆（个人环境，不入库） ----------------
+# ---------------- 本地 IDE 状态与工作记忆（个人环境，不入库） ----------------
+.openidea/
 .workbuddy/
+
+# AI-10 评测结果（本地前后对比用，不入库）
+evals/ai/.last-run.json

@@ -32,6 +32,9 @@ use tokio::sync::oneshot;
 
 const DEFAULT_PORT: u16 = 8888;
 const PORT_SCAN: u16 = 10;
+/// 单次 HAR 导出允许携带的正文总量。超过后只允许「仅元数据」导出，
+/// 避免满载（128MB 预算）时序列化把内存推到两倍以上。
+pub const HAR_BODY_LIMIT: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -116,13 +119,23 @@ pub struct CaptureManager {
 }
 
 impl CaptureManager {
+    /// 仅测试用：以默认预算构造，生产路径走 `new_with_limits`（按档位）
+    #[cfg(test)]
     pub fn new(data_dir: PathBuf) -> Self {
+        Self::new_with_limits(data_dir, crate::services::profile::CaptureLimits::default())
+    }
+
+    /// 按性能档位初始化抓包预算（P-05）
+    pub fn new_with_limits(
+        data_dir: PathBuf,
+        limits: crate::services::profile::CaptureLimits,
+    ) -> Self {
         // 上次异常退出可能没来得及恢复系统代理，启动时先清理
         sysproxy::restore_stale(&data_dir);
         Self {
             data_dir: data_dir.clone(),
             status: Arc::new(Mutex::new(CaptureStatus::default())),
-            store: Arc::new(CaptureStore::new()),
+            store: Arc::new(CaptureStore::new_with_limits(limits)),
             // 断点/映射/弱网规则落盘，重启后仍然生效
             intercept: Arc::new(InterceptState::load(&intercept_path(&data_dir))),
             control: Mutex::new(Control {
@@ -131,6 +144,11 @@ impl CaptureManager {
                 config: CaptureConfig::default(),
             }),
         }
+    }
+
+    /// 设置页切换档位后立即生效：裁剪已有流量，不重启代理
+    pub fn set_limits(&self, limits: crate::services::profile::CaptureLimits) {
+        self.store.set_limits(limits);
     }
 
     pub fn data_dir(&self) -> &PathBuf {
@@ -212,24 +230,69 @@ impl CaptureManager {
     }
 
     /// 导出当前全部流量为 HAR 1.2 文件。
-    pub fn export_har(&self, path: &std::path::Path) -> Result<(), String> {
-        let flows = self.store.details();
-        if flows.is_empty() {
-            return Err("E_CAPTURE_EMPTY: 当前没有可导出的流量".into());
-        }
-        har::export(path, &flows)
+    pub fn export_har(&self, path: &std::path::Path, metadata_only: bool) -> Result<(), String> {
+        self.export_har_inner(path, None, metadata_only)
     }
 
     /// 导出指定流量（如某个域名分组）为 HAR 1.2 文件。
-    pub fn export_har_ids(&self, path: &std::path::Path, ids: &[u64]) -> Result<(), String> {
+    pub fn export_har_ids(
+        &self,
+        path: &std::path::Path,
+        ids: &[u64],
+        metadata_only: bool,
+    ) -> Result<(), String> {
         if ids.is_empty() {
             return Err("E_CAPTURE_EMPTY: 没有可导出的流量".into());
         }
-        let flows = self.store.details_by_ids(ids);
-        if flows.is_empty() {
-            return Err("E_CAPTURE_EMPTY: 选中的流量已被淘汰".into());
+        self.export_har_inner(path, Some(ids), metadata_only)
+    }
+
+    /// 流式写 HAR：分批从 store 取明细逐条落盘，内存不再随流量翻倍。
+    ///
+    /// 正文总量超过 [`HAR_BODY_LIMIT`] 时拒绝，由前端引导改用仅元数据模式；
+    /// 中途失败或一条都没写出去时删掉半成品文件，避免留下损坏的 .har。
+    fn export_har_inner(
+        &self,
+        path: &std::path::Path,
+        ids: Option<&[u64]>,
+        metadata_only: bool,
+    ) -> Result<(), String> {
+        let body_bytes = self.store.body_bytes(ids);
+        if !metadata_only && body_bytes > HAR_BODY_LIMIT {
+            return Err(format!(
+                "E_CAPTURE_HAR_LARGE: 请求与响应正文共 {}，超过 {} 上限，请改用「仅元数据」导出",
+                pretty_bytes(body_bytes),
+                pretty_bytes(HAR_BODY_LIMIT)
+            ));
         }
-        har::export(path, &flows)
+
+        let mut written = 0usize;
+        let outcome = har::export_stream(path, |writer| {
+            let mut emit = |flow: &FlowDetail| -> Result<(), String> {
+                written += 1;
+                writer.write_flow(flow, metadata_only)
+            };
+            match ids {
+                Some(ids) => self
+                    .store
+                    .for_each_detail_ids(ids, store::EXPORT_BATCH, &mut emit),
+                None => self.store.for_each_detail(store::EXPORT_BATCH, &mut emit),
+            }
+        });
+
+        if let Err(error) = outcome {
+            let _ = std::fs::remove_file(path);
+            return Err(error);
+        }
+        if written == 0 {
+            let _ = std::fs::remove_file(path);
+            return Err(if ids.is_some() {
+                "E_CAPTURE_EMPTY: 选中的流量已被淘汰".into()
+            } else {
+                "E_CAPTURE_EMPTY: 当前没有可导出的流量".into()
+            });
+        }
+        Ok(())
     }
 
     /// 导出当前全部流量为 ZIP：索引页 + HAR + 每条流量的可读明细。
@@ -491,5 +554,21 @@ fn bind_listener(ip: IpAddr, preferred: u16) -> Result<TcpListener, String> {
             preferred.saturating_add(PORT_SCAN - 1)
         )),
         None => Err(format!("E_BIND: 没有可用端口（起始 {preferred}）")),
+    }
+}
+
+/// 给导出上限提示用的粗略字节数（1024 进制，保留一位小数）。
+fn pretty_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }

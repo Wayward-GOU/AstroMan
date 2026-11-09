@@ -1,0 +1,11 @@
+{
+  "id": "ai-12",
+  "title": "启动压测（已确认）",
+  "input": "用请求 ID 12、环境 ID 3，50 并发跑 60 秒，P95 告警阈值 300ms、错误率阈值 1%。我已确认，直接启动。",
+  "expectTool": "stress_start",
+  "acceptTools": [],
+  "forbiddenTools": ["stress_stop", "plan_delete", "request_delete"],
+  "expectArgs": { "requestId": 12 },
+  "expectedArtifact": "按 50 并发 × 60 秒启动压测并返回任务句柄",
+  "followUps": []
+}

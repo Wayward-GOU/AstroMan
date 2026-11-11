@@ -3,15 +3,22 @@ import { createPinia } from 'pinia'
 import Antd, { message } from 'ant-design-vue'
 import 'ant-design-vue/dist/reset.css'
 import './styles/main.css'
+import './styles/tokens.css' // 静态令牌 + 首帧兜底（必须在 main.css 之后）
+import './styles/components.css' // 组件层：只引用令牌
 import App from './App.vue'
 import router from './router'
-import { initTheme } from './stores/theme'
+import { initTheme, themes } from './stores/theme'
 import { useErrorDialogStore } from './stores/errorDialog'
 import { applyPlatformAttributes } from './utils/platform'
 import * as api from './api'
 
 applyPlatformAttributes()
 initTheme()
+
+// dev 期自检：每套主题必须包含 COLOR_KEYS 的全部键。动态 import 避免令牌工具进首屏。
+if (import.meta.env.DEV) {
+  void import('./design/validate').then((m) => m.assertThemesComplete(themes))
+}
 
 // 前端异常转后端日志：同类只报一次、总量封顶，避免异常风暴写爆日志盘
 const reportedErrors = new Set<string>()

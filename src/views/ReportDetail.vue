@@ -283,21 +283,21 @@ function clearDetails() {
 const chartLabels = computed(() => samples.value.map((s) => `${s.elapsedSec}s`))
 
 const qpsSeries = computed(() => [
-  { name: 'QPS', color: '#4d6bfe', values: samples.value.map((s) => s.qps) },
-  { name: '并发', color: '#7d8fa6', values: samples.value.map((s) => s.concurrent) },
+  { name: 'QPS', color: 'var(--fm-primary)', values: samples.value.map((s) => s.qps) },
+  { name: '并发', color: 'var(--fm-muted)', values: samples.value.map((s) => s.concurrent) },
 ])
 
 const latencySeries = computed(() => [
-  { name: '平均', color: '#4d6bfe', values: samples.value.map((s) => s.avgRt) },
-  { name: 'P50', color: '#6d8fa8', values: samples.value.map((s) => s.p50Rt) },
-  { name: 'P95', color: '#d97706', values: samples.value.map((s) => s.p95Rt) },
-  { name: 'P99', color: '#dc2626', values: samples.value.map((s) => s.p99Rt) },
+  { name: '平均', color: 'var(--fm-primary)', values: samples.value.map((s) => s.avgRt) },
+  { name: 'P50', color: 'var(--fm-json-key)', values: samples.value.map((s) => s.p50Rt) },
+  { name: 'P95', color: 'var(--fm-warning)', values: samples.value.map((s) => s.p95Rt) },
+  { name: 'P99', color: 'var(--fm-danger)', values: samples.value.map((s) => s.p99Rt) },
 ])
 
 const errorSeries = computed(() => [
   {
     name: '错误率',
-    color: '#dc2626',
+    color: 'var(--fm-danger)',
     values: samples.value.map((s) => {
       const total = s.successCount + s.errorCount
       return total > 0 ? (s.errorCount / total) * 100 : 0
@@ -1371,7 +1371,7 @@ function remove() {
 }
 
 .dot-sep {
-  color: #d3dae6;
+  color: var(--fm-border-strong);
 }
 
 .target-line {
@@ -1385,7 +1385,7 @@ function remove() {
 .method-chip {
   flex-shrink: 0;
   padding: 2px 8px;
-  border-radius: 5px;
+  border-radius: var(--fm-radius-sm);
   background: var(--fm-primary-soft);
   color: var(--fm-primary);
   font-size: 10px;
@@ -1406,7 +1406,7 @@ function remove() {
   align-items: center;
   gap: 11px;
   padding: 10px 16px;
-  border-radius: 11px;
+  border-radius: var(--fm-radius);
   background: var(--fm-success-soft);
   color: var(--fm-success);
   flex-shrink: 0;
@@ -1546,7 +1546,7 @@ function remove() {
   align-items: center;
   gap: 12px;
   padding: 8px 12px;
-  border-radius: 9px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface-alt);
   font-size: 12px;
 }
@@ -1612,7 +1612,7 @@ function remove() {
   flex-direction: column;
   gap: 4px;
   padding: 9px 10px;
-  border-radius: 9px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface-alt);
   border: 1px solid var(--fm-border);
 }
@@ -1640,7 +1640,7 @@ function remove() {
   flex-direction: column;
   gap: 4px;
   padding: 9px 10px;
-  border-radius: 9px;
+  border-radius: var(--fm-radius);
   border: 1px dashed var(--fm-border);
 }
 
@@ -1662,7 +1662,7 @@ function remove() {
 .code-tag {
   text-align: center;
   padding: 2px 0;
-  border-radius: 6px;
+  border-radius: var(--fm-radius-sm);
   font-weight: 700;
   font-size: 11px;
   font-variant-numeric: tabular-nums;
@@ -1799,7 +1799,7 @@ function remove() {
 .hist-bar {
   height: 100%;
   border-radius: 999px;
-  background: linear-gradient(90deg, #4b7fa3, #7fa3bd);
+  background: linear-gradient(90deg, var(--fm-primary), var(--fm-primary-dark));
   transition: width 0.3s ease;
 }
 
@@ -1929,7 +1929,7 @@ function remove() {
 .req-method {
   display: inline-block;
   padding: 0 6px;
-  border-radius: 4px;
+  border-radius: var(--fm-radius-sm);
   background: var(--fm-primary-soft);
   color: var(--fm-primary);
   font-family: 'JetBrains Mono', 'Cascadia Code', Consolas, monospace;
@@ -1959,7 +1959,7 @@ function remove() {
   display: inline-block;
   margin-right: 6px;
   padding: 0 5px;
-  border-radius: 4px;
+  border-radius: var(--fm-radius-sm);
   background: var(--fm-danger-soft);
   color: var(--fm-danger);
   font-size: 10px;
@@ -2023,7 +2023,7 @@ function remove() {
 .rec-url {
   margin: 10px 0 14px;
   padding: 9px 11px;
-  border-radius: 7px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface-alt);
   font-size: 11.5px;
   line-height: 1.7;
@@ -2062,7 +2062,7 @@ function remove() {
   min-width: 16px;
   margin-left: 5px;
   padding: 0 5px;
-  border-radius: 9px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface-alt);
   color: var(--fm-muted);
   font-size: 9.5px;
@@ -2072,7 +2072,7 @@ function remove() {
 
 .kv-list {
   border: 1px solid var(--fm-border);
-  border-radius: 8px;
+  border-radius: var(--fm-radius);
   overflow: hidden;
   background: var(--fm-surface-alt);
 }
@@ -2133,7 +2133,7 @@ function remove() {
   max-height: 380px;
   overflow: auto;
   border: 1px solid var(--fm-border);
-  border-radius: 8px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface-alt);
   font-size: 11.5px;
   line-height: 1.7;
@@ -2145,7 +2145,7 @@ function remove() {
 .rec-empty {
   padding: 12px 14px;
   border: 1px dashed var(--fm-border);
-  border-radius: 8px;
+  border-radius: var(--fm-radius);
   font-size: 11px;
   color: var(--fm-muted);
 }
@@ -2155,7 +2155,7 @@ function remove() {
   align-items: flex-start;
   gap: 8px;
   padding: 11px 13px;
-  border-radius: 8px;
+  border-radius: var(--fm-radius);
   background: var(--fm-danger-soft);
 }
 
@@ -2184,7 +2184,7 @@ function remove() {
   flex-direction: column;
   gap: 4px;
   padding: 9px 11px;
-  border-radius: 9px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface-alt);
   border: 1px solid var(--fm-border);
   min-width: 0;
@@ -2256,7 +2256,7 @@ function remove() {
 
 .error-type {
   padding: 1px 8px;
-  border-radius: 5px;
+  border-radius: var(--fm-radius-sm);
   background: var(--fm-danger-soft);
   color: var(--fm-danger);
   font-weight: 600;
@@ -2297,7 +2297,7 @@ function remove() {
 .error-body {
   margin: 8px 0 0;
   padding: 8px 10px;
-  border-radius: 7px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface-alt);
   font-size: 11px;
   line-height: 1.6;
@@ -2364,15 +2364,15 @@ function remove() {
 }
 .text-label {
   font-size: 12px;
-  color: var(--fm-text-3, #7d8c8b);
+  color: var(--fm-muted);
 }
 .analysis-note {
   font-size: 12px;
   line-height: 1.7;
-  color: var(--fm-text-2, #4a5a59);
-  background: #f6f8f8;
-  border-left: 3px solid #2f6f62;
-  border-radius: 6px;
+  color: var(--fm-text-2);
+  background: var(--fm-surface-alt);
+  border-left: 3px solid var(--fm-primary);
+  border-radius: var(--fm-radius-sm);
   padding: 8px 10px;
   margin-bottom: 12px;
 }
@@ -2391,19 +2391,19 @@ function remove() {
 }
 .score-label {
   grid-area: label;
-  color: var(--fm-text-2, #4a5a59);
+  color: var(--fm-text-2);
 }
 .score-bar-wrap {
   grid-area: bar;
   height: 6px;
-  border-radius: 3px;
-  background: #eef1f2;
+  border-radius: var(--fm-radius-sm);
+  background: var(--fm-surface-alt);
   overflow: hidden;
 }
 .score-bar {
   height: 100%;
-  background: #2f6f62;
-  border-radius: 3px;
+  background: var(--fm-primary);
+  border-radius: var(--fm-radius-sm);
 }
 .score-value {
   grid-area: value;
@@ -2413,11 +2413,11 @@ function remove() {
 .score-detail {
   grid-area: detail;
   font-size: 11px;
-  color: var(--fm-text-3, #7d8c8b);
+  color: var(--fm-muted);
 }
 .checks {
   margin-top: 12px;
-  border-top: 1px dashed #e3e8ea;
+  border-top: 1px dashed var(--fm-border);
   padding-top: 10px;
   display: flex;
   flex-direction: column;
@@ -2430,26 +2430,26 @@ function remove() {
   font-size: 12px;
 }
 .check-ok {
-  color: #2f8f5b;
+  color: var(--fm-success);
   font-weight: 700;
 }
 .check-bad {
-  color: #b7822f;
+  color: var(--fm-warning);
   font-weight: 700;
 }
 .check-label {
-  color: var(--fm-text-2, #4a5a59);
+  color: var(--fm-text-2);
   white-space: nowrap;
 }
 .check-detail {
-  color: var(--fm-text-3, #7d8c8b);
+  color: var(--fm-muted);
   font-size: 11px;
 }
 .rule-note {
   margin-top: 10px;
   font-size: 11px;
   line-height: 1.6;
-  color: var(--fm-text-3, #7d8c8b);
+  color: var(--fm-muted);
 }
 @media (max-width: 1180px) {
   .text-grid {

@@ -842,15 +842,23 @@ async function openReleasePage() {
               >
                 <span
                   class="theme-preview"
-                  :style="{ background: item.swatches[0], borderColor: item.swatches[2] }"
+                  :style="{ background: item.swatches[0], borderColor: item.swatches[5] }"
                 >
-                  <span class="theme-side" :style="{ background: item.swatches[1] }" />
-                  <span class="theme-dot" :style="{ background: item.swatches[2] }" />
-                  <span class="theme-line" :style="{ background: item.swatches[3] }" />
+                  <span class="theme-side" :style="{ background: item.swatches[2] }" />
+                  <span
+                    class="theme-card"
+                    :style="{ background: item.swatches[1], borderColor: item.swatches[5] }"
+                  >
+                    <span class="theme-dot" :style="{ background: item.swatches[3] }" />
+                    <span class="theme-line" :style="{ background: item.swatches[4] }" />
+                    <span class="theme-line short" :style="{ background: item.swatches[4] }" />
+                  </span>
                 </span>
-                <span class="theme-name">{{ item.name }}</span>
+                <span class="theme-meta">
+                  <span class="theme-name">{{ item.name }}</span>
+                  <CheckOutlined v-if="currentThemeId === item.id" class="theme-check" />
+                </span>
                 <span class="theme-desc">{{ item.desc }}</span>
-                <CheckOutlined v-if="currentThemeId === item.id" class="theme-check" />
               </button>
             </div>
           </div>
@@ -1524,7 +1532,7 @@ async function openReleasePage() {
                 </div>
               </div>
 
-              <div v-if="policy?.error" class="callout" style="color: var(--fm-danger, #d4380d)">
+              <div v-if="policy?.error" class="callout" style="color: var(--fm-danger)">
                 <SafetyCertificateOutlined />
                 <span>{{ policy.error }}</span>
               </div>
@@ -2067,7 +2075,6 @@ async function openReleasePage() {
   border: 1px solid var(--fm-border);
   border-radius: var(--fm-radius-lg);
   background: var(--fm-surface);
-  box-shadow: var(--fm-shadow);
   overflow: hidden;
 }
 
@@ -2091,7 +2098,7 @@ async function openReleasePage() {
   width: 100%;
   padding: 9px 10px;
   border: none;
-  border-radius: 9px;
+  border-radius: var(--fm-radius-sm);
   background: transparent;
   text-align: left;
   cursor: pointer;
@@ -2105,14 +2112,14 @@ async function openReleasePage() {
 
 .nav-item.active {
   background: var(--fm-primary-soft);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--fm-primary) 22%, transparent);
+  box-shadow: inset 2px 0 0 var(--fm-primary);
 }
 
 .nav-ico {
   width: 26px;
   height: 26px;
   flex-shrink: 0;
-  border-radius: 7px;
+  border-radius: var(--fm-radius-sm);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -2124,7 +2131,7 @@ async function openReleasePage() {
 
 .nav-item.active .nav-ico {
   background: var(--fm-primary);
-  color: #fff;
+  color: var(--fm-surface);
 }
 
 .nav-text {
@@ -2298,7 +2305,7 @@ async function openReleasePage() {
 }
 
 .mono {
-  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-family: var(--fm-font-mono);
   font-size: 11px;
 }
 
@@ -2326,7 +2333,7 @@ async function openReleasePage() {
   gap: 9px;
   margin-bottom: 20px;
   padding: 11px 13px;
-  border-radius: 10px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface-alt);
   border: 1px dashed var(--fm-border-strong);
   font-size: 11px;
@@ -2346,10 +2353,10 @@ async function openReleasePage() {
 }
 
 .callout code {
-  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-family: var(--fm-font-mono);
   font-size: 10.5px;
   padding: 1px 5px;
-  border-radius: 4px;
+  border-radius: var(--fm-radius-sm);
   background: var(--fm-bg);
   word-break: break-all;
 }
@@ -2357,7 +2364,7 @@ async function openReleasePage() {
 .hint {
   padding: 12px 14px;
   margin-bottom: 14px;
-  border-radius: 10px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface-alt);
   border: 1px dashed var(--fm-border-strong);
   font-size: 11.5px;
@@ -2383,7 +2390,7 @@ async function openReleasePage() {
   margin-top: 10px;
   padding: 9px 11px;
   border: 1px solid var(--fm-border);
-  border-radius: 8px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface-alt);
   font-size: 11px;
   line-height: 1.7;
@@ -2417,11 +2424,11 @@ async function openReleasePage() {
 kbd {
   display: inline-block;
   padding: 2px 7px;
-  border-radius: 5px;
+  border-radius: var(--fm-radius-sm);
   border: 1px solid var(--fm-border-strong);
   border-bottom-width: 2px;
   background: var(--fm-surface-alt);
-  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-family: var(--fm-font-mono);
   font-size: 10px;
   color: var(--fm-text-2);
 }
@@ -2434,17 +2441,16 @@ kbd {
 }
 
 .theme-item {
-  position: relative;
   display: flex;
   flex-direction: column;
   gap: 3px;
   padding: 10px;
   border: 1px solid var(--fm-border);
-  border-radius: 10px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface);
   text-align: left;
   cursor: pointer;
-  transition: border-color 0.16s, box-shadow 0.16s;
+  transition: border-color 0.16s;
 }
 
 .theme-item:hover {
@@ -2453,16 +2459,16 @@ kbd {
 
 .theme-item.active {
   border-color: var(--fm-primary);
-  box-shadow: 0 0 0 2px var(--fm-primary-soft);
+  box-shadow: inset 0 0 0 1px var(--fm-primary);
 }
 
 .theme-preview {
   position: relative;
   display: block;
-  height: 46px;
-  margin-bottom: 5px;
+  height: 56px;
+  margin-bottom: 6px;
   border: 1px solid;
-  border-radius: 6px;
+  border-radius: var(--fm-radius-sm);
   overflow: hidden;
 }
 
@@ -2471,26 +2477,51 @@ kbd {
   top: 0;
   left: 0;
   bottom: 0;
-  width: 14px;
+  width: 16px;
+}
+
+.theme-card {
+  position: absolute;
+  top: 9px;
+  left: 25px;
+  right: 9px;
+  bottom: 9px;
+  display: block;
+  border: 1px solid;
+}
+
+.theme-dot,
+.theme-card {
+  border-radius: var(--fm-radius-sm);
 }
 
 .theme-dot {
   position: absolute;
-  top: 10px;
-  left: 22px;
-  width: 20px;
-  height: 6px;
-  border-radius: 3px;
+  top: 7px;
+  left: 7px;
+  width: 18px;
+  height: 5px;
 }
 
 .theme-line {
   position: absolute;
-  top: 24px;
-  left: 22px;
-  right: 10px;
-  height: 4px;
-  border-radius: 2px;
-  opacity: 0.32;
+  top: 17px;
+  left: 7px;
+  right: 7px;
+  height: 3px;
+  border-radius: var(--fm-radius-sm);
+  opacity: 0.5;
+}
+
+.theme-line.short {
+  top: 23px;
+  right: 46%;
+}
+
+.theme-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .theme-name {
@@ -2505,10 +2536,7 @@ kbd {
 }
 
 .theme-check {
-  position: absolute;
-  top: 12px;
-  right: 12px;
-  font-size: 12px;
+  font-size: 11px;
   color: var(--fm-primary);
 }
 
@@ -2579,9 +2607,9 @@ kbd {
   align-items: center;
   gap: 12px;
   padding: 9px 11px;
-  border-radius: 7px;
-  border: 1px solid var(--fm-border, rgba(0, 0, 0, 0.07));
-  background: var(--fm-surface-2, rgba(0, 0, 0, 0.02));
+  border-radius: var(--fm-radius);
+  border: 1px solid var(--fm-border);
+  background: var(--fm-surface-alt);
 }
 
 .backup-main {
@@ -2600,37 +2628,37 @@ kbd {
   gap: 10px;
   margin-top: 4px;
   font-size: 11px;
-  color: var(--fm-text-3, #999);
+  color: var(--fm-muted);
 }
 
 .backup-kind {
   padding: 0 6px;
-  border-radius: 4px;
+  border-radius: var(--fm-radius-sm);
   font-size: 10px;
   line-height: 16px;
-  background: rgba(128, 128, 128, 0.14);
-  color: var(--fm-text-2, #666);
+  background: var(--fm-surface-alt);
+  color: var(--fm-text-2);
 }
 
 .backup-kind.kind-daily {
-  background: rgba(14, 165, 233, 0.14);
-  color: #0284c7;
+  background: var(--fm-primary-soft);
+  color: var(--fm-primary);
 }
 
 .backup-kind.kind-weekly {
-  background: rgba(139, 92, 246, 0.14);
-  color: #7c3aed;
+  background: var(--fm-purple-soft);
+  color: var(--fm-purple);
 }
 
 .backup-kind.kind-manual {
-  background: rgba(16, 185, 129, 0.14);
-  color: #059669;
+  background: var(--fm-success-soft);
+  color: var(--fm-success);
 }
 
 .backup-kind.kind-pre-restore,
 .backup-kind.kind-pre-migrate {
-  background: rgba(217, 119, 6, 0.14);
-  color: #b45309;
+  background: var(--fm-warning-soft);
+  color: var(--fm-warning);
 }
 
 .backup-actions {
@@ -2642,20 +2670,20 @@ kbd {
 .empty-line {
   padding: 14px 0;
   font-size: 12px;
-  color: var(--fm-text-3, #999);
+  color: var(--fm-muted);
 }
 
 .check-result {
   margin-top: 10px;
   padding: 9px 11px;
-  border-radius: 7px;
-  background: rgba(16, 185, 129, 0.1);
-  border: 1px solid rgba(16, 185, 129, 0.28);
+  border-radius: var(--fm-radius);
+  background: var(--fm-success-soft);
+  border: 1px solid var(--fm-success);
 }
 
 .check-result.bad {
-  background: rgba(220, 38, 38, 0.08);
-  border-color: rgba(220, 38, 38, 0.28);
+  background: var(--fm-danger-soft);
+  border-color: var(--fm-danger);
 }
 
 .check-line {
@@ -2663,11 +2691,11 @@ kbd {
   align-items: center;
   gap: 7px;
   font-size: 12px;
-  color: #047857;
+  color: var(--fm-success);
 }
 
 .check-result.bad .check-line {
-  color: #b91c1c;
+  color: var(--fm-danger);
 }
 
 .check-dot {
@@ -2683,7 +2711,7 @@ kbd {
   line-height: 1.6;
   white-space: pre-wrap;
   word-break: break-all;
-  color: #b91c1c;
+  color: var(--fm-danger);
   max-height: 160px;
   overflow: auto;
 }
@@ -2694,14 +2722,14 @@ kbd {
 }
 
 .tag.warn {
-  color: #b45309;
-  background: rgba(217, 119, 6, 0.12);
-  border-color: rgba(217, 119, 6, 0.3);
+  color: var(--fm-warning);
+  background: var(--fm-warning-soft);
+  border-color: var(--fm-warning);
 }
 
 .unit {
   font-size: 11px;
-  color: var(--fm-text-3, #999);
+  color: var(--fm-muted);
   margin-left: 6px;
 }
 
@@ -2717,7 +2745,7 @@ kbd {
 .modal-note {
   font-size: 12px;
   line-height: 1.7;
-  color: var(--fm-text-3, #999);
+  color: var(--fm-muted);
   margin: 0;
 }
 </style>

@@ -437,15 +437,15 @@ const samples = computed(() => liveSamples.value)
 const qpsSeries = computed(() => [
   {
     name: 'QPS',
-    color: '#4d6bfe',
+    color: 'var(--fm-primary)',
     values: samples.value.map((s) => s.qps),
   },
 ])
 
 const latencySeries = computed(() => [
-  { name: '平均', color: '#4d6bfe', values: samples.value.map((s) => s.avgRt) },
-  { name: 'P95', color: '#d97706', values: samples.value.map((s) => s.p95Rt) },
-  { name: 'P99', color: '#dc2626', values: samples.value.map((s) => s.p99Rt) },
+  { name: '平均', color: 'var(--fm-primary)', values: samples.value.map((s) => s.avgRt) },
+  { name: 'P95', color: 'var(--fm-warning)', values: samples.value.map((s) => s.p95Rt) },
+  { name: 'P99', color: 'var(--fm-danger)', values: samples.value.map((s) => s.p99Rt) },
 ])
 
 const chartLabels = computed(() => samples.value.map((s) => `${s.elapsedSec}s`))
@@ -720,7 +720,7 @@ function backToRequest() {
                 <div class="label">并发数</div>
                 <a-input-number v-model:value="settings.concurrent" :min="1" :max="MAX_CONCURRENT" style="width: 100%" />
                 <div class="hint">同一时刻同时执行的请求数量，建议从 10～30 起步</div>
-                <div v-if="settings.concurrent > HIGH_CONCURRENT_HINT" class="hint" style="color:#b7822f">
+                <div v-if="settings.concurrent > HIGH_CONCURRENT_HINT" class="hint warn">
                   高并发将占用较多 CPU/内存，建议 8 核以上机器，并确认本机端口与文件句柄限制
                 </div>
               </div>
@@ -875,7 +875,7 @@ function backToRequest() {
             <a-progress
               :percent="running || done ? percent : 0"
               :show-info="false"
-              :stroke-color="running ? '#4d6bfe' : done ? '#16a34a' : '#cbd5e1'"
+              :stroke-color="running ? 'var(--fm-primary)' : done ? 'var(--fm-success)' : 'var(--fm-border-strong)'"
               size="small"
             />
             <div class="stats">
@@ -1192,7 +1192,7 @@ function backToRequest() {
                       </div>
                     </div>
                     <div class="hint">共 {{ totalSeconds }} 秒，峰值并发 {{ peakConcurrent }}</div>
-                    <div v-if="peakConcurrent > HIGH_CONCURRENT_HINT" class="hint" style="color:#b7822f">
+                    <div v-if="peakConcurrent > HIGH_CONCURRENT_HINT" class="hint warn">
                       高并发将占用较多 CPU/内存，建议 8 核以上机器，并确认本机端口与文件句柄限制
                     </div>
                   </div>
@@ -1450,7 +1450,7 @@ function backToRequest() {
   word-break: break-all;
   background: var(--fm-surface);
   border: 1px solid var(--fm-border);
-  border-radius: 7px;
+  border-radius: var(--fm-radius);
   padding: 7px 9px;
 }
 
@@ -1485,6 +1485,10 @@ function backToRequest() {
   font-size: 10px;
   line-height: 1.6;
   color: var(--fm-muted);
+}
+
+.hint.warn {
+  color: var(--fm-warning);
 }
 
 .config-foot {
@@ -1527,12 +1531,12 @@ function backToRequest() {
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: #cbd5e1;
+  background: var(--fm-border-strong);
 }
 
 .status-dot.live {
   background: var(--fm-success);
-  box-shadow: 0 0 0 4px rgba(18, 183, 106, 0.14);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--fm-success) 14%, transparent);
   animation: pulse 1.6s infinite;
 }
 
@@ -1542,13 +1546,13 @@ function backToRequest() {
 
 @keyframes pulse {
   0% {
-    box-shadow: 0 0 0 0 rgba(18, 183, 106, 0.32);
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--fm-success) 32%, transparent);
   }
   70% {
-    box-shadow: 0 0 0 7px rgba(18, 183, 106, 0);
+    box-shadow: 0 0 0 7px color-mix(in srgb, var(--fm-success) 0%, transparent);
   }
   100% {
-    box-shadow: 0 0 0 0 rgba(18, 183, 106, 0);
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--fm-success) 0%, transparent);
   }
 }
 
@@ -1611,9 +1615,10 @@ function backToRequest() {
 .stage-index {
   width: 20px;
   height: 20px;
-  border-radius: 6px;
+  border-radius: var(--fm-radius-sm);
   background: var(--fm-surface-alt);
   color: var(--fm-muted);
+  font-family: var(--fm-font-mono);
   font-size: 10px;
   display: flex;
   align-items: center;
@@ -1624,7 +1629,7 @@ function backToRequest() {
 .sla-block {
   padding: 12px;
   border: 1px dashed var(--fm-border);
-  border-radius: 10px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface-alt);
 }
 
@@ -1656,7 +1661,7 @@ function backToRequest() {
   align-items: baseline;
   gap: 5px;
   padding: 3px 9px;
-  border-radius: 7px;
+  border-radius: var(--fm-radius-sm);
   background: var(--fm-surface-alt);
   border: 1px solid var(--fm-border);
 }
@@ -1706,19 +1711,23 @@ function backToRequest() {
   flex-direction: column;
   gap: 4px;
   padding: 9px 10px;
-  border-radius: 9px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface-alt);
-  border: 1px solid #f0f3f9;
+  border: 1px solid var(--fm-border);
 }
 
 .stat-label {
-  font-size: 10px;
+  font-family: var(--fm-font-mono);
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
   color: var(--fm-muted);
 }
 
 .stat-value {
+  font-family: var(--fm-font-mono);
   font-size: 15px;
-  font-weight: 700;
+  font-weight: 600;
   font-variant-numeric: tabular-nums;
   line-height: 1.3;
 }
@@ -1772,7 +1781,7 @@ function backToRequest() {
   width: 38px;
   height: 38px;
   flex-shrink: 0;
-  border-radius: 10px;
+  border-radius: var(--fm-radius);
   background: var(--fm-success-soft);
   color: var(--fm-success);
   display: flex;
@@ -1832,7 +1841,7 @@ function backToRequest() {
   width: 56px;
   height: 56px;
   margin: 0 auto 16px;
-  border-radius: 16px;
+  border-radius: var(--fm-radius-lg);
   background: var(--fm-primary-soft);
   color: var(--fm-primary);
   font-size: 24px;
@@ -1926,7 +1935,7 @@ function backToRequest() {
 .step {
   width: 18px;
   height: 18px;
-  border-radius: 6px;
+  border-radius: var(--fm-radius-sm);
   background: var(--fm-primary-soft);
   color: var(--fm-primary);
   font-size: 11px;
@@ -2061,7 +2070,7 @@ function backToRequest() {
 .target-card {
   padding: 10px 12px;
   border: 1px solid color-mix(in srgb, var(--fm-primary) 32%, var(--fm-border));
-  border-radius: 10px;
+  border-radius: var(--fm-radius);
   background: color-mix(in srgb, var(--fm-primary) 5%, var(--fm-surface-alt));
 }
 
@@ -2075,7 +2084,7 @@ function backToRequest() {
 .target-card-badge {
   flex-shrink: 0;
   padding: 1px 7px;
-  border-radius: 4px;
+  border-radius: var(--fm-radius-sm);
   background: color-mix(in srgb, var(--fm-primary) 14%, transparent);
   color: var(--fm-primary);
   font-size: 10px;
@@ -2105,7 +2114,7 @@ function backToRequest() {
 .target-card-url {
   margin-top: 7px;
   padding: 6px 9px;
-  border-radius: 7px;
+  border-radius: var(--fm-radius);
   border: 1px solid var(--fm-border);
   background: var(--fm-surface);
   font-size: 11.5px;
@@ -2123,7 +2132,7 @@ function backToRequest() {
 /* 参数分组卡片 */
 .param-card {
   border: 1px solid var(--fm-border);
-  border-radius: 11px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface);
   overflow: hidden;
 }

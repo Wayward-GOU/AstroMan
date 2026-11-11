@@ -792,7 +792,7 @@ const columns = computed(() =>
           工作台
         </a-button>
         <span class="slash">/</span>
-        <span class="project-dot" :style="{ background: store.currentProject?.color || '#4d6bfe' }" />
+        <span class="project-dot" :style="{ background: store.currentProject?.color || 'var(--fm-primary)' }" />
         <div class="project-title">
           <span class="name">{{ store.currentProject?.name || '项目' }}</span>
           <span class="desc">{{ store.currentProject?.description || '本地项目' }}</span>
@@ -1159,7 +1159,7 @@ const columns = computed(() =>
   align-items: center;
   justify-content: space-between;
   border-bottom: 1px solid var(--fm-border);
-  background: rgba(255, 255, 255, 0.86);
+  background: color-mix(in srgb, var(--fm-surface) 86%, transparent);
   backdrop-filter: blur(8px);
 }
 
@@ -1175,7 +1175,7 @@ const columns = computed(() =>
 }
 
 .slash {
-  color: #d3dae6;
+  color: var(--fm-border-strong);
 }
 
 .project-dot {
@@ -1183,7 +1183,7 @@ const columns = computed(() =>
   height: 9px;
   border-radius: 50%;
   flex-shrink: 0;
-  box-shadow: 0 0 0 3px rgba(60, 107, 136, 0.1);
+  box-shadow: 0 0 0 3px var(--fm-primary-soft);
 }
 
 .project-title {
@@ -1321,11 +1321,12 @@ const columns = computed(() =>
   align-items: center;
   gap: 7px;
   font-size: 13px;
-  min-height: 24px;
+  min-height: 28px;
+  line-height: 28px;
 }
 
 .folder {
-  color: #c0cad9;
+  color: var(--fm-muted);
   font-size: 12px;
   flex-shrink: 0;
 }
@@ -1367,7 +1368,7 @@ const columns = computed(() =>
   padding: 10px 14px;
   border-top: 1px solid var(--fm-border);
   font-size: 10px;
-  color: #b6c0ce;
+  color: var(--fm-muted);
 }
 
 .list-title {
@@ -1411,7 +1412,7 @@ const columns = computed(() =>
   background: var(--fm-surface-alt);
   border: 1px solid var(--fm-border);
   padding: 1px 7px;
-  border-radius: 5px;
+  border-radius: var(--fm-radius-sm);
 }
 
 .count {
@@ -1442,7 +1443,7 @@ const columns = computed(() =>
 }
 
 .table-wrap :deep(tr.last-opened-row > td:first-child) {
-  box-shadow: inset 3px 0 0 var(--fm-primary);
+  box-shadow: inset 2px 0 0 var(--fm-primary);
 }
 
 .table-wrap :deep(tr.last-opened-row:hover > td) {
@@ -1467,7 +1468,7 @@ const columns = computed(() =>
 }
 
 .req-icon {
-  color: #b6c0ce;
+  color: var(--fm-muted);
   font-size: 12px;
   flex-shrink: 0;
 }
@@ -1521,9 +1522,9 @@ const columns = computed(() =>
   width: 48px;
   height: 48px;
   margin: 0 auto 14px;
-  border-radius: 14px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface-alt);
-  color: #c2ccdb;
+  color: var(--fm-muted);
   font-size: 22px;
   display: flex;
   align-items: center;

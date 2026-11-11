@@ -44,13 +44,13 @@ let timer: number | null = null
 let errorNotified = false
 
 const COLORS = {
-  cpu: '#4d6bfe',
-  mem: '#7a8fa6',
-  gpu: '#d97706',
-  down: '#4d6bfe',
-  up: '#4f8a76',
-  read: '#d97706',
-  write: '#dc2626',
+  cpu: 'var(--fm-primary)',
+  mem: 'var(--fm-brass)',
+  gpu: 'var(--fm-warning)',
+  down: 'var(--fm-primary)',
+  up: 'var(--fm-success)',
+  read: 'var(--fm-warning)',
+  write: 'var(--fm-danger)',
 }
 
 function pushHistory(list: number[], value: number) {
@@ -882,7 +882,7 @@ function fmtUptime(seconds: number) {
 .ip-icon {
   width: 30px;
   height: 30px;
-  border-radius: 9px;
+  border-radius: var(--fm-radius-sm);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -912,6 +912,7 @@ function fmtUptime(seconds: number) {
 }
 
 .ip-value {
+  font-family: var(--fm-font-mono);
   font-size: 21px;
   font-weight: 700;
   letter-spacing: 0.3px;
@@ -963,7 +964,7 @@ function fmtUptime(seconds: number) {
   max-width: 100%;
   padding: 5px 9px;
   border: 1px solid var(--fm-border);
-  border-radius: 8px;
+  border-radius: var(--fm-radius-sm);
   background: var(--fm-surface-alt);
   font-size: 11px;
   color: var(--fm-text);
@@ -1137,7 +1138,7 @@ function fmtUptime(seconds: number) {
 .core-track {
   width: 100%;
   height: 54px;
-  border-radius: 5px;
+  border-radius: var(--fm-radius-sm);
   background: var(--fm-surface-alt);
   display: flex;
   align-items: flex-end;
@@ -1146,7 +1147,7 @@ function fmtUptime(seconds: number) {
 
 .core-bar {
   width: 100%;
-  border-radius: 4px 4px 0 0;
+  border-radius: var(--fm-radius-sm) var(--fm-radius-sm) 0 0;
   background: var(--fm-success);
   transition: height 0.35s ease;
 }
@@ -1255,7 +1256,7 @@ function fmtUptime(seconds: number) {
   justify-content: space-between;
   gap: 14px;
   padding: 9px 12px;
-  border-radius: 9px;
+  border-radius: var(--fm-radius-sm);
   background: var(--fm-surface-alt);
   border: 1px solid var(--fm-border);
 }
@@ -1280,7 +1281,7 @@ function fmtUptime(seconds: number) {
   font-style: normal;
   margin-left: 5px;
   padding: 0 5px;
-  border-radius: 4px;
+  border-radius: var(--fm-radius-sm);
   background: var(--fm-primary-soft);
   color: var(--fm-primary);
   font-size: 9px;
@@ -1505,7 +1506,7 @@ function fmtUptime(seconds: number) {
 .hot-tag {
   flex-shrink: 0;
   padding: 0 5px;
-  border-radius: 4px;
+  border-radius: var(--fm-radius-sm);
   background: var(--fm-danger-soft);
   color: var(--fm-danger);
   font-size: 9px;
@@ -1580,7 +1581,7 @@ function fmtUptime(seconds: number) {
   flex-direction: column;
   gap: 4px;
   padding: 9px 11px;
-  border-radius: 9px;
+  border-radius: var(--fm-radius-sm);
   background: var(--fm-surface-alt);
   border: 1px solid var(--fm-border);
   min-width: 0;
@@ -1610,7 +1611,7 @@ function fmtUptime(seconds: number) {
 .paused-tip {
   margin-top: 14px;
   padding: 9px 12px;
-  border-radius: 8px;
+  border-radius: var(--fm-radius-sm);
   background: var(--fm-warning-soft);
   color: var(--fm-warning);
   font-size: 11px;

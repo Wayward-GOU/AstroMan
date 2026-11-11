@@ -229,7 +229,7 @@ defineExpose({ openSearch, scrollToTop: () => preEl.value?.scrollTo({ top: 0 }) 
   margin: 0;
   padding: 14px 16px;
   overflow: auto;
-  font-family: 'JetBrains Mono', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  font-family: var(--fm-font-mono);
   font-size: 12.5px;
   line-height: 1.75;
   white-space: pre-wrap;
@@ -273,6 +273,6 @@ defineExpose({ openSearch, scrollToTop: () => preEl.value?.scrollTo({ top: 0 }) 
 
 .resp-pre :deep(mark.hl-current) {
   background: var(--fm-primary);
-  color: #fff;
+  color: var(--fm-surface);
 }
 </style>

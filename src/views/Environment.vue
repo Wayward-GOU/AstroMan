@@ -2,7 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
-import { PlusOutlined, CheckCircleFilled } from '@ant-design/icons-vue'
+import { PlusOutlined, CheckCircleOutlined, EyeInvisibleOutlined, EyeOutlined } from '@ant-design/icons-vue'
 import AiSparkIcon from '@/components/AiSparkIcon.vue'
 import PageHeader from '@/components/PageHeader.vue'
 import { useAiAssistStore } from '@/stores/aiAssist'
@@ -186,7 +186,7 @@ function removeEnv(env: Environment) {
             <span class="env-dot" :class="{ on: env.isActive }" />
             <span class="env-text">{{ env.name }}</span>
             <span v-if="env.isProd" class="prod-pill">生产</span>
-            <CheckCircleFilled v-if="env.isActive" class="active-icon" />
+            <CheckCircleOutlined v-if="env.isActive" class="active-icon" />
           </div>
           <div class="env-op-row">
             <a v-if="!env.isActive" @click.stop="activate(env.id)">设为当前</a>
@@ -233,8 +233,14 @@ function removeEnv(env: Environment) {
                 :type="v.isSecret && !showSecret[i] ? 'password' : 'text'"
                 placeholder="变量值"
               />
-              <a v-if="v.isSecret" class="eye" @click="showSecret[i] = !showSecret[i]">
-                {{ showSecret[i] ? '隐藏' : '显示' }}
+              <a
+                v-if="v.isSecret"
+                class="eye"
+                :title="showSecret[i] ? '隐藏密钥' : '显示密钥'"
+                @click="showSecret[i] = !showSecret[i]"
+              >
+                <EyeInvisibleOutlined v-if="showSecret[i]" />
+                <EyeOutlined v-else />
               </a>
             </div>
             <a-checkbox v-model:checked="v.isSecret" class="c-secret" />
@@ -503,7 +509,7 @@ test('业务码为 0', () => assert(data.code === 0, `code=${data.code}`))</pre>
 
 .env-item {
   padding: 11px 14px;
-  border-bottom: 1px solid #f2f5fa;
+  border-bottom: 1px solid var(--fm-border);
   cursor: pointer;
   transition: background 0.14s;
 }
@@ -514,6 +520,7 @@ test('业务码为 0', () => assert(data.code === 0, `code=${data.code}`))</pre>
 
 .env-item.active {
   background: var(--fm-primary-soft);
+  box-shadow: inset 2px 0 0 var(--fm-primary);
 }
 
 .env-name {
@@ -602,8 +609,8 @@ test('业务码为 0', () => assert(data.code === 0, `code=${data.code}`))</pre>
 .prod-pill {
   font-size: 9px;
   font-weight: 500;
-  color: var(--fm-danger, #d4380d);
-  background: rgba(212, 56, 13, 0.1);
+  color: var(--fm-danger);
+  background: var(--fm-danger-soft);
   padding: 1px 6px;
   border-radius: 999px;
 }
@@ -636,7 +643,7 @@ test('业务码为 0', () => assert(data.code === 0, `code=${data.code}`))</pre>
 }
 
 .c-key {
-  width: 30%;
+  width: 32%;
 }
 
 .c-value {
@@ -650,8 +657,15 @@ test('业务码为 0', () => assert(data.code === 0, `code=${data.code}`))</pre>
 }
 
 .eye {
-  font-size: 11px;
-  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  font-size: 16px;
+  color: var(--fm-muted);
+  cursor: pointer;
+  transition: color 0.14s;
+}
+
+.eye:hover {
   color: var(--fm-primary);
 }
 
@@ -676,9 +690,9 @@ test('业务码为 0', () => assert(data.code === 0, `code=${data.code}`))</pre>
   width: 48px;
   height: 48px;
   margin: 0 auto 14px;
-  border-radius: 14px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface-alt);
-  color: #c2ccdb;
+  color: var(--fm-muted);
   font-size: 20px;
   display: flex;
   align-items: center;
@@ -701,7 +715,7 @@ test('业务码为 0', () => assert(data.code === 0, `code=${data.code}`))</pre>
 
 .tag {
   padding: 1px 6px;
-  border-radius: 5px;
+  border-radius: var(--fm-radius-sm);
   background: var(--fm-primary-soft);
   color: var(--fm-primary);
   font-size: 10px;

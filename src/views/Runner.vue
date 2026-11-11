@@ -609,6 +609,7 @@ function openRequest(id: number) {
     <div class="layout">
       <div class="fm-card pane config">
         <div class="pane-head">
+          <span class="step-no">01</span>
           <span class="pane-title">执行配置</span>
         </div>
 
@@ -671,6 +672,7 @@ function openRequest(id: number) {
 
       <div class="fm-card pane picker">
         <div class="pane-head">
+          <span class="step-no">02</span>
           <span class="pane-title">选择接口</span>
           <a-button size="small" type="link" @click="selectAll">全选</a-button>
           <a-button size="small" type="link" @click="clearAll">清空</a-button>
@@ -697,6 +699,7 @@ function openRequest(id: number) {
 
       <div class="fm-card pane order">
         <div class="pane-head">
+          <span class="step-no">03</span>
           <span class="pane-title">执行顺序</span>
           <span class="hint">{{ selected.length }} 个</span>
         </div>
@@ -718,6 +721,7 @@ function openRequest(id: number) {
 
     <div class="fm-card result">
       <div class="pane-head">
+        <span class="step-no">04</span>
         <span class="pane-title">执行结果</span>
         <a-button size="small" :disabled="!results.length" @click="exportResult">
           <template #icon><DownloadOutlined /></template>
@@ -871,6 +875,13 @@ function openRequest(id: number) {
   flex: 1;
 }
 
+.step-no {
+  font-family: var(--fm-font-mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  color: var(--fm-brass-text);
+}
+
 .field {
   display: flex;
   align-items: center;
@@ -939,18 +950,20 @@ function openRequest(id: number) {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 5px 6px;
-  border-radius: 6px;
+  height: 28px;
+  padding: 0 6px;
+  border-radius: var(--fm-radius-sm);
   font-size: 12px;
   cursor: pointer;
 }
 
 .list-item:hover {
-  background: var(--fm-hover, rgba(127, 127, 127, 0.08));
+  background: var(--fm-surface-alt);
 }
 
 .list-item.active {
-  background: var(--fm-primary-soft, rgba(64, 120, 210, 0.12));
+  background: var(--fm-primary-soft);
+  box-shadow: inset 2px 0 0 var(--fm-primary);
 }
 
 .name {
@@ -974,13 +987,13 @@ function openRequest(id: number) {
   font-size: 10px;
   font-weight: 600;
   padding: 1px 5px;
-  border-radius: 4px;
-  background: var(--fm-surface-2, rgba(127, 127, 127, 0.1));
+  border-radius: var(--fm-radius-sm);
+  background: var(--fm-surface-alt);
 }
 
 .m-get { color: var(--fm-success); }
 .m-post { color: var(--fm-warning); }
-.m-put { color: #4a7bd0; }
+.m-put { color: var(--fm-primary); }
 .m-delete { color: var(--fm-danger); }
 
 .order-list {
@@ -995,10 +1008,11 @@ function openRequest(id: number) {
   display: flex;
   align-items: center;
   gap: 6px;
+  height: 28px;
   font-size: 12px;
-  padding: 4px 6px;
+  padding: 0 6px;
   border: 1px solid var(--fm-border);
-  border-radius: 6px;
+  border-radius: var(--fm-radius-sm);
 }
 
 .index {
@@ -1019,8 +1033,8 @@ function openRequest(id: number) {
   flex-wrap: wrap;
   gap: 20px;
   padding: 8px 12px;
-  border-radius: 8px;
-  background: var(--fm-surface-2, rgba(127, 127, 127, 0.06));
+  border-radius: var(--fm-radius);
+  background: var(--fm-surface-alt);
 }
 
 .sum-item {

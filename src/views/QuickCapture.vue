@@ -195,9 +195,11 @@ onBeforeUnmount(() => {
 }
 
 .quick-label {
-  font-size: 11px;
+  font-size: 10.5px;
   font-weight: 600;
-  color: var(--fm-text-2);
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--fm-muted);
   flex: 1;
 }
 
@@ -205,8 +207,9 @@ onBeforeUnmount(() => {
   font-size: 10px;
   color: var(--fm-muted);
   border: 1px solid var(--fm-border);
-  border-radius: 4px;
+  border-radius: var(--fm-radius-sm);
   padding: 0 4px;
+  font-family: var(--fm-font-mono);
 }
 
 .quick-close {
@@ -217,7 +220,7 @@ onBeforeUnmount(() => {
   line-height: 1;
   width: 22px;
   height: 22px;
-  border-radius: 4px;
+  border-radius: var(--fm-radius-sm);
   cursor: pointer;
 }
 
@@ -264,7 +267,7 @@ onBeforeUnmount(() => {
   font-size: 11px;
   color: var(--fm-primary);
   background: var(--fm-primary-soft);
-  border-radius: 4px;
+  border-radius: var(--fm-radius-sm);
   padding: 1px 6px;
 }
 

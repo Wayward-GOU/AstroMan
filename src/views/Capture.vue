@@ -2346,14 +2346,14 @@ watch(settingsOpen, (open) => {
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: #fff;
+  background: var(--fm-surface);
 }
 
 .rec-square {
   display: inline-block;
   width: 8px;
   height: 8px;
-  border-radius: 2px;
+  border-radius: var(--fm-radius-sm);
   background: currentColor;
 }
 
@@ -2425,9 +2425,9 @@ watch(settingsOpen, (open) => {
   margin-left: 2px;
   padding: 0 4px;
   font-size: 10px;
-  color: #fff;
-  background: var(--fm-warning, #faad14);
-  border-radius: 8px;
+  color: var(--fm-surface);
+  background: var(--fm-warning);
+  border-radius: var(--fm-radius-sm);
 }
 
 .intercept-dot {
@@ -2621,7 +2621,7 @@ watch(settingsOpen, (open) => {
   height: 28px;
   padding: 0 9px;
   border: 0;
-  background: var(--fm-sidebar);
+  background: var(--fm-surface-alt);
   text-align: left;
   font-family: inherit;
   font-size: 11.5px;
@@ -2631,7 +2631,7 @@ watch(settingsOpen, (open) => {
 }
 
 .host-row:hover {
-  background: var(--fm-sidebar-hover);
+  background: color-mix(in srgb, var(--fm-text) 6%, var(--fm-surface-alt));
 }
 
 /* 域名下的路径目录：比域名行轻，比请求行略重，形成层级 */
@@ -2652,7 +2652,7 @@ watch(settingsOpen, (open) => {
 }
 
 .folder-row:hover {
-  background: var(--fm-sidebar-hover);
+  background: color-mix(in srgb, var(--fm-text) 6%, var(--fm-surface-alt));
 }
 
 .folder-icon {
@@ -2715,7 +2715,7 @@ watch(settingsOpen, (open) => {
   height: 30px;
   padding: 0 8px;
   border: 0;
-  border-radius: 4px;
+  border-radius: var(--fm-radius-sm);
   background: transparent;
   font-family: inherit;
   font-size: 12px;
@@ -2725,7 +2725,7 @@ watch(settingsOpen, (open) => {
 }
 
 .capture-context-menu button:hover {
-  background: var(--fm-sidebar-hover);
+  background: color-mix(in srgb, var(--fm-text) 6%, var(--fm-surface-alt));
   color: var(--fm-text);
 }
 
@@ -2771,7 +2771,7 @@ watch(settingsOpen, (open) => {
   color: var(--fm-muted);
   background: var(--fm-surface);
   border: 1px solid var(--fm-border);
-  border-radius: 8px;
+  border-radius: var(--fm-radius-sm);
 }
 
 .host-errors {
@@ -2794,7 +2794,7 @@ watch(settingsOpen, (open) => {
   gap: 6px;
   align-items: center;
   width: 100%;
-  height: 27px;
+  height: 28px;
   padding: 0 8px 0 24px;
   border: 0;
   border-left: 2px solid transparent;
@@ -2806,11 +2806,11 @@ watch(settingsOpen, (open) => {
   cursor: pointer;
   /* 上千条流量时让浏览器跳过视口外行的布局与绘制 */
   content-visibility: auto;
-  contain-intrinsic-size: auto 27px;
+  contain-intrinsic-size: auto 28px;
 }
 
 .flow-row:hover {
-  background: var(--fm-sidebar-hover);
+  background: color-mix(in srgb, var(--fm-text) 6%, var(--fm-surface-alt));
 }
 
 .flow-row.active {
@@ -2855,7 +2855,7 @@ watch(settingsOpen, (open) => {
   line-height: 14px;
   color: var(--fm-method-put);
   background: color-mix(in srgb, var(--fm-method-put) 12%, transparent);
-  border-radius: 2px;
+  border-radius: var(--fm-radius-sm);
 }
 
 .flow-flag.modified {
@@ -2906,7 +2906,7 @@ watch(settingsOpen, (open) => {
   top: 0;
   bottom: 0;
   width: 2px;
-  border-radius: 2px;
+  border-radius: var(--fm-radius-sm);
   background: transparent;
 }
 

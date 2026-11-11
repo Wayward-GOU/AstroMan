@@ -1,0 +1,121 @@
+/* ============================================================
+   静态令牌 + 首帧兜底
+   颜色由 theme.ts 运行时写入（优先级更高）；此处仅为首帧兜底。
+   不要在这里写只属于某套主题的颜色。
+   ============================================================ */
+:root {
+  /* ---- L1 首帧兜底：宣纸 ---- */
+  --fm-primary: #0F6B64;
+  --fm-primary-dark: #0D5C56;
+  --fm-primary-soft: #DFE9E5;
+  --fm-success: #2A7253;
+  --fm-success-soft: #E2EAE3;
+  --fm-warning: #8F6118;
+  --fm-warning-soft: #EEE8DC;
+  --fm-danger: #A83A2C;
+  --fm-danger-soft: #F1E3DF;
+  --fm-purple: #6A4A87;
+  --fm-purple-soft: #EAE5EA;
+
+  --fm-bg: #F3F1EC;
+  --fm-surface: #FBFAF7;
+  --fm-surface-alt: #F0EEE8;
+  --fm-border: #DBD6CB;
+  --fm-border-strong: #C9C2B5;
+  --fm-border-control: #C9C2B5;
+
+  --fm-text: #1C1F1B;
+  --fm-text-2: #3E4742;
+  --fm-muted: #636C65;
+
+  --fm-sidebar: #15181A;
+  --fm-sidebar-hover: #232628;
+  --fm-sidebar-active: #142526;
+  --fm-sidebar-text: #A8B0A9;
+  --fm-sidebar-icon: #7C827E;
+  --fm-sidebar-active-text: #6FA6A2;
+
+  --fm-code-bg: #F2F1EE;
+  --fm-gutter-bg: #ECEBE8;
+  --fm-json-key: #2B5D8C;
+  --fm-json-string: #2A7253;
+  --fm-json-number: #8F6118;
+  --fm-json-bool: #6A4A87;
+  --fm-json-punct: #8B959B;
+
+  --fm-shadow-sm: none;
+  --fm-shadow: none;
+  --fm-shadow-lg: 0 18px 48px rgba(20, 24, 27, 0.16);
+
+  --fm-brass: #A97C3F;
+  --fm-brass-text: #7A5626;
+
+  /* ---- 形态 ---- */
+  --fm-radius-sm: 2px;
+  --fm-radius: 3px;
+  --fm-radius-lg: 3px;
+  --fm-gap-1: 4px;
+  --fm-gap-2: 8px;
+  --fm-gap-3: 12px;
+  --fm-gap-4: 16px;
+  --fm-gap-6: 24px;
+  --fm-gap-8: 32px;
+
+  /* ---- 字体 ---- */
+  --fm-font-serif: 'Source Han Serif SC', 'Noto Serif SC', 'Songti SC', SimSun, serif;
+  --fm-font-sans: 'Inter', 'Segoe UI Variable Text', 'Microsoft YaHei UI', 'PingFang SC', sans-serif;
+  --fm-font-mono: 'JetBrains Mono', 'Cascadia Mono', 'Consolas', monospace;
+
+  /* ---- 动效 ---- */
+  --fm-dur-fast: 120ms;
+  --fm-dur-mid: 180ms;
+  --fm-dur-slow: 240ms;
+  --fm-ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+
+  /* ---- HTTP 方法色：跨主题恒定，不进 theme.vars ---- */
+  --fm-method-get: #2A7253;
+  --fm-method-get-soft: #E7F0EB;
+  --fm-method-post: #8A5E16;
+  --fm-method-post-soft: #F7EFE1;
+  --fm-method-put: #2B5D8C;
+  --fm-method-put-soft: #E8EFF5;
+  --fm-method-patch: #6A4A87;
+  --fm-method-patch-soft: #EFEAF4;
+  --fm-method-delete: #A83A2C;
+  --fm-method-delete-soft: #F6E7E4;
+  --fm-method-other: #5E6970;
+  --fm-method-other-soft: #EFF0F1;
+
+  /* ---- 兼容别名：旧视图沿用但从未声明的键，统一映射到语义令牌 ----
+     这些名字不在设计令牌表里，C3 逐视图清理时替换为右侧的规范名；
+     在此之前先给统一取值，避免 var() 解析失败退回继承/初始值。 */
+  --fm-bg-soft: var(--fm-surface-alt);
+  --fm-bg-subtle: var(--fm-surface-alt);
+  --fm-border-soft: var(--fm-border);
+  --fm-fill: var(--fm-surface-alt);
+  --fm-fill-1: var(--fm-surface-alt);
+  --fm-font: var(--fm-font-sans);
+  --fm-hover: var(--fm-surface-alt);
+  --fm-mono: var(--fm-font-mono);
+  --fm-surface-2: var(--fm-surface-alt);
+  --fm-text-3: var(--fm-muted);
+  --fm-text-4: var(--fm-muted);
+  --fm-text-muted: var(--fm-muted);
+  --fm-text-secondary: var(--fm-text-2);
+}
+
+/* 深色作用域：全局深色主题与局部深色区块都生效 */
+[data-palette='night'] {
+  --fm-method-get: #7FB79A;
+  --fm-method-get-soft: #16241D;
+  --fm-method-post: #C9A063;
+  --fm-method-post-soft: #2A2317;
+  --fm-method-put: #7FA8C9;
+  --fm-method-put-soft: #17242E;
+  --fm-method-patch: #B49FD0;
+  --fm-method-patch-soft: #232030;
+  --fm-method-delete: #D0705F;
+  --fm-method-delete-soft: #2E1C19;
+  --fm-method-other: #9BA5AB;
+  --fm-method-other-soft: #1E2429;
+}

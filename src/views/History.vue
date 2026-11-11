@@ -255,10 +255,10 @@ function timingBars(item: HistoryItem) {
     bars.push({ key, label, ms, left: (cursor / total) * 100, width: Math.max((ms / total) * 100, 1), color })
     cursor += ms
   }
-  if (t.dnsMs && t.dnsMs > 0) push('dns', 'DNS', t.dnsMs, '#8b5cf6')
-  push('connect', t.reusedConnection ? '连接(复用)' : 'TCP+TLS', t.connectMs, '#0ea5e9')
-  push('ttfb', '首字节', t.ttfbMs, '#f59e0b')
-  push('download', '下载', t.downloadMs, '#10b981')
+  if (t.dnsMs && t.dnsMs > 0) push('dns', 'DNS', t.dnsMs, 'var(--fm-purple)')
+  push('connect', t.reusedConnection ? '连接(复用)' : 'TCP+TLS', t.connectMs, 'var(--fm-primary)')
+  push('ttfb', '首字节', t.ttfbMs, 'var(--fm-warning)')
+  push('download', '下载', t.downloadMs, 'var(--fm-success)')
   return bars
 }
 
@@ -476,7 +476,6 @@ function timingCaption(item: HistoryItem): string {
   background: var(--fm-surface);
   border: 1px solid var(--fm-border);
   border-radius: var(--fm-radius);
-  box-shadow: var(--fm-shadow);
 }
 
 .summary-item {
@@ -537,8 +536,8 @@ function timingCaption(item: HistoryItem): string {
 
 .cleanup-preview {
   padding: 10px 12px;
-  border-radius: 8px;
-  background: var(--fm-surface-2, rgba(127, 127, 127, 0.08));
+  border-radius: var(--fm-radius);
+  background: var(--fm-surface-alt);
   border: 1px dashed var(--fm-border);
   font-size: 12px;
   color: var(--fm-text-2);
@@ -577,7 +576,6 @@ function timingCaption(item: HistoryItem): string {
   background: var(--fm-surface);
   border: 1px solid var(--fm-border);
   border-radius: var(--fm-radius);
-  box-shadow: var(--fm-shadow);
   overflow: hidden;
 }
 
@@ -649,13 +647,13 @@ function timingCaption(item: HistoryItem): string {
 /* ---------- v1.0.8：历史回看耗时分解 ---------- */
 .timing-link {
   font-size: 12px;
-  color: var(--fm-primary, #1677ff);
+  color: var(--fm-primary);
   cursor: pointer;
 }
 
 .timing-none {
   font-size: 12px;
-  color: var(--fm-text-3, #999);
+  color: var(--fm-muted);
 }
 
 .timing-pop {
@@ -667,7 +665,7 @@ function timingCaption(item: HistoryItem): string {
 
 .timing-pop-title {
   font-size: 11px;
-  color: var(--fm-text-3, #999);
+  color: var(--fm-muted);
 }
 
 .timing-pop-bars {
@@ -685,15 +683,15 @@ function timingCaption(item: HistoryItem): string {
 
 .timing-pop-label {
   font-size: 11px;
-  color: var(--fm-text-2, #666);
+  color: var(--fm-text-2);
   text-align: right;
 }
 
 .timing-pop-track {
   position: relative;
   height: 10px;
-  border-radius: 3px;
-  background: rgba(128, 128, 128, 0.14);
+  border-radius: var(--fm-radius-sm);
+  background: var(--fm-surface-alt);
   overflow: hidden;
 }
 
@@ -701,12 +699,12 @@ function timingCaption(item: HistoryItem): string {
   position: absolute;
   top: 0;
   height: 100%;
-  border-radius: 3px;
+  border-radius: var(--fm-radius-sm);
 }
 
 .timing-pop-ms {
   font-size: 10px;
-  color: var(--fm-text-3, #999);
+  color: var(--fm-muted);
   text-align: right;
 }
 </style>

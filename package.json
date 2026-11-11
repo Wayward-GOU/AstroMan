@@ -20,6 +20,7 @@
     "version:check": "node scripts/sync-version.mjs",
     "version:set": "node scripts/sync-version.mjs",
     "sbom": "node scripts/gen-sbom.mjs",
+    "ui:check": "node scripts/check-hardcoded-color.mjs && vite-node scripts/check-contrast.ts",
     "security:check": "node scripts/check-release-security.mjs",
     "tauri": "tauri"
   },

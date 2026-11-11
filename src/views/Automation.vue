@@ -1202,15 +1202,14 @@ onBeforeUnmount(stopPolling)
 
 /* ---------- 左侧套件列表 ---------- */
 .suite-pane {
-  width: 268px;
-  flex: 0 0 268px;
+  width: 260px;
+  flex: 0 0 260px;
   display: flex;
   flex-direction: column;
   min-height: 0;
   background: var(--fm-surface);
   border: 1px solid var(--fm-border);
   border-radius: var(--fm-radius-lg);
-  box-shadow: var(--fm-shadow);
   overflow: hidden;
 }
 
@@ -1257,7 +1256,7 @@ onBeforeUnmount(stopPolling)
 }
 
 .pane-search :deep(.ant-input-affix-wrapper) {
-  border-radius: 7px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface-alt);
   border-color: transparent;
 }
@@ -1284,7 +1283,7 @@ onBeforeUnmount(stopPolling)
   width: 100%;
   padding: 8px;
   border: none;
-  border-radius: 9px;
+  border-radius: var(--fm-radius-sm);
   background: transparent;
   text-align: left;
   cursor: pointer;
@@ -1297,13 +1296,14 @@ onBeforeUnmount(stopPolling)
 
 .suite-item.active {
   background: var(--fm-primary-soft);
+  box-shadow: inset 2px 0 0 var(--fm-primary);
 }
 
 .suite-dot {
   width: 24px;
   height: 24px;
   flex-shrink: 0;
-  border-radius: 7px;
+  border-radius: var(--fm-radius-sm);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1315,7 +1315,7 @@ onBeforeUnmount(stopPolling)
 
 .suite-item.active .suite-dot {
   background: var(--fm-primary);
-  color: #fff;
+  color: var(--fm-surface);
 }
 
 .suite-main {
@@ -1409,7 +1409,6 @@ onBeforeUnmount(stopPolling)
   background: var(--fm-surface);
   border: 1px solid var(--fm-border);
   border-radius: var(--fm-radius-lg);
-  box-shadow: var(--fm-shadow);
   overflow: hidden;
 }
 
@@ -1433,7 +1432,7 @@ onBeforeUnmount(stopPolling)
   width: 30px;
   height: 30px;
   flex-shrink: 0;
-  border-radius: 9px;
+  border-radius: var(--fm-radius-sm);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1494,7 +1493,7 @@ onBeforeUnmount(stopPolling)
 /* ---------- 表格 ---------- */
 .suite-table :deep(.ant-table) {
   border: 1px solid var(--fm-border);
-  border-radius: 9px;
+  border-radius: var(--fm-radius);
   overflow: hidden;
 }
 
@@ -1528,7 +1527,7 @@ onBeforeUnmount(stopPolling)
   align-items: center;
   height: 19px;
   padding: 0 7px;
-  border-radius: 5px;
+  border-radius: var(--fm-radius-sm);
   font-size: 10.5px;
   font-weight: 600;
   letter-spacing: 0.2px;
@@ -1598,14 +1597,13 @@ onBeforeUnmount(stopPolling)
 .empty-illus {
   width: 62px;
   height: 62px;
-  border-radius: 20px;
+  border-radius: var(--fm-radius);
   display: flex;
   align-items: center;
   justify-content: center;
   font-size: 26px;
   color: var(--fm-primary);
   background: var(--fm-primary-soft);
-  box-shadow: 0 10px 24px rgba(77, 107, 254, 0.16);
 }
 
 .main-empty h3 {

@@ -704,6 +704,7 @@ function resetResponseState() {
   // 运行时变量是跨接口共享的（例如登录接口写入 token），切标签时保留
   responseTab.value = 'body'
   bodyView.value = 'pretty'
+  htmlPreview.value = false
   bodyAbsPath.value = ''
   bodyPreviewError.value = ''
   diffOpen.value = false
@@ -763,6 +764,8 @@ function restoreSnapshot(snapshot: RequestWorkspaceSnapshot) {
   scriptMs.value = snapshot.turn.ms
   responseTab.value = snapshot.responseTab
   bodyView.value = snapshot.bodyView
+  // 预览是临时态，不入现场快照：切回标签时统一从源码开始
+  htmlPreview.value = false
   activeTab.value = snapshot.activeTab
   bodyAbsPath.value = snapshot.bodyAbsPath
   bodyPreviewError.value = snapshot.bodyPreviewError
@@ -1943,16 +1946,16 @@ const timingRows = computed<TimingRow[]>(() => {
     })
     cursor += ms
   }
-  if (t.dnsMs && t.dnsMs > 0) push('dns', 'DNS 解析', t.dnsMs, '#8b5cf6', '域名解析耗时')
+  if (t.dnsMs && t.dnsMs > 0) push('dns', 'DNS 解析', t.dnsMs, 'var(--fm-purple)', '域名解析耗时')
   push(
     'connect',
     t.reusedConnection ? '连接（复用）' : 'TCP + TLS',
     t.connectMs,
-    '#0ea5e9',
+    'var(--fm-primary)',
     t.reusedConnection ? '复用了已有连接，未新建握手' : '含 TCP 与 TLS 握手',
   )
-  push('ttfb', '等待首字节', t.ttfbMs, '#f59e0b', '从请求发出到收到响应首字节')
-  push('download', '正文下载', t.downloadMs, '#10b981', '读取响应体的耗时')
+  push('ttfb', '等待首字节', t.ttfbMs, 'var(--fm-warning)', '从请求发出到收到响应首字节')
+  push('download', '正文下载', t.downloadMs, 'var(--fm-success)', '读取响应体的耗时')
   return rows
 })
 
@@ -2391,6 +2394,49 @@ const prettyLineCount = computed(() => {
 
 const bodyView = ref<'pretty' | 'raw'>('pretty')
 
+/** 响应是 HTML（WAF 拦截页、调试页很常见），可用沙箱 iframe 直接渲染 */
+const isHtmlResponse = computed(() => {
+  const current = result.value
+  if (!current || isBinaryBody.value || current.bodyOmitted || !current.body) return false
+  const type = headerOf(current.headers, 'content-type').toLowerCase()
+  if (type.includes('text/html') || type.includes('application/xhtml')) return true
+  // 不少服务端漏配 content-type，按开头标签兜底识别
+  const head = current.body.slice(0, 512).trimStart()
+  return /^<!doctype\s+html/i.test(head) || /^<html[\s>]/i.test(head)
+})
+
+/** 预览上限：再大就只给源码，整页排版没必要在响应面板里硬扛 */
+const HTML_PREVIEW_MAX = 2 * 1024 * 1024
+const htmlPreviewable = computed(
+  () => isHtmlResponse.value && (result.value?.body.length ?? 0) <= HTML_PREVIEW_MAX,
+)
+
+/** 预览是临时视图，不写进 bodyView：现场快照的类型仍只认 pretty / raw */
+const htmlPreview = ref(false)
+const htmlPreviewActive = computed(() => htmlPreview.value && htmlPreviewable.value)
+
+/** 工具栏视图：HTML 用「源码 / 预览」两段（非 JSON 的 Pretty 与 Raw 内容相同），其余仍是 Pretty / Raw */
+const responseView = computed<'pretty' | 'raw' | 'html'>({
+  get: () => {
+    if (htmlPreviewActive.value) return 'html'
+    return htmlPreviewable.value ? 'raw' : bodyView.value
+  },
+  set: (value) => {
+    htmlPreview.value = value === 'html'
+    // HTML 的「源码」只是临时视图，不覆盖 Pretty/Raw 偏好，免得影响后续 JSON 响应
+    if (value !== 'html' && !htmlPreviewable.value) bodyView.value = value
+  },
+})
+
+/** Body 页签角标：预览态不展示源码行数，改显示响应体大小 */
+const bodyTabBadge = computed(() => {
+  const current = result.value
+  if (!current) return '0'
+  if (htmlPreviewActive.value) return fmtSize(current.sizeBytes)
+  if (isBinaryBody.value) return fmtSize(current.bodyBytes || current.sizeBytes)
+  return prettyLineCount.value ? `${prettyLineCount.value} 行` : '0'
+})
+
 const responseBodyText = computed(() =>
   bodyView.value === 'pretty' ? prettyBody.value : result.value?.body ?? '',
 )
@@ -2403,6 +2449,8 @@ const responseLanguage = computed<'json' | 'plain'>(() => {
 
 function openResponseSearch() {
   if (!result.value || isBinaryBody.value) return
+  // 预览是 iframe，搜索作用于源码：先退出预览
+  htmlPreview.value = false
   if (responseTab.value !== 'body') responseTab.value = 'body'
   nextTick(() => responseBodyRef.value?.openSearch())
 }
@@ -3438,7 +3486,7 @@ const responseHeaders = computed(() => {
             <span class="res-spacer" />
             <template v-if="result && !result.error">
               <a-button
-                v-if="!isBinaryBody"
+                v-if="!isBinaryBody && !htmlPreviewActive"
                 size="small"
                 type="text"
                 title="搜索响应（Ctrl+F）"
@@ -3448,13 +3496,14 @@ const responseHeaders = computed(() => {
               </a-button>
               <a-radio-group
                 v-if="!isBinaryBody"
-                v-model:value="bodyView"
+                v-model:value="responseView"
                 size="small"
                 button-style="solid"
                 class="view-toggle"
               >
-                <a-radio-button value="pretty">Pretty</a-radio-button>
-                <a-radio-button value="raw">Raw</a-radio-button>
+                <a-radio-button v-if="!htmlPreviewable" value="pretty">Pretty</a-radio-button>
+                <a-radio-button value="raw">{{ htmlPreviewable ? '源码' : 'Raw' }}</a-radio-button>
+                <a-radio-button v-if="htmlPreviewable" value="html">预览</a-radio-button>
               </a-radio-group>
               <a-button v-if="!isBinaryBody" size="small" type="text" @click="copyBody">复制</a-button>
               <a-button size="small" type="text" @click="isBinaryBody ? saveBinaryBody() : saveResponseBody()">
@@ -3485,13 +3534,7 @@ const responseHeaders = computed(() => {
               <a-tab-pane key="body">
                 <template #tab>
                   Body
-                  <span class="tab-count">{{
-                    isBinaryBody
-                      ? fmtSize(result.bodyBytes || result.sizeBytes)
-                      : prettyLineCount
-                        ? `${prettyLineCount} 行`
-                        : '0'
-                  }}</span>
+                  <span class="tab-count">{{ bodyTabBadge }}</span>
                 </template>
 
                 <!-- 二进制 / 超大响应：已落盘，不塞进文本框 -->
@@ -3542,7 +3585,19 @@ const responseHeaders = computed(() => {
                     点「另存为」导出的是完整文件。
                   </div>
                   <div v-else-if="result.truncated" class="truncate-hint">响应体超过 5MB，已截断显示</div>
-                  <div class="res-body-wrap">
+                  <div v-if="htmlPreviewActive" class="res-body-wrap">
+                    <div class="html-preview-note">
+                      沙箱预览：脚本、表单与弹窗已禁用；查看源码请切回「源码」
+                    </div>
+                    <iframe
+                      class="html-preview-frame"
+                      :srcdoc="result.body"
+                      sandbox=""
+                      referrerpolicy="no-referrer"
+                      :title="`HTML 响应预览 ${result.status}`"
+                    />
+                  </div>
+                  <div v-else class="res-body-wrap">
                     <ResponseBody
                       ref="responseBodyRef"
                       :text="responseBodyText"
@@ -4072,7 +4127,7 @@ const responseHeaders = computed(() => {
 
 .tabs-scroll::-webkit-scrollbar-thumb {
   border: none;
-  border-radius: 4px;
+  border-radius: var(--fm-radius-sm);
   background: var(--fm-border-strong);
 }
 
@@ -4086,7 +4141,7 @@ const responseHeaders = computed(() => {
   padding: 0 8px 0 10px;
   border: 1px solid transparent;
   border-bottom: none;
-  border-radius: 7px 7px 0 0;
+  border-radius: var(--fm-radius-sm) var(--fm-radius-sm) 0 0;
   color: var(--fm-muted);
   font-size: 12px;
   white-space: nowrap;
@@ -4096,7 +4151,7 @@ const responseHeaders = computed(() => {
 }
 
 .req-tab:hover {
-  background: rgba(100, 116, 139, 0.08);
+  background: var(--fm-surface-alt);
   color: var(--fm-text-2);
 }
 
@@ -4104,7 +4159,7 @@ const responseHeaders = computed(() => {
   background: var(--fm-surface);
   border-color: var(--fm-border);
   color: var(--fm-text);
-  box-shadow: inset 0 1px 0 var(--fm-primary);
+  box-shadow: inset 0 2px 0 var(--fm-primary);
 }
 
 .tab-method {
@@ -4154,13 +4209,13 @@ const responseHeaders = computed(() => {
   width: 16px;
   height: 16px;
   flex-shrink: 0;
-  border-radius: 4px;
+  border-radius: var(--fm-radius-sm);
   font-size: 10px;
   color: var(--fm-muted);
 }
 
 .tab-close:hover {
-  background: rgba(100, 116, 139, 0.18);
+  background: var(--fm-border);
   color: var(--fm-danger);
 }
 
@@ -4276,17 +4331,16 @@ const responseHeaders = computed(() => {
   display: flex;
   align-items: center;
   gap: 2px;
-  height: 42px;
-  padding: 3px 3px 3px 4px;
-  border: 1px solid var(--fm-border-strong);
-  border-radius: 9px;
+  height: 38px;
+  padding: 2px 3px 2px 4px;
+  border: 1px solid var(--fm-border-control);
+  border-radius: var(--fm-radius);
   background: var(--fm-surface);
-  transition: border-color 0.16s, box-shadow 0.16s;
+  transition: border-color 0.16s;
 }
 
 .request-bar:focus-within {
   border-color: var(--fm-primary);
-  box-shadow: 0 0 0 3px var(--fm-primary-soft);
 }
 
 .method-select {
@@ -4302,13 +4356,15 @@ const responseHeaders = computed(() => {
 }
 
 .proto-select :deep(.ant-select-selector) {
+  height: 32px;
   box-shadow: none !important;
-  border-radius: 6px !important;
+  border-radius: var(--fm-radius-sm) !important;
 }
 
 .method-select :deep(.ant-select-selector) {
+  height: 32px;
   box-shadow: none !important;
-  border-radius: 6px !important;
+  border-radius: var(--fm-radius-sm) !important;
   transition: background-color 0.14s ease;
 }
 
@@ -4359,7 +4415,7 @@ const responseHeaders = computed(() => {
 }
 
 .url-input :deep(.ant-input) {
-  height: 36px;
+  height: 32px;
 }
 
 .env-select {
@@ -4369,6 +4425,7 @@ const responseHeaders = computed(() => {
 }
 
 .env-select :deep(.ant-select-selector) {
+  height: 32px;
   box-shadow: none !important;
 }
 
@@ -4384,28 +4441,19 @@ const responseHeaders = computed(() => {
 }
 
 .send-btn {
-  height: 34px;
+  height: 32px;
   flex-shrink: 0;
-  border-radius: 8px;
+  border-radius: var(--fm-radius-sm);
   font-weight: 600;
-  background: linear-gradient(
-    135deg,
-    color-mix(in srgb, var(--fm-primary) 80%, #ffffff) 0%,
-    var(--fm-primary) 100%
-  );
   border: none;
-  box-shadow: 0 3px 10px color-mix(in srgb, var(--fm-primary) 32%, transparent);
-  transition: filter 0.16s ease, box-shadow 0.16s ease, transform 0.1s ease;
+  transition: filter 0.16s ease;
 }
 
 .send-btn:not(:disabled):hover {
   filter: brightness(1.07);
-  box-shadow: 0 5px 16px color-mix(in srgb, var(--fm-primary) 42%, transparent);
-  transform: translateY(-1px);
 }
 
 .send-btn:not(:disabled):active {
-  transform: translateY(0);
   filter: brightness(0.97);
 }
 
@@ -4468,10 +4516,9 @@ const responseHeaders = computed(() => {
   flex-direction: column;
   overflow: hidden;
   border: 1px solid var(--fm-border);
-  border-radius: 10px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface);
-  box-shadow: var(--fm-shadow-sm);
-  transition: border-color 0.16s ease, box-shadow 0.16s ease;
+  transition: border-color 0.16s ease;
 }
 
 .req-pane:focus-within,
@@ -4557,7 +4604,7 @@ const responseHeaders = computed(() => {
   height: 16px;
   padding: 0 5px;
   margin-left: 5px;
-  border-radius: 5px;
+  border-radius: var(--fm-radius-sm);
   background: var(--fm-surface-alt);
   color: var(--fm-muted);
   font-size: 9.5px;
@@ -4679,8 +4726,8 @@ const responseHeaders = computed(() => {
   gap: 6px;
   padding: 8px;
   border: 1px solid var(--fm-border);
-  border-radius: 4px;
-  background: var(--fm-bg-soft, #fafafa);
+  border-radius: var(--fm-radius-sm);
+  background: var(--fm-surface-alt);
 }
 
 .gql-schema-list {
@@ -4708,9 +4755,9 @@ const responseHeaders = computed(() => {
 .gql-type-kind {
   font-size: 10px;
   padding: 0 4px;
-  border-radius: 2px;
+  border-radius: var(--fm-radius-sm);
   color: var(--fm-primary);
-  background: var(--fm-primary-soft, rgba(0, 150, 136, 0.12));
+  background: var(--fm-primary-soft);
 }
 
 .gql-field {
@@ -4721,11 +4768,11 @@ const responseHeaders = computed(() => {
   padding: 1px 6px 1px 18px;
   font-size: 12px;
   cursor: pointer;
-  border-radius: 2px;
+  border-radius: var(--fm-radius-sm);
 }
 
 .gql-field:hover {
-  background: var(--fm-primary-soft, rgba(0, 150, 136, 0.12));
+  background: var(--fm-primary-soft);
 }
 
 .gql-field-type {
@@ -4759,7 +4806,7 @@ const responseHeaders = computed(() => {
   display: flex;
   gap: 8px;
   padding: 2px 0;
-  border-bottom: 1px dashed var(--fm-border-soft, rgba(0, 0, 0, 0.06));
+  border-bottom: 1px dashed var(--fm-border);
 }
 
 .realtime-item.t-error .rt-data {
@@ -4787,19 +4834,19 @@ const responseHeaders = computed(() => {
 .rt-tag {
   font-size: 10px;
   padding: 0 4px;
-  border-radius: 2px;
+  border-radius: var(--fm-radius-sm);
   color: var(--fm-primary);
-  background: var(--fm-primary-soft, rgba(0, 150, 136, 0.12));
+  background: var(--fm-primary-soft);
 }
 
 .rt-tag.sent {
-  color: #b45309;
-  background: rgba(180, 83, 9, 0.12);
+  color: var(--fm-warning);
+  background: var(--fm-warning-soft);
 }
 
 .rt-tag.sys {
   color: var(--fm-text-3);
-  background: var(--fm-bg-soft, #f0f0f0);
+  background: var(--fm-surface-alt);
 }
 
 .rt-event-name,
@@ -4882,7 +4929,7 @@ const responseHeaders = computed(() => {
   max-height: 460px;
   overflow: auto;
   border: 1px solid var(--fm-border);
-  border-radius: 6px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface-alt);
 }
 
@@ -4999,7 +5046,7 @@ const responseHeaders = computed(() => {
 .script-hint {
   margin-top: 10px;
   padding: 9px 11px;
-  border-radius: 7px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface-alt);
   font-size: 10.5px;
   line-height: 1.8;
@@ -5009,7 +5056,7 @@ const responseHeaders = computed(() => {
 .script-hint code {
   padding: 1px 4px;
   margin: 0 1px;
-  border-radius: 4px;
+  border-radius: var(--fm-radius-sm);
   background: var(--fm-surface);
   color: var(--fm-text-2);
   font-size: 10px;
@@ -5021,7 +5068,7 @@ const responseHeaders = computed(() => {
   gap: 4px;
   margin-left: 10px;
   padding: 2px 8px;
-  border-radius: 20px;
+  border-radius: 999px;
   background: var(--fm-success-soft);
   color: var(--fm-success);
   font-size: 10px;
@@ -5029,7 +5076,7 @@ const responseHeaders = computed(() => {
 }
 
 .assert-pill.bad {
-  background: var(--fm-danger-soft, #fdeaea);
+  background: var(--fm-danger-soft);
   color: var(--fm-danger);
 }
 
@@ -5039,7 +5086,7 @@ const responseHeaders = computed(() => {
 }
 
 .tab-count.bad {
-  background: var(--fm-danger-soft, #fdeaea);
+  background: var(--fm-danger-soft);
   color: var(--fm-danger);
 }
 
@@ -5062,7 +5109,7 @@ const responseHeaders = computed(() => {
   overflow: auto;
   white-space: pre-wrap;
   word-break: break-word;
-  font-family: 'JetBrains Mono', 'Cascadia Code', 'SFMono-Regular', Consolas, monospace;
+  font-family: var(--fm-font-mono);
   font-size: 11px;
   line-height: 1.6;
 }
@@ -5078,13 +5125,13 @@ const responseHeaders = computed(() => {
   align-items: baseline;
   gap: 8px;
   padding: 6px 9px;
-  border-radius: 6px;
+  border-radius: var(--fm-radius);
   background: var(--fm-success-soft);
   color: var(--fm-text-2);
 }
 
 .test-row.failed {
-  background: var(--fm-danger-soft, #fdeaea);
+  background: var(--fm-danger-soft);
 }
 
 .test-mark {
@@ -5136,7 +5183,7 @@ const responseHeaders = computed(() => {
   display: flex;
   gap: 8px;
   padding: 4px 8px;
-  border-radius: 5px;
+  border-radius: var(--fm-radius-sm);
   border-bottom: 1px dashed var(--fm-border);
 }
 
@@ -5153,7 +5200,7 @@ const responseHeaders = computed(() => {
   padding: 0 5px;
   height: 15px;
   line-height: 15px;
-  border-radius: 4px;
+  border-radius: var(--fm-radius-sm);
   background: var(--fm-surface-alt);
   color: var(--fm-muted);
   font-size: 9.5px;
@@ -5230,7 +5277,7 @@ const responseHeaders = computed(() => {
 
 .status-pill {
   padding: 1px 8px;
-  border-radius: 5px;
+  border-radius: var(--fm-radius-sm);
   font-size: 11.5px;
   font-weight: 700;
 }
@@ -5284,9 +5331,9 @@ const responseHeaders = computed(() => {
 .res-empty-icon {
   width: 48px;
   height: 48px;
-  border-radius: 14px;
+  border-radius: var(--fm-radius-lg);
   background: var(--fm-surface-alt);
-  color: #c2ccdb;
+  color: var(--fm-muted);
   font-size: 22px;
   display: flex;
   align-items: center;
@@ -5331,6 +5378,23 @@ const responseHeaders = computed(() => {
   min-height: 0;
   display: flex;
   flex-direction: column;
+}
+
+/* HTML 预览：iframe 自己撑满 Body 区，页面背景由响应自己决定 */
+.html-preview-note {
+  flex-shrink: 0;
+  padding: 5px 14px;
+  font-size: 11px;
+  color: var(--fm-muted);
+  border-bottom: 1px dashed var(--fm-border);
+}
+
+.html-preview-frame {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  border: 0;
+  display: block;
 }
 
 .truncate-hint {
@@ -5405,7 +5469,7 @@ const responseHeaders = computed(() => {
 .runs-count {
   min-width: 18px;
   padding: 0 5px;
-  border-radius: 9px;
+  border-radius: var(--fm-radius-sm);
   background: var(--fm-border);
   color: var(--fm-text-2);
   font-size: 10px;
@@ -5592,7 +5656,7 @@ const responseHeaders = computed(() => {
   overflow: auto;
   background: var(--fm-surface);
   border: 1px solid var(--fm-border);
-  border-radius: 4px;
+  border-radius: var(--fm-radius-sm);
   font-size: 11px;
   line-height: 1.6;
   white-space: pre-wrap;
@@ -5603,7 +5667,7 @@ const responseHeaders = computed(() => {
 .run-error {
   padding: 6px 8px;
   background: var(--fm-danger-soft);
-  border-radius: 4px;
+  border-radius: var(--fm-radius-sm);
   font-size: 11px;
   color: var(--fm-danger);
   word-break: break-all;
@@ -5739,7 +5803,7 @@ const responseHeaders = computed(() => {
   line-height: 1.75;
   color: var(--fm-muted);
   padding: 10px 12px;
-  border-radius: 9px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface-alt);
   border: 1px dashed var(--fm-border-strong);
   margin-bottom: 14px;
@@ -5772,16 +5836,16 @@ const responseHeaders = computed(() => {
   border-radius: 999px;
   font-size: 10.5px;
   line-height: 16px;
-  color: var(--fm-warning, #d97706);
-  background: color-mix(in srgb, var(--fm-warning, #d97706) 12%, transparent);
-  border: 1px solid color-mix(in srgb, var(--fm-warning, #d97706) 30%, transparent);
+  color: var(--fm-warning);
+  background: var(--fm-warning-soft);
+  border: 1px solid color-mix(in srgb, var(--fm-warning) 30%, transparent);
   cursor: help;
 }
 
 .code-block {
   margin: 0;
   padding: 14px 16px;
-  border-radius: 10px;
+  border-radius: var(--fm-radius);
   border: 1px solid var(--fm-border);
   background: var(--fm-surface-alt);
   font-size: 11.5px;
@@ -5811,7 +5875,6 @@ const responseHeaders = computed(() => {
   border-color: var(--fm-primary);
   border-style: solid;
   background: var(--fm-surface);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--fm-primary) 16%, transparent);
 }
 
 /* ---------- v1.0.8：发送选项 / 停止按钮 / 协议徽标 ---------- */
@@ -5867,14 +5930,14 @@ const responseHeaders = computed(() => {
 .send-opt-hint code {
   font-size: 11px;
   padding: 0 3px;
-  border-radius: 3px;
-  background: var(--fm-surface-2, rgba(0, 0, 0, 0.05));
+  border-radius: var(--fm-radius-sm);
+  background: var(--fm-surface-alt);
 }
 
 .send-opt-warn {
   font-size: 11px;
   line-height: 1.5;
-  color: #d97706;
+  color: var(--fm-warning);
 }
 
 .stop-btn {
@@ -5887,28 +5950,28 @@ const responseHeaders = computed(() => {
   height: 18px;
   line-height: 18px;
   font-size: 11px;
-  border-radius: 4px;
+  border-radius: var(--fm-radius-sm);
   color: var(--fm-text-2);
-  background: var(--fm-surface-2, rgba(0, 0, 0, 0.05));
-  border: 1px solid var(--fm-border, rgba(0, 0, 0, 0.08));
+  background: var(--fm-surface-alt);
+  border: 1px solid var(--fm-border);
 }
 
 .proto-pill.warn {
-  color: #d97706;
-  border-color: rgba(217, 119, 6, 0.4);
-  background: rgba(217, 119, 6, 0.1);
+  color: var(--fm-warning);
+  border-color: var(--fm-warning);
+  background: var(--fm-warning-soft);
 }
 
 .proto-pill.retry {
-  color: #2563eb;
-  border-color: rgba(37, 99, 235, 0.35);
-  background: rgba(37, 99, 235, 0.08);
+  color: var(--fm-primary);
+  border-color: var(--fm-primary);
+  background: var(--fm-primary-soft);
 }
 
 .proto-pill.run-source {
-  color: #7c3aed;
-  border-color: rgba(124, 58, 237, 0.35);
-  background: rgba(124, 58, 237, 0.08);
+  color: var(--fm-purple);
+  border-color: var(--fm-purple);
+  background: var(--fm-purple-soft);
 }
 
 /* ---------- v1.0.8：二进制响应 ---------- */
@@ -5922,10 +5985,14 @@ const responseHeaders = computed(() => {
 .binary-preview {
   flex: 0 0 auto;
   max-width: 46%;
-  border: 1px solid var(--fm-border, rgba(0, 0, 0, 0.08));
-  border-radius: 8px;
+  border: 1px solid var(--fm-border);
+  border-radius: var(--fm-radius);
   overflow: hidden;
-  background: repeating-conic-gradient(rgba(128, 128, 128, 0.12) 0% 25%, transparent 0% 50%) 50% / 16px 16px;
+  background: repeating-conic-gradient(
+      color-mix(in srgb, var(--fm-border-strong) 12%, transparent) 0% 25%,
+      transparent 0% 50%
+    )
+    50% / 16px 16px;
 }
 
 .binary-preview img {
@@ -5939,15 +6006,15 @@ const responseHeaders = computed(() => {
   flex: 0 0 auto;
   width: 96px;
   height: 96px;
-  border-radius: 10px;
+  border-radius: var(--fm-radius);
   display: flex;
   align-items: center;
   justify-content: center;
   font-weight: 700;
   letter-spacing: 1px;
   color: var(--fm-text-3);
-  background: var(--fm-surface-2, rgba(0, 0, 0, 0.05));
-  border: 1px dashed var(--fm-border, rgba(0, 0, 0, 0.15));
+  background: var(--fm-surface-alt);
+  border: 1px dashed var(--fm-border);
 }
 
 .binary-meta {
@@ -5979,7 +6046,7 @@ const responseHeaders = computed(() => {
 }
 
 .binary-desc.bad {
-  color: #dc2626;
+  color: var(--fm-danger);
 }
 
 .binary-path {
@@ -5987,8 +6054,8 @@ const responseHeaders = computed(() => {
   color: var(--fm-text-3);
   word-break: break-all;
   padding: 6px 8px;
-  border-radius: 5px;
-  background: var(--fm-surface-2, rgba(0, 0, 0, 0.04));
+  border-radius: var(--fm-radius-sm);
+  background: var(--fm-surface-alt);
 }
 
 .binary-actions {
@@ -6043,8 +6110,8 @@ const responseHeaders = computed(() => {
 .wf-track {
   position: relative;
   height: 16px;
-  border-radius: 4px;
-  background: var(--fm-surface-2, rgba(0, 0, 0, 0.05));
+  border-radius: var(--fm-radius-sm);
+  background: var(--fm-surface-alt);
   overflow: hidden;
 }
 
@@ -6052,7 +6119,7 @@ const responseHeaders = computed(() => {
   position: absolute;
   top: 0;
   height: 100%;
-  border-radius: 4px;
+  border-radius: var(--fm-radius-sm);
   min-width: 2px;
   transition: width 0.2s ease;
 }
@@ -6068,8 +6135,8 @@ const responseHeaders = computed(() => {
   flex-direction: column;
   gap: 4px;
   padding: 8px 10px;
-  border-radius: 6px;
-  background: var(--fm-surface-2, rgba(0, 0, 0, 0.04));
+  border-radius: var(--fm-radius);
+  background: var(--fm-surface-alt);
 }
 
 .timing-note {
@@ -6082,7 +6149,7 @@ const responseHeaders = computed(() => {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  border-top: 1px solid var(--fm-border, rgba(0, 0, 0, 0.07));
+  border-top: 1px solid var(--fm-border);
   padding-top: 10px;
 }
 
@@ -6107,11 +6174,11 @@ const responseHeaders = computed(() => {
 
 .hop-status {
   font-weight: 600;
-  color: #059669;
+  color: var(--fm-success);
 }
 
 .hop-status.bad {
-  color: #dc2626;
+  color: var(--fm-danger);
 }
 
 .hop-host {
@@ -6136,9 +6203,9 @@ const responseHeaders = computed(() => {
 .ignored-headers {
   margin-top: 10px;
   padding: 10px 12px;
-  border-radius: 6px;
-  background: rgba(217, 119, 6, 0.08);
-  border: 1px solid rgba(217, 119, 6, 0.25);
+  border-radius: var(--fm-radius);
+  background: var(--fm-warning-soft);
+  border: 1px solid var(--fm-warning);
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -6147,12 +6214,12 @@ const responseHeaders = computed(() => {
 .ignored-title {
   font-size: 12px;
   font-weight: 600;
-  color: #b45309;
+  color: var(--fm-warning);
 }
 
 .ignored-list {
   font-size: 11px;
-  color: #b45309;
+  color: var(--fm-warning);
   word-break: break-all;
 }
 

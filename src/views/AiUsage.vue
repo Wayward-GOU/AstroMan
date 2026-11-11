@@ -399,7 +399,7 @@ onMounted(() => {
 
 <template>
   <div class="page usage-page">
-    <PageHeader title="用量统计" subtitle="每次模型调用各记一条，含 token 与估算费用，保留近 1 年">
+    <PageHeader eyebrow="AI Usage" title="用量统计" subtitle="每次模型调用各记一条，含 token 与估算费用，保留近 1 年">
       <a-button size="small" @click="backToAi">
         <template #icon><ArrowLeftOutlined /></template>
         返回航仔
@@ -771,18 +771,18 @@ onMounted(() => {
   align-items: center;
   gap: 4px;
   padding: 3px;
-  border-radius: 8px;
+  border-radius: var(--fm-radius-sm);
   background: var(--fm-surface-alt);
   border: 1px solid var(--fm-border);
 }
 
 .chip {
-  border: none;
+  border: 1px solid transparent;
   background: transparent;
   color: var(--fm-muted);
   font-size: 12px;
   padding: 4px 12px;
-  border-radius: 6px;
+  border-radius: var(--fm-radius-sm);
   cursor: pointer;
   transition: background 0.15s ease, color 0.15s ease;
 }
@@ -795,7 +795,7 @@ onMounted(() => {
   background: var(--fm-surface);
   color: var(--fm-text);
   font-weight: 600;
-  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08);
+  border-color: var(--fm-border-strong);
 }
 
 .filter-right {
@@ -821,7 +821,7 @@ onMounted(() => {
 
 .stat-card {
   padding: 10px 14px 12px;
-  border-radius: 10px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface);
   border: 1px solid var(--fm-border);
 }
@@ -833,6 +833,7 @@ onMounted(() => {
 
 .stat-value {
   margin-top: 4px;
+  font-family: var(--fm-font-mono);
   font-size: 21px;
   font-weight: 600;
   letter-spacing: -0.3px;
@@ -850,7 +851,7 @@ onMounted(() => {
 
 .panel {
   padding: 12px 14px;
-  border-radius: 10px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface);
   border: 1px solid var(--fm-border);
   margin-bottom: 10px;
@@ -886,7 +887,7 @@ onMounted(() => {
 .dot {
   width: 7px;
   height: 7px;
-  border-radius: 2px;
+  border-radius: var(--fm-radius-sm);
   display: inline-block;
 }
 
@@ -895,7 +896,7 @@ onMounted(() => {
 }
 
 .dot-out {
-  background: #a855f7;
+  background: var(--fm-purple);
   margin-left: 6px;
 }
 
@@ -945,7 +946,7 @@ onMounted(() => {
   height: 100%;
   display: flex;
   flex-direction: column-reverse;
-  border-radius: 3px 3px 0 0;
+  border-radius: var(--fm-radius-sm) var(--fm-radius-sm) 0 0;
   overflow: hidden;
 }
 
@@ -958,13 +959,21 @@ onMounted(() => {
 .bar-in {
   display: block;
   width: 100%;
-  background: linear-gradient(180deg, color-mix(in srgb, var(--fm-primary) 78%, #fff), var(--fm-primary));
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--fm-primary) 78%, var(--fm-surface)),
+    var(--fm-primary)
+  );
 }
 
 .bar-out {
   display: block;
   width: 100%;
-  background: linear-gradient(180deg, #c4b5fd, #a855f7);
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--fm-purple) 42%, var(--fm-surface)),
+    var(--fm-purple)
+  );
   opacity: 0.9;
 }
 
@@ -1054,7 +1063,7 @@ onMounted(() => {
 
 .cell-tool-id {
   font-size: 10px;
-  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-family: var(--fm-font-mono);
   color: var(--fm-muted);
 }
 
@@ -1180,10 +1189,10 @@ onMounted(() => {
   max-height: 260px;
   overflow: auto;
   padding: 10px 12px;
-  border-radius: 8px;
+  border-radius: var(--fm-radius-sm);
   background: var(--fm-surface-alt);
   border: 1px solid var(--fm-border);
-  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-family: var(--fm-font-mono);
   font-size: 11.5px;
   line-height: 1.65;
   white-space: pre-wrap;
@@ -1195,7 +1204,7 @@ onMounted(() => {
   border-collapse: collapse;
   font-size: 12px;
   border: 1px solid var(--fm-border);
-  border-radius: 8px;
+  border-radius: var(--fm-radius);
   overflow: hidden;
 }
 

@@ -22,7 +22,12 @@ fn read_zip_entry(archive: &mut zip::ZipArchive<std::fs::File>, suffix: &str) ->
         .find(|index| {
             archive
                 .by_index(*index)
-                .map(|entry| entry.name().ends_with(suffix))
+                .map(|entry| {
+                    entry
+                        .name()
+                        .map(|name| name.ends_with(suffix))
+                        .unwrap_or(false)
+                })
                 .unwrap_or(false)
         })
         .unwrap_or_else(|| panic!("ZIP 中找不到 {suffix}"));
@@ -165,10 +170,12 @@ fn proxy_forwards_http_and_ca_is_stable() {
         zip::ZipArchive::new(std::fs::File::open(&zip_path).expect("open zip")).expect("read zip");
     let names: Vec<String> = (0..archive.len())
         .filter_map(|index| {
-            archive
-                .by_index(index)
-                .ok()
-                .map(|entry| entry.name().to_string())
+            archive.by_index(index).ok().map(|entry| {
+                entry
+                    .name()
+                    .map(|name| name.to_string())
+                    .unwrap_or_default()
+            })
         })
         .collect();
     assert!(names.iter().any(|name| name.ends_with("/index.html")));

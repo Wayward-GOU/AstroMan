@@ -87,17 +87,53 @@ jobs:
             || { echo "::error::sidecar 未预置到 target/universal-apple-darwin/release/"; exit 1; }
           lipo -archs src-tauri/target/universal-apple-darwin/release/astroman-cli
 
-      - name: Build and upload to release
-        uses: tauri-apps/tauri-action@v0
+      # 先校验证书，再决定是否把 Apple 变量交给 tauri-action。
+      # 直接无条件传入时，只要 secret 填了但内容不是合法 PKCS#12（或密码不匹配），
+      # codesign 就会以 SecKeychainItemImport: Unable to decode the provided data 失败，
+      # 整个 macOS 任务挂掉；这里检测不通过就退回 ad-hoc 签名，先保证 dmg 能出。
+      - name: Validate Apple signing secrets
+        if: matrix.platform == 'macos-latest'
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # W4 / A-20：配置 Apple Developer ID 后由 Tauri 直接签名并公证；未配置时保持 ad-hoc
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE" ]; then
+            echo "未配置 APPLE_CERTIFICATE，按 ad-hoc 签名构建"
+            exit 0
+          fi
+          python3 - <<'PY'
+          import base64, os, sys
+          raw = "".join(os.environ.get("APPLE_CERTIFICATE", "").split())
+          try:
+              data = base64.b64decode(raw, validate=True)
+          except Exception as error:
+              print(f"::warning::APPLE_CERTIFICATE 不是合法 base64（{error}），退回 ad-hoc")
+              sys.exit(0)
+          # PKCS#12 是 DER 编码的 SEQUENCE，正常证书链至少几百字节
+          if not data.startswith(b"\x30") or len(data) < 1000:
+              print("::warning::APPLE_CERTIFICATE 解码后不是 PKCS#12，退回 ad-hoc")
+              sys.exit(0)
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as out:
+              for key in (
+                  "APPLE_CERTIFICATE",
+                  "APPLE_CERTIFICATE_PASSWORD",
+                  "APPLE_SIGNING_IDENTITY",
+                  "APPLE_ID",
+                  "APPLE_PASSWORD",
+                  "APPLE_TEAM_ID",
+              ):
+                  out.write(f"{key}={os.environ.get(key, '')}\n")
+          print("Apple 签名变量已通过格式校验，交给 tauri-action")
+          PY
+
+      - name: Build and upload to release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: 'AstroMan ${{ github.ref_name }}'

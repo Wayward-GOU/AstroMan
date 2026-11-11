@@ -191,7 +191,19 @@ pub fn save(conn: &Connection, input: BackupTargetInput) -> Result<BackupTarget,
         other => return Err(format!("不支持的备份目标类型：{other}")),
     };
     let url = input.url.trim().trim_end_matches('/').to_string();
-    let dir = normalize_dir(&input.dir);
+    // 本地目标是文件系统路径，不能复用 WebDAV 的路径清洗：
+    // normalize_dir 会裁掉前导 '/'，POSIX 绝对路径会退化成相对路径，
+    // 备份被写进进程工作目录而不是用户选定的目录（CI Linux 上必现）。
+    let dir = if kind == KIND_LOCAL {
+        let slashed = input.dir.trim().replace('\\', "/");
+        if slashed == "/" {
+            slashed
+        } else {
+            slashed.trim_end_matches('/').to_string()
+        }
+    } else {
+        normalize_dir(&input.dir)
+    };
     if kind == KIND_LOCAL {
         if dir.is_empty() {
             return Err("本地备份目录不能为空".to_string());
@@ -1076,6 +1088,18 @@ mod tests {
         assert_eq!(list(&conn).unwrap().len(), 1);
         delete(&conn, saved.id).unwrap();
         assert!(list(&conn).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回归：POSIX 绝对路径入库时不能被裁掉前导 '/'，否则会上传到工作目录
+    #[cfg(unix)]
+    #[test]
+    fn local_target_keeps_absolute_dir() {
+        let (dir, pool, _) = temp_state("abs-dir");
+        let conn = pool.get().unwrap();
+        let remote = dir.join("remote");
+        let saved = save_local(&conn, &remote, "绝对路径");
+        assert_eq!(saved.dir, remote.to_string_lossy());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -38,10 +38,13 @@ export default defineConfig({
     channel: CI ? undefined : process.env.PW_CHANNEL || 'chrome',
   },
   webServer: {
-    command: `npm run dev -- --port ${PORT} --strictPort`,
+    // 显式绑 IPv4：Linux runner 上 localhost 可能先解析到 ::1，
+    // 而 baseURL 用的是 127.0.0.1，会出现「服务已起但探测不到」的假超时
+    command: `npm run dev -- --port ${PORT} --strictPort --host 127.0.0.1`,
     url: `http://127.0.0.1:${PORT}`,
     reuseExistingServer: !CI,
     timeout: 120_000,
+    stdout: 'pipe',
   },
   projects: [
     { name: 'smoke', testMatch: /smoke\.spec\.ts/ },

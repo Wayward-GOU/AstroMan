@@ -830,8 +830,12 @@ const theme = computed(() => {
   flex-direction: column;
   padding: 14px 10px 12px;
   border-right: 1px solid var(--fm-border);
-  transition: width 0.18s ease, padding 0.18s ease, background 0.2s ease, border-color 0.2s ease;
+  /* 只过渡颜色：宽度/内边距动画会让 WebView2 在折叠瞬间留下旧合成层，
+     表现为返回按钮或导航图标残影压在内容区上 */
+  transition: background 0.2s ease, border-color 0.2s ease;
   overflow: hidden;
+  contain: layout paint;
+  isolation: isolate;
 }
 
 .sider.collapsed {

@@ -4108,6 +4108,9 @@ const responseHeaders = computed(() => {
   padding: 0 10px;
   background: var(--fm-surface-alt);
   border-bottom: 1px solid var(--fm-border);
+  /* 双保险：即使滚动容器在 WebView2 里没有及时裁剪，也不能让标签压到右侧工具上 */
+  overflow: hidden;
+  contain: paint;
 }
 
 .tabs-scroll {
@@ -4220,9 +4223,18 @@ const responseHeaders = computed(() => {
 }
 
 .tabs-tools {
+  position: relative;
+  z-index: 1;
   display: flex;
   align-items: center;
   gap: 6px;
+  flex-shrink: 0;
+  padding-left: 8px;
+  margin-left: -4px;
+  background: var(--fm-surface-alt);
+}
+
+.tabs-tools > * {
   flex-shrink: 0;
 }
 
@@ -4234,6 +4246,8 @@ const responseHeaders = computed(() => {
 
 .quick-open {
   width: 168px;
+  flex: 0 0 168px;
+  background: var(--fm-surface);
 }
 
 .back-btn {

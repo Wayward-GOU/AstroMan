@@ -39,9 +39,9 @@ futures-util = "0.3"
 tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
 base64 = "0.22"
 aes-gcm = "0.10"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 r2d2 = "0.8"
-r2d2_sqlite = "0.25"
+r2d2_sqlite = "0.36"
 parking_lot = "0.12"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
@@ -66,7 +66,7 @@ hudsucker = { version = "0.25", default-features = false, features = [
 http-body-util = "0.1"
 bytes = "1"
 # 抓包 ZIP 导出：只启用 deflate，避免带入 bzip2 / zstd 等未用压缩器
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 sysinfo = { version = "0.33", default-features = false, features = ["system", "disk", "network"] }
 
 [target.'cfg(windows)'.dependencies]

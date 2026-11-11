@@ -104,7 +104,8 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
-          releaseBody: |            AstroMan ${{ github.ref_name }} — 纯本地运行的 API 调试、抓包、压测、记事本与开发工具箱。
+          releaseBody: |
+            AstroMan ${{ github.ref_name }} — 纯本地运行的 API 调试、抓包、压测、记事本与开发工具箱。
 
             ### 下载
             - macOS 10.15+（Apple Silicon / Intel 通用）：`AstroMan_*_universal.dmg` + 一键安装脚本 `install-macos.sh`

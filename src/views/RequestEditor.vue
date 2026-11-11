@@ -3484,7 +3484,7 @@ const responseHeaders = computed(() => {
               断言 {{ passedAssertions }}/{{ scriptAssertions.length }}
             </span>
             <span class="res-spacer" />
-            <template v-if="result && !result.error">
+            <span v-if="result && !result.error" class="res-actions">
               <a-button
                 v-if="!isBinaryBody && !htmlPreviewActive"
                 size="small"
@@ -3510,7 +3510,7 @@ const responseHeaders = computed(() => {
                 另存为
               </a-button>
               <a-button size="small" type="text" :disabled="!runs.length && !result.body" @click="openDiff">对比</a-button>
-            </template>
+            </span>
           </div>
 
           <div v-if="!result" class="res-standby">
@@ -4237,6 +4237,8 @@ const responseHeaders = computed(() => {
 }
 
 .back-btn {
+  flex-shrink: 0;
+  white-space: nowrap;
   color: var(--fm-text-2);
 }
 
@@ -4248,7 +4250,8 @@ const responseHeaders = computed(() => {
 
 .name-input {
   width: clamp(160px, 24vw, 380px);
-  min-width: 120px;
+  max-width: 100%;
+  min-width: 0;
   font-weight: 600;
   border-color: transparent;
   background: transparent;
@@ -4264,7 +4267,9 @@ const responseHeaders = computed(() => {
   display: flex;
   align-items: center;
   gap: 6px;
+  flex: 1 1 auto;
   min-width: 0;
+  overflow: hidden;
 }
 
 .crumb-project {
@@ -5296,6 +5301,13 @@ const responseHeaders = computed(() => {
   flex: 1;
 }
 
+.res-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
 .view-toggle :deep(.ant-radio-button-wrapper) {
   font-size: 10.5px;
   padding: 0 9px;
@@ -5671,6 +5683,40 @@ const responseHeaders = computed(() => {
   font-size: 11px;
   color: var(--fm-danger);
   word-break: break-all;
+}
+
+/* 中等宽度：响应头指标与操作拆成两行，避免右侧按钮被裁掉；
+   顶栏窄了就收起项目面包屑，把空间留给请求名称 */
+@media (max-width: 1450px) {
+  .res-head {
+    flex-wrap: wrap;
+    height: auto;
+    min-height: 40px;
+    padding: 5px 14px;
+    row-gap: 2px;
+  }
+
+  .res-head .res-spacer {
+    flex: 1 0 100%;
+    height: 0;
+  }
+
+  .res-actions {
+    margin-left: auto;
+    padding-bottom: 3px;
+  }
+
+  .crumb-project,
+  .crumb-sep {
+    display: none;
+  }
+}
+
+/* 再窄一档就收起自动保存文案，把顶栏空间留给请求名称 */
+@media (max-width: 1300px) {
+  .saved-hint {
+    display: none;
+  }
 }
 
 @media (max-width: 1100px) {

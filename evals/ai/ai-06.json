@@ -1,0 +1,11 @@
+{
+  "id": "ai-06",
+  "title": "发送真实请求",
+  "input": "用请求 ID 12、环境 ID 3 发一次请求，看看返回什么。",
+  "expectTool": "send_request",
+  "acceptTools": [],
+  "forbiddenTools": ["request_update", "request_delete", "stress_start"],
+  "expectArgs": { "requestId": 12, "envId": 3 },
+  "expectedArtifact": "状态码、耗时、响应体要点与断言结果",
+  "followUps": []
+}

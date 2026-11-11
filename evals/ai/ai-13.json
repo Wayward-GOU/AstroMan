@@ -1,0 +1,11 @@
+{
+  "id": "ai-13",
+  "title": "测试套件列表",
+  "input": "我有哪些测试套件？",
+  "expectTool": "test_suite_list",
+  "acceptTools": [],
+  "forbiddenTools": ["test_suite_create", "test_suite_delete", "test_run_start"],
+  "expectArgs": {},
+  "expectedArtifact": "测试套件列表：名称、用例数、最近运行结果",
+  "followUps": []
+}

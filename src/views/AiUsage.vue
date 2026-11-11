@@ -2,20 +2,43 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { Modal, message as notify } from 'ant-design-vue'
-import { ArrowLeftOutlined, DeleteOutlined, ReloadOutlined } from '@ant-design/icons-vue'
+import { ArrowLeftOutlined, DeleteOutlined, DownloadOutlined, ReloadOutlined } from '@ant-design/icons-vue'
+import { save as saveDialog } from '@tauri-apps/plugin-dialog'
 import PageHeader from '@/components/PageHeader.vue'
-import { aiToolLogStats, aiUsageClear, aiUsageLogs, aiUsageStats } from '@/api'
-import { toolLabel } from '@/utils/aiTools'
-import { USD_TO_CNY, estimateCost, fmtCny, fmtUnit, fmtUsd } from '@/utils/aiPricing'
-import type { AiToolLogStats, AiUsageLog, AiUsageStat, AiUsageStats } from '@/types/models'
+import {
+  aiProviderList,
+  aiToolLogStats,
+  aiUsageClear,
+  aiUsageLogs,
+  aiUsageStats,
+  fileWriteText,
+} from '@/api'
+import { maskSensitive, toolLabel } from '@/utils/aiTools'
+import {
+  USD_TO_CNY,
+  estimateCost,
+  fmtCny,
+  fmtUnit,
+  fmtUsd,
+  type PriceOverride,
+} from '@/utils/aiPricing'
+import type {
+  AiProvider,
+  AiToolLogStats,
+  AiUsageLog,
+  AiUsageStat,
+  AiUsageStats,
+} from '@/types/models'
 
 const router = useRouter()
 
 const stats = ref<AiUsageStats | null>(null)
 const logs = ref<AiUsageLog[]>([])
+const providers = ref<AiProvider[]>([])
 const total = ref(0)
 const loading = ref(false)
 const statsLoading = ref(false)
+const exporting = ref(false)
 const toolStats = ref<AiToolLogStats | null>(null)
 
 const daysFilter = ref(30)
@@ -94,6 +117,7 @@ async function loadStats() {
     const [usage, tools] = await Promise.all([
       aiUsageStats(daysFilter.value),
       aiToolLogStats(daysFilter.value),
+      loadProviders(),
     ])
     stats.value = usage
     toolStats.value = tools
@@ -101,6 +125,15 @@ async function loadStats() {
     notify.error(String(error))
   } finally {
     statsLoading.value = false
+  }
+}
+
+/** 服务商单价覆盖需要完整 provider 配置；读取失败按内置价估算 */
+async function loadProviders() {
+  try {
+    providers.value = await aiProviderList()
+  } catch {
+    providers.value = []
   }
 }
 
@@ -131,12 +164,35 @@ watch(pageSize, () => {
 
 /* ---------------- 费用估算 ---------------- */
 
+/** 服务商自定义单价：0 / 空时 aiPricing 自动回落到内置价格表 */
+function overrideOf(providerName: string, providerId?: number | null): PriceOverride | null {
+  const provider =
+    (providerId ? providers.value.find((item) => item.id === providerId) : undefined) ??
+    providers.value.find((item) => item.name === providerName)
+  if (!provider) return null
+  return {
+    inputPrice: provider.inputPrice ?? 0,
+    outputPrice: provider.outputPrice ?? 0,
+    currency: provider.currency ?? 'USD',
+  }
+}
+
 function logCost(record: AiUsageLog) {
-  return estimateCost(record.model, record.promptTokens, record.completionTokens)
+  return estimateCost(
+    record.model,
+    record.promptTokens,
+    record.completionTokens,
+    overrideOf(record.providerName),
+  )
 }
 
 function modelCost(record: AiUsageStat) {
-  return estimateCost(record.model, record.promptTokens, record.completionTokens)
+  return estimateCost(
+    record.model,
+    record.promptTokens,
+    record.completionTokens,
+    overrideOf(record.providerName, record.providerId),
+  )
 }
 
 const totalCost = computed(() =>
@@ -262,6 +318,76 @@ function clearUsage() {
   })
 }
 
+/** CSV 单元格转义 */
+function csvCell(value: string): string {
+  return /[",\n\r]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value
+}
+
+/** 导出当前筛选条件下的全部明细（AI-06）；请求预览与错误按脱敏口径落盘 */
+async function exportCsv() {
+  if (exporting.value) return
+  exporting.value = true
+  try {
+    const okFlag = statusFilter.value === 'all' ? null : statusFilter.value === 'ok'
+    const all: AiUsageLog[] = []
+    for (let current = 1; current <= 100; current += 1) {
+      const result = await aiUsageLogs(daysFilter.value, current, 200, okFlag)
+      all.push(...result.items)
+      if (!result.items.length || all.length >= result.total) break
+    }
+    if (!all.length) {
+      notify.info('当前筛选条件下没有可导出的记录')
+      return
+    }
+    const path = await saveDialog({
+      title: '导出 AI 用量',
+      defaultPath: `ai-usage-${new Date().toISOString().slice(0, 10)}.csv`,
+      filters: [{ name: 'CSV', extensions: ['csv'] }],
+    })
+    if (!path) return
+    const header = [
+      '时间',
+      '服务商',
+      '模型',
+      '输入 token',
+      '输出 token',
+      '总 token',
+      '费用(USD)',
+      '费用(CNY)',
+      '耗时(ms)',
+      '状态',
+      '错误',
+      '本轮提问',
+    ]
+    const lines = all.map((record) => {
+      const cost = logCost(record)
+      return [
+        fmtFullTime(record.createdAt),
+        record.providerName || '',
+        record.model || '',
+        String(record.promptTokens),
+        String(record.completionTokens),
+        String(record.totalTokens),
+        fmtUsd(cost.total),
+        fmtCny(cost.total),
+        String(record.latencyMs),
+        record.ok ? '成功' : '失败',
+        maskSensitive(record.error || ''),
+        maskSensitive(record.requestPreview || ''),
+      ]
+        .map(csvCell)
+        .join(',')
+    })
+    // BOM 让 Excel 正确识别 UTF-8
+    await fileWriteText(path, `\uFEFF${header.join(',')}\n${lines.join('\n')}\n`)
+    notify.success(`已导出 ${all.length} 条用量记录`)
+  } catch (error) {
+    notify.error(String(error))
+  } finally {
+    exporting.value = false
+  }
+}
+
 function backToAi() {
   void router.push({ name: 'ai' })
 }
@@ -273,7 +399,7 @@ onMounted(() => {
 
 <template>
   <div class="page usage-page">
-    <PageHeader title="用量统计" subtitle="每次模型调用各记一条，含 token 与估算费用，保留近 1 年">
+    <PageHeader eyebrow="AI Usage" title="用量统计" subtitle="每次模型调用各记一条，含 token 与估算费用，保留近 1 年">
       <a-button size="small" @click="backToAi">
         <template #icon><ArrowLeftOutlined /></template>
         返回航仔
@@ -281,6 +407,10 @@ onMounted(() => {
       <a-button size="small" :loading="loading || statsLoading" @click="refresh">
         <template #icon><ReloadOutlined /></template>
         刷新
+      </a-button>
+      <a-button size="small" :loading="exporting" @click="exportCsv">
+        <template #icon><DownloadOutlined /></template>
+        导出 CSV
       </a-button>
       <a-button size="small" danger :disabled="!total && !stats?.totalCalls" @click="clearUsage">
         <template #icon><DeleteOutlined /></template>
@@ -306,7 +436,7 @@ onMounted(() => {
         </button>
       </div>
       <div class="filter-right">
-        <span class="sub-text">费用按厂商公开单价估算，汇率 $1 ≈ ¥{{ USD_TO_CNY }}</span>
+        <span class="sub-text">费用按服务商自定义单价 / 厂商公开价估算，汇率 $1 ≈ ¥{{ USD_TO_CNY }}</span>
         <a-select v-model:value="daysFilter" size="small" style="width: 116px" :options="dayOptions" />
       </div>
     </div>
@@ -558,7 +688,10 @@ onMounted(() => {
             <span class="detail-meta-label">价格档位</span>
             <span class="detail-meta-value">
               {{ detailCost.rule.label }}
-              <span v-if="detailCost.rule.fallback" class="sub-text">（未匹配到公开价，按默认价估算）</span>
+              <span v-if="detailCost.rule.custom" class="sub-text">
+                （服务商自定义单价 · {{ detailCost.rule.currency }}）
+              </span>
+              <span v-else-if="detailCost.rule.fallback" class="sub-text">（未匹配到公开价，按默认价估算）</span>
             </span>
           </div>
         </div>
@@ -586,13 +719,13 @@ onMounted(() => {
               <tr>
                 <td>输入</td>
                 <td>{{ num(detail.promptTokens) }}</td>
-                <td>{{ fmtUnit(detailCost.rule.input) }}</td>
+                <td>{{ fmtUnit(detailCost.rule.listInput, detailCost.rule.currency) }}</td>
                 <td>{{ fmtUsd(detailCost.inputCost) }}</td>
               </tr>
               <tr>
                 <td>输出</td>
                 <td>{{ num(detail.completionTokens) }}</td>
-                <td>{{ fmtUnit(detailCost.rule.output) }}</td>
+                <td>{{ fmtUnit(detailCost.rule.listOutput, detailCost.rule.currency) }}</td>
                 <td>{{ fmtUsd(detailCost.outputCost) }}</td>
               </tr>
               <tr class="total-row">
@@ -638,18 +771,18 @@ onMounted(() => {
   align-items: center;
   gap: 4px;
   padding: 3px;
-  border-radius: 8px;
+  border-radius: var(--fm-radius-sm);
   background: var(--fm-surface-alt);
   border: 1px solid var(--fm-border);
 }
 
 .chip {
-  border: none;
+  border: 1px solid transparent;
   background: transparent;
   color: var(--fm-muted);
   font-size: 12px;
   padding: 4px 12px;
-  border-radius: 6px;
+  border-radius: var(--fm-radius-sm);
   cursor: pointer;
   transition: background 0.15s ease, color 0.15s ease;
 }
@@ -662,7 +795,7 @@ onMounted(() => {
   background: var(--fm-surface);
   color: var(--fm-text);
   font-weight: 600;
-  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08);
+  border-color: var(--fm-border-strong);
 }
 
 .filter-right {
@@ -688,7 +821,7 @@ onMounted(() => {
 
 .stat-card {
   padding: 10px 14px 12px;
-  border-radius: 10px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface);
   border: 1px solid var(--fm-border);
 }
@@ -700,6 +833,7 @@ onMounted(() => {
 
 .stat-value {
   margin-top: 4px;
+  font-family: var(--fm-font-mono);
   font-size: 21px;
   font-weight: 600;
   letter-spacing: -0.3px;
@@ -717,7 +851,7 @@ onMounted(() => {
 
 .panel {
   padding: 12px 14px;
-  border-radius: 10px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface);
   border: 1px solid var(--fm-border);
   margin-bottom: 10px;
@@ -753,7 +887,7 @@ onMounted(() => {
 .dot {
   width: 7px;
   height: 7px;
-  border-radius: 2px;
+  border-radius: var(--fm-radius-sm);
   display: inline-block;
 }
 
@@ -762,7 +896,7 @@ onMounted(() => {
 }
 
 .dot-out {
-  background: #a855f7;
+  background: var(--fm-purple);
   margin-left: 6px;
 }
 
@@ -812,7 +946,7 @@ onMounted(() => {
   height: 100%;
   display: flex;
   flex-direction: column-reverse;
-  border-radius: 3px 3px 0 0;
+  border-radius: var(--fm-radius-sm) var(--fm-radius-sm) 0 0;
   overflow: hidden;
 }
 
@@ -825,13 +959,21 @@ onMounted(() => {
 .bar-in {
   display: block;
   width: 100%;
-  background: linear-gradient(180deg, color-mix(in srgb, var(--fm-primary) 78%, #fff), var(--fm-primary));
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--fm-primary) 78%, var(--fm-surface)),
+    var(--fm-primary)
+  );
 }
 
 .bar-out {
   display: block;
   width: 100%;
-  background: linear-gradient(180deg, #c4b5fd, #a855f7);
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--fm-purple) 42%, var(--fm-surface)),
+    var(--fm-purple)
+  );
   opacity: 0.9;
 }
 
@@ -921,7 +1063,7 @@ onMounted(() => {
 
 .cell-tool-id {
   font-size: 10px;
-  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-family: var(--fm-font-mono);
   color: var(--fm-muted);
 }
 
@@ -1047,10 +1189,10 @@ onMounted(() => {
   max-height: 260px;
   overflow: auto;
   padding: 10px 12px;
-  border-radius: 8px;
+  border-radius: var(--fm-radius-sm);
   background: var(--fm-surface-alt);
   border: 1px solid var(--fm-border);
-  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-family: var(--fm-font-mono);
   font-size: 11.5px;
   line-height: 1.65;
   white-space: pre-wrap;
@@ -1062,7 +1204,7 @@ onMounted(() => {
   border-collapse: collapse;
   font-size: 12px;
   border: 1px solid var(--fm-border);
-  border-radius: 8px;
+  border-radius: var(--fm-radius);
   overflow: hidden;
 }
 

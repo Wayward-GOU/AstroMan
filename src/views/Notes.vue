@@ -807,6 +807,15 @@ onBeforeUnmount(() => {
       <span v-else-if="store.quietText" class="pause-state quiet">
         免打扰 {{ store.quietText }}
       </span>
+      <a-input
+        ref="searchRef"
+        v-model:value="keyword"
+        class="search-input"
+        allow-clear
+        placeholder="搜索标题或正文…"
+      >
+        <template #prefix><SearchOutlined /></template>
+      </a-input>
       <a-button @click="importOpen = true">
         <template #icon><CameraOutlined /></template>
         截图生成
@@ -859,15 +868,6 @@ onBeforeUnmount(() => {
           </a-menu>
         </template>
       </a-dropdown>
-      <a-input
-        ref="searchRef"
-        v-model:value="keyword"
-        class="search-input"
-        allow-clear
-        placeholder="搜索标题或正文…"
-      >
-        <template #prefix><SearchOutlined /></template>
-      </a-input>
     </PageHeader>
 
     <div class="notes-grid">
@@ -1260,50 +1260,50 @@ onBeforeUnmount(() => {
 
 /* 标签整块配色：同一标签在侧栏、列表和卡片里颜色一致 */
 .tone-0 {
-  --tag-bg: #d9f3ef;
-  --tag-fg: #0f766e;
+  --tag-bg: var(--fm-primary-soft);
+  --tag-fg: var(--fm-primary);
 }
 
 .tone-1 {
-  --tag-bg: #dce8ff;
-  --tag-fg: #1d4ed8;
+  --tag-bg: var(--fm-surface-alt);
+  --tag-fg: var(--fm-json-key);
 }
 
 .tone-2 {
-  --tag-bg: #ebe4ff;
-  --tag-fg: #6d28d9;
+  --tag-bg: var(--fm-purple-soft);
+  --tag-fg: var(--fm-purple);
 }
 
 .tone-3 {
-  --tag-bg: #ffe1e8;
-  --tag-fg: #be123c;
+  --tag-bg: var(--fm-danger-soft);
+  --tag-fg: var(--fm-danger);
 }
 
 .tone-4 {
-  --tag-bg: #fdf0cc;
-  --tag-fg: #a16207;
+  --tag-bg: var(--fm-warning-soft);
+  --tag-fg: var(--fm-warning);
 }
 
 .tone-5 {
-  --tag-bg: #dcf7e4;
-  --tag-fg: #15803d;
+  --tag-bg: var(--fm-success-soft);
+  --tag-fg: var(--fm-success);
 }
 
 .tone-6 {
-  --tag-bg: #d6f4fb;
-  --tag-fg: #0e7490;
+  --tag-bg: var(--fm-surface-alt);
+  --tag-fg: var(--fm-json-number);
 }
 
 .tone-7 {
-  --tag-bg: #ffe7d6;
-  --tag-fg: #c2410c;
+  --tag-bg: var(--fm-warning-soft);
+  --tag-fg: var(--fm-brass-text);
 }
 
 .pause-state {
   font-size: 11px;
   color: var(--fm-warning);
   background: var(--fm-warning-soft);
-  border-radius: 4px;
+  border-radius: var(--fm-radius-sm);
   padding: 2px 8px;
 }
 
@@ -1322,7 +1322,7 @@ onBeforeUnmount(() => {
   gap: 8px;
   margin-bottom: 10px;
   padding: 6px 10px;
-  border: 1px solid #f2d9a8;
+  border: 1px solid var(--fm-border);
   background: var(--fm-warning-soft);
   border-radius: var(--fm-radius-sm);
   font-size: 11px;
@@ -1353,7 +1353,6 @@ onBeforeUnmount(() => {
   padding: 10px;
   overflow: hidden;
   border-radius: var(--fm-radius-lg);
-  box-shadow: var(--fm-shadow);
   background:
     linear-gradient(180deg, var(--fm-primary-soft) 0, transparent 132px),
     var(--fm-surface);
@@ -1459,22 +1458,21 @@ onBeforeUnmount(() => {
 
 .tag-chip:hover {
   background: var(--tag-bg);
-  filter: brightness(0.97);
 }
 
 .tag-chip .tag-count {
   color: var(--tag-fg);
-  background: rgba(255, 255, 255, 0.62);
+  background: var(--fm-surface);
 }
 
 .tag-chip.active {
   background: var(--tag-fg);
-  color: #ffffff;
+  color: var(--fm-surface);
 }
 
 .tag-chip.active .tag-count {
   color: var(--tag-fg);
-  background: rgba(255, 255, 255, 0.9);
+  background: var(--fm-surface);
 }
 
 .scope-count,
@@ -1483,14 +1481,14 @@ onBeforeUnmount(() => {
   font-size: 10px;
   color: var(--fm-muted);
   background: var(--fm-surface-alt);
-  border-radius: 8px;
+  border-radius: var(--fm-radius-sm);
   padding: 0 6px;
 }
 
 .scope-item.active .scope-count,
 .tag-item.active .tag-count {
   color: var(--fm-primary);
-  background: #ffffff;
+  background: var(--fm-surface);
 }
 
 .tag-name {
@@ -1512,7 +1510,7 @@ onBeforeUnmount(() => {
   gap: 2px;
   padding: 0 5px;
   border: 1px dashed var(--fm-border-strong);
-  border-radius: 4px;
+  border-radius: var(--fm-radius);
   background: transparent;
   color: var(--fm-muted);
   font-size: 10px;
@@ -1565,7 +1563,6 @@ onBeforeUnmount(() => {
   border: 1px solid var(--fm-border);
   border-radius: var(--fm-radius);
   background: var(--fm-surface);
-  box-shadow: var(--fm-shadow-sm);
 }
 
 .quick-input {
@@ -1585,7 +1582,7 @@ onBeforeUnmount(() => {
   font-size: 10px;
   color: var(--fm-primary);
   background: var(--fm-primary-soft);
-  border-radius: 4px;
+  border-radius: var(--fm-radius-sm);
   padding: 1px 6px;
 }
 
@@ -1617,7 +1614,7 @@ onBeforeUnmount(() => {
   gap: 2px;
   padding: 1px;
   background: var(--fm-surface-alt);
-  border-radius: 5px;
+  border-radius: var(--fm-radius-sm);
 }
 
 .view-toggle button {
@@ -1628,7 +1625,7 @@ onBeforeUnmount(() => {
   justify-content: center;
   padding: 0;
   border: none;
-  border-radius: 4px;
+  border-radius: var(--fm-radius-sm);
   background: transparent;
   color: var(--fm-muted);
   font-size: 11px;
@@ -1643,7 +1640,6 @@ onBeforeUnmount(() => {
 .view-toggle button.active {
   background: var(--fm-surface);
   color: var(--fm-primary);
-  box-shadow: var(--fm-shadow-sm);
 }
 
 .list-scroll {
@@ -1683,9 +1679,11 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 6px;
   padding: 5px 4px;
-  font-size: 10px;
+  font-size: 9.5px;
+  font-family: var(--fm-font-mono);
   font-weight: 600;
-  letter-spacing: 0.5px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
   color: var(--fm-muted);
   background: var(--fm-surface);
 }
@@ -1694,7 +1692,7 @@ onBeforeUnmount(() => {
   content: '';
   width: 3px;
   height: 11px;
-  border-radius: 2px;
+  border-radius: var(--fm-radius-sm);
   background: var(--fm-primary);
   opacity: 0.55;
 }
@@ -1712,7 +1710,7 @@ onBeforeUnmount(() => {
   font-weight: 500;
   color: var(--fm-primary);
   background: var(--fm-primary-soft);
-  border-radius: 8px;
+  border-radius: var(--fm-radius-sm);
   padding: 0 6px;
 }
 
@@ -1725,7 +1723,8 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: flex-start;
   gap: 8px;
-  padding: 7px 8px;
+  min-height: 32px;
+  padding: 5px 8px;
   border-radius: var(--fm-radius-sm);
   cursor: pointer;
   border-left: 2px solid transparent;
@@ -1763,25 +1762,21 @@ onBeforeUnmount(() => {
   min-height: 96px;
   padding: 10px 10px 26px;
   border: 1px solid var(--fm-border);
-  border-left: 3px solid var(--fm-border-strong);
+  border-left: 2px solid var(--fm-border-strong);
   border-radius: var(--fm-radius);
   background: var(--fm-surface);
-  box-shadow: var(--fm-shadow-sm);
-  transition: border-color 0.15s, box-shadow 0.15s, transform 0.15s;
+  transition: border-color 0.15s;
 }
 
 .note-items.card .note-row:hover {
   background: var(--fm-surface);
   border-color: var(--fm-border-strong);
-  box-shadow: var(--fm-shadow);
-  transform: translateY(-1px);
 }
 
 .note-items.card .note-row.selected {
   background: linear-gradient(180deg, var(--fm-primary-soft), var(--fm-surface) 72%);
   border-color: var(--fm-primary);
   border-left-color: var(--fm-primary);
-  box-shadow: 0 0 0 2px var(--fm-primary-soft), var(--fm-shadow-sm);
 }
 
 .note-items.card .note-row.overdue:not(.selected) {
@@ -1792,7 +1787,6 @@ onBeforeUnmount(() => {
 .note-items.card .note-row.done {
   background: var(--fm-surface-alt);
   border-color: var(--fm-border);
-  box-shadow: none;
 }
 
 .note-items.card .note-row.done:hover {
@@ -1909,7 +1903,7 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 2px;
   background: var(--fm-surface-alt);
-  border-radius: 3px;
+  border-radius: var(--fm-radius-sm);
   padding: 0 4px;
 }
 
@@ -1933,7 +1927,7 @@ onBeforeUnmount(() => {
   align-items: center;
   max-width: 100px;
   padding: 0 5px;
-  border-radius: 4px;
+  border-radius: var(--fm-radius-sm);
   font-size: 9px;
   line-height: 15px;
   color: var(--tag-fg, var(--fm-text-2));
@@ -1974,7 +1968,7 @@ onBeforeUnmount(() => {
   border: none;
   background: transparent;
   color: var(--fm-muted);
-  border-radius: 4px;
+  border-radius: var(--fm-radius-sm);
   cursor: pointer;
   font-size: 12px;
 }
@@ -2023,8 +2017,9 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 8px;
   padding: 7px 12px;
-  background: var(--fm-text);
-  color: #fff;
+  background: var(--fm-surface);
+  color: var(--fm-text);
+  border: 1px solid var(--fm-border-strong);
   border-radius: var(--fm-radius);
   box-shadow: var(--fm-shadow-lg);
   font-size: 12px;
@@ -2032,7 +2027,7 @@ onBeforeUnmount(() => {
 }
 
 .undo-bar :deep(.ant-btn-link) {
-  color: #9db1ff;
+  color: var(--fm-primary);
   padding: 0;
   height: auto;
 }

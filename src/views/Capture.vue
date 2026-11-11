@@ -46,6 +46,7 @@ import {
   buildCaptureTree,
   captureFlowLabel,
   captureTreeKeys,
+  captureTreeWindow,
   type CaptureHostTree,
   type CaptureTreeNode,
 } from '@/utils/captureTree'
@@ -132,6 +133,10 @@ const groupMenu = ref<GroupMenu | null>(null)
 const requestPretty = ref(true)
 const responsePretty = ref(true)
 const flowList = ref<HTMLElement | null>(null)
+/** 虚拟滚动的输入：列表滚动位置与可视高度（行高固定，窗口按像素算） */
+const listScrollTop = ref(0)
+const listViewport = ref(0)
+let listObserver: ResizeObserver | null = null
 const workspace = ref<HTMLElement | null>(null)
 const splitWidth = ref(380)
 const resizing = ref(false)
@@ -393,6 +398,36 @@ const treeRows = computed<TreeRow[]>(() => {
   }
   return rows
 })
+
+/** 虚拟滚动窗口：只渲染视口附近的几十行，5000 条流量也不一次性铺 DOM */
+const listWindow = computed(() =>
+  captureTreeWindow(treeRows.value, listScrollTop.value, listViewport.value || 600),
+)
+
+// 列表容器挂载 / 尺寸变化时同步可视高度
+watch(flowList, (element) => {
+  listObserver?.disconnect()
+  listObserver = null
+  if (!element) return
+  listViewport.value = element.clientHeight
+  listObserver = new ResizeObserver(() => {
+    listViewport.value = element.clientHeight
+  })
+  listObserver.observe(element)
+})
+
+// 折叠 / 过滤后总高度变矮时把滚动位置收回，避免停在空白区
+watch(
+  treeRows,
+  () => {
+    const element = flowList.value
+    if (!element) return
+    const max = Math.max(0, element.scrollHeight - element.clientHeight)
+    if (element.scrollTop > max) element.scrollTop = max
+    listScrollTop.value = element.scrollTop
+  },
+  { flush: 'post' },
+)
 
 const errorCount = computed(() => flows.value.filter((flow) => flow.error).length)
 const queryParams = computed(() => (detail.value ? queryRows(detail.value.path) : []))
@@ -769,6 +804,7 @@ function onListScroll() {
   closeGroupMenu()
   const element = flowList.value
   if (!element) return
+  listScrollTop.value = element.scrollTop
   autoScroll.value = element.scrollHeight - element.scrollTop - element.clientHeight < 40
 }
 
@@ -1074,7 +1110,27 @@ async function exportCapture(kind: ExportKind, ids?: number[], host?: string) {
     })
     if (!path) return
     if (kind === 'har') {
-      await api.captureExportHar(path, ids)
+      try {
+        await api.captureExportHar(path, ids)
+      } catch (error) {
+        // 正文超 64MB：引导改用仅元数据导出，避免满载时序列化吃满内存
+        if (!String(error).includes('E_CAPTURE_HAR_LARGE')) throw error
+        const detail = String(error).replace(/^E_CAPTURE_HAR_LARGE:\s*/, '')
+        const confirmed = await new Promise<boolean>((resolve) => {
+          Modal.confirm({
+            title: '正文过多，改为仅元数据导出？',
+            content: `${detail}。仅元数据会保留 URL、状态、请求头、响应头与大小，不写请求与响应正文。`,
+            okText: '仅元数据导出',
+            cancelText: '取消',
+            onOk: () => resolve(true),
+            onCancel: () => resolve(false),
+          })
+        })
+        if (!confirmed) return
+        await api.captureExportHar(path, ids, true)
+        message.success('HAR 已导出（仅元数据）')
+        return
+      }
     } else {
       await api.captureExportZip(path, ids)
     }
@@ -1190,6 +1246,7 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   if (timer) window.clearInterval(timer)
   if (caTimer) window.clearInterval(caTimer)
+  listObserver?.disconnect()
   window.removeEventListener('pointermove', onResizeMove)
   window.removeEventListener('click', closeGroupMenu)
   window.removeEventListener('keydown', onGlobalKeydown)
@@ -1443,79 +1500,91 @@ watch(settingsOpen, (open) => {
         </div>
 
         <div v-else ref="flowList" class="tree" @scroll="onListScroll">
-          <template v-for="row in treeRows" :key="row.key">
-            <div v-if="row.kind === 'host'" class="host-group">
-              <button
-                type="button"
-                class="host-row"
-                @click="toggleNode(row.group.key)"
-                @contextmenu.prevent="openGroupMenu($event, row.group)"
-              >
-                <RightOutlined v-if="isCollapsed(row.group.key)" class="caret" />
-                <DownOutlined v-else class="caret" />
-                <GlobalOutlined class="host-icon" />
-                <span class="host-name" :title="row.group.host">{{ row.group.host }}</span>
-                <span class="host-count">{{ row.group.count }}</span>
-                <span v-if="row.group.errors" class="host-errors">
-                  {{ row.group.errors }} 错误
-                </span>
-                <span class="host-last" :class="statusTone(row.group.lastStatus)">
-                  {{ row.group.lastStatus ?? 'ERR' }}
-                </span>
-              </button>
+          <div class="tree-space" :style="{ height: `${listWindow.height}px` }">
+            <div class="tree-window" :style="{ transform: `translateY(${listWindow.top}px)` }">
+              <template v-for="item in listWindow.items" :key="item.row.key">
+                <div v-if="item.row.kind === 'host'" class="host-group">
+                  <button
+                    type="button"
+                    class="host-row"
+                    @click="toggleNode(item.row.group.key)"
+                    @contextmenu.prevent="openGroupMenu($event, item.row.group)"
+                  >
+                    <RightOutlined v-if="isCollapsed(item.row.group.key)" class="caret" />
+                    <DownOutlined v-else class="caret" />
+                    <GlobalOutlined class="host-icon" />
+                    <span class="host-name" :title="item.row.group.host">{{ item.row.group.host }}</span>
+                    <span class="host-count">{{ item.row.group.count }}</span>
+                    <span v-if="item.row.group.errors" class="host-errors">
+                      {{ item.row.group.errors }} 错误
+                    </span>
+                    <span class="host-last" :class="statusTone(item.row.group.lastStatus)">
+                      {{ item.row.group.lastStatus ?? 'ERR' }}
+                    </span>
+                  </button>
+                </div>
+
+                <button
+                  v-else-if="item.row.kind === 'folder'"
+                  type="button"
+                  class="folder-row"
+                  :style="{ paddingLeft: `${10 + item.row.depth * 16}px` }"
+                  :title="item.row.node.path"
+                  @click="toggleNode(item.row.node.key)"
+                >
+                  <RightOutlined v-if="isCollapsed(item.row.node.key)" class="caret" />
+                  <DownOutlined v-else class="caret" />
+                  <FolderOutlined class="folder-icon" />
+                  <span class="folder-name">{{ item.row.node.name }}</span>
+                  <span class="host-count">{{ item.row.node.count }}</span>
+                  <span v-if="item.row.node.errors" class="host-errors">
+                    {{ item.row.node.errors }} 错误
+                  </span>
+                </button>
+
+                <button
+                  v-else
+                  type="button"
+                  class="flow-row"
+                  :class="{ active: selectedId === item.row.flow.id, failed: !!item.row.flow.error }"
+                  :style="{ paddingLeft: `${24 + item.row.depth * 16}px` }"
+                  @click="selectFlow(item.row.flow)"
+                >
+                  <span class="method-tag flow-method" :class="methodClass(item.row.flow.method)">
+                    {{ item.row.flow.method }}
+                  </span>
+                  <span
+                    class="flow-path"
+                    :title="`${item.row.flow.path}\n${item.row.flow.status ?? 'ERR'} · ${formatDuration(item.row.flow.durationMs)}`"
+                  >
+                    {{ captureFlowLabel(item.row.flow) }}
+                  </span>
+                  <span class="flow-state">
+                    <span class="flow-status" :class="statusClass(item.row.flow)">
+                      {{ item.row.flow.status ?? 'ERR' }}
+                    </span>
+                    <span
+                      v-if="item.row.flow.mapped"
+                      class="flow-flag mapped"
+                      title="本地映射直接返回"
+                    >本地</span>
+                    <span
+                      v-if="item.row.flow.remote"
+                      class="flow-flag remote"
+                      :title="`远程映射到 ${item.row.flow.remote}`"
+                    >远程</span>
+                    <span
+                      v-if="item.row.flow.modified"
+                      class="flow-flag modified"
+                      title="断点修改过请求或响应"
+                    >已改</span>
+                  </span>
+                  <span class="flow-time">{{ formatDuration(item.row.flow.durationMs) }}</span>
+                  <span class="flow-size">{{ formatBytes(item.row.flow.responseSize) }}</span>
+                </button>
+              </template>
             </div>
-
-            <button
-              v-else-if="row.kind === 'folder'"
-              type="button"
-              class="folder-row"
-              :style="{ paddingLeft: `${10 + row.depth * 16}px` }"
-              :title="row.node.path"
-              @click="toggleNode(row.node.key)"
-            >
-              <RightOutlined v-if="isCollapsed(row.node.key)" class="caret" />
-              <DownOutlined v-else class="caret" />
-              <FolderOutlined class="folder-icon" />
-              <span class="folder-name">{{ row.node.name }}</span>
-              <span class="host-count">{{ row.node.count }}</span>
-              <span v-if="row.node.errors" class="host-errors">{{ row.node.errors }} 错误</span>
-            </button>
-
-            <button
-              v-else
-              type="button"
-              class="flow-row"
-              :class="{ active: selectedId === row.flow.id, failed: !!row.flow.error }"
-              :style="{ paddingLeft: `${24 + row.depth * 16}px` }"
-              @click="selectFlow(row.flow)"
-            >
-              <span class="method-tag flow-method" :class="methodClass(row.flow.method)">
-                {{ row.flow.method }}
-              </span>
-              <span
-                class="flow-path"
-                :title="`${row.flow.path}\n${row.flow.status ?? 'ERR'} · ${formatDuration(row.flow.durationMs)}`"
-              >
-                {{ captureFlowLabel(row.flow) }}
-              </span>
-              <span class="flow-state">
-                <span class="flow-status" :class="statusClass(row.flow)">
-                  {{ row.flow.status ?? 'ERR' }}
-                </span>
-                <span v-if="row.flow.mapped" class="flow-flag mapped" title="本地映射直接返回">本地</span>
-                <span
-                  v-if="row.flow.remote"
-                  class="flow-flag remote"
-                  :title="`远程映射到 ${row.flow.remote}`"
-                >远程</span>
-                <span v-if="row.flow.modified" class="flow-flag modified" title="断点修改过请求或响应">
-                  已改
-                </span>
-              </span>
-              <span class="flow-time">{{ formatDuration(row.flow.durationMs) }}</span>
-              <span class="flow-size">{{ formatBytes(row.flow.responseSize) }}</span>
-            </button>
-          </template>
+          </div>
         </div>
 
         <div class="pane-foot">
@@ -2277,14 +2346,14 @@ watch(settingsOpen, (open) => {
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: #fff;
+  background: var(--fm-surface);
 }
 
 .rec-square {
   display: inline-block;
   width: 8px;
   height: 8px;
-  border-radius: 2px;
+  border-radius: var(--fm-radius-sm);
   background: currentColor;
 }
 
@@ -2356,9 +2425,9 @@ watch(settingsOpen, (open) => {
   margin-left: 2px;
   padding: 0 4px;
   font-size: 10px;
-  color: #fff;
-  background: var(--fm-warning, #faad14);
-  border-radius: 8px;
+  color: var(--fm-surface);
+  background: var(--fm-warning);
+  border-radius: var(--fm-radius-sm);
 }
 
 .intercept-dot {
@@ -2522,6 +2591,22 @@ watch(settingsOpen, (open) => {
   flex: 1;
   min-height: 0;
   overflow: auto;
+  /* 虚拟滚动窗口会随滚动替换 DOM，关掉滚动锚定避免浏览器反向拉扯 scrollTop */
+  overflow-anchor: none;
+}
+
+/* 虚拟滚动：外层只负责撑出滚动条，内层按 translateY 平铺当前窗口 */
+.tree-space {
+  position: relative;
+  width: 100%;
+}
+
+.tree-window {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  will-change: transform;
 }
 
 .host-group {
@@ -2536,7 +2621,7 @@ watch(settingsOpen, (open) => {
   height: 28px;
   padding: 0 9px;
   border: 0;
-  background: var(--fm-sidebar);
+  background: var(--fm-surface-alt);
   text-align: left;
   font-family: inherit;
   font-size: 11.5px;
@@ -2546,7 +2631,7 @@ watch(settingsOpen, (open) => {
 }
 
 .host-row:hover {
-  background: var(--fm-sidebar-hover);
+  background: color-mix(in srgb, var(--fm-text) 6%, var(--fm-surface-alt));
 }
 
 /* 域名下的路径目录：比域名行轻，比请求行略重，形成层级 */
@@ -2567,7 +2652,7 @@ watch(settingsOpen, (open) => {
 }
 
 .folder-row:hover {
-  background: var(--fm-sidebar-hover);
+  background: color-mix(in srgb, var(--fm-text) 6%, var(--fm-surface-alt));
 }
 
 .folder-icon {
@@ -2630,7 +2715,7 @@ watch(settingsOpen, (open) => {
   height: 30px;
   padding: 0 8px;
   border: 0;
-  border-radius: 4px;
+  border-radius: var(--fm-radius-sm);
   background: transparent;
   font-family: inherit;
   font-size: 12px;
@@ -2640,7 +2725,7 @@ watch(settingsOpen, (open) => {
 }
 
 .capture-context-menu button:hover {
-  background: var(--fm-sidebar-hover);
+  background: color-mix(in srgb, var(--fm-text) 6%, var(--fm-surface-alt));
   color: var(--fm-text);
 }
 
@@ -2686,7 +2771,7 @@ watch(settingsOpen, (open) => {
   color: var(--fm-muted);
   background: var(--fm-surface);
   border: 1px solid var(--fm-border);
-  border-radius: 8px;
+  border-radius: var(--fm-radius-sm);
 }
 
 .host-errors {
@@ -2709,7 +2794,7 @@ watch(settingsOpen, (open) => {
   gap: 6px;
   align-items: center;
   width: 100%;
-  height: 27px;
+  height: 28px;
   padding: 0 8px 0 24px;
   border: 0;
   border-left: 2px solid transparent;
@@ -2721,11 +2806,11 @@ watch(settingsOpen, (open) => {
   cursor: pointer;
   /* 上千条流量时让浏览器跳过视口外行的布局与绘制 */
   content-visibility: auto;
-  contain-intrinsic-size: auto 27px;
+  contain-intrinsic-size: auto 28px;
 }
 
 .flow-row:hover {
-  background: var(--fm-sidebar-hover);
+  background: color-mix(in srgb, var(--fm-text) 6%, var(--fm-surface-alt));
 }
 
 .flow-row.active {
@@ -2770,7 +2855,7 @@ watch(settingsOpen, (open) => {
   line-height: 14px;
   color: var(--fm-method-put);
   background: color-mix(in srgb, var(--fm-method-put) 12%, transparent);
-  border-radius: 2px;
+  border-radius: var(--fm-radius-sm);
 }
 
 .flow-flag.modified {
@@ -2821,7 +2906,7 @@ watch(settingsOpen, (open) => {
   top: 0;
   bottom: 0;
   width: 2px;
-  border-radius: 2px;
+  border-radius: var(--fm-radius-sm);
   background: transparent;
 }
 

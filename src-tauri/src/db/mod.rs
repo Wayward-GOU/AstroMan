@@ -12,7 +12,31 @@ mod seed;
 /// 6 = 记事本类型（notes.kind：todo / note / idea / reference）
 /// 7 = 运行记录瘦身（请求 / 响应体积与截断标记）
 /// 8 = 模型上下文窗口覆盖（ai_providers.context_window）
-pub const DB_VERSION: i64 = 8;
+/// 9 = 接口实体（requests.request_entity / response_entity）
+/// 10 = 资产闭环（请求版本历史 request_revisions、契约快照 contract_snapshots）
+/// 11 = AI 治理（审计表 audit_logs、生产环境标记 environments.is_prod）
+/// 12 = 协议广度（requests.protocol、GraphQL schema 表 graphql_schemas）
+/// 13 = AI 专项（ai_providers.native_tools / 单价 / 币种；设置项随 settings.json 落盘）
+/// 14 = AI 写操作回滚（request_revisions.trace_id）
+pub const DB_VERSION: i64 = 14;
+
+/// 每条连接都要应用的 SQLite 参数（P-06）。
+///
+/// - `cache_size = -16000`：16MB page cache，换大库查询命中率；
+/// - `synchronous = NORMAL`：WAL 下足够安全，避免每次提交都 fsync；
+/// - `mmap_size`：只在 64 位构建启用，32 位地址空间不足，开了反而更容易失败。
+pub fn connection_pragmas() -> String {
+    let mut sql = String::from(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA foreign_keys = ON;
+         PRAGMA busy_timeout = 5000;
+         PRAGMA cache_size = -16000;
+         PRAGMA synchronous = NORMAL;",
+    );
+    #[cfg(target_pointer_width = "64")]
+    sql.push_str(" PRAGMA mmap_size = 134217728;");
+    sql
+}
 
 /// 打开库时发现库版本高于本程序：说明用户降级了应用。
 /// 直接返回错误而不是继续写，避免旧代码用旧结构写坏新数据。
@@ -111,8 +135,7 @@ const COLUMN_MIGRATIONS: &[(&str, &str, &str)] = &[
     ("report_requests", "req_headers", "TEXT"),
     ("report_requests", "res_headers", "TEXT"),
     ("report_requests", "res_body", "TEXT"),
-    ("environments", "script", "TEXT"),
-    ("requests", "auth", "TEXT"),
+    ("notes", "deleted_from_status", "TEXT"),
     ("test_plans", "config_json", "TEXT"),
     ("test_plans", "updated_at", "INTEGER DEFAULT 0"),
     ("ai_providers", "kind", "TEXT NOT NULL DEFAULT 'openai'"),
@@ -127,6 +150,8 @@ const COLUMN_MIGRATIONS: &[(&str, &str, &str)] = &[
     ("ai_tool_logs", "round", "INTEGER DEFAULT 0"),
     ("ai_tool_logs", "trace_id", "TEXT"),
     ("ai_tool_logs", "timeout", "INTEGER DEFAULT 0"),
+    // W5：AI 写操作执行前的快照关联同一次提问，用于按 trace_id 聚合回滚
+    ("request_revisions", "trace_id", "TEXT"),
     // v1.0.8：执行记录来源（manual | batch | suite | cli），老数据默认手工
     (
         "request_history",
@@ -177,6 +202,24 @@ const COLUMN_MIGRATIONS: &[(&str, &str, &str)] = &[
         "context_window",
         "INTEGER NOT NULL DEFAULT 0",
     ),
+    // v1.1.2：接口实体（请求 / 返回字段树，结构 JSON，不含取值）
+    ("requests", "request_entity", "TEXT"),
+    ("requests", "response_entity", "TEXT"),
+    // v1.1.3：环境是否生产（AI-01 生产环境强制确认）
+    ("environments", "is_prod", "INTEGER NOT NULL DEFAULT 0"),
+    ("environments", "script", "TEXT"),
+    ("requests", "auth", "TEXT"),
+    // v12：请求类型（http | graphql | sse | websocket），与发送时的 HTTP 版本协议无关
+    ("requests", "protocol", "TEXT NOT NULL DEFAULT 'http'"),
+    // v13：AI 专项——原生工具开关（-1 自动 / 0 关闭 / 1 开启）、单价覆盖与币种
+    (
+        "ai_providers",
+        "native_tools",
+        "INTEGER NOT NULL DEFAULT -1",
+    ),
+    ("ai_providers", "input_price", "REAL NOT NULL DEFAULT 0"),
+    ("ai_providers", "output_price", "REAL NOT NULL DEFAULT 0"),
+    ("ai_providers", "currency", "TEXT NOT NULL DEFAULT 'USD'"),
 ];
 
 fn column_exists(conn: &rusqlite::Connection, table: &str, column: &str) -> Result<bool, String> {
@@ -233,7 +276,8 @@ fn migrate(pool: &DbPool) -> Result<(), String> {
         tx.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_history_origin ON request_history(origin, created_at DESC);
              CREATE INDEX IF NOT EXISTS idx_runs_origin ON request_runs(origin, created_at DESC);
-             CREATE INDEX IF NOT EXISTS idx_notes_status_done ON notes(status, done_at DESC);",
+             CREATE INDEX IF NOT EXISTS idx_notes_status_done ON notes(status, done_at DESC);
+             CREATE INDEX IF NOT EXISTS idx_revisions_trace ON request_revisions(trace_id, id);",
         )
         .map_err(err)?;
         if version < 6 {
@@ -334,15 +378,25 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("astroman-db-{tag}-{}-{stamp}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let manager = SqliteConnectionManager::file(dir.join("astroman.db")).with_init(|conn| {
-            conn.execute_batch(
-                "PRAGMA journal_mode = WAL;
-                 PRAGMA foreign_keys = ON;
-                 PRAGMA busy_timeout = 5000;",
-            )
-        });
+        let manager = SqliteConnectionManager::file(dir.join("astroman.db"))
+            .with_init(|conn| conn.execute_batch(&connection_pragmas()));
         let pool = r2d2::Pool::builder().max_size(2).build(manager).unwrap();
         (dir, pool)
+    }
+
+    #[test]
+    fn connection_pragmas_apply_cache_and_synchronous() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&connection_pragmas()).unwrap();
+        let cache: i64 = conn
+            .query_row("PRAGMA cache_size", [], |row| row.get(0))
+            .unwrap();
+        let synchronous: i64 = conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(cache, -16000);
+        // NORMAL = 1；WAL 下不需要每次提交都 fsync
+        assert_eq!(synchronous, 1);
     }
 
     fn has_column(pool: &DbPool, table: &str, column: &str) -> bool {
@@ -502,6 +556,70 @@ mod tests {
             )
             .unwrap();
         assert_eq!(suites, 1);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn creates_contract_and_revision_tables_with_cascade() {
+        let (dir, pool) = temp_pool("w1-tables");
+        init(&pool).unwrap();
+        // 重复初始化保持幂等
+        init(&pool).unwrap();
+
+        // v11 起追加 AI 治理表；这里只保证资产闭环所需的 v10 不会被回退
+        const { assert!(DB_VERSION >= 10, "W1 资产闭环需要 v10 及以上") };
+        let conn = pool.get().unwrap();
+        for table in ["request_revisions", "contract_snapshots"] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "缺少表 {table}");
+        }
+
+        // 请求被删除时，版本历史随之级联清理
+        let now = crate::util::now_ms();
+        conn.execute(
+            "INSERT INTO projects (name, created_at, updated_at) VALUES ('p', ?1, ?1)",
+            params![now],
+        )
+        .unwrap();
+        let project_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO collections (project_id, name, created_at, updated_at)
+             VALUES (?1, 'c', ?2, ?2)",
+            params![project_id, now],
+        )
+        .unwrap();
+        let collection_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO requests (collection_id, name, method, url, created_at, updated_at)
+             VALUES (?1, 'r', 'GET', 'https://example.com', ?2, ?2)",
+            params![collection_id, now],
+        )
+        .unwrap();
+        let request_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO request_revisions
+               (request_id, revision, snapshot_json, source, created_at, truncated)
+             VALUES (?1, 1, '{}', 'save', ?2, 0)",
+            params![request_id, now],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM requests WHERE id = ?1", params![request_id])
+            .unwrap();
+        let left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM request_revisions WHERE request_id = ?1",
+                params![request_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0, "删除请求必须级联删除版本历史");
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -1,40 +1,33 @@
 use tauri::command;
 
+use crate::services::paths;
+
 /// 读取文本文件（用于 Runner 数据文件等场景），最大 20 MB
 #[command]
 pub fn file_read_text(path: String) -> Result<String, String> {
-    let path = path.trim();
-    if path.is_empty() {
-        return Err("文件路径为空".to_string());
-    }
-    let meta = std::fs::metadata(path).map_err(|e| format!("读取文件失败（{path}）：{e}"))?;
+    let path = paths::prepare_read(&path)?;
+    let meta =
+        std::fs::metadata(&path).map_err(|e| format!("读取文件失败（{}）：{e}", path.display()))?;
     if meta.len() > 20 * 1024 * 1024 {
         return Err("文件超过 20 MB，请拆分后再导入".to_string());
     }
-    std::fs::read_to_string(path).map_err(|e| format!("读取文件失败（{path}）：{e}"))
+    std::fs::read_to_string(&path).map_err(|e| format!("读取文件失败（{}）：{e}", path.display()))
 }
 
 /// 判断文件是否已存在：导出前用于提示覆盖（T-17）
 #[command]
 pub fn file_exists(path: String) -> bool {
     let path = path.trim();
-    !path.is_empty() && std::path::Path::new(path).exists()
+    !path.is_empty()
+        && std::path::Path::new(path).is_absolute()
+        && std::path::Path::new(path).exists()
 }
 
 /// 写入文本文件（用于导出结果、保存响应体等场景）
 #[command]
 pub fn file_write_text(path: String, content: String) -> Result<(), String> {
-    let path = path.trim();
-    if path.is_empty() {
-        return Err("文件路径为空".to_string());
-    }
-    if let Some(parent) = std::path::Path::new(path).parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("创建目录失败（{}）：{e}", parent.display()))?;
-        }
-    }
-    std::fs::write(path, content).map_err(|e| format!("写入文件失败（{path}）：{e}"))
+    let path = paths::prepare_write(&path)?;
+    std::fs::write(&path, content).map_err(|e| format!("写入文件失败（{}）：{e}", path.display()))
 }
 
 /* ---------- v1.0.8：二进制与响应文件（G-04） ---------- */
@@ -50,38 +43,19 @@ use crate::state::AppState;
 /// 写入二进制文件（Base64 入参）：另存图片、导出小文件用
 #[command]
 pub fn file_write_binary(path: String, base64: String) -> Result<(), String> {
-    let target = path.trim();
-    if target.is_empty() {
-        return Err("文件路径为空".to_string());
-    }
     let bytes = B64
         .decode(base64.as_bytes())
         .map_err(|_| "Base64 内容不合法".to_string())?;
-    let path = Path::new(target);
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("创建目录失败（{}）：{e}", parent.display()))?;
-        }
-    }
-    std::fs::write(path, bytes).map_err(|e| format!("写入文件失败（{target}）：{e}"))
+    let path = paths::prepare_write(&path)?;
+    std::fs::write(&path, bytes).map_err(|e| format!("写入文件失败（{}）：{e}", path.display()))
 }
 
 /// 复制文件：响应落盘文件「另存为」优先用它，避免大文件过 IPC
 #[command]
 pub fn file_copy(src: String, dst: String) -> Result<u64, String> {
-    let from = Path::new(src.trim());
-    let to = Path::new(dst.trim());
-    if !from.exists() {
-        return Err("源文件不存在".to_string());
-    }
-    if let Some(parent) = to.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("创建目录失败（{}）：{e}", parent.display()))?;
-        }
-    }
-    std::fs::copy(from, to)
+    let from = paths::prepare_read(&src)?;
+    let to = paths::prepare_write(&dst)?;
+    std::fs::copy(&from, &to)
         .map_err(|e| format!("复制文件失败（{} → {}）：{e}", from.display(), to.display()))
 }
 

@@ -17,6 +17,7 @@ import {
   ToolOutlined,
 } from '@ant-design/icons-vue'
 import ToolWorkbench from '@/components/tools/ToolWorkbench.vue'
+import PageHeader from '@/components/PageHeader.vue'
 import { searchTools, TOOL_CATEGORIES, TOOLS, TOOL_MAP } from '@/tools/registry'
 import { useToolPrefsStore } from '@/stores/toolPrefs'
 import type { ToolCategoryId, ToolDef } from '@/tools/types'
@@ -120,13 +121,11 @@ const componentKey = computed(() => activeTool.value?.id ?? '')
 
 <template>
   <div class="page tools-page">
-    <header class="page-head">
-      <div>
-        <h1 class="page-title">工具箱</h1>
-        <p class="page-subtitle">
-          共 {{ TOOLS.length }} 个开发工具，全部在本机离线运行，输入内容不会离开这台电脑
-        </p>
-      </div>
+    <PageHeader
+      eyebrow="Toolbox"
+      title="工具箱"
+      :subtitle="`共 ${TOOLS.length} 个开发工具，全部在本机离线运行，输入内容不会离开这台电脑`"
+    >
       <a-input
         v-model:value="keyword"
         class="tools-search"
@@ -135,7 +134,7 @@ const componentKey = computed(() => activeTool.value?.id ?? '')
       >
         <template #prefix><SearchOutlined /></template>
       </a-input>
-    </header>
+    </PageHeader>
 
     <div class="tools-layout">
       <aside class="tools-nav">
@@ -257,15 +256,6 @@ const componentKey = computed(() => activeTool.value?.id ?? '')
 .tools-page {
   display: flex;
   flex-direction: column;
-  gap: 16px;
-}
-
-.page-head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 16px;
-  flex-wrap: wrap;
 }
 
 .tools-search {
@@ -275,7 +265,7 @@ const componentKey = computed(() => activeTool.value?.id ?? '')
 
 .tools-layout {
   display: grid;
-  grid-template-columns: 208px minmax(0, 1fr);
+  grid-template-columns: 200px minmax(0, 1fr);
   gap: 16px;
   align-items: start;
 }
@@ -312,6 +302,7 @@ const componentKey = computed(() => activeTool.value?.id ?? '')
 
 .tools-nav-item.active {
   background: var(--fm-primary-soft);
+  box-shadow: inset 2px 0 0 var(--fm-primary);
   color: var(--fm-primary);
 }
 
@@ -428,7 +419,7 @@ const componentKey = computed(() => activeTool.value?.id ?? '')
 }
 
 .fav-on {
-  color: #f5a623;
+  color: var(--fm-brass);
 }
 
 .tools-fav {
@@ -455,7 +446,7 @@ const componentKey = computed(() => activeTool.value?.id ?? '')
   border: 1px solid var(--fm-border);
   border-radius: var(--fm-radius);
   cursor: pointer;
-  transition: border-color 0.15s, box-shadow 0.15s, transform 0.15s;
+  transition: border-color 0.15s, transform 0.15s;
 }
 
 .tool-star {
@@ -472,7 +463,7 @@ const componentKey = computed(() => activeTool.value?.id ?? '')
   color: var(--fm-muted);
   background: transparent;
   border: none;
-  border-radius: 4px;
+  border-radius: var(--fm-radius-sm);
   cursor: pointer;
   opacity: 0;
   transition: opacity 0.15s, color 0.15s, background 0.15s;
@@ -484,17 +475,16 @@ const componentKey = computed(() => activeTool.value?.id ?? '')
 }
 
 .tool-star:hover {
-  color: #f5a623;
+  color: var(--fm-brass);
   background: var(--fm-surface-alt);
 }
 
 .tool-star.on {
-  color: #f5a623;
+  color: var(--fm-brass);
 }
 
 .tool-card:hover {
-  border-color: var(--fm-primary);
-  box-shadow: var(--fm-shadow);
+  border-color: var(--fm-border-strong);
 }
 
 .tool-card-tag {
@@ -550,6 +540,10 @@ const componentKey = computed(() => activeTool.value?.id ?? '')
     position: static;
     flex-direction: row;
     overflow-x: auto;
+  }
+
+  .tools-nav-item.active {
+    box-shadow: inset 0 -2px 0 var(--fm-primary);
   }
 
   .tools-nav-text {

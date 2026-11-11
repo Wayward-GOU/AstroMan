@@ -33,9 +33,25 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// 统一的错误转字符串，方便直接返回给前端展示
+/// 统一的错误转字符串，方便直接返回给前端展示。
+///
+/// SQLite 的写锁冲突统一收口成 `E_BUSY`：GUI 与 CLI 是独立进程，
+/// 单实例插件只能挡住 GUI 多开，挡不住 CLI 同时写库。
 pub fn err<E: std::fmt::Display>(e: E) -> String {
-    e.to_string()
+    let text = e.to_string();
+    if is_db_busy(&text) {
+        return format!("E_BUSY: 数据库正被其他进程写入，请关闭 GUI 或其他 CLI 后重试（{text}）");
+    }
+    text
+}
+
+/// 判断错误文本是否属于 SQLite 写锁冲突
+pub fn is_db_busy(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("database is locked")
+        || lower.contains("database table is locked")
+        || lower.contains("sqlite_busy")
+        || lower.contains("database schema is locked")
 }
 
 /// 创建不弹控制台窗口的子进程命令。
@@ -160,6 +176,15 @@ fn resolve_expr(
             return value.clone();
         }
         return format!("{{{{secret:{secret_expr}}}}}");
+    }
+
+    // {{faker:name}} / {{faker:int(1,100)}}：每次渲染重新取值（G-05）
+    if let Some(faker_expr) = expr.strip_prefix("faker:") {
+        if let Some(value) = crate::services::faker::runtime_value(faker_expr) {
+            return value;
+        }
+        log::warn!("未知 faker 变量，保留原占位：{faker_expr}");
+        return format!("{{{{faker:{faker_expr}}}}}");
     }
 
     let name = expr.strip_prefix('$').unwrap_or(expr);
@@ -348,7 +373,7 @@ pub fn collect_placeholders(input: &str) -> Vec<String> {
 
 /// 是否为内置变量或函数型占位符（这些不需要用户提供）
 pub fn is_builtin_placeholder(name: &str) -> bool {
-    if name.starts_with("secret:") || name.contains('(') {
+    if name.starts_with("secret:") || name.starts_with("faker:") || name.contains('(') {
         return true;
     }
     resolve_time(name).is_some()
@@ -423,6 +448,18 @@ fn random_string(len: usize, pool: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maps_sqlite_busy_to_error_code() {
+        let text = err("database is locked");
+        assert!(text.starts_with("E_BUSY:"), "{text}");
+        assert!(text.contains("关闭 GUI"));
+    }
+
+    #[test]
+    fn keeps_normal_errors_unchanged() {
+        assert_eq!(err("文件不存在"), "文件不存在");
+    }
 
     fn vars(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
@@ -560,7 +597,23 @@ mod tests {
         assert!(is_builtin_placeholder("uuid"));
         assert!(is_builtin_placeholder("timestamp"));
         assert!(is_builtin_placeholder("secret:TOKEN"));
+        assert!(is_builtin_placeholder("faker:email"));
         assert!(is_builtin_placeholder("randomInt(1,3)"));
         assert!(!is_builtin_placeholder("host"));
+    }
+
+    #[test]
+    fn render_expands_faker_and_keeps_unknown() {
+        let map = HashMap::new();
+        let email = render("{{faker:email}}", &map);
+        assert!(email.contains('@'));
+        assert!(!email.contains("{{"));
+        let value: i64 = render("{{faker:int(2,4)}}", &map).parse().unwrap();
+        assert!((2..=4).contains(&value));
+        // 拼写错误保留原样，提醒用户而不是悄悄变成空串
+        assert_eq!(render("{{faker:nope}}", &map), "{{faker:nope}}");
+        // 自定义变量不抢占 faker 命名空间
+        let map = vars(&[("faker:email", "fixed")]);
+        assert!(render("{{faker:email}}", &map).contains('@'));
     }
 }

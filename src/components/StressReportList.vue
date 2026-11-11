@@ -241,10 +241,9 @@ function compareMetricRows() {
 }
 .report-card {
   padding: 16px 18px;
-  transition: box-shadow 0.18s, border-color 0.18s;
+  transition: border-color 0.18s;
 }
 .report-card:hover {
-  box-shadow: var(--fm-shadow-lg);
   border-color: var(--fm-border-strong);
 }
 .report-head {
@@ -305,7 +304,7 @@ function compareMetricRows() {
   gap: 3px;
   padding: 8px 10px;
   background: var(--fm-surface-alt);
-  border: 1px solid #f1f4fa;
+  border: 1px solid var(--fm-border);
 }
 .m-label {
   font-size: 10px;
@@ -357,7 +356,7 @@ function compareMetricRows() {
   width: 48px;
   height: 48px;
   margin: 0 auto 12px;
-  border-radius: 12px;
+  border-radius: var(--fm-radius);
   background: var(--fm-primary-soft);
   color: var(--fm-primary);
   font-size: 20px;

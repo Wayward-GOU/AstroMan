@@ -1,0 +1,11 @@
+{
+  "id": "ai-02",
+  "title": "读取集合树",
+  "input": "项目 ID 1 下有哪些集合？",
+  "expectTool": "collection_tree",
+  "acceptTools": [],
+  "forbiddenTools": ["collection_create", "collection_rename", "collection_delete"],
+  "expectArgs": { "projectId": 1 },
+  "expectedArtifact": "该项目下的集合树（含嵌套关系）",
+  "followUps": []
+}

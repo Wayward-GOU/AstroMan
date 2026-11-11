@@ -5,8 +5,11 @@
 
 use crate::commands::test_case::load_cases;
 use crate::commands::test_preflight;
-use crate::models::RunSummary;
+use crate::contract::ContractDiff;
+use crate::docs::model::{DocsExportPayload, DocsExportSource, DocsOptions, DocsPreparePayload};
+use crate::models::{KeyValueItem, RequestAuth, RunSummary, SendRequestPayload};
 use crate::report_builder;
+use crate::services::contract::{check_contract, latest_snapshot_id, ContractCheckResult};
 use crate::state::AppState;
 use crate::test_runner::{self, RunOptions, TestEvent};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
@@ -22,6 +25,7 @@ pub const EXIT_CONFIG: i32 = 3;
 pub const EXIT_CANCELLED: i32 = 4;
 pub const EXIT_DB: i32 = 5;
 
+#[derive(Debug)]
 struct CliError {
     code: i32,
     message: String,
@@ -37,6 +41,12 @@ impl CliError {
     fn db(message: impl Into<String>) -> Self {
         Self {
             code: EXIT_DB,
+            message: message.into(),
+        }
+    }
+    fn run(message: impl Into<String>) -> Self {
+        Self {
+            code: EXIT_RUN_ERROR,
             message: message.into(),
         }
     }
@@ -143,8 +153,21 @@ const HELP: &str = "AstroMan CLI（无窗口执行测试套件）
   astroman-cli python check   [--json] [--db <path>]
   astroman-cli suite import   <pack.astromantest.json> [--project <ID|名称>]
                               [--on-conflict skip|overwrite|rename] [--db <path>]
+  astroman-cli contract check --project <ID|名称> [--baseline <快照ID>]
+                              [--fail-on breaking|none] [--json] [--db <path>]
+                              --baseline 省略时使用该项目最近一次快照
+  astroman-cli mock start     --project <ID|名称> [--port <端口>] [--host 0.0.0.0]
+                              [--json] [--db <path>]
+                              --port 省略或 0 时自动分配；启动后阻塞，Ctrl+C 结束
+  astroman-cli backup upload  --target <名称|ID> [--passphrase <口令>] [--json] [--db <path>]
+                              口令也可放在环境变量 ASTROMAN_BACKUP_PASSPHRASE
+  astroman-cli request send   --request <ID> [--env <名称|ID>] [--timeout <秒>]
+                              [--allow-prod] [--json] [--db <path>]
+  astroman-cli docs export    --scope project|collection|request --id <ID>
+                              [--env <名称|ID>] [--format markdown|html]
+                              --out <文件路径> [--json] [--db <path>]
 
-退出码：0 通过 / 1 断言失败 / 2 执行错误 / 3 配置错误 / 4 取消 / 5 数据库不可用";
+退出码：0 通过 / 1 断言失败（契约存在破坏性变更 / HTTP 4xx·5xx）/ 2 执行错误 / 3 配置错误 / 4 取消 / 5 数据库不可用";
 
 // ---------------------------------------------------------------------------
 // 入口
@@ -186,6 +209,11 @@ fn dispatch(args: &Args) -> CliResult<i32> {
         ("report", "export") => cmd_report_export(args),
         ("python", "check") => cmd_python_check(args),
         ("suite", "import") => cmd_suite_import(args),
+        ("contract", "check") => cmd_contract_check(args),
+        ("mock", "start") => cmd_mock_start(args),
+        ("backup", "upload") => cmd_backup_upload(args),
+        ("request", "send") => cmd_request_send(args),
+        ("docs", "export") => cmd_docs_export(args),
         _ => Err(CliError::config(format!(
             "未知命令：{} {}（用 --help 查看用法）",
             first, second
@@ -229,6 +257,17 @@ struct Env {
     state: AppState,
 }
 
+/// GUI 启动时会在数据目录写 `gui.pid`；这里只做轻量探测，进程不存在就当未运行。
+fn gui_running_pid(data_dir: &Path) -> Option<u32> {
+    let text = std::fs::read_to_string(data_dir.join("gui.pid")).ok()?;
+    let pid = text.trim().parse::<u32>().ok()?;
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    let process = system.process(sysinfo::Pid::from_u32(pid))?;
+    let name = process.name().to_string_lossy().to_ascii_lowercase();
+    name.contains("astroman").then_some(pid)
+}
+
 impl Env {
     fn open(args: &Args) -> CliResult<Self> {
         let (default_data, default_config) = platform_dirs();
@@ -263,15 +302,22 @@ impl Env {
         };
 
         check_db_version(&db_path)?;
-        let state = AppState::headless_at(data_dir, config_dir, db_path).map_err(|error| {
-            if error.to_ascii_lowercase().contains("locked")
-                || error.to_ascii_lowercase().contains("busy")
-            {
-                CliError::db(format!("数据库被占用：{error}"))
-            } else {
-                CliError::config(error)
-            }
-        })?;
+        let state =
+            AppState::headless_at(data_dir.clone(), config_dir, db_path).map_err(|error| {
+                if crate::util::is_db_busy(&error) {
+                    CliError::db(format!(
+                        "E_BUSY: 数据库正被 GUI 或其他进程写入，请关闭 GUI 后重试（{error}）"
+                    ))
+                } else {
+                    CliError::config(error)
+                }
+            })?;
+        // GUI 正在运行时只提示，不阻断只读命令；写入冲突由 SQLite 的 E_BUSY 兜底
+        if let Some(pid) = gui_running_pid(&data_dir) {
+            eprintln!(
+                "提示：AstroMan GUI 正在运行（PID {pid}），写操作可能冲突；如遇 E_BUSY 请先关闭 GUI"
+            );
+        }
         Ok(Self { state })
     }
 }
@@ -963,6 +1009,613 @@ fn cmd_report_export(args: &Args) -> CliResult<i32> {
     Ok(EXIT_OK)
 }
 
+/// 契约检查的退出策略：只有破坏性变更会阻断 CI（技术方案 A-05）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailOn {
+    Breaking,
+    None,
+}
+
+impl FailOn {
+    fn parse(text: Option<&str>) -> CliResult<Self> {
+        match text
+            .map(str::trim)
+            .unwrap_or("breaking")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "" | "breaking" => Ok(Self::Breaking),
+            "none" => Ok(Self::None),
+            other => Err(CliError::config(format!(
+                "--fail-on 仅支持 breaking / none：{other}"
+            ))),
+        }
+    }
+}
+
+fn contract_exit_code(diff: &ContractDiff, fail_on: FailOn) -> i32 {
+    if fail_on == FailOn::Breaking && !diff.breaking.is_empty() {
+        EXIT_ASSERT_FAILED
+    } else {
+        EXIT_OK
+    }
+}
+
+fn run_contract_check(
+    conn: &Connection,
+    project: Option<&str>,
+    baseline_id: Option<i64>,
+) -> CliResult<ContractCheckResult> {
+    let project_id = resolve_project(conn, project)?
+        .ok_or_else(|| CliError::config("缺少 --project <ID|名称>"))?;
+    let baseline_id = match baseline_id {
+        Some(id) => id,
+        None => latest_snapshot_id(conn, project_id).map_err(|error| {
+            if error.starts_with("E_CONTRACT") {
+                CliError::config(error)
+            } else {
+                CliError::db(error)
+            }
+        })?,
+    };
+    check_contract(conn, project_id, baseline_id).map_err(|error| {
+        if error.starts_with("E_CONTRACT") {
+            CliError::config(error)
+        } else {
+            CliError::db(error)
+        }
+    })
+}
+
+fn cmd_contract_check(args: &Args) -> CliResult<i32> {
+    let baseline_id = match args.value("baseline") {
+        Some(text) => Some(
+            text.trim()
+                .parse::<i64>()
+                .map_err(|_| CliError::config("--baseline 必须是快照 ID（数字）"))?,
+        ),
+        None => None,
+    };
+    let fail_on = FailOn::parse(args.value("fail-on"))?;
+    let env = Env::open(args)?;
+    let state = env.state;
+    let conn = state
+        .pool
+        .get()
+        .map_err(|error| CliError::db(crate::util::err(error)))?;
+    let result = run_contract_check(&conn, args.value("project"), baseline_id)?;
+
+    if args.has("json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "projectId": result.baseline.project_id,
+                "baseline": result.baseline,
+                "diff": result.diff,
+                "generatedAt": result.generated_at,
+            }))
+            .unwrap_or_default()
+        );
+    } else {
+        print_contract_check(&result);
+    }
+    Ok(contract_exit_code(&result.diff, fail_on))
+}
+
+fn print_contract_check(result: &ContractCheckResult) {
+    let diff = &result.diff;
+    let baseline = &result.baseline;
+    println!(
+        "契约基线 #{} {} · {} 个请求",
+        baseline.id, baseline.label, baseline.request_count
+    );
+    println!(
+        "当前契约：{} 条路径 / {} 个操作 · 破坏 {} / 兼容 {} / 提醒 {}",
+        diff.summary.paths,
+        diff.summary.operations,
+        diff.summary.breaking,
+        diff.summary.compatible,
+        diff.summary.warnings
+    );
+    for (level, items) in [
+        ("破坏", &diff.breaking),
+        ("兼容", &diff.compatible),
+        ("提醒", &diff.warnings),
+    ] {
+        for change in items {
+            let field = if change.field.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", change.field)
+            };
+            println!(
+                "  [{level}] {} {}{}：{}",
+                change.method.to_ascii_uppercase(),
+                change.path,
+                field,
+                change.message
+            );
+        }
+    }
+    for item in &diff.schema_missing {
+        println!("  [无实体] {item}（响应侧不参与判定）");
+    }
+    if diff.breaking.is_empty() {
+        println!("结果：未发现破坏性变更");
+    } else {
+        println!("结果：发现 {} 处破坏性变更", diff.breaking.len());
+    }
+}
+
+/// 启动本地 Mock Server 并阻塞，直到进程被终止（Ctrl+C）
+fn cmd_mock_start(args: &Args) -> CliResult<i32> {
+    let project = args
+        .value("project")
+        .ok_or_else(|| CliError::config("缺少 --project <ID|名称>"))?;
+    let port = match args.value("port") {
+        Some(text) => Some(
+            text.trim()
+                .parse::<u16>()
+                .map_err(|_| CliError::config("--port 必须是 0-65535 的端口"))?,
+        ),
+        None => None,
+    };
+    let host = args
+        .value("host")
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+    if let Some(host) = &host {
+        if !matches!(host.as_str(), "127.0.0.1" | "localhost" | "0.0.0.0") {
+            return Err(CliError::config(
+                "--host 仅支持 127.0.0.1 / localhost / 0.0.0.0",
+            ));
+        }
+    }
+
+    let env = Env::open(args)?;
+    let state = env.state;
+    let project_id = {
+        let conn = state
+            .pool
+            .get()
+            .map_err(|error| CliError::db(crate::util::err(error)))?;
+        resolve_project(&conn, Some(project))?
+            .ok_or_else(|| CliError::config(format!("项目不存在：{project}")))?
+    };
+    let payload = crate::services::mock::server::MockStartPayload {
+        project_id,
+        port,
+        host,
+    };
+    state
+        .policy()
+        .ensure_lan(payload.host.as_deref())
+        .map_err(CliError::config)?;
+    let status = state
+        .mock
+        .start(&state.db_path, &payload)
+        .map_err(CliError::run)?;
+
+    if args.has("json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&status).unwrap_or_default()
+        );
+    } else {
+        println!(
+            "Mock Server 已启动：{}（项目 #{project_id}，{} 条路由）",
+            status.url, status.route_count
+        );
+        if status.lan {
+            println!("局域网访问已开启，端口 {}", status.port);
+            if let Some(token) = &status.token {
+                println!("访问令牌（查询参数 / X-AstroMan-Mock-Token 头）：{token}");
+            }
+        }
+        println!("按 Ctrl+C 停止");
+    }
+
+    // 监听线程随进程退出自动结束；这里只保持前台运行
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
+}
+
+/// 上传一份加密备份到异地目标（G-06）
+fn cmd_backup_upload(args: &Args) -> CliResult<i32> {
+    let target_spec = args
+        .value("target")
+        .ok_or_else(|| CliError::config("缺少 --target <名称|ID>"))?;
+    let passphrase = args
+        .value("passphrase")
+        .map(str::to_string)
+        .or_else(|| std::env::var("ASTROMAN_BACKUP_PASSPHRASE").ok())
+        .unwrap_or_default();
+    if passphrase.trim().chars().count() < 8 {
+        return Err(CliError::config(
+            "缺少备份口令：用 --passphrase 或环境变量 ASTROMAN_BACKUP_PASSPHRASE（至少 8 位）",
+        ));
+    }
+
+    let env = Env::open(args)?;
+    let state = env.state;
+    let target = {
+        let conn = state
+            .pool
+            .get()
+            .map_err(|error| CliError::db(crate::util::err(error)))?;
+        let targets = crate::services::backup_target::list(&conn).map_err(CliError::db)?;
+        let numeric = target_spec.trim().parse::<i64>().ok();
+        targets
+            .into_iter()
+            .find(|item| {
+                item.name == target_spec.trim() || numeric.map(|id| id == item.id).unwrap_or(false)
+            })
+            .ok_or_else(|| CliError::config(format!("备份目标不存在：{target_spec}")))?
+    };
+
+    let result = crate::services::backup_target::upload(
+        &state.pool,
+        &state.data_dir,
+        target.id,
+        &passphrase,
+    )
+    .map_err(|error| {
+        if error.starts_with("E_CRYPTO") || error.starts_with("E_NO_SPACE") {
+            CliError::config(error)
+        } else {
+            CliError::run(error)
+        }
+    })?;
+
+    if args.has("json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "targetId": result.target_id,
+                "target": result.target_name,
+                "kind": result.kind,
+                "remoteName": result.remote_name,
+                "encryptedSize": result.encrypted_size,
+                "uploadedAt": result.uploaded_at,
+                "snapshot": result.snapshot,
+            }))
+            .unwrap_or_default()
+        );
+    } else {
+        println!(
+            "已上传到「{}」：{}\n加密包 {} 字节\n本地副本：{}",
+            result.target_name, result.remote_name, result.encrypted_size, result.encrypted_path
+        );
+    }
+    Ok(EXIT_OK)
+}
+
+/// 发送单个请求（G-08）：与桌面端共用执行引擎，环境变量按 `{{key}}` 渲染
+fn cmd_request_send(args: &Args) -> CliResult<i32> {
+    let spec = args
+        .value("request")
+        .ok_or_else(|| CliError::config("缺少 --request <ID>"))?;
+    let request_id = spec
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| CliError::config(format!("--request 需要数字 ID：{spec}")))?;
+    let timeout_ms = match args.value("timeout") {
+        Some(text) => {
+            let secs = text
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| CliError::config("--timeout 必须是正整数（秒）"))?;
+            if secs == 0 {
+                return Err(CliError::config("--timeout 必须大于 0"));
+            }
+            secs.saturating_mul(1000)
+        }
+        None => 30_000,
+    };
+
+    let env = Env::open(args)?;
+    let state = env.state;
+    let (request, project_id) = {
+        let conn = state
+            .pool
+            .get()
+            .map_err(|error| CliError::db(crate::util::err(error)))?;
+        let request =
+            crate::services::request::find_request(&conn, request_id).map_err(CliError::config)?;
+        let project_id: i64 = conn
+            .query_row(
+                "SELECT c.project_id FROM requests r JOIN collections c ON c.id = r.collection_id
+                 WHERE r.id = ?1",
+                params![request_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| CliError::db(crate::util::err(error)))?
+            .ok_or_else(|| CliError::config(format!("请求不存在：{request_id}")))?;
+        (request, project_id)
+    };
+    if matches!(request.protocol.as_str(), "sse" | "websocket") {
+        return Err(CliError::config(format!(
+            "请求「{}」是 {} 类型，请用桌面端实时面板调试",
+            request.name,
+            request.protocol.to_ascii_uppercase()
+        )));
+    }
+    let (env_id, env_name) = {
+        let conn = state
+            .pool
+            .get()
+            .map_err(|error| CliError::db(crate::util::err(error)))?;
+        let env_id = resolve_env(&conn, project_id, args.value("env"))?;
+        guard_prod(&conn, env_id, args.has("allow-prod"))?;
+        let name: Option<String> = match env_id {
+            Some(id) => conn
+                .query_row(
+                    "SELECT name FROM environments WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| CliError::config(crate::util::err(error)))?,
+            None => None,
+        };
+        (env_id, name)
+    };
+    let vars = {
+        let conn = state
+            .pool
+            .get()
+            .map_err(|error| CliError::db(crate::util::err(error)))?;
+        match env_id {
+            Some(id) => crate::commands::http::load_vars(&conn, id).map_err(CliError::config)?,
+            None => HashMap::new(),
+        }
+    };
+
+    let url = crate::util::render(&request.url, &vars);
+    let payload = SendRequestPayload {
+        request_id: Some(request_id),
+        name: Some(request.name.clone()),
+        method: request.method.clone(),
+        url: url.clone(),
+        headers: request
+            .headers
+            .iter()
+            .filter(|item| item.enabled)
+            .map(|item| KeyValueItem {
+                key: crate::util::render(&item.key, &vars),
+                value: crate::util::render(&item.value, &vars),
+                enabled: true,
+            })
+            .collect(),
+        params: request
+            .params
+            .iter()
+            .filter(|item| item.enabled)
+            .map(|item| KeyValueItem {
+                key: crate::util::render(&item.key, &vars),
+                value: crate::util::render(&item.value, &vars),
+                enabled: true,
+            })
+            .collect(),
+        body_type: request.body_type.clone(),
+        body: (!request.body.is_empty()).then(|| crate::util::render(&request.body, &vars)),
+        env_id,
+        insecure: false,
+        timeout_ms,
+        auth: Some(render_auth(&request.auth, &vars)),
+        cookie_enabled: Some(true),
+        origin: Some("cli".to_string()),
+        request_key: None,
+        protocol: None,
+        follow_redirects: None,
+        connect_timeout_ms: None,
+        retry: None,
+    };
+
+    let result = tauri::async_runtime::block_on(crate::commands::http::execute(&state, payload))
+        .map_err(CliError::run)?;
+
+    if args.has("json") {
+        let output = json!({
+            "requestId": request_id,
+            "name": request.name,
+            "method": request.method,
+            "url": url,
+            "env": env_name,
+            "status": result.status,
+            "statusText": result.status_text,
+            "httpVersion": result.http_version,
+            "durationMs": result.duration_ms,
+            "sizeBytes": result.body_bytes.max(result.size_bytes as u64),
+            "truncated": result.truncated,
+            "bodyKind": result.body_kind,
+            "bodyFile": result.body_file,
+            "headers": result.headers,
+            "body": result.body,
+            "error": result.error,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&output).unwrap_or_default()
+        );
+    } else {
+        match &result.error {
+            Some(error) => eprintln!("请求失败：{error}"),
+            None => {
+                println!(
+                    "{} {} · {} · {} ms · {} 字节",
+                    result.status,
+                    result.status_text,
+                    if result.http_version.is_empty() {
+                        "-"
+                    } else {
+                        &result.http_version
+                    },
+                    result.duration_ms,
+                    result.body_bytes.max(result.size_bytes as u64)
+                );
+                if let Some(file) = &result.body_file {
+                    println!("响应已落盘：{file}");
+                } else if !result.body.is_empty() {
+                    println!("\n{}", truncate_cli_text(&result.body, 512 * 1024));
+                }
+                if result.truncated {
+                    println!("\n（响应已截断，可用 --json 获取落盘路径）");
+                }
+            }
+        }
+    }
+
+    if result.error.is_some() {
+        return Ok(EXIT_RUN_ERROR);
+    }
+    if result.status >= 400 {
+        return Ok(EXIT_ASSERT_FAILED);
+    }
+    Ok(EXIT_OK)
+}
+
+fn render_auth(auth: &RequestAuth, vars: &HashMap<String, String>) -> RequestAuth {
+    let render = |text: &str| crate::util::render(text, vars);
+    RequestAuth {
+        kind: auth.kind.clone(),
+        token: render(&auth.token),
+        username: render(&auth.username),
+        password: render(&auth.password),
+        key: render(&auth.key),
+        value: render(&auth.value),
+        add_to: auth.add_to.clone(),
+        token_url: render(&auth.token_url),
+        client_id: render(&auth.client_id),
+        client_secret: render(&auth.client_secret),
+        scope: render(&auth.scope),
+    }
+}
+
+fn truncate_cli_text(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_string();
+    }
+    let mut end = limit;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n…（已截断显示，共 {} 字节）", &text[..end], text.len())
+}
+
+/// 导出接口文档（G-08）：与桌面端共用 builder / 渲染器，敏感值在构建阶段脱敏
+fn cmd_docs_export(args: &Args) -> CliResult<i32> {
+    let scope = args
+        .value("scope")
+        .map(|text| text.trim().to_ascii_lowercase())
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| "project".to_string());
+    if !matches!(scope.as_str(), "project" | "collection" | "request") {
+        return Err(CliError::config(
+            "--scope 仅支持 project / collection / request",
+        ));
+    }
+    let id_spec = args
+        .value("id")
+        .ok_or_else(|| CliError::config("缺少 --id <ID>"))?;
+    let target_id = id_spec
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| CliError::config(format!("--id 需要数字 ID：{id_spec}")))?;
+    let format = args
+        .value("format")
+        .map(|text| text.trim().to_ascii_lowercase())
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| "markdown".to_string());
+    if !matches!(format.as_str(), "markdown" | "html") {
+        return Err(CliError::config("--format 仅支持 markdown / html"));
+    }
+    let out = args
+        .value("out")
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| CliError::config("缺少 --out <文件路径>"))?;
+
+    let env = Env::open(args)?;
+    let state = env.state;
+    let conn = state
+        .pool
+        .get()
+        .map_err(|error| CliError::db(crate::util::err(error)))?;
+    let project_id: i64 = match scope.as_str() {
+        "project" => conn
+            .query_row(
+                "SELECT id FROM projects WHERE id = ?1",
+                params![target_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| CliError::db(crate::util::err(error)))?
+            .ok_or_else(|| CliError::config(format!("项目不存在：{target_id}")))?,
+        "collection" => conn
+            .query_row(
+                "SELECT project_id FROM collections WHERE id = ?1",
+                params![target_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| CliError::db(crate::util::err(error)))?
+            .ok_or_else(|| CliError::config(format!("集合不存在：{target_id}")))?,
+        _ => conn
+            .query_row(
+                "SELECT c.project_id FROM requests r JOIN collections c ON c.id = r.collection_id
+                 WHERE r.id = ?1",
+                params![target_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| CliError::db(crate::util::err(error)))?
+            .ok_or_else(|| CliError::config(format!("请求不存在：{target_id}")))?,
+    };
+    let env_id = resolve_env(&conn, project_id, args.value("env"))?;
+    let payload = DocsExportPayload {
+        format: format.clone(),
+        path: out.to_string(),
+        source: DocsExportSource::Scope(DocsPreparePayload {
+            scope: scope.clone(),
+            target_id,
+            environment_id: env_id,
+            options: DocsOptions::default(),
+        }),
+    };
+    let result =
+        crate::services::docs::export(&conn, &state.docs_cache, &payload).map_err(|error| {
+            if error.starts_with("E_") {
+                CliError::config(error)
+            } else {
+                CliError::run(error)
+            }
+        })?;
+
+    if args.has("json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).unwrap_or_default()
+        );
+    } else {
+        println!(
+            "已导出文档：{}\n范围：{} #{} · {} 个接口 · {} 个集合 · {} 字节",
+            result.path,
+            scope,
+            target_id,
+            result.request_count,
+            result.collection_count,
+            result.bytes
+        );
+        for warning in &result.warnings {
+            eprintln!("提醒 {warning}");
+        }
+    }
+    Ok(EXIT_OK)
+}
+
 fn cmd_python_check(args: &Args) -> CliResult<i32> {
     let env = Env::open(args)?;
     let state = env.state;
@@ -1370,4 +2023,279 @@ fn insert_pack_request(
     )
     .map_err(|error| CliError::config(crate::util::err(error)))?;
     Ok(conn.last_insert_rowid())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entity::model::{EntityDoc, EntityNode};
+    use r2d2_sqlite::SqliteConnectionManager;
+
+    fn pool(tag: &str) -> crate::state::DbPool {
+        let dir = crate::util::test_dir(tag);
+        let manager = SqliteConnectionManager::file(dir.join("astroman.db"));
+        let pool = r2d2::Pool::builder().max_size(2).build(manager).unwrap();
+        crate::db::init(&pool).unwrap();
+        pool
+    }
+
+    fn entity(children: Vec<EntityNode>) -> String {
+        let root = EntityNode {
+            children,
+            ..EntityNode::new_root("object")
+        };
+        EntityDoc::new(root, 0).encode().unwrap()
+    }
+
+    fn field(name: &str) -> EntityNode {
+        EntityNode {
+            name: name.into(),
+            type_name: "string".into(),
+            required: true,
+            ..EntityNode::default()
+        }
+    }
+
+    /// 返回 (projectId, requestId)；新库自带示例数据，这里总是追加
+    fn seed(conn: &Connection, response_entity: &str) -> (i64, i64) {
+        let now = crate::util::now_ms();
+        conn.execute(
+            "INSERT INTO projects (name, created_at, updated_at) VALUES ('契约项目', ?1, ?1)",
+            params![now],
+        )
+        .unwrap();
+        let project = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO collections (project_id, name, created_at, updated_at)
+             VALUES (?1, 'C', ?2, ?2)",
+            params![project, now],
+        )
+        .unwrap();
+        let collection = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO requests
+               (collection_id, name, method, url, response_entity, created_at, updated_at)
+             VALUES (?1, '详情', 'GET', 'https://api.example.com/users/{id}', ?2, ?3, ?3)",
+            params![collection, response_entity, now],
+        )
+        .unwrap();
+        (project, conn.last_insert_rowid())
+    }
+
+    #[test]
+    fn contract_check_exit_code_follows_breaking_changes() {
+        let pool = pool("cli-contract");
+        let conn = pool.get().unwrap();
+        let (project, _) = seed(&conn, &entity(vec![field("name"), field("email")]));
+        let snapshot = crate::services::contract::create_snapshot(&conn, project, "v1").unwrap();
+
+        // 未变更：默认 --fail-on breaking 也退出 0
+        let result = run_contract_check(&conn, Some("契约项目"), Some(snapshot.id)).unwrap();
+        assert!(result.diff.breaking.is_empty());
+        assert_eq!(result.baseline.project_id, project);
+        assert_eq!(contract_exit_code(&result.diff, FailOn::Breaking), EXIT_OK);
+
+        // 删除响应字段：退出码非 0（CI 拦截），--fail-on none 时恢复 0
+        conn.execute(
+            "UPDATE requests SET response_entity = ?1",
+            params![entity(vec![field("name")])],
+        )
+        .unwrap();
+        let result =
+            run_contract_check(&conn, Some(&project.to_string()), Some(snapshot.id)).unwrap();
+        assert_eq!(result.diff.breaking.len(), 1);
+        assert_eq!(
+            contract_exit_code(&result.diff, FailOn::Breaking),
+            EXIT_ASSERT_FAILED
+        );
+        assert_eq!(contract_exit_code(&result.diff, FailOn::None), EXIT_OK);
+    }
+
+    #[test]
+    fn clearing_all_fields_is_schema_missing_not_breaking() {
+        let pool = pool("cli-contract-missing");
+        let conn = pool.get().unwrap();
+        let (project, _) = seed(&conn, &entity(vec![field("email")]));
+        let snapshot = crate::services::contract::create_snapshot(&conn, project, "v1").unwrap();
+
+        // 实体被清空 → 不生成 schema，只标 schemaMissing，不判破坏（A-04）
+        conn.execute(
+            "UPDATE requests SET response_entity = ?1",
+            params![entity(vec![])],
+        )
+        .unwrap();
+        let result =
+            run_contract_check(&conn, Some(&project.to_string()), Some(snapshot.id)).unwrap();
+        assert!(result.diff.breaking.is_empty());
+        assert_eq!(result.diff.schema_missing, vec!["GET /users/{id}"]);
+        assert_eq!(contract_exit_code(&result.diff, FailOn::Breaking), EXIT_OK);
+    }
+
+    #[test]
+    fn contract_check_rejects_missing_project_and_bad_baseline() {
+        let pool = pool("cli-contract-errors");
+        let conn = pool.get().unwrap();
+        let (project, _) = seed(&conn, &entity(vec![]));
+
+        let missing = run_contract_check(&conn, None, None).unwrap_err();
+        assert_eq!(missing.code, EXIT_CONFIG);
+        assert!(missing.message.contains("--project"));
+
+        let unknown = run_contract_check(&conn, Some(&project.to_string()), Some(999)).unwrap_err();
+        assert_eq!(unknown.code, EXIT_CONFIG);
+        assert!(unknown.message.contains("E_CONTRACT_BASELINE"));
+    }
+
+    #[test]
+    fn contract_check_defaults_to_latest_snapshot() {
+        let pool = pool("cli-contract-latest");
+        let conn = pool.get().unwrap();
+        let (project, _) = seed(&conn, &entity(vec![field("name")]));
+        let first = crate::services::contract::create_snapshot(&conn, project, "v1").unwrap();
+        let second = crate::services::contract::create_snapshot(&conn, project, "v2").unwrap();
+
+        let result = run_contract_check(&conn, Some("契约项目"), None).unwrap();
+        assert_eq!(result.baseline.id, second.id);
+        assert!(result.baseline.id > first.id);
+    }
+
+    #[test]
+    fn contract_check_without_snapshot_is_config_error() {
+        let pool = pool("cli-contract-nosnap");
+        let conn = pool.get().unwrap();
+        let (project, _) = seed(&conn, &entity(vec![]));
+
+        let error = run_contract_check(&conn, Some(&project.to_string()), None).unwrap_err();
+        assert_eq!(error.code, EXIT_CONFIG);
+        assert!(error.message.contains("E_CONTRACT_BASELINE"));
+    }
+
+    #[test]
+    fn fail_on_accepts_breaking_and_none_only() {
+        assert_eq!(FailOn::parse(None).unwrap(), FailOn::Breaking);
+        assert_eq!(FailOn::parse(Some("breaking")).unwrap(), FailOn::Breaking);
+        assert_eq!(FailOn::parse(Some("NONE")).unwrap(), FailOn::None);
+        assert_eq!(
+            FailOn::parse(Some("warning")).unwrap_err().code,
+            EXIT_CONFIG
+        );
+    }
+
+    fn db(tag: &str) -> (PathBuf, crate::state::DbPool) {
+        let dir = crate::util::test_dir(tag);
+        let db_path = dir.join("astroman.db");
+        let manager = SqliteConnectionManager::file(&db_path);
+        let pool = r2d2::Pool::builder().max_size(2).build(manager).unwrap();
+        crate::db::init(&pool).unwrap();
+        (db_path, pool)
+    }
+
+    fn args(items: &[&str]) -> Args {
+        Args::parse(
+            &items
+                .iter()
+                .map(|item| item.to_string())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn render_auth_renders_environment_variables() {
+        let vars = HashMap::from([
+            ("token".to_string(), "abc".to_string()),
+            ("host".to_string(), "example.com".to_string()),
+        ]);
+        let auth = RequestAuth {
+            kind: "bearer".into(),
+            token: "{{token}}".into(),
+            username: "{{host}}".into(),
+            password: "{{missing}}".into(),
+            key: "X-Key".into(),
+            value: "{{token}}-{{host}}".into(),
+            add_to: "header".into(),
+            token_url: "https://{{host}}/oauth".into(),
+            client_id: "{{token}}".into(),
+            client_secret: "{{token}}".into(),
+            scope: "read".into(),
+        };
+        let rendered = render_auth(&auth, &vars);
+        assert_eq!(rendered.token, "abc");
+        assert_eq!(rendered.username, "example.com");
+        assert_eq!(rendered.value, "abc-example.com");
+        assert_eq!(rendered.token_url, "https://example.com/oauth");
+        assert_eq!(rendered.key, "X-Key");
+        assert_eq!(rendered.scope, "read");
+    }
+
+    #[test]
+    fn truncate_cli_text_keeps_utf8_boundary() {
+        let text = "中文内容".repeat(64);
+        let cut = truncate_cli_text(&text, 7);
+        assert!(cut.contains("已截断"));
+        assert!(std::str::from_utf8(cut.as_bytes()).is_ok());
+        assert!(cut.starts_with('中'));
+    }
+
+    #[test]
+    fn request_send_rejects_realtime_protocol() {
+        let (db_path, pool) = db("cli-request-send");
+        let conn = pool.get().unwrap();
+        let (_project, request) = seed(&conn, &entity(vec![]));
+        conn.execute(
+            "UPDATE requests SET protocol = 'websocket' WHERE id = ?1",
+            params![request],
+        )
+        .unwrap();
+        drop(conn);
+
+        let args = args(&[
+            "request",
+            "send",
+            "--request",
+            &request.to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ]);
+        let error = cmd_request_send(&args).unwrap_err();
+        assert_eq!(error.code, EXIT_CONFIG);
+        assert!(error.message.contains("实时面板"));
+    }
+
+    #[test]
+    fn docs_export_writes_markdown_for_project_scope() {
+        let (db_path, pool) = db("cli-docs-export");
+        let conn = pool.get().unwrap();
+        let (project, _) = seed(&conn, &entity(vec![]));
+        drop(conn);
+        let out = db_path.parent().unwrap().join("api-doc.md");
+        let args = args(&[
+            "docs",
+            "export",
+            "--scope",
+            "project",
+            "--id",
+            &project.to_string(),
+            "--out",
+            &out.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ]);
+
+        assert_eq!(cmd_docs_export(&args).unwrap(), EXIT_OK);
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(text.contains("契约项目"));
+        assert!(text.contains("详情"));
+    }
+
+    #[test]
+    fn docs_export_rejects_unknown_format_before_opening_db() {
+        let args = args(&[
+            "docs", "export", "--scope", "project", "--id", "1", "--format", "pdf", "--out",
+            "api.pdf",
+        ]);
+        let error = cmd_docs_export(&args).unwrap_err();
+        assert_eq!(error.code, EXIT_CONFIG);
+        assert!(error.message.contains("markdown"));
+    }
 }

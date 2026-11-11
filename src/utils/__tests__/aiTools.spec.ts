@@ -243,8 +243,8 @@ describe('阶段四：工具生态', () => {
     expect(TOOL_CATALOG).toContain('toolbox_json_to_entity')
     expect(TOOL_CATALOG).not.toContain('把 JSON 转成 Java')
     // 目录整体保持精简（v1.0.9 新增抓包 7 + 测试 10 + 批量创建 1 个长尾工具，
-    // 只增加名字、不增加说明，上限随名字清单长度放宽）
-    expect(TOOL_CATALOG.length).toBeLessThan(4200)
+    // W5 列表工具补 offset / limit 参数；只增加名字与参数名，上限随清单放宽）
+    expect(TOOL_CATALOG.length).toBeLessThan(4400)
     // 验收：注入字符数相比全量目录下降 ≥30%
     const stats = toolCatalogStats()
     expect(stats.ratio).toBeLessThanOrEqual(0.7)
@@ -379,5 +379,40 @@ describe('P0：抓包域与测试域补齐', () => {
     )
     expect(validateToolArgs('test_preflight', {})).toBe('缺少必填参数 suiteId')
     expect(validateToolArgs('test_run_list', { size: 500 })).toContain('不能大于 100')
+  })
+})
+
+describe('单一定义源（AI-11）', () => {
+  it('每个工具都有参数 Schema，且能派生原生 function calling 定义', async () => {
+    const { nativeToolDefs, toolParameterSchema, toolArgsSignature } = await import('@/utils/aiTools')
+    const defs = nativeToolDefs()
+    expect(defs.length).toBe(toolNames().length)
+    for (const def of defs) {
+      const schema = toolParameterSchema(def.name)
+      expect(schema.type).toBe('object')
+      expect(schema.properties).toBeTypeOf('object')
+      expect(Array.isArray(schema.required)).toBe(true)
+      expect(def.description.length).toBeGreaterThan(0)
+      expect(toolArgsSignature(def.name).length).toBeGreaterThan(0)
+    }
+  })
+
+  it('Schema 派生枚举、必填与上下界', async () => {
+    const { toolParameterSchema, toolArgsSignature } = await import('@/utils/aiTools')
+    const create = toolParameterSchema('request_create')
+    expect((create.required as string[]).sort()).toEqual(['collectionId', 'method', 'name', 'url'])
+    const props = create.properties as Record<string, Record<string, unknown>>
+    expect(props.method.enum).toContain('POST')
+    expect(props.timeoutMs).toBeUndefined()
+
+    const send = toolParameterSchema('send_request')
+    const sendProps = send.properties as Record<string, Record<string, unknown>>
+    expect(sendProps.timeoutMs.minimum).toBe(1000)
+    expect(sendProps.timeoutMs.maximum).toBe(30000)
+
+    expect(toolArgsSignature('project_create')).toBe('{ name, description? }')
+    expect(toolArgsSignature('request_create')).toContain('method: enum')
+    expect(toolArgsSignature('send_request')).toContain('timeoutMs?')
+    expect(toolArgsSignature('project_list')).toBe('无')
   })
 })

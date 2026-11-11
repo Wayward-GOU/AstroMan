@@ -41,6 +41,7 @@ import {
   requestGet,
   requestList,
   requestOptions,
+  requestRevisionSnapshot,
   requestSave,
   requestSearch,
   runGet,
@@ -153,6 +154,16 @@ import {
 /** 工具参数：模型输出的 JSON 对象 */
 export type ToolArgs = Record<string, unknown>
 
+/** 调度器传给工具的上下文：确认标记只在这里流转，不写进模型可见参数 */
+export interface ToolContext {
+  confirmed?: boolean
+  traceId?: string | null
+  /** 在途 HTTP 请求的取消键（与 traceId 对齐） */
+  requestKey?: string | null
+  /** 用户已点停止；长任务在每个子步骤前自检 */
+  isCancelled?: () => boolean
+}
+
 export interface ToolResult {
   ok: boolean
   /** 回灌给模型 / 展示给用户的文本 */
@@ -165,6 +176,10 @@ export interface ToolResult {
   total?: number
   /** 结果是否被截断（true 时 total 仍然准确） */
   truncated?: boolean
+  /** 本次结果起始下标（从 0 开始；AI-08） */
+  offset?: number
+  /** 下一页的 offset；为空表示已取完（AI-08） */
+  nextCursor?: string | null
   /** ok=false 时进一步区分：普通失败 / 等待超时 / 结果未知 */
   outcome?: 'ok' | 'error' | 'timeout' | 'unknown'
   /** 写工具超时后的结果可能已经落库，禁止自动重试 */
@@ -174,8 +189,7 @@ export interface ToolResult {
 interface ToolSpec {
   name: string
   desc: string
-  args: string
-  handler: (args: ToolArgs) => Promise<unknown>
+  handler: (args: ToolArgs, ctx?: ToolContext) => Promise<unknown>
   format?: (value: unknown) => string
   /** 会修改 / 删除数据或启动压测，必须由用户确认后再执行 */
   danger?: boolean
@@ -230,13 +244,23 @@ const SCHEMAS: Record<string, Record<string, ArgRule>> = {
     name: { kind: 'string', required: true },
   },
   collection_delete: { id: { kind: 'number', required: true } },
-  request_list: { collectionId: { kind: 'number', required: true } },
+  request_list: {
+    collectionId: { kind: 'number', required: true },
+    limit: { kind: 'number', min: 1, max: 200 },
+    offset: { kind: 'number', min: 0, max: 19999 },
+  },
   request_get: { id: { kind: 'number', required: true } },
   request_search: {
     projectId: { kind: 'number', required: true },
     keyword: { kind: 'string', required: true },
+    limit: { kind: 'number', min: 1, max: 200 },
+    offset: { kind: 'number', min: 0, max: 19999 },
   },
-  request_options: { projectId: { kind: 'number', required: true } },
+  request_options: {
+    projectId: { kind: 'number', required: true },
+    limit: { kind: 'number', min: 1, max: 200 },
+    offset: { kind: 'number', min: 0, max: 19999 },
+  },
   request_create: {
     collectionId: { kind: 'number', required: true },
     name: { kind: 'string', required: true },
@@ -305,7 +329,10 @@ const SCHEMAS: Record<string, Record<string, ArgRule>> = {
     limit: { kind: 'number', min: 1, max: 20000 },
     format: { kind: 'string', enum: ['csv', 'json'] },
   },
-  report_list: { limit: { kind: 'number', min: 1, max: 200 } },
+  report_list: {
+    limit: { kind: 'number', min: 1, max: 200 },
+    offset: { kind: 'number', min: 0, max: 1999 },
+  },
   report_get: { id: { kind: 'number', required: true } },
   env_create: {
     projectId: { kind: 'number', required: true },
@@ -570,7 +597,8 @@ const SCHEMAS: Record<string, Record<string, ArgRule>> = {
   /* ---------------- 抓包域 ---------------- */
   capture_status: {},
   capture_flow_list: {
-    limit: { kind: 'number', min: 1, max: 5000 },
+    limit: { kind: 'number', min: 1, max: 200 },
+    offset: { kind: 'number', min: 0, max: 4999 },
     method: { kind: 'string', enum: METHODS },
     host: { kind: 'string' },
     status: { kind: 'number', min: 100, max: 599 },
@@ -711,6 +739,79 @@ export function validateToolArgs(tool: string, args: ToolArgs): string | null {
   return null
 }
 
+/* ---------------- 单一定义源（AI-11） ----------------
+ * SCHEMAS 是工具参数的唯一来源：提示词参数行、原生 function calling 的
+ * JSON Schema、执行前校验全部由它派生，避免多处维护时漏改。
+ */
+
+export interface NativeToolDef {
+  name: string
+  description: string
+  parameters: Record<string, unknown>
+}
+
+const JSON_KINDS: Record<ArgKind, string | null> = {
+  string: 'string',
+  number: 'number',
+  boolean: 'boolean',
+  object: 'object',
+  array: 'array',
+  any: null,
+}
+
+function propertySchema(rule: ArgRule): Record<string, unknown> {
+  const out: Record<string, unknown> = {}
+  const type = JSON_KINDS[rule.kind]
+  if (type) out.type = type
+  if (rule.enum) out.enum = [...rule.enum]
+  if (rule.pattern) out.pattern = rule.pattern.source
+  if (rule.kind === 'number') {
+    if (rule.min !== undefined) out.minimum = rule.min
+    if (rule.max !== undefined) out.maximum = rule.max
+  }
+  if (rule.kind === 'array') {
+    if (rule.item) out.items = { type: rule.item }
+    if (rule.min !== undefined) out.minItems = rule.min
+    if (rule.max !== undefined) out.maxItems = rule.max
+  }
+  return out
+}
+
+/** 工具参数的 JSON Schema（原生 function calling 与文档共用） */
+export function toolParameterSchema(tool: string): Record<string, unknown> {
+  const rules = SCHEMAS[tool] ?? {}
+  const properties: Record<string, unknown> = {}
+  const required: string[] = []
+  for (const [key, rule] of Object.entries(rules)) {
+    properties[key] = propertySchema(rule)
+    if (rule.required) required.push(key)
+  }
+  return { type: 'object', properties, required }
+}
+
+/** 从 Schema 派生给提示词看的紧凑参数签名（只标必填、枚举、范围和数组） */
+export function toolArgsSignature(tool: string): string {
+  const rules = SCHEMAS[tool] ?? {}
+  const parts = Object.entries(rules).map(([key, rule]) => {
+    let label = ''
+    if (rule.pattern) label = '绝对路径'
+    // 枚举过多时只标 enum，避免把整张枚举表塞进提示词；完整枚举在 JSON Schema 里
+    else if (rule.enum) label = rule.enum.length <= 5 ? `enum(${rule.enum.join('|')})` : 'enum'
+    else if (rule.kind === 'array') label = rule.item ? `${rule.item}[]` : 'array'
+    return `${key}${rule.required ? '' : '?'}${label ? `: ${label}` : ''}`
+  })
+  return parts.length ? `{ ${parts.join(', ')} }` : '无'
+}
+
+/** 原生 function calling 的工具清单：由同一份 Schema 派生 */
+export function nativeToolDefs(): NativeToolDef[] {
+  return SPECS.map((spec) => ({
+    name: spec.name,
+    description: spec.desc,
+    parameters: toolParameterSchema(spec.name),
+  }))
+}
+
 /* ---------------- 数据脱敏（禁止明文密钥进入模型上下文） ---------------- */
 
 function maskValue(value: string): string {
@@ -788,14 +889,59 @@ function clip(text: string, limit: number): string {
   return `${text.slice(0, limit)}\n…（已截断，共 ${text.length} 字符）`
 }
 
+/** 列表类工具单页上限：默认 50，最大 200（AI-08） */
+const LIST_PAGE_DEFAULT = 50
+const LIST_PAGE_MAX = 200
+
+function pageWindow(args?: ToolArgs): { limit: number; offset: number } {
+  const limit = Math.min(
+    LIST_PAGE_MAX,
+    Math.max(1, Math.round(optionalNum(args?.limit) ?? LIST_PAGE_DEFAULT)),
+  )
+  const offset = Math.max(0, Math.round(optionalNum(args?.offset) ?? 0))
+  return { limit, offset }
+}
+
 /**
- * 列表类工具统一输出结构：明确给出 total，最多附 50 条明细。
- * 模型可以直接引用 total，不需要逐条数，也不会把「截断」误当成真实数量。
+ * 列表类工具统一输出结构：明确给出 total、offset 与 nextCursor。
+ * 模型可以直接引用 total，需要更多明细时用 nextCursor 作为 offset 继续翻页，
+ * 不会把「截断」误当成真实数量，也不用一次把全量塞进上下文。
  */
-function summarizeList(list: unknown[]): Record<string, unknown> {
-  // 明细限 50 条：total 放在最前，即使输出被二次截断，模型也能拿到准确总数
-  const items = list.slice(0, 50)
-  return { total: list.length, shown: items.length, truncated: list.length > items.length, items }
+function summarizeList(list: unknown[], args?: ToolArgs): Record<string, unknown> {
+  const { limit, offset } = pageWindow(args)
+  return pageEnvelope(list.length, list.slice(offset, offset + limit), args)
+}
+
+/** 已按 offset / limit 切好的明细 + 全量总数 → 统一分页信封 */
+function pageEnvelope(
+  total: number,
+  rows: unknown[],
+  args?: ToolArgs,
+): Record<string, unknown> {
+  const offset = Math.max(0, Math.round(optionalNum(args?.offset) ?? 0))
+  const next = offset + rows.length
+  const nextCursor = next < total ? String(next) : null
+  return {
+    total,
+    offset,
+    shown: rows.length,
+    truncated: nextCursor !== null,
+    nextCursor,
+    items: rows,
+  }
+}
+
+/** 分页元信息：只有列表工具显式返回 offset / nextCursor 时才带出 */
+function pageMeta(record: Record<string, unknown>): {
+  offset?: number
+  nextCursor?: string | null
+} {
+  const offset = record.offset
+  const cursor = record.nextCursor
+  return {
+    ...(typeof offset === 'number' && Number.isFinite(offset) ? { offset } : {}),
+    ...(typeof cursor === 'string' ? { nextCursor: cursor } : cursor === null ? { nextCursor: null } : {}),
+  }
 }
 
 /** 工具结果摘要：界面卡片先展示这一行，全文收进「详情」 */
@@ -806,6 +952,8 @@ function envelopeOf(
   summary: string
   total?: number
   truncated?: boolean
+  offset?: number
+  nextCursor?: string | null
 } {
   if (Array.isArray(raw)) {
     return { summary: `共 ${raw.length} 条记录`, total: raw.length, truncated: false }
@@ -824,16 +972,22 @@ function envelopeOf(
         ...(Number.isFinite(total) ? { total } : {}),
         // 摘要型结果（例如 run_get）也要把截断标记带到界面
         ...(record.truncated === true ? { truncated: true } : {}),
+        ...pageMeta(record),
       }
     }
     const total = Number(record.total)
     if (Number.isFinite(total) && Array.isArray(record.items)) {
       const shown = record.items.length
-      const truncated = record.truncated === true || total > shown
+      const meta = pageMeta(record)
+      const nextCursor = meta.nextCursor ?? null
+      const truncated = record.truncated === true || nextCursor !== null || total > shown
+      const offset = Number(record.offset)
       return {
-        summary: `共 ${total} 条${truncated ? `，仅展示前 ${shown} 条` : ''}`,
+        summary: `共 ${total} 条${truncated ? `，本次 ${shown} 条${nextCursor ? `（下一页 offset=${nextCursor}）` : ''}` : ''}`,
         total,
         truncated,
+        ...(Number.isFinite(offset) ? { offset } : {}),
+        nextCursor,
       }
     }
     if (Number.isFinite(total) && 'total' in record) {
@@ -1459,9 +1613,21 @@ interface DetailRunOptions {
   envId: number | null
   timeoutMs: number
   cookieEnabled: boolean
+  /** 用户已确认（AI-01）；命令层还会再判一次 */
+  confirmed?: boolean
+  traceId?: string | null
+  /** 停止按钮定位在途请求（AI-02） */
+  requestKey?: string | null
 }
 
-let envSnapshotCache: { envId: number; script: string; vars: Record<string, string> } | null = null
+interface EnvSnapshot {
+  envId: number
+  script: string
+  vars: Record<string, string>
+  isProd: boolean
+}
+
+let envSnapshotCache: EnvSnapshot | null = null
 
 /** 已保存请求 → 脚本可读写的请求对象 */
 function toScriptRequest(detail: HttpRequestDetail): ScriptRequest {
@@ -1483,24 +1649,85 @@ function toScriptRequest(detail: HttpRequestDetail): ScriptRequest {
 }
 
 /** 环境脚本与明文变量；同一轮批量只查一次 */
-async function envSnapshot(
-  envId: number | null,
-): Promise<{ script: string; vars: Record<string, string> }> {
-  if (envId === null) return { script: '', vars: {} }
+async function envSnapshot(envId: number | null): Promise<EnvSnapshot> {
+  if (envId === null) return { envId: 0, script: '', vars: {}, isProd: false }
   if (envSnapshotCache?.envId === envId) return envSnapshotCache
   const vars = await envPlainVars(envId).catch(() => ({} as Record<string, string>))
   let script = ''
+  let isProd = false
   const projects = await projectList().catch(() => [])
   for (const project of projects) {
     const envs = await envList(project.id).catch(() => [])
     const hit = envs.find((item) => item.id === envId)
     if (hit) {
       script = hit.script ?? ''
+      isProd = hit.isProd === true
       break
     }
   }
-  envSnapshotCache = { envId, script, vars }
+  envSnapshotCache = { envId, script, vars, isProd }
   return envSnapshotCache
+}
+
+/* ---------------- AI 权限判定（AI-01，与后端 ai_policy 对齐） ---------------- */
+
+export type AiPermissionMode = 'readonly' | 'confirm_write' | 'trusted'
+export type SendDecision = 'allow' | 'confirm' | 'deny'
+
+/** 只读方法：不改变服务端状态 */
+export function isReadOnlyMethod(method: string): boolean {
+  return ['GET', 'HEAD', 'OPTIONS'].includes(method.trim().toUpperCase())
+}
+
+export function normalizeAiPermissionMode(mode: string | null | undefined): AiPermissionMode {
+  const value = (mode ?? '').trim().toLowerCase()
+  if (value === 'readonly' || value === 'read_only' || value === 'read-only') return 'readonly'
+  if (value === 'trusted') return 'trusted'
+  return 'confirm_write'
+}
+
+/**
+ * 发送判定顺序：只读方法 → 生产环境 → 权限模式。
+ * 生产环境无论哪种模式都要确认；只读模式对非只读方法直接拒绝。
+ */
+export function decideSend(
+  mode: string | null | undefined,
+  method: string,
+  isProd: boolean,
+): SendDecision {
+  const parsed = normalizeAiPermissionMode(mode)
+  const readOnly = isReadOnlyMethod(method)
+  if (parsed === 'readonly' && !readOnly) return 'deny'
+  if (isProd) return 'confirm'
+  if (readOnly) return 'allow'
+  return parsed === 'trusted' ? 'allow' : 'confirm'
+}
+
+/** 写工具：只读模式拒绝，其余模式都确认 */
+export function decideWrite(mode: string | null | undefined): SendDecision {
+  return normalizeAiPermissionMode(mode) === 'readonly' ? 'deny' : 'confirm'
+}
+
+export interface SendRequestPreview {
+  method: string
+  url: string
+  envId: number | null
+  isProd: boolean
+}
+
+/** 确认卡 / 权限判定用的发送预览：解析 requestId 的当前方法与环境生产标记 */
+export async function previewSendRequest(args: ToolArgs): Promise<SendRequestPreview> {
+  const requestId = optionalNum(args.requestId)
+  const envId = optionalNum(args.envId) ?? null
+  let method = str(args.method, 'GET').toUpperCase()
+  let url = str(args.url).trim()
+  if (requestId !== undefined) {
+    const detail = await requestGet(requestId)
+    method = str(args.method, detail.method).trim().toUpperCase() || 'GET'
+    url = str(args.url, detail.url).trim()
+  }
+  const snapshot = await envSnapshot(envId)
+  return { method, url, envId, isProd: snapshot.isProd }
 }
 
 /** 与界面「发送 / 批量执行」同链路：环境脚本 → 前置脚本 → HTTP → 后置脚本与断言 */
@@ -1541,28 +1768,33 @@ async function runDetailWithScripts(
   }
 
   const render = (text: string) => renderRuntimeVars(text)
-  const result = await aiExecute({
-    requestId: detail.id ?? null,
-    name: detail.name,
-    method: outgoing.method,
-    url: render(outgoing.url),
-    headers: Object.entries(outgoing.headers).map(([key, value]) => ({
-      key,
-      value: render(value),
-      enabled: true,
-    })),
-    params: Object.entries(outgoing.params).map(([key, value]) => ({
-      key,
-      value: render(value),
-      enabled: true,
-    })),
-    bodyType: outgoing.bodyType,
-    body: render(outgoing.body),
-    envId: options.envId,
-    timeoutMs: options.timeoutMs,
-    auth: detail.auth ?? null,
-    cookieEnabled: options.cookieEnabled,
-  })
+  const result = await aiExecute(
+    {
+      requestId: detail.id ?? null,
+      name: detail.name,
+      method: outgoing.method,
+      url: render(outgoing.url),
+      headers: Object.entries(outgoing.headers).map(([key, value]) => ({
+        key,
+        value: render(value),
+        enabled: true,
+      })),
+      params: Object.entries(outgoing.params).map(([key, value]) => ({
+        key,
+        value: render(value),
+        enabled: true,
+      })),
+      bodyType: outgoing.bodyType,
+      body: render(outgoing.body),
+      envId: options.envId,
+      timeoutMs: options.timeoutMs,
+      auth: detail.auth ?? null,
+      cookieEnabled: options.cookieEnabled,
+      requestKey: options.requestKey ?? null,
+    },
+    options.confirmed === true,
+    options.traceId ?? null,
+  )
 
   const assertions: ScriptAssertion[] = []
   let scriptError: string | undefined
@@ -1822,11 +2054,23 @@ function testCasePayload(args: ToolArgs, suiteId: number, existing?: TestCase): 
   return payload
 }
 
+/**
+ * AI-09：写操作落库前把目标请求的当前状态记入版本表（source=ai, trace_id）。
+ * 没有 traceId（脚本直调 / 老会话）时跳过，不阻断工具执行。
+ */
+async function snapshotForRollback(
+  ctx: ToolContext | undefined,
+  requestId: number,
+): Promise<void> {
+  const trace = ctx?.traceId?.trim()
+  if (!trace) return
+  await requestRevisionSnapshot(requestId, trace)
+}
+
 const SPECS: ToolSpec[] = [
   {
     name: 'project_list',
     desc: '列出本机全部项目（id / 名称 / 描述 / 时间）；回答里必须原样使用 name 字段',
-    args: '无',
     handler: async () => {
       const projects = await projectList()
       return projects.map((item) => ({
@@ -1841,7 +2085,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'project_request_counts',
     desc: '按项目统计请求数量，返回真实项目名称 + 请求数（数值降序）；问「各项目请求数」时必须用它',
-    args: '无',
     handler: async () => {
       const projects = await projectList()
       const rows = await Promise.all(
@@ -1869,13 +2112,11 @@ const SPECS: ToolSpec[] = [
   {
     name: 'project_create',
     desc: '新建项目',
-    args: '{ name, description? }',
     handler: (args) => projectCreate(str(args.name, '新项目').trim() || '新项目', str(args.description)),
   },
   {
     name: 'project_update',
     desc: '修改项目名称或描述（只传需要改的字段）',
-    args: '{ id, name?, description? }',
     danger: true,
     handler: async (args) => {
       const id = needNum(args.id, 'id')
@@ -1891,7 +2132,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'project_delete',
     desc: '删除项目及其中全部集合与请求（危险操作，需用户确认）',
-    args: '{ id }',
     danger: true,
     handler: async (args) => {
       const id = needNum(args.id, 'id')
@@ -1903,13 +2143,11 @@ const SPECS: ToolSpec[] = [
   {
     name: 'collection_tree',
     desc: '读取某项目下的集合树',
-    args: '{ projectId }',
     handler: (args) => collectionTree(needNum(args.projectId, 'projectId')),
   },
   {
     name: 'collection_create',
     desc: '在项目下新建集合（parentId 为空表示顶级）',
-    args: '{ projectId, parentId?, name }',
     handler: (args) =>
       collectionCreate(
         needNum(args.projectId, 'projectId'),
@@ -1920,7 +2158,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'collection_rename',
     desc: '重命名集合',
-    args: '{ id, name }',
     danger: true,
     handler: async (args) => {
       const id = needNum(args.id, 'id')
@@ -1933,7 +2170,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'collection_delete',
     desc: '删除集合及其下全部请求（危险操作，需用户确认）',
-    args: '{ id }',
     danger: true,
     handler: async (args) => {
       const id = needNum(args.id, 'id')
@@ -1943,27 +2179,27 @@ const SPECS: ToolSpec[] = [
   },
   {
     name: 'request_list',
-    desc: '列出某集合下的请求（返回 total 总条数，items 最多前 50 条；时间为本地格式）',
-    args: '{ collectionId }',
+    desc: '列出某集合下的请求（默认 50 条；用 offset 翻页）',
     handler: async (args) =>
-      summarizeList(requestRows(await requestList(needNum(args.collectionId, 'collectionId')))),
+      summarizeList(
+        requestRows(await requestList(needNum(args.collectionId, 'collectionId'))),
+        args,
+      ),
   },
   {
     name: 'request_get',
     desc: '读取单个请求的完整定义',
-    args: '{ id }',
     handler: (args) => requestGet(needNum(args.id, 'id')),
   },
   {
     name: 'request_search',
-    desc: '在项目内按关键字搜索请求（返回 total 命中数，items 最多前 50 条，含所属集合与更新时间）',
-    args: '{ projectId, keyword }',
+    desc: '在项目内按关键字搜索请求（含所属集合；用 offset 翻页）',
     handler: async (args) => {
       const hits = await requestSearch(
         needNum(args.projectId, 'projectId'),
         str(args.keyword),
       )
-      const result: Record<string, unknown> = summarizeList(requestRows(hits))
+      const result: Record<string, unknown> = summarizeList(requestRows(hits), args)
       if (hits.length >= 100) {
         result.说明 = '搜索结果达到 100 条查询上限，实际命中可能更多，请补充关键字'
       }
@@ -1972,21 +2208,21 @@ const SPECS: ToolSpec[] = [
   },
   {
     name: 'request_options',
-    desc: '列出项目内请求的 id / 名称 / 方法 / URL，便于挑选（返回 total 总条数，items 最多前 50 条）',
-    args: '{ projectId }',
+    desc: '列出项目内请求的 id / 名称 / 方法 / URL（用 offset 翻页）',
     handler: async (args) =>
-      summarizeList(requestRows(await requestOptions(needNum(args.projectId, 'projectId')))),
+      summarizeList(
+        requestRows(await requestOptions(needNum(args.projectId, 'projectId'))),
+        args,
+      ),
   },
   {
     name: 'request_create',
     desc: '在集合下新建请求（自动保存到数据库）',
-    args: '{ collectionId, name, method, url, headers?, params?, bodyType?, body?, preScript?, postScript?, assertions?, auth? }',
     handler: (args) => requestSave(requestDetail(args)),
   },
   {
     name: 'request_batch_create',
     desc: '在同一个集合下批量新建请求（最多 50 个，一次确认后全部落库，适合按接口清单快速铺量）',
-    args: '{ collectionId, requests: [{ name, method, url, headers?, params?, bodyType?, body?, preScript?, postScript?, assertions? }] }',
     handler: async (args) => {
       const collectionId = needNum(args.collectionId, 'collectionId')
       const rawItems = Array.isArray(args.requests) ? args.requests : []
@@ -2029,8 +2265,7 @@ const SPECS: ToolSpec[] = [
   {
     name: 'send_request',
     desc: '发送真实 HTTP 请求并返回状态码、耗时、响应体、断言结果与脚本日志。传 requestId 时完整执行该请求的环境 / 前置 / 后置脚本与断言（与界面发送同一条链路）；只传 method + url 时按裸请求发送',
-    args: '{ requestId?, method?, url?, headers?, params?, bodyType?, body?, envId?, timeoutMs?, cookieEnabled? }',
-    handler: async (args) => {
+    handler: async (args, ctx) => {
       const requestId = optionalNum(args.requestId)
       const envId = optionalNum(args.envId) ?? null
       const timeoutMs = Math.round(optionalNum(args.timeoutMs) ?? 30000)
@@ -2062,14 +2297,20 @@ const SPECS: ToolSpec[] = [
         }
       }
       if (!detail.url.trim()) throw new Error('参数 url 不能为空')
-      return runDetailWithScripts(detail, { envId, timeoutMs, cookieEnabled })
+      return runDetailWithScripts(detail, {
+        envId,
+        timeoutMs,
+        cookieEnabled,
+        confirmed: ctx?.confirmed === true,
+        traceId: ctx?.traceId ?? null,
+        requestKey: ctx?.requestKey ?? null,
+      })
     },
     format: formatSendOutcome,
   },
   {
     name: 'curl_import',
     desc: '解析 cURL 命令；传入 collectionId 时直接保存为新请求，否则只返回解析结果',
-    args: '{ curl, collectionId?, name? }',
     handler: async (args) => {
       const curl = str(args.curl).trim()
       if (!curl) throw new Error('参数 curl 不能为空')
@@ -2110,9 +2351,8 @@ const SPECS: ToolSpec[] = [
   {
     name: 'request_update',
     desc: '修改已保存请求的字段（只传要改的字段，其余保留）',
-    args: '{ id, name?, method?, url?, headers?, params?, bodyType?, body?, preScript?, postScript?, assertions?, auth? }',
     danger: true,
-    handler: async (args) => {
+    handler: async (args, ctx) => {
       const id = needNum(args.id, 'id')
       const current = await requestGet(id)
       const next: HttpRequestDetail = { ...current }
@@ -2140,6 +2380,8 @@ const SPECS: ToolSpec[] = [
         next.auth = args.auth as RequestAuth
       }
 
+      // AI-09：写前快照，用户可在复盘时间线按本轮 traceId 一键回滚
+      await snapshotForRollback(ctx, id)
       await requestSave(next)
       return { id: next.id ?? id, name: next.name, method: next.method, url: next.url }
     },
@@ -2147,9 +2389,8 @@ const SPECS: ToolSpec[] = [
   {
     name: 'request_script_save',
     desc: '给已保存的请求写入前置 / 后置脚本（只改脚本字段，其余保持不变），保存前会做语法检查',
-    args: '{ id, preScript?, postScript?, assertions? }',
     danger: true,
-    handler: async (args) => {
+    handler: async (args, ctx) => {
       const id = needNum(args.id, 'id')
       const current = await requestGet(id)
       const next: HttpRequestDetail = { ...current }
@@ -2174,6 +2415,7 @@ const SPECS: ToolSpec[] = [
         }
       }
 
+      await snapshotForRollback(ctx, id)
       await requestSave(next)
       return {
         id,
@@ -2187,7 +2429,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'request_delete',
     desc: '删除已保存的请求（危险操作，需用户确认）',
-    args: '{ id }',
     danger: true,
     handler: async (args) => {
       const id = needNum(args.id, 'id')
@@ -2199,7 +2440,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'env_list',
     desc: '读取项目的环境与变量（密钥类变量的值会打码，不进入模型上下文）',
-    args: '{ projectId }',
     handler: async (args) => {
       const envs = await envList(needNum(args.projectId, 'projectId'))
       return envs.map((env) => ({
@@ -2219,7 +2459,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'history_list',
     desc: '请求历史，按时间倒序；可按接口（requestId）或项目（projectId）过滤，用 offset 翻页；返回接口名、项目名与本地时间',
-    args: '{ limit?, offset?, requestId?, projectId? }',
     handler: async (args) => {
       const limit = Math.min(2000, Math.max(1, Math.round(optionalNum(args.limit) ?? 20)))
       const offset = Math.min(19999, Math.max(0, Math.round(optionalNum(args.offset) ?? 0)))
@@ -2246,7 +2485,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'history_export',
     desc: '把执行记录导出成 CSV / JSON 文件：可按接口或项目过滤，例如「某个接口最近 50 条」「某个项目最近 100 条」',
-    args: "{ path, requestId?, projectId?, limit?, format?: 'csv' | 'json' }",
     danger: true,
     handler: async (args) => {
       const path = needPath(args.path)
@@ -2285,20 +2523,21 @@ const SPECS: ToolSpec[] = [
   },
   {
     name: 'report_list',
-    desc: '压测报告列表（状态、时间、成功率已转中文）',
-    args: '{ limit? }',
-    handler: async (args) => reportRows(await reportList(optionalNum(args.limit) ?? 20)),
+    desc: '压测报告列表（中文标签；可用 offset 翻页）',
+    handler: async (args) => {
+      const { limit, offset } = pageWindow(args)
+      const rows = reportRows(await reportList(Math.min(200, offset + limit)))
+      return pageEnvelope(rows.length, rows.slice(offset, offset + limit), args)
+    },
   },
   {
     name: 'report_get',
     desc: '压测报告详情（指标、状态码、错误、阶段均已转中文标签，项目/请求/环境显示名称而非 ID）',
-    args: '{ id }',
     handler: async (args) => reportDigest(await reportGet(needNum(args.id, 'id'))),
   },
   {
     name: 'env_create',
     desc: '在项目下新建环境（如 dev / test / prod）',
-    args: '{ projectId, name }',
     handler: async (args) => {
       const projectId = needNum(args.projectId, 'projectId')
       const name = str(args.name, '新环境').trim() || '新环境'
@@ -2309,7 +2548,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'env_var_save',
     desc: '新增或覆盖环境变量：同 key 覆盖、其他保留，removeKeys 用于删除变量',
-    args: '{ projectId, envId, variables?: [{ key, value, isSecret? }], removeKeys?: string[] }',
     danger: true,
     handler: async (args) => {
       const projectId = needNum(args.projectId, 'projectId')
@@ -2359,7 +2597,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'env_activate',
     desc: '切换项目当前生效的环境',
-    args: '{ projectId, id }',
     handler: async (args) => {
       const projectId = needNum(args.projectId, 'projectId')
       const id = needNum(args.id, 'id')
@@ -2375,7 +2612,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'plan_list',
     desc: '项目的压测计划列表（含关联请求名与本地时间）',
-    args: '{ projectId }',
     handler: async (args) => {
       const plans = await planList(needNum(args.projectId, 'projectId'))
       return plans.map((item) => ({
@@ -2388,7 +2624,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'plan_get',
     desc: '读取某个压测计划的完整配置（参数、阶段、SLA、关联请求）',
-    args: '{ id }',
     handler: async (args) => {
       const plan = await planGet(needNum(args.id, 'id'))
       return {
@@ -2402,7 +2637,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'plan_delete',
     desc: '删除压测计划（危险操作，需用户确认）',
-    args: '{ id }',
     danger: true,
     handler: async (args) => {
       const id = needNum(args.id, 'id')
@@ -2413,7 +2647,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'plan_save',
     desc: '保存压测计划到项目（固定并发或梯度阶段，可带 SLA），保存后可在「压测」页直接载入执行',
-    args: '{ projectId, name, requestId?, mode?: fixed|stages, concurrent?, durationSec?, rampUpSec?, thinkTimeMs?, targetRps?, stages?: [{ concurrent, durationSec }], slaP95?, slaP99?, slaErrorRate?, slaMinRps?, envId? }',
     handler: async (args) => {
       const projectId = needNum(args.projectId, 'projectId')
       const name = str(args.name).trim()
@@ -2465,7 +2698,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'stress_start',
     desc: '启动压测：按已保存请求（requestId）或直接给 URL；默认 10 并发 × 30 秒，支持梯度阶段与 SLA',
-    args: '{ requestId?, url?, method?, name?, headers?, params?, bodyType?, body?, envId?, concurrent?, durationSec?, rampUpSec?, thinkTimeMs?, targetRps?, stages?, slaP95?, slaP99?, slaErrorRate?, slaMinRps? }',
     danger: true,
     handler: async (args) => {
       const requestId = optionalNum(args.requestId)
@@ -2538,7 +2770,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'stress_stop',
     desc: '停止正在运行的压测（危险操作，需用户确认）',
-    args: '无',
     danger: true,
     handler: async () => {
       await stressStop()
@@ -2549,7 +2780,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'test_suite_list',
     desc: '列出自动化测试套件（可按项目 / 关键词 / 标签过滤），返回套件 id、名称、用例数与默认环境',
-    args: '{ projectId?, keyword?, tag? }',
     handler: async (args) => {
       const projectId = optionalNum(args.projectId)
       const list = await testSuiteList(
@@ -2570,7 +2800,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'test_suite_get',
     desc: '读取测试套件详情：用例顺序、类型、断言、数据集与脚本摘要（完整脚本只回前 600 字）',
-    args: '{ id }',
     handler: async (args) => {
       const id = needNum(args.id, 'id')
       const detail = await testSuiteGet(id)
@@ -2609,7 +2838,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'test_suite_create',
     desc: '新建测试套件（可在 config 中写 failFast / maxWorkers / cookieMode / vars 等套件配置）',
-    args: '{ projectId, name, description?, envId?, tags?: string[], config?: object, setupScript?, teardownScript? }',
     handler: async (args) => {
       const projectId = needNum(args.projectId, 'projectId')
       const name = str(args.name).trim()
@@ -2630,7 +2858,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'test_suite_update',
     desc: '修改测试套件配置 / 脚本 / 标签（只传需要改的字段）',
-    args: '{ id, name?, description?, envId?, tags?: string[], config?: object, setupScript?, teardownScript? }',
     handler: async (args) => {
       const id = needNum(args.id, 'id')
       const existing = await testSuiteGet(id)
@@ -2655,7 +2882,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'test_suite_delete',
     desc: '删除测试套件及其用例、数据集与运行记录（危险操作，需用户确认）',
-    args: '{ id }',
     danger: true,
     handler: async (args) => {
       const id = needNum(args.id, 'id')
@@ -2666,7 +2892,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'test_case_create',
     desc: '新增测试用例：request（绑定接口 + 断言）、python（mainScript）、stress（内联压测配置 + SLA）',
-    args: '{ suiteId, name, kind: request|python|stress, requestId?, datasetId?, dependsOn?: string[], assertions?: object[], variables?: object, preScript?, postScript?, mainScript?, stress?: object, timeoutMs?, retries? }',
     handler: async (args) => {
       const suiteId = needNum(args.suiteId, 'suiteId')
       const payload = testCasePayload(args, suiteId)
@@ -2677,7 +2902,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'test_case_update',
     desc: '修改测试用例（断言 / 脚本 / 压测配置 / 顺序等；只传需要改的字段）',
-    args: '{ id, name?, kind?, requestId?, datasetId?, dependsOn?: string[], assertions?: object[], variables?: object, preScript?, postScript?, mainScript?, stress?, timeoutMs?, retries? }',
     handler: async (args) => {
       const id = needNum(args.id, 'id')
       const existing = await testCaseGet(id)
@@ -2689,7 +2913,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'test_case_delete',
     desc: '删除测试用例（危险操作，需用户确认）',
-    args: '{ id }',
     danger: true,
     handler: async (args) => {
       const id = needNum(args.id, 'id')
@@ -2700,7 +2923,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'test_run_start',
     desc: '启动测试套件运行（先做预检；生产环境需用户确认）。立即返回 runId，用 test_run_get 查询结果',
-    args: '{ suiteId, envId?, failFast?, vars?: object, secrets?: object }',
     danger: true,
     handler: async (args) => {
       const suiteId = needNum(args.suiteId, 'suiteId')
@@ -2740,7 +2962,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'test_run_stop',
     desc: '停止正在运行的测试套件（已完成的用例结果会保留）',
-    args: '{ runId }',
     danger: true,
     handler: async (args) => {
       const runId = needNum(args.runId, 'runId')
@@ -2751,7 +2972,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'test_run_get',
     desc: '读取测试运行结果：汇总、失败用例、失败断言与错误；报告生成后用 test_report_export 导出',
-    args: '{ runId }',
     handler: async (args) => {
       const runId = needNum(args.runId, 'runId')
       const detail = await testRunGet(runId)
@@ -2784,7 +3004,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'test_report_export',
     desc: '为一次测试运行生成并导出报告（html / json / junit / summary）',
-    args: '{ runId, formats?: string[] }',
     handler: async (args) => {
       const runId = needNum(args.runId, 'runId')
       const formats = Array.isArray(args.formats) ? args.formats.map((item) => str(item)) : undefined
@@ -2795,7 +3014,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'test_dataset_list',
     desc: '列出测试套件的数据集（只返回元信息，不返回 content 全文）',
-    args: '{ suiteId }',
     handler: async (args) => {
       const datasets = await testDatasetList(needNum(args.suiteId, 'suiteId'))
       return summarizeList(
@@ -2814,7 +3032,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'test_dataset_get',
     desc: '读取数据集详情与内容预览（content 最多返回 6000 字符）',
-    args: '{ id }',
     handler: async (args) => {
       const dataset = await testDatasetGet(needNum(args.id, 'id'))
       const content = dataset.content ?? ''
@@ -2836,7 +3053,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'test_dataset_save',
     desc: '新建或修改数据集（json / csv；提供 path 或 content 之一，需用户确认）',
-    args: '{ id?, suiteId?, name?, format?: json|csv, path?, content? }',
     handler: async (args) => {
       const id = optionalNum(args.id)
       let suiteId = optionalNum(args.suiteId)
@@ -2873,7 +3089,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'test_dataset_delete',
     desc: '删除测试数据集（危险操作，需用户确认）',
-    args: '{ id }',
     danger: true,
     handler: async (args) => {
       const id = needNum(args.id, 'id')
@@ -2884,7 +3099,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'test_suite_import',
     desc: '从套件包（*.astromantest.json）导入测试套件（可能覆盖同名套件，需用户确认）',
-    args: '{ path, projectId?, onConflict?: skip|overwrite|rename }',
     danger: true,
     handler: async (args) => {
       const path = needPath(args.path)
@@ -2905,7 +3119,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'test_suite_export',
     desc: '把测试套件导出为套件包（*.astromantest.json，会写入用户给出的路径）',
-    args: '{ suiteId, path }',
     danger: true,
     handler: async (args) => {
       const suiteId = needNum(args.suiteId, 'suiteId')
@@ -2917,7 +3130,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'test_run_list',
     desc: '分页列出测试运行记录（可按套件过滤；返回 total 总条数，items 最多前 50 条）',
-    args: '{ suiteId?, page?, size? }',
     handler: async (args) => {
       const suiteId = optionalNum(args.suiteId)
       const page = Math.max(1, Math.round(optionalNum(args.page) ?? 1))
@@ -2951,7 +3163,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'test_artifact_list',
     desc: '列出一次测试运行产生的附件（日志 / 截图 / 导出文件），含文件是否存在与大小',
-    args: '{ runId }',
     handler: async (args) => {
       const artifacts = await testArtifactList(needNum(args.runId, 'runId'))
       return summarizeList(
@@ -2970,7 +3181,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'test_artifact_export',
     desc: '把测试运行附件复制到用户指定路径（需用户确认）',
-    args: '{ artifactId, path }',
     danger: true,
     handler: async (args) => {
       const artifactId = needNum(args.artifactId, 'artifactId')
@@ -2982,7 +3192,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'test_preflight',
     desc: '运行前预检：检查环境、引用、脚本、数据集与压测配置，给出 errors / warnings 与是否可运行',
-    args: '{ suiteId, envId? }',
     handler: async (args) => {
       const report = await testPreflight(
         needNum(args.suiteId, 'suiteId'),
@@ -3017,9 +3226,8 @@ const SPECS: ToolSpec[] = [
   {
     name: 'run_batch',
     desc: '按顺序批量执行已保存请求（最多 50 个 × 20 轮），每个请求完整走环境 / 前置 / 后置脚本与断言，返回状态码、耗时与断言结果',
-    args: '{ requestIds: number[], rounds?, envId?, stopOnError?, timeoutMs? }',
     danger: true,
-    handler: async (args) => {
+    handler: async (args, ctx) => {
       const rawIds = Array.isArray(args.requestIds) ? args.requestIds : []
       const requestIds = rawIds.map((item) => needNum(item, 'requestIds')).slice(0, 50)
       if (!requestIds.length) throw new Error('参数 requestIds 不能为空')
@@ -3042,6 +3250,12 @@ const SPECS: ToolSpec[] = [
 
       for (let round = 1; round <= rounds && !aborted; round += 1) {
         for (const detail of details) {
+          // AI-02：停止后不再产生新请求
+          if (ctx?.isCancelled?.()) {
+            aborted = true
+            lines.push('用户已停止，后续请求未发送')
+            break
+          }
           total += 1
           const label = `${detail.name} ${detail.method} ${detail.url}`
           try {
@@ -3049,6 +3263,7 @@ const SPECS: ToolSpec[] = [
               envId,
               timeoutMs,
               cookieEnabled: true,
+              requestKey: ctx?.requestKey ?? null,
             })
             const failedAssertions = outcome.assertions.filter((item) => !item.passed).length
             const good =
@@ -3097,15 +3312,13 @@ const SPECS: ToolSpec[] = [
   {
     name: 'capture_status',
     desc: '读取抓包状态：是否录制、端口、监听地址、已抓流量数、CA 证书与系统代理状态',
-    args: '{}',
     handler: async () => captureStatusDigest(await captureStatus()),
   },
   {
     name: 'capture_flow_list',
-    desc: '列出已抓到的流量（按方法 / 域名 / 状态码 / 关键字过滤；返回 total 命中数，items 最多前 50 条）',
-    args: '{ limit?, method?, host?, status?, keyword? }',
+    desc: '列出已抓到的流量（可按方法 / 域名 / 状态码 / 关键字过滤；可用 offset 翻页）',
     handler: async (args) => {
-      const limit = Math.min(5000, Math.max(1, Math.round(optionalNum(args.limit) ?? 100)))
+      const { limit, offset } = pageWindow(args)
       const method = str(args.method).trim().toUpperCase()
       const host = str(args.host).trim().toLowerCase()
       const status = optionalNum(args.status)
@@ -3121,13 +3334,13 @@ const SPECS: ToolSpec[] = [
         }
         return true
       })
-      return summarizeList(captureFlowRows(hits.slice(0, limit)))
+      const rows = captureFlowRows(hits.slice(offset, offset + limit))
+      return pageEnvelope(hits.length, rows, args)
     },
   },
   {
     name: 'capture_flow_get',
     desc: '读取单条抓包流量的完整请求 / 响应：头、Body（文本最多 6000 字符）、耗时与错误',
-    args: '{ id }',
     handler: async (args) => {
       const detail = await captureFlowDetail(needNum(args.id, 'id'))
       const headerRows = (list: CaptureHeader[]) =>
@@ -3152,7 +3365,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'capture_start',
     desc: '启动本地抓包代理（会开始真实监听；需用户确认）。端口默认沿用当前配置',
-    args: '{ port?, bindAddr?, sslHosts?, ignorePatterns?, captureStatic?, upstreamProxy? }',
     handler: async (args) => {
       const options: CaptureStartOptions = {}
       const port = optionalNum(args.port)
@@ -3172,13 +3384,11 @@ const SPECS: ToolSpec[] = [
   {
     name: 'capture_stop',
     desc: '停止抓包代理（已抓到的流量会保留，不会清空）',
-    args: '{}',
     handler: async () => captureStatusDigest(await captureStop()),
   },
   {
     name: 'capture_repeat',
     desc: '重发一条抓包流量，可临时改方法 / URL / 请求头 / Body；录制中会生成一条新流量',
-    args: '{ id, method?, url?, headers?, body? }',
     danger: true,
     handler: async (args) => {
       const payload: CaptureRepeatPayload = { id: needNum(args.id, 'id') }
@@ -3200,7 +3410,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'capture_export',
     desc: '把抓到的流量导出为 HAR 或 ZIP（ZIP 内含按域名分组的请求 / 响应明细，用户可直接打开查看）',
-    args: '{ path, format?: har|zip, ids?: number[] }',
     danger: true,
     handler: async (args) => {
       const path = needPath(args.path)
@@ -3224,7 +3433,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'project_import',
     desc: '从 AstroMan 项目导出文件（.astroman.json）导入项目（可能覆盖同名项目，需用户确认）',
-    args: '{ path }',
     danger: true,
     handler: async (args) => {
       const project = await projectImport(needPath(args.path))
@@ -3234,7 +3442,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'project_export',
     desc: '把项目导出为 .astroman.json 文件（会写入用户给出的路径）',
-    args: '{ projectId, path }',
     danger: true,
     handler: async (args) => {
       const projectId = needNum(args.projectId, 'projectId')
@@ -3247,7 +3454,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'api_import',
     desc: '导入 Postman Collection v2 / Apifox / HAR 文件（projectId 为空则新建项目）',
-    args: '{ path, projectId? }',
     handler: async (args) => {
       const project = await apiImport(needPath(args.path), optionalNum(args.projectId) ?? null)
       return { id: project.id, name: project.name }
@@ -3256,7 +3462,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'openapi_import',
     desc: '导入 OpenAPI 3 / Swagger 文件（projectId 为空则新建项目）',
-    args: '{ path, projectId? }',
     handler: async (args) => {
       const project = await openapiImport(needPath(args.path), optionalNum(args.projectId) ?? null)
       return { id: project.id, name: project.name }
@@ -3265,7 +3470,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'openapi_export',
     desc: '把项目导出为 OpenAPI 3 JSON（会写入用户给出的路径）',
-    args: '{ projectId, path }',
     danger: true,
     handler: async (args) => {
       const projectId = needNum(args.projectId, 'projectId')
@@ -3278,7 +3482,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'report_export',
     desc: '把压测报告导出为 HTML（会写入用户给出的路径）',
-    args: '{ id, path }',
     danger: true,
     handler: async (args) => {
       const id = needNum(args.id, 'id')
@@ -3291,19 +3494,16 @@ const SPECS: ToolSpec[] = [
   {
     name: 'workspace_stats',
     desc: '工作台总览：项目 / 接口 / 环境 / 记录 / 报告数量与压测成功率（已转中文标签）',
-    args: '无',
     handler: async () => workspaceDigest(await workspaceStats()),
   },
   {
     name: 'dashboard_metrics',
     desc: '数据大屏指标：趋势、状态码、方法、耗时、热门接口、活跃项目（已转中文标签与可读单位）',
-    args: '无',
     handler: async () => dashboardDigest(await dashboardMetrics()),
   },
   {
     name: 'system_snapshot',
     desc: '读取当前电脑资源概览（CPU / 内存 / 磁盘 / 网络 / GPU / 电池）；只在用户问「电脑为什么卡 / 现在占用多少」时调用一次',
-    args: '无',
     handler: async () => {
       const snap = await winstatsSnapshot()
       return {
@@ -3343,7 +3543,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'system_process_list',
     desc: '按 CPU 或内存列出当前占用最高的进程；可按进程名关键字过滤；只读，不会结束进程',
-    args: '{ keyword?, limit?, byMemory? }',
     handler: async (args) => {
       const limit = Math.min(50, Math.max(1, Math.round(optionalNum(args.limit) ?? 15)))
       const byMemory = args.byMemory === true
@@ -3369,7 +3568,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'app_info',
     desc: '读取 AstroMan 版本、数据目录与数据库路径；排障或回答「数据存在哪」时使用',
-    args: '无',
     handler: async () => {
       const info = await appInfo()
       return {
@@ -3382,7 +3580,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'notes_counts',
     desc: '读取记事本计数：待办、今日到期、逾期、已完成；回答「我还有多少事」',
-    args: '无',
     handler: async () => {
       const counts = await notesCounts()
       return {
@@ -3396,13 +3593,11 @@ const SPECS: ToolSpec[] = [
   {
     name: 'notes_tags',
     desc: '列出现有记事本标签及各自条目数，便于按标签筛选',
-    args: '无',
     handler: async () => summarizeList(await notesTags()),
   },
   {
     name: 'notes_snooze',
     desc: '把某个待办 / 笔记的提醒延后 N 分钟（需用户确认）',
-    args: '{ id, minutes }',
     danger: true,
     handler: async (args) => {
       const id = needNum(args.id, 'id')
@@ -3420,7 +3615,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'env_delete',
     desc: '删除某个环境及其变量（危险操作，需用户确认）',
-    args: '{ id }',
     danger: true,
     handler: async (args) => {
       const id = needNum(args.id, 'id')
@@ -3431,7 +3625,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'env_script_save',
     desc: '写入 / 清空某个环境的环境脚本（每次发请求前执行，可用 vars.set 生成运行时变量）',
-    args: '{ id, script }',
     danger: true,
     handler: async (args) => {
       const id = needNum(args.id, 'id')
@@ -3444,7 +3637,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'report_delete',
     desc: '删除某份压测报告（危险操作，需用户确认，无法撤销）',
-    args: '{ id }',
     danger: true,
     handler: async (args) => {
       const id = needNum(args.id, 'id')
@@ -3455,7 +3647,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'report_requests',
     desc: '分页读取压测报告里的单请求记录（状态码、耗时、是否成功、错误原因）；total 为真实总数',
-    args: '{ id, page?, pageSize?, success? }',
     handler: async (args) => {
       const id = needNum(args.id, 'id')
       const page = Math.max(1, Math.round(optionalNum(args.page) ?? 1))
@@ -3488,7 +3679,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'history_stats',
     desc: '请求历史总览：历史条数、单接口运行记录数、最早 / 最近记录时间',
-    args: '无',
     handler: async () => {
       const stats: HistoryStats = await historyStats()
       return {
@@ -3502,7 +3692,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'run_list',
     desc: '读取某个已保存请求的运行记录摘要（状态码、耗时、响应片段）；按时间倒序，可用 offset 翻页；需先拿到 requestId',
-    args: '{ requestId, limit?, offset? }',
     handler: async (args) => {
       const requestId = needNum(args.requestId, 'requestId')
       const limit = Math.min(200, Math.max(1, Math.round(optionalNum(args.limit) ?? 50)))
@@ -3536,7 +3725,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'run_get',
     desc: '读取单次运行记录的完整快照：请求头、查询参数、请求体、响应头、响应体、耗时与错误；id 来自 run_list',
-    args: '{ id }',
     handler: async (args) => {
       const run = await runGet(needNum(args.id, 'id'))
       const requestBody = str(run.body)
@@ -3582,7 +3770,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'cookie_list',
     desc: '列出本机 Cookie 管理器中的 Cookie（值已打码，只用于确认域名与是否过期）',
-    args: '无',
     handler: async () => {
       const items: CookieItem[] = await cookieList()
       const rows = items.map((item) => ({
@@ -3603,7 +3790,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'toolbox_json_format',
     desc: '格式化 / 压缩 JSON，返回缩进后的文本；解析失败会给出错误原因',
-    args: '{ text, indent? }',
     handler: async (args) => {
       const indent = Math.min(8, Math.max(0, Math.round(optionalNum(args.indent) ?? 2)))
       return stringifyJson(parseJson(str(args.text)), indent)
@@ -3612,7 +3798,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'toolbox_json_to_entity',
     desc: '把 JSON 转成 Java / C# / Go / TypeScript 实体类代码',
-    args: '{ text, target: java|csharp|go|ts, rootName?, packageName?, lombok?, comments? }',
     handler: async (args) => {
       const target = str(args.target, 'java') as EntityTarget
       return jsonToEntity(target, str(args.text), {
@@ -3626,7 +3811,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'toolbox_json_to_sql',
     desc: '把 JSON（对象或数组）转成 INSERT SQL 语句，需指定表名',
-    args: '{ text, table, mode?: single|batch }',
     handler: async (args) => {
       const mode = str(args.mode, 'single') === 'batch' ? 'batch' : 'single'
       return jsonToSql(str(args.text), str(args.table).trim(), mode)
@@ -3635,7 +3819,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'toolbox_convert',
     desc: '结构化数据互转：JSON↔YAML / JSON↔XML / CSV↔JSON / JSON→Markdown / JSON↔Query String',
-    args: '{ text, kind: json2yaml|yaml2json|json2xml|xml2json|csv2json|json2csv|json2markdown|json2query|query2json, delimiter?, rootName? }',
     handler: async (args) => {
       const text = str(args.text)
       const delimiter = str(args.delimiter, ',') || ','
@@ -3666,13 +3849,11 @@ const SPECS: ToolSpec[] = [
   {
     name: 'toolbox_timestamp',
     desc: '时间戳 / 日期互转：秒、毫秒、纳秒与本地 / UTC / ISO 时间',
-    args: '{ input? }',
     handler: async (args) => timestampInfo(str(args.input)),
   },
   {
     name: 'toolbox_base64',
     desc: 'Base64 编码 / 解码（含 URL-safe 变体）',
-    args: '{ text, action: encode|decode|urlEncode|urlDecode }',
     handler: async (args) => {
       const text = str(args.text)
       switch (str(args.action)) {
@@ -3692,7 +3873,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'toolbox_hash',
     desc: '计算文本哈希（MD5 / SHA1 / SHA256 / SHA512）；传 hmacKey 时改为 HMAC 签名',
-    args: '{ text, algorithm: MD5|SHA1|SHA256|SHA512, hmacKey? }',
     handler: async (args) => {
       const text = str(args.text)
       const algorithm = str(args.algorithm, 'SHA256') || 'SHA256'
@@ -3704,13 +3884,11 @@ const SPECS: ToolSpec[] = [
   {
     name: 'toolbox_url',
     desc: '解析 URL：协议、主机、端口、路径、查询串与逐项查询参数',
-    args: '{ text }',
     handler: async (args) => urlInfo(str(args.text)),
   },
   {
     name: 'toolbox_regex',
     desc: '正则匹配：返回命中数量与每组匹配内容；最多返回前 50 条',
-    args: '{ pattern, text, flags? }',
     handler: async (args) => {
       const result = runRegex(str(args.pattern), str(args.flags, 'g') || 'g', str(args.text))
       const rows = result.matches.slice(0, 50).map((item) => ({
@@ -3731,7 +3909,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'toolbox_jwt',
     desc: '解析 JWT 的 Header / Payload（不校验签名，签名段只显示前 12 位）',
-    args: '{ token }',
     handler: async (args) => {
       const parts = decodeJwt(str(args.token))
       return {
@@ -3744,7 +3921,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'toolbox_diff',
     desc: '对比两段文本的行级差异，返回新增 / 删除行数；format=json 时附带明细',
-    args: '{ left, right, format?: text|json }',
     handler: async (args) => {
       const result = diffLines(str(args.left), str(args.right))
       if (str(args.format, 'text') !== 'json') return diffAsText(result)
@@ -3766,7 +3942,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'toolbox_uuid',
     desc: '生成 UUID v4（默认 1 个，最多 20 个）',
-    args: '{ count? }',
     handler: async (args) => {
       const count = Math.min(20, Math.max(1, Math.round(optionalNum(args.count) ?? 1)))
       return { total: count, items: Array.from({ length: count }, () => uuidV4()) }
@@ -3775,7 +3950,6 @@ const SPECS: ToolSpec[] = [
   {
     name: 'tool_search',
     desc: '按关键词检索工具清单（长尾工具先用它查用法），返回工具名、用途与参数',
-    args: '{ keyword }',
     handler: async (args) => {
       const keyword = str(args.keyword).trim().toLowerCase()
       if (!keyword) throw new Error('参数 keyword 不能为空')
@@ -3783,7 +3957,7 @@ const SPECS: ToolSpec[] = [
       const terms = [keyword, ...aliases.flatMap((item) => item.tools)].map((item) => item.toLowerCase())
       const hits = SPECS.filter((spec) => {
         if (spec.name === 'tool_search') return false
-        const haystack = `${spec.name} ${spec.desc} ${spec.args}`.toLowerCase()
+        const haystack = `${spec.name} ${spec.desc} ${toolArgsSignature(spec.name)}`.toLowerCase()
         return terms.some((term) => term && haystack.includes(term))
       }).slice(0, 12)
       if (!hits.length) {
@@ -3794,7 +3968,11 @@ const SPECS: ToolSpec[] = [
       }
       return {
         total: hits.length,
-        items: hits.map((spec) => ({ tool: spec.name, desc: spec.desc, args: spec.args })),
+        items: hits.map((spec) => ({
+          tool: spec.name,
+          desc: spec.desc,
+          args: toolArgsSignature(spec.name),
+        })),
       }
     },
   },
@@ -4066,7 +4244,8 @@ const CORE_TOOL_NAMES = new Set([
   'tool_search',
 ])
 
-const catalogLine = (spec: ToolSpec) => `- ${spec.name}：${spec.desc}；参数 ${spec.args}`
+const catalogLine = (spec: ToolSpec) =>
+  `- ${spec.name}：${spec.desc}；参数 ${toolArgsSignature(spec.name)}`
 
 /** 供系统提示词使用的工具清单：常用工具给全量说明，长尾只给名字 */
 export const TOOL_CATALOG = [
@@ -4164,7 +4343,13 @@ export async function executeTool(
   tool: string,
   args: ToolArgs,
   sessionId: number | null,
-  meta?: { round?: number; traceId?: string | null },
+  meta?: {
+    round?: number
+    traceId?: string | null
+    confirmed?: boolean
+    requestKey?: string | null
+    isCancelled?: () => boolean
+  },
 ): Promise<ToolResult> {
   const spec = TOOL_MAP.get(tool)
   const started = typeof performance !== 'undefined' ? performance.now() : Date.now()
@@ -4185,7 +4370,12 @@ export async function executeTool(
     } else {
       try {
         const limit = toolTimeoutOf(tool, args)
-        let task = spec.handler(args)
+        let task = spec.handler(args, {
+          confirmed: meta?.confirmed === true,
+          traceId: meta?.traceId ?? null,
+          requestKey: meta?.requestKey ?? null,
+          isCancelled: meta?.isCancelled,
+        })
         if (limit) task = withTimeout(task, limit)
         raw = await task
         output = spec.format ? spec.format(raw) : clip(pretty(raw), 8000)
@@ -4208,7 +4398,17 @@ export async function executeTool(
     output = maskSensitive(output)
   }
 
-  const { outcome, retryable } = classifyToolFailure(tool, timedOut, ok)
+  // AI-02：停止后的结果统一标记「已取消」，写工具无法确认是否已落库，按结果未知处理
+  const cancelled = meta?.isCancelled?.() === true
+  if (cancelled) {
+    ok = false
+    if (!output.startsWith('已取消')) {
+      output = `已取消：${output || '用户已停止，未产生可复用的结果'}`
+    }
+  }
+  const failed = classifyToolFailure(tool, timedOut, ok)
+  const outcome = cancelled && isWriteTool(tool) ? 'unknown' : failed.outcome
+  const retryable = cancelled ? false : failed.retryable
 
   const durationMs = Math.round(
     (typeof performance !== 'undefined' ? performance.now() : Date.now()) - started,
@@ -4225,7 +4425,7 @@ export async function executeTool(
       resultPreview: clip(output, 2000),
       round: meta?.round ?? 0,
       traceId: meta?.traceId ?? null,
-      timeout: timedOut,
+      timeout: timedOut || cancelled,
     })
   } catch {
     // 流水写入失败不影响主流程

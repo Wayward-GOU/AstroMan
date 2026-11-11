@@ -200,6 +200,11 @@ onMounted(load)
   gap: 12px;
   padding: 16px;
   min-height: 150px;
+  transition: border-color 0.15s;
+}
+
+.project-card:hover {
+  border-color: var(--fm-border-strong);
 }
 .card-head {
   display: flex;

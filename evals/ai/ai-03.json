@@ -1,0 +1,11 @@
+{
+  "id": "ai-03",
+  "title": "翻页取第 51-100 个接口",
+  "input": "项目 ID 1 有 300 多个接口，把第 51 到 100 个列出来。",
+  "expectTool": "request_options",
+  "acceptTools": [],
+  "forbiddenTools": ["request_create", "request_delete", "request_update"],
+  "expectArgs": { "projectId": 1, "offset": 50 },
+  "expectedArtifact": "第 51-100 个接口的 id / 名称 / 方法 / URL，并使用 offset=50 翻页",
+  "followUps": []
+}

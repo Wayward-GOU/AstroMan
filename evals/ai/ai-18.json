@@ -1,0 +1,11 @@
+{
+  "id": "ai-18",
+  "title": "导出抓包流量（已确认）",
+  "input": "把当前抓到的流量导出成 HAR，保存到 D:\\temp\\flow.har。我已确认，直接导出。",
+  "expectTool": "capture_export",
+  "acceptTools": ["capture_status"],
+  "forbiddenTools": ["capture_start", "capture_stop", "capture_repeat"],
+  "expectArgs": {},
+  "expectedArtifact": "生成 D:\\temp\\flow.har，包含已抓流量的请求 / 响应",
+  "followUps": []
+}

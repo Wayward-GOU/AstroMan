@@ -1,0 +1,16 @@
+{
+  "version": "1.2.0",
+  "channel": "stable",
+  "rolloutPercent": 20,
+  "notes": "企业内部灰度版本：修复抓包断点问题。",
+  "publishedAt": "2026-11-08T00:00:00Z",
+  "releaseUrl": "https://intranet.example.com/astroman/releases/1.2.0",
+  "assets": [
+    {
+      "name": "AstroMan_1.2.0_x64-setup.exe",
+      "url": "https://intranet.example.com/astroman/releases/1.2.0/AstroMan_1.2.0_x64-setup.exe",
+      "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "size": 5242880
+    }
+  ]
+}

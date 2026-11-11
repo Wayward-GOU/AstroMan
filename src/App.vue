@@ -21,6 +21,7 @@ import {
   MenuFoldOutlined,
   MenuUnfoldOutlined,
   ArrowLeftOutlined,
+  CloseOutlined,
   ScheduleOutlined,
 } from '@ant-design/icons-vue'
 import AppLogo from '@/components/AppLogo.vue'
@@ -31,6 +32,8 @@ import ErrorDialog from '@/components/ErrorDialog.vue'
 import NotesReminderHost from '@/components/notes/NotesReminderHost.vue'
 import HangzaiTaskDock from '@/components/HangzaiTaskDock.vue'
 import { currentTheme, currentThemeId, setTheme, themes } from '@/stores/theme'
+import { staticTokens, type ColorKey } from '@/design/tokens'
+import { nightColors, paperColors } from '@/design/themes'
 import { canGoBack, previousEntry, stepBack } from '@/stores/navHistory'
 import { isMac, shortcutText } from '@/utils/platform'
 import { checkForUpdates, isAutoUpdateEnabled } from '@/utils/updater'
@@ -161,6 +164,8 @@ const navGroups = computed(() => {
 /* ---------- 侧边栏折叠 ---------- */
 const SIDEBAR_KEY = 'astroman:sidebar-collapsed'
 const NARROW_BREAKPOINT = 1180
+/** 低于此宽度侧边栏改为抽屉，主内容独占整屏（1366×768@150% 也能放下） */
+const DRAWER_BREAKPOINT = 1024
 
 const sidebarPinned = ref(false)
 try {
@@ -169,13 +174,48 @@ try {
   // localStorage 不可用时使用默认展开态
 }
 const windowNarrow = ref(false)
-const sidebarCollapsed = computed(() => windowNarrow.value || sidebarPinned.value)
+const windowDrawer = ref(false)
+const sidebarDrawerOpen = ref(false)
+const sidebarCollapsed = computed(
+  () => !windowDrawer.value && (windowNarrow.value || sidebarPinned.value),
+)
 
 function syncSidebarWidth() {
-  windowNarrow.value = window.innerWidth < NARROW_BREAKPOINT
+  const width = window.innerWidth
+  windowDrawer.value = width < DRAWER_BREAKPOINT
+  windowNarrow.value = width < NARROW_BREAKPOINT
+  if (!windowDrawer.value) sidebarDrawerOpen.value = false
 }
 
+function openSidebarDrawer() {
+  sidebarDrawerOpen.value = true
+}
+
+function closeSidebarDrawer() {
+  sidebarDrawerOpen.value = false
+}
+
+/** 全局动效开关：localStorage 里记 off 时关掉所有非必要动画 */
+function applyMotionPreference() {
+  let off = false
+  try {
+    off = localStorage.getItem('fm-motion') === 'off'
+  } catch {
+    // localStorage 不可用时跟随系统 prefers-reduced-motion
+  }
+  document.documentElement.dataset.motion = off ? 'off' : 'on'
+}
+
+watch(
+  () => route.fullPath,
+  () => closeSidebarDrawer(),
+)
+
 function toggleSidebar() {
+  if (windowDrawer.value) {
+    closeSidebarDrawer()
+    return
+  }
   if (windowNarrow.value) {
     // 窄窗口下强制展开会把内容挤没，先让窗口变宽再展开
     windowNarrow.value = false
@@ -346,6 +386,7 @@ function groupPalette(items: PaletteItem[]) {
 }
 
 onMounted(() => {
+  applyMotionPreference()
   if (isBare.value) return
   const stored = Number(localStorage.getItem(ZOOM_KEY) ?? '1')
   applyZoom(Number.isFinite(stored) && stored > 0 ? stored : 1, false)
@@ -423,36 +464,148 @@ const activeKey = computed(() => {
 })
 
 const theme = computed(() => {
+  // 密度本次不动（保持 32/34），统一到 30 留到 P2 单独回归
   const controlHeight = isMac ? 32 : 34
+  const current = currentTheme.value
+  const vars = current.vars
+  // 取色器：主题 vars 优先，缺键时按当前明暗组回退。
+  // 不能直接写 vars['--fm-x']：C1 阶段 21 套旧主题还没有 border-control /
+  // brass / brass-text，直接取值是 undefined，AntD 会退回默认算法色。
+  // 也不能从 vars 取 font-sans / radius / gap —— 它们属于静态令牌，不在 vars 里。
+  const base = current.dark ? nightColors : paperColors
+  const c = (key: ColorKey) => vars[`--fm-${key}`] ?? base[key]
+
   return {
-    algorithm: AntTheme[currentTheme.value.dark ? 'darkAlgorithm' : 'defaultAlgorithm'],
+    algorithm: AntTheme[current.dark ? 'darkAlgorithm' : 'defaultAlgorithm'],
     token: {
-      colorPrimary: currentTheme.value.vars['--fm-primary'],
-      colorInfo: currentTheme.value.vars['--fm-primary'],
-      colorSuccess: currentTheme.value.vars['--fm-success'],
-      colorWarning: currentTheme.value.vars['--fm-warning'],
-      colorError: currentTheme.value.vars['--fm-danger'],
-      colorText: currentTheme.value.vars['--fm-text'],
-      colorTextSecondary: currentTheme.value.vars['--fm-text-2'],
-      colorBorder: currentTheme.value.vars['--fm-border'],
-      colorBgLayout: currentTheme.value.vars['--fm-bg'],
-      colorBgContainer: currentTheme.value.vars['--fm-surface'],
-      colorBgElevated: currentTheme.value.vars['--fm-surface'],
-      borderRadius: isMac ? 7 : 6,
-      borderRadiusLG: isMac ? 11 : 10,
+      /* 语义色 */
+      colorPrimary: c('primary'),
+      colorInfo: c('primary'),
+      colorSuccess: c('success'),
+      colorWarning: c('warning'),
+      colorError: c('danger'),
+      colorLink: c('primary'),
+
+      /* 文字三级 */
+      colorText: c('text'),
+      colorTextSecondary: c('text-2'),
+      colorTextTertiary: c('muted'),
+      colorTextQuaternary: c('muted'),
+      colorTextPlaceholder: c('muted'),
+
+      /* 描边：控件描边与发丝线必须分开 —— 本次最关键的一处修正 */
+      colorBorder: c('border-control'),
+      colorBorderSecondary: c('border'),
+      colorSplit: c('border'),
+
+      /* 底色 */
+      colorBgLayout: c('bg'),
+      colorBgContainer: c('surface'),
+      colorBgElevated: c('surface'),
+      colorFillQuaternary: c('surface-alt'),
+      colorFillTertiary: c('surface-alt'),
+
+      /* 形态 */
+      borderRadius: 3,
+      borderRadiusLG: 3,
+      borderRadiusSM: 2,
+      borderRadiusXS: 2,
       fontSize: 13,
-      fontFamily: isMac
-        ? "'SF Pro Text', -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Hiragino Sans GB', sans-serif"
-        : "'Segoe UI Variable Text', 'Segoe UI', 'Microsoft YaHei', 'PingFang SC', sans-serif",
+      fontFamily: staticTokens['font-sans'],
+      lineHeight: 1.7,
+
+      /* 去投影 */
+      boxShadow: 'none',
+      boxShadowSecondary: 'none',
+      boxShadowTertiary: 'none',
+
+      /* 动效 */
+      motionDurationFast: '0.12s',
+      motionDurationMid: '0.18s',
+      motionDurationSlow: '0.24s',
+      motionEaseOut: 'cubic-bezier(0.2, 0.8, 0.2, 1)',
+
+      wireframe: false,
     },
     components: {
-      Button: { controlHeight, fontWeight: 500 },
-      Input: { controlHeight },
-      Select: { controlHeight },
-      Table: {
-        headerBg: currentTheme.value.vars['--fm-surface-alt'],
-        headerColor: currentTheme.value.vars['--fm-muted'],
+      Button: {
+        controlHeight,
+        fontWeight: 500,
+        primaryShadow: 'none',
+        defaultShadow: 'none',
+        dangerShadow: 'none',
+        defaultBorderColor: c('border-control'),
+        defaultColor: c('text'),
       },
+      Input: {
+        controlHeight,
+        activeShadow: 'none',
+        activeBorderColor: c('primary'),
+        hoverBorderColor: c('border-strong'),
+        paddingInline: 10,
+      },
+      InputNumber: { controlHeight, activeShadow: 'none' },
+      Select: {
+        controlHeight,
+        optionSelectedBg: c('primary-soft'),
+        optionSelectedColor: c('primary'),
+        optionActiveBg: c('surface-alt'),
+      },
+      Table: {
+        headerBg: c('surface-alt'),
+        headerColor: c('muted'),
+        headerSplitColor: 'transparent',
+        borderColor: c('border'),
+        rowHoverBg: c('surface-alt'),
+        cellPaddingBlock: 8,
+        cellPaddingInline: 16,
+        footerBg: c('surface'),
+      },
+      Tabs: {
+        itemSelectedColor: c('primary'),
+        itemHoverColor: c('text'),
+        inkBarColor: c('primary'),
+        titleFontSize: 12.5,
+        horizontalItemPadding: '9px 0',
+        horizontalItemGutter: 24,
+      },
+      Collapse: {
+        headerBg: 'transparent',
+        contentBg: 'transparent',
+        headerPadding: '0 16px',
+      },
+      Modal: {
+        contentBg: c('surface'),
+        headerBg: c('surface'),
+        titleFontSize: 16,
+      },
+      Drawer: { colorBgElevated: c('surface') },
+      Tag: { defaultBg: c('surface-alt'), defaultColor: c('muted'), borderRadiusSM: 2 },
+      Tree: {
+        nodeSelectedBg: c('primary-soft'),
+        nodeHoverBg: c('surface-alt'),
+        titleHeight: 28,
+      },
+      Menu: {
+        itemSelectedBg: c('primary-soft'),
+        itemSelectedColor: c('primary'),
+        itemHoverBg: c('surface-alt'),
+      },
+      Dropdown: { paddingBlock: 4 },
+      Tooltip: { colorBgSpotlight: c('text'), colorTextLightSolid: c('surface') },
+      Message: { contentBg: c('surface') },
+      Notification: { colorBgElevated: c('surface') },
+      Pagination: { itemActiveBg: c('surface-alt') },
+      Progress: { defaultColor: c('primary'), remainingColor: c('border') },
+      Empty: { colorTextDescription: c('muted') },
+      Steps: { colorPrimary: c('primary') },
+      Alert: { defaultPadding: '8px 12px' },
+      Descriptions: { labelBg: c('surface-alt') },
+      Segmented: { itemSelectedBg: c('surface'), trackBg: c('surface-alt') },
+      Switch: { colorPrimary: c('primary') },
+      Checkbox: { colorPrimary: c('primary') },
+      Radio: { colorPrimary: c('primary') },
+      Slider: { trackBg: c('primary'), handleColor: c('primary') },
     },
   }
 })
@@ -462,7 +615,34 @@ const theme = computed(() => {
   <a-config-provider :theme="theme">
     <router-view v-if="isBare" />
     <div v-else class="shell">
-      <aside class="sider" :class="{ collapsed: sidebarCollapsed }">
+      <button
+        v-if="windowDrawer"
+        class="sider-fab"
+        type="button"
+        aria-label="打开导航菜单"
+        @click="openSidebarDrawer"
+      >
+        <MenuUnfoldOutlined />
+      </button>
+      <div
+        v-if="windowDrawer && sidebarDrawerOpen"
+        class="sider-backdrop"
+        @click="closeSidebarDrawer"
+      />
+      <aside
+        class="sider"
+        :class="{ collapsed: sidebarCollapsed, drawer: windowDrawer, 'drawer-open': sidebarDrawerOpen }"
+        :aria-hidden="windowDrawer && !sidebarDrawerOpen ? 'true' : undefined"
+      >
+        <button
+          v-if="windowDrawer"
+          class="sider-drawer-close"
+          type="button"
+          aria-label="关闭导航菜单"
+          @click="closeSidebarDrawer"
+        >
+          <CloseOutlined />
+        </button>
         <div class="brand">
           <AppLogo :size="34" />
           <div class="brand-text">
@@ -499,30 +679,37 @@ const theme = computed(() => {
         <nav class="nav">
           <div v-for="group in navGroups" :key="group.name" class="nav-section">
             <div class="nav-label">{{ group.name }}</div>
-            <router-link
+            <a-tooltip
               v-for="item in group.items"
               :key="item.key"
-              :to="item.to"
-              class="nav-item"
-              :class="{ active: activeKey === item.key }"
-              :title="`${item.label} · ${item.hint}`"
+              :title="sidebarCollapsed ? item.label : undefined"
+              placement="right"
+              :mouse-enter-delay="0.08"
             >
-              <span class="nav-icon">
-                <component :is="item.icon" />
-              </span>
-              <span class="nav-text">
-                <span class="nav-name">{{ item.label }}</span>
-              </span>
-              <span v-if="item.key === 'notes' && notesStore.badge" class="nav-badge">
-                {{ notesStore.badge }}
-              </span>
-              <span
-                v-if="item.key === 'ai' && hangzaiTask.active"
-                class="nav-live"
-                :title="hangzaiTask.phaseText"
-              />
-              <span class="nav-indicator" />
-            </router-link>
+              <router-link
+                :to="item.to"
+                class="nav-item"
+                :class="{ active: activeKey === item.key }"
+                :aria-label="item.label"
+                :title="sidebarCollapsed ? undefined : `${item.label} · ${item.hint}`"
+              >
+                <span class="nav-icon">
+                  <component :is="item.icon" />
+                </span>
+                <span class="nav-text">
+                  <span class="nav-name">{{ item.label }}</span>
+                </span>
+                <span v-if="item.key === 'notes' && notesStore.badge" class="nav-badge">
+                  {{ notesStore.badge }}
+                </span>
+                <span
+                  v-if="item.key === 'ai' && hangzaiTask.active"
+                  class="nav-live"
+                  :title="hangzaiTask.phaseText"
+                />
+                <span class="nav-indicator" />
+              </router-link>
+            </a-tooltip>
           </div>
         </nav>
 
@@ -652,6 +839,82 @@ const theme = computed(() => {
   padding: 14px 8px 12px;
 }
 
+/* ---------- 窄窗口抽屉导航（<1024） ---------- */
+.sider-fab,
+.sider-backdrop,
+.sider-drawer-close {
+  display: none;
+}
+
+@media (max-width: 1023px) {
+  .sider-fab {
+    position: fixed;
+    left: 10px;
+    top: 9px;
+    z-index: 70;
+    width: 32px;
+    height: 32px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--fm-border);
+    border-radius: 8px;
+    background: var(--fm-surface);
+    color: var(--fm-text-2);
+    box-shadow: var(--fm-shadow-sm);
+    cursor: pointer;
+  }
+
+  .sider-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 80;
+    display: block;
+    background: rgba(15, 23, 42, 0.38);
+  }
+
+  .sider.drawer {
+    position: fixed;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    z-index: 90;
+    width: 244px;
+    padding: 14px 10px 12px;
+    transform: translateX(-100%);
+    transition: transform 0.18s ease;
+    box-shadow: var(--fm-shadow-lg);
+  }
+
+  .sider.drawer.drawer-open {
+    transform: translateX(0);
+  }
+
+  .sider-drawer-close {
+    position: absolute;
+    right: 8px;
+    top: 10px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 26px;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--fm-sidebar-text);
+    cursor: pointer;
+  }
+
+  .sider-drawer-close:hover {
+    background: var(--fm-sidebar-hover);
+  }
+
+  .main {
+    width: 100%;
+  }
+}
+
 .brand {
   display: flex;
   align-items: center;
@@ -675,12 +938,17 @@ const theme = computed(() => {
   min-width: 0;
 }
 
+/* 品牌区在深色侧栏上，必须用侧栏自己的文字色阶 */
 .brand-name {
-  color: var(--fm-text);
+  color: var(--fm-sidebar-text);
   font-weight: 700;
   font-size: 14.5px;
   letter-spacing: 0.2px;
-  background: linear-gradient(120deg, var(--fm-text) 30%, var(--fm-primary) 100%);
+  background: linear-gradient(
+    120deg,
+    var(--fm-sidebar-text) 30%,
+    var(--fm-sidebar-active-text) 100%
+  );
   -webkit-background-clip: text;
   background-clip: text;
   -webkit-text-fill-color: transparent;
@@ -688,7 +956,7 @@ const theme = computed(() => {
 
 .brand-sub {
   font-size: 10px;
-  color: var(--fm-muted);
+  color: var(--fm-sidebar-icon);
   letter-spacing: 0.4px;
   margin-top: 1px;
 }
@@ -840,8 +1108,7 @@ const theme = computed(() => {
   font-weight: 600;
   letter-spacing: 1px;
   text-transform: uppercase;
-  color: var(--fm-muted);
-  opacity: 0.75;
+  color: var(--fm-sidebar-icon);
 }
 
 .nav-item {
@@ -857,9 +1124,9 @@ const theme = computed(() => {
   transition: background 0.16s, color 0.16s;
 }
 
+/* 侧栏是深色锚点：悬停只能换侧栏自己的色阶，不能落到正文色上 */
 .nav-item:hover {
   background: var(--fm-sidebar-hover);
-  color: var(--fm-text-2);
 }
 
 .nav-item.active {
@@ -893,7 +1160,8 @@ const theme = computed(() => {
 }
 
 .nav-item:hover .nav-icon {
-  color: var(--fm-text);
+  color: var(--fm-sidebar-active-text);
+  background: color-mix(in srgb, var(--fm-primary) 10%, transparent);
 }
 
 .nav-item.active .nav-icon {
@@ -1007,6 +1275,12 @@ const theme = computed(() => {
   width: 30px;
   height: 28px;
   font-size: 15px;
+  transition: transform 0.18s ease, color 0.16s ease, background 0.16s ease;
+}
+
+/* 折叠态悬停放大图标，配合右侧 tooltip 露出名称，接近 Dock 的反馈 */
+.sider.collapsed .nav-item:hover .nav-icon {
+  transform: scale(1.22);
 }
 
 /* ---------- 缩放控制：一条横向胶囊 ---------- */
@@ -1104,7 +1378,7 @@ const theme = computed(() => {
 
 .sider-toggle:hover {
   background: var(--fm-sidebar-hover);
-  color: var(--fm-primary);
+  color: var(--fm-sidebar-active-text);
 }
 
 .sider.collapsed .sider-toggle {

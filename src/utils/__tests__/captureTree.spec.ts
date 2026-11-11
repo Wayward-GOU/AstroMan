@@ -4,7 +4,18 @@ import {
   buildCaptureTree,
   captureFlowLabel,
   captureTreeKeys,
+  captureTreeWindow,
+  CAPTURE_ROW_HEIGHT,
 } from '@/utils/captureTree'
+
+type FlatRow = { kind: 'host' | 'folder' | 'flow'; key: string }
+
+function flatRows(count: number): FlatRow[] {
+  return Array.from({ length: count }, (_, index) => ({
+    kind: index % 3 === 0 ? 'host' : index % 3 === 1 ? 'folder' : 'flow',
+    key: `r${index}`,
+  }))
+}
 
 function flow(
   id: number,
@@ -96,6 +107,51 @@ describe('captureFlowLabel', () => {
     expect(captureFlowLabel(flow(1, 'a.com', '/v1/users?page=1'))).toBe('users?page=1')
     expect(captureFlowLabel(flow(1, 'a.com', '/v1/users/'))).toBe('users')
     expect(captureFlowLabel(flow(1, 'a.com', '/'))).toBe('/')
+  })
+})
+
+describe('captureTreeWindow', () => {
+  it('视口足够时返回全部行，总高度按各类行高累计', () => {
+    const rows = flatRows(3)
+    const result = captureTreeWindow(rows, 0, 1000)
+    expect(result.items.map((item) => item.row.key)).toEqual(['r0', 'r1', 'r2'])
+    expect(result.top).toBe(0)
+    expect(result.height).toBe(
+      CAPTURE_ROW_HEIGHT.host + CAPTURE_ROW_HEIGHT.folder + CAPTURE_ROW_HEIGHT.flow,
+    )
+    expect(result.items.map((item) => item.top)).toEqual([
+      0,
+      CAPTURE_ROW_HEIGHT.host,
+      CAPTURE_ROW_HEIGHT.host + CAPTURE_ROW_HEIGHT.folder,
+    ])
+  })
+
+  it('滚动到中段只返回视口附近的行，偏移量与累计行高一致', () => {
+    const rows = flatRows(300)
+    const result = captureTreeWindow(rows, 1200, 200, 0)
+    expect(result.items.length).toBeGreaterThan(0)
+    expect(result.items.length).toBeLessThan(rows.length)
+    // 窗口第一行必须覆盖 scrollTop，之后的 top 依次递增
+    expect(result.items[0].top).toBeLessThanOrEqual(1200)
+    const first = result.items[0]
+    expect(first.top + CAPTURE_ROW_HEIGHT[first.row.kind]).toBeGreaterThan(1200)
+    for (let index = 1; index < result.items.length; index += 1) {
+      expect(result.items[index].top).toBeGreaterThan(result.items[index - 1].top)
+    }
+    // 最后一行覆盖视口底部
+    const last = result.items[result.items.length - 1]
+    expect(last.top).toBeLessThan(1400)
+  })
+
+  it('滚动超过底部时收敛到最后一段，不返回空窗口', () => {
+    const rows = flatRows(30)
+    const result = captureTreeWindow(rows, 999_999, 200, 0)
+    expect(result.items.length).toBeGreaterThan(0)
+    expect(result.items[result.items.length - 1].row.key).toBe('r29')
+  })
+
+  it('空树返回零高度空窗口', () => {
+    expect(captureTreeWindow([], 0, 300)).toEqual({ items: [], top: 0, height: 0 })
   })
 })
 

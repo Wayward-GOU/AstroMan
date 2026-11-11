@@ -1,0 +1,11 @@
+{
+  "id": "ai-04",
+  "title": "搜索接口",
+  "input": "在项目 ID 1 里搜一下 URL 包含 login 的接口。",
+  "expectTool": "request_search",
+  "acceptTools": [],
+  "forbiddenTools": ["request_create", "request_update", "request_delete"],
+  "expectArgs": { "projectId": 1, "keyword": "login" },
+  "expectedArtifact": "命中的接口列表与总数",
+  "followUps": []
+}

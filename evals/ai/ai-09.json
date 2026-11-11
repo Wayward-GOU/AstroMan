@@ -1,0 +1,11 @@
+{
+  "id": "ai-09",
+  "title": "压测报告列表",
+  "input": "最近的压测报告有哪些？",
+  "expectTool": "report_list",
+  "acceptTools": [],
+  "forbiddenTools": ["report_delete", "report_export", "stress_start"],
+  "expectArgs": {},
+  "expectedArtifact": "报告列表：名称、时间、P95、错误率",
+  "followUps": []
+}

@@ -60,6 +60,10 @@ fn default_body_type() -> String {
     "none".to_string()
 }
 
+fn default_protocol() -> String {
+    "http".to_string()
+}
+
 fn default_timeout() -> u64 {
     30_000
 }
@@ -112,6 +116,9 @@ pub struct HttpRequestDetail {
     pub name: String,
     #[serde(default = "default_method")]
     pub method: String,
+    /// 请求类型：http | graphql | sse | websocket（与发送时的 HTTP 版本无关）
+    #[serde(default = "default_protocol")]
+    pub protocol: String,
     #[serde(default)]
     pub url: String,
     #[serde(default)]
@@ -133,6 +140,12 @@ pub struct HttpRequestDetail {
     pub assertions: String,
     #[serde(default)]
     pub auth: RequestAuth,
+    /// 请求实体（字段结构 JSON）；None 表示本次保存不修改该列
+    #[serde(default)]
+    pub request_entity: Option<String>,
+    /// 返回实体（字段结构 JSON）；None 表示本次保存不修改该列
+    #[serde(default)]
+    pub response_entity: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -322,6 +335,9 @@ pub struct Environment {
     pub is_active: bool,
     #[serde(default)]
     pub script: String,
+    /// 生产环境：AI 无论哪种权限模式都强制确认（AI-01）
+    #[serde(default)]
+    pub is_prod: bool,
     pub variables: Vec<EnvVariable>,
 }
 
@@ -447,6 +463,10 @@ pub struct AppInfo {
     pub version: String,
     pub data_dir: String,
     pub db_path: String,
+    /// WebView2 / WebKit 版本（诊断与兼容性排查用）
+    pub webview_version: Option<String>,
+    /// 数据目录风险提示（同步盘 / 网络共享 / 剩余空间 / FAT32）
+    pub data_dir_risks: Vec<String>,
 }
 
 /// 工作台总览统计
@@ -884,13 +904,67 @@ pub struct AiProvider {
     /// 上下文窗口覆盖（token）；0 / 空 = 前端按模型名自动识别
     #[serde(default)]
     pub context_window: Option<i64>,
+    /// 原生 function calling：-1 / 空 = 按协议默认，0 = 关闭，1 = 开启（AI-04）
+    #[serde(default)]
+    pub native_tools: Option<i64>,
+    /// 输入单价覆盖（每百万 token）；0 / 空 = 使用内置价格表（AI-06）
+    #[serde(default)]
+    pub input_price: Option<f64>,
+    /// 输出单价覆盖（每百万 token）；0 / 空 = 使用内置价格表
+    #[serde(default)]
+    pub output_price: Option<f64>,
+    /// 计价币种：USD / CNY，空按 USD
+    #[serde(default)]
+    pub currency: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiMessage {
     pub role: String,
     pub content: String,
+    /// 原生 function calling：assistant 消息携带的工具调用（AI-04）
+    #[serde(default)]
+    pub tool_calls: Vec<AiToolCall>,
+    /// 工具结果消息对应的调用 id（OpenAI tool_call_id）
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    /// 工具结果消息对应的工具名（Anthropic / Gemini 需要）
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// 原生工具定义：前端由单一 JSON Schema 源派生（AI-11）
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AiToolDef {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub parameters: serde_json::Value,
+}
+
+/// assistant 消息里的一次原生工具调用
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AiToolCall {
+    #[serde(default)]
+    pub id: String,
+    pub name: String,
+    /// JSON 文本，保持与 OpenAI arguments 一致
+    #[serde(default)]
+    pub arguments: String,
+}
+
+/// 视觉输入（AI-03）：只随当前轮发送，不落库
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiImage {
+    /// image/jpeg、image/png、image/webp
+    pub mime: String,
+    /// base64（不含 data: 前缀）
+    pub data: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -910,6 +984,12 @@ pub struct AiChatPayload {
     /// 本次请求按哪个上下文窗口预留输出；由前端传入，后端据此收紧 max_tokens
     #[serde(default)]
     pub context_window: Option<i64>,
+    /// 当前轮图片（最多 3 张，单张 base64 ≤ 约 1.4MB）
+    #[serde(default)]
+    pub images: Vec<AiImage>,
+    /// 原生工具定义；为空时走文本 fbin-tool 协议
+    #[serde(default)]
+    pub tools: Vec<AiToolDef>,
 }
 
 /// 流式事件：delta 增量文本 / reasoning 思考 / done 结束 / cancelled 已停止 / error 错误
@@ -1409,4 +1489,21 @@ pub struct PreflightReport {
     /// 无 error 时可直接运行；strictScripts 会把跳过项升级为 error
     pub runnable: bool,
     pub items: Vec<PreflightItem>,
+}
+
+/// 审计日志（P-07 / AI-01）：只追加，默认保留 90 天
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditLog {
+    pub id: i64,
+    pub created_at: i64,
+    /// docs_export / ca_install / ai_write_confirm ...
+    pub action: String,
+    pub target: Option<String>,
+    /// ok / failed / denied
+    pub result: String,
+    pub detail: Option<serde_json::Value>,
+    pub trace_id: Option<String>,
+    /// 固定 local：当前版本只有本机操作
+    pub actor: String,
 }

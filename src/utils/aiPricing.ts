@@ -1,20 +1,42 @@
 /**
  * 模型计费估算：单价按厂商公开价（美元 / 百万 token）整理，仅用于「大概多少钱」的展示。
- * 匹配不上的模型走兜底价，并在界面上标注「默认估算」。
+ * 服务商可以覆盖单价（AI-06）：填了就用自定义价，0 表示沿用内置价格表。
  */
+
+export type PriceCurrency = 'USD' | 'CNY'
+
+export interface PriceOverride {
+  /** 输入单价；0 / 空表示使用内置价格表 */
+  inputPrice?: number | null
+  /** 输出单价；0 / 空表示使用内置价格表 */
+  outputPrice?: number | null
+  /** 自定义单价的计价币种；默认美元 */
+  currency?: string | null
+}
+
 export interface PriceRule {
   /** 展示用的价格档位名 */
   label: string
-  /** 输入单价：美元 / 百万 token */
+  /** 输入单价：美元 / 百万 token（内部统一按美元计算成本） */
   input: number
   /** 输出单价：美元 / 百万 token */
   output: number
   /** 是否为兜底估算价 */
   fallback: boolean
+  /** 报价币种：内置价为 USD，自定义价按服务商配置 */
+  currency: PriceCurrency
+  /** 原始报价单价（币种见 currency），用于按服务商币种展示 */
+  listInput: number
+  listOutput: number
+  /** 是否来自服务商自定义单价 */
+  custom: boolean
 }
 
 /** 顺序敏感：越具体的模型名放前面，避免 gpt-4o-mini 命中 gpt-4o */
-const PRICE_TABLE: { pattern: RegExp; rule: PriceRule }[] = [
+const PRICE_TABLE: {
+  pattern: RegExp
+  rule: Omit<PriceRule, 'currency' | 'listInput' | 'listOutput' | 'custom'>
+}[] = [
   { pattern: /gpt-4o-mini/i, rule: { label: 'gpt-4o-mini', input: 0.15, output: 0.6, fallback: false } },
   { pattern: /gpt-4o/i, rule: { label: 'gpt-4o', input: 2.5, output: 10, fallback: false } },
   { pattern: /gpt-4\.1-mini/i, rule: { label: 'gpt-4.1-mini', input: 0.4, output: 1.6, fallback: false } },
@@ -48,16 +70,65 @@ const PRICE_TABLE: { pattern: RegExp; rule: PriceRule }[] = [
   { pattern: /llama|mistral|mixtral/i, rule: { label: '开源模型', input: 0.2, output: 0.6, fallback: false } },
 ]
 
-const FALLBACK: PriceRule = { label: '默认估算', input: 1, output: 3, fallback: true }
+const FALLBACK: Omit<PriceRule, 'currency' | 'listInput' | 'listOutput' | 'custom'> = {
+  label: '默认估算',
+  input: 1,
+  output: 3,
+  fallback: true,
+}
 
 /** 人民币展示汇率，只做粗略换算 */
 export const USD_TO_CNY = 7.2
 
-export function priceOf(model: string): PriceRule {
+function withDefaults(
+  rule: Omit<PriceRule, 'currency' | 'listInput' | 'listOutput' | 'custom'>,
+): PriceRule {
+  return {
+    ...rule,
+    currency: 'USD',
+    listInput: rule.input,
+    listOutput: rule.output,
+    custom: false,
+  }
+}
+
+/** 正数才算有效单价；0 / 空 / 负数都回落到内置价格表 */
+function positive(value: number | null | undefined): number | null {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return null
+  return value
+}
+
+/**
+ * 解析生效单价：内置表 + 服务商覆盖（AI-06）。
+ * - 自定义价 0 / 空 -> 该边沿用内置价；
+ * - 自定义价币种为 CNY 时，按固定汇率折算成美元再计算成本，展示仍用人民币原价；
+ * - 两边都填了自定义价时不再标记「默认估算」。
+ */
+export function priceOf(model: string, override?: PriceOverride | null): PriceRule {
   const name = (model ?? '').trim()
-  if (!name) return FALLBACK
-  const hit = PRICE_TABLE.find((item) => item.pattern.test(name))
-  return hit ? hit.rule : FALLBACK
+  const hit = name ? PRICE_TABLE.find((item) => item.pattern.test(name)) : undefined
+  const base = withDefaults(hit ? hit.rule : FALLBACK)
+  const inputRaw = positive(override?.inputPrice)
+  const outputRaw = positive(override?.outputPrice)
+  if (inputRaw === null && outputRaw === null) return base
+
+  const currency: PriceCurrency =
+    (override?.currency ?? 'USD').toUpperCase() === 'CNY' ? 'CNY' : 'USD'
+  const cny = currency === 'CNY'
+  // 缺失的一边沿用内置价；人民币报价时把内置美元价折成人民币展示
+  const listInput = inputRaw ?? (cny ? base.input * USD_TO_CNY : base.input)
+  const listOutput = outputRaw ?? (cny ? base.output * USD_TO_CNY : base.output)
+  const scale = cny ? 1 / USD_TO_CNY : 1
+  return {
+    label: '自定义单价',
+    input: listInput * scale,
+    output: listOutput * scale,
+    fallback: base.fallback && !(inputRaw !== null && outputRaw !== null),
+    currency,
+    listInput,
+    listOutput,
+    custom: true,
+  }
 }
 
 export interface CostBreakdown {
@@ -74,8 +145,9 @@ export function estimateCost(
   model: string,
   promptTokens: number,
   completionTokens: number,
+  override?: PriceOverride | null,
 ): CostBreakdown {
-  const rule = priceOf(model)
+  const rule = priceOf(model, override)
   const inputCost = ((promptTokens || 0) / 1_000_000) * rule.input
   const outputCost = ((completionTokens || 0) / 1_000_000) * rule.output
   return { inputCost, outputCost, total: inputCost + outputCost, rule }
@@ -96,8 +168,8 @@ export function fmtCny(usd: number): string {
   return `¥${cny.toFixed(2)}`
 }
 
-/** 单价展示：$x / 1M tokens */
-export function fmtUnit(perMillion: number): string {
+/** 单价展示：$x / 1M tokens（自定义人民币报价直接按 ¥ 展示原价） */
+export function fmtUnit(perMillion: number, currency: PriceCurrency = 'USD'): string {
   const text = perMillion >= 1 ? perMillion.toFixed(2) : perMillion.toFixed(3)
-  return `$${text}/M`
+  return currency === 'CNY' ? `¥${text}/M` : `$${text}/M`
 }

@@ -1,0 +1,11 @@
+{
+  "id": "ai-19",
+  "title": "纯知识问答不调工具",
+  "input": "HTTP 401 和 403 有什么区别？",
+  "expectTool": null,
+  "acceptTools": [],
+  "forbiddenTools": ["project_list", "request_search", "tool_search", "send_request"],
+  "expectArgs": {},
+  "expectedArtifact": "直接解释 401 未认证与 403 无权限的区别，不输出任何工具块",
+  "followUps": []
+}

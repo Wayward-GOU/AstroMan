@@ -208,7 +208,8 @@ AstroMan/
 |---|---|
 | [快速开始](docs/quick-start.md) | 安装后第一个请求、环境变量、脚本、压测、AI |
 | [完整功能清单](docs/features.md) | 按当前代码逐项列出的能力 |
-| [系统兼容性](docs/compatibility.md) | Windows / macOS 下限、安装包差异、放行方式 |
+| [系统兼容性](docs/compatibility.md) | Windows / macOS 下限、安装包差异、兼容矩阵、长稳回归 |
+| [企业部署与交付](docs/enterprise.md) | 数据目录、policy.json、更新渠道与灰度、代码签名、离线安装、诊断包 |
 | [脚本 API](docs/script-api.md) | 前后置脚本对象、内置变量、加密示例 |
 | [压测与报告](docs/load-testing.md) | 压测配置、指标、SLA、报告导出与对比 |
 | [抓包](docs/capture.md) | 本机 / 手机 HTTPS 抓包、根证书、断点改包、Map Local / Remote、弱网、HAR / ZIP 导出与改参重发 |

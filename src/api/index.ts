@@ -11,7 +11,12 @@ import type {
   AiUsagePage,
   AiUsageStats,
   AppSettings,
+  AuditLog,
   BackupItem,
+  BackupTarget,
+  BackupTargetInput,
+  BackupTargetTestReport,
+  BackupUploadResult,
   CheckResult,
   CleanupResult,
   CollectionNode,
@@ -20,6 +25,10 @@ import type {
   DashboardMetrics,
   Environment,
   EnvVariable,
+  EntityTarget,
+  GraphqlIntrospectPayload,
+  GraphqlSchemaEntry,
+  GraphqlSchemaMeta,
   HistoryItem,
   HistoryStats,
   HttpRequestDetail,
@@ -28,15 +37,29 @@ import type {
   KeyPack,
   MonitorProcess,
   MonitorSnapshot,
+  MockLog,
+  MockRoute,
+  MockRouteInput,
+  MockStartPayload,
+  MockStatus,
+  OpenApiSource,
   PlanSummary,
+  PerformanceProfile,
+  PolicySnapshot,
+  PostmanExportReport,
   Project,
   PythonCheckResult,
+  RealtimeConnectPayload,
+  RealtimeSendPayload,
+  RealtimeStatus,
   ReportDetail,
   ReportRequestsPage,
+  RemoteBackup,
   RequestRun,
   RequestSearchHit,
   RequestRunSummary,
   RequestSummary,
+  RequestEntities,
   SecretStatus,
   SendRequestPayload,
   StorageInfo,
@@ -58,6 +81,24 @@ import type {
   UpdateInfo,
   WorkspaceStats,
 } from '@/types/models'
+import type {
+  ContractCheckResult,
+  ContractSnapshot,
+  RevisionBrief,
+  RevisionDetail,
+  RevisionDiff,
+  TraceRollbackResult,
+} from '@/types/contract'
+import type {
+  DocsExportPayload,
+  DocsExportResult,
+  DocsPreparePayload,
+  DocsPrepareResult,
+  DocsRenderPayload,
+  DocsRenderResult,
+  DocsSiteStartPayload,
+  DocsSiteStatus,
+} from '@/types/docs'
 
 export { appInfo, projectList, projectCreate, projectUpdate, projectDelete } from './project'
 
@@ -117,6 +158,62 @@ export const runGet = (id: number) => invoke<RequestRun>('run_get', { id })
 
 export const runClear = (requestId: number) => invoke<void>('run_clear', { requestId })
 
+// 接口实体（请求 / 返回字段树）
+export const requestEntitiesGet = (requestId: number) =>
+  invoke<RequestEntities>('request_entities_get', { requestId })
+
+/** 重新推断实体；target=request 时优先用编辑器里的当前请求体 */
+export const requestEntityGenerate = (params: {
+  requestId: number
+  target: EntityTarget
+  body?: string | null
+  bodyType?: string | null
+}) => invoke<RequestEntities>('request_entity_generate', params)
+
+// 请求版本历史
+export const requestRevisionList = (requestId: number, limit?: number) =>
+  invoke<RevisionBrief[]>('request_revision_list', { requestId, limit: limit ?? null })
+
+export const requestRevisionGet = (requestId: number, revision: number) =>
+  invoke<RevisionDetail>('request_revision_get', { requestId, revision })
+
+export const requestRevisionDiff = (requestId: number, from: number, to: number) =>
+  invoke<RevisionDiff>('request_revision_diff', { requestId, from, to })
+
+/** 回滚到某个版本：后端按实体合并语义恢复，并生成一条 source=restore 的新版本 */
+export const requestRevisionRestore = (requestId: number, revision: number) =>
+  invoke<HttpRequestDetail>('request_revision_restore', { requestId, revision })
+
+/** AI 写操作执行前记录前置快照（source=ai，按 traceId 聚合回滚） */
+export const requestRevisionSnapshot = (requestId: number, traceId: string) =>
+  invoke<void>('request_revision_snapshot', { requestId, traceId })
+
+/** 某轮提问关联的 AI 前置快照 */
+export const requestRevisionTrace = (traceId: string, limit?: number) =>
+  invoke<RevisionBrief[]>('request_revision_trace', { traceId, limit: limit ?? null })
+
+/** 按 traceId 一键回滚该轮全部 AI 写操作 */
+export const requestRevisionRollbackTrace = (traceId: string) =>
+  invoke<TraceRollbackResult>('request_revision_rollback_trace', { traceId })
+
+// 契约快照与变更检测
+export const contractSnapshotCreate = (projectId: number, label?: string) =>
+  invoke<ContractSnapshot>('contract_snapshot_create', { projectId, label: label ?? null })
+
+export const contractSnapshotList = (projectId: number) =>
+  invoke<ContractSnapshot[]>('contract_snapshot_list', { projectId })
+
+export const contractCheck = (projectId: number, baselineId: number) =>
+  invoke<ContractCheckResult>('contract_check', { projectId, baselineId })
+
+/** 生成契约报告；传 path 时同时写入文件 */
+export const contractReport = (
+  projectId: number,
+  baselineId: number,
+  format: 'markdown' | 'html',
+  path?: string | null,
+) => invoke<string>('contract_report', { projectId, baselineId, format, path: path ?? null })
+
 export const sendRequest = (payload: SendRequestPayload) =>
   invoke<HttpResult>('send_http_request', { payload })
 
@@ -146,6 +243,20 @@ export const envVarSave = (envId: number, variables: EnvVariable[]) =>
 
 export const envScriptSave = (id: number, script: string) =>
   invoke<void>('env_script_save', { id, script })
+
+/** 标记环境是否为生产（AI-01 强制确认） */
+export const envSetProd = (id: number, isProd: boolean) =>
+  invoke<void>('env_set_prod', { id, isProd })
+
+/** 最近审计（P-07） */
+export const auditLogList = (options?: { action?: string; limit?: number; offset?: number }) =>
+  invoke<AuditLog[]>('audit_log_list', {
+    action: options?.action ?? null,
+    limit: options?.limit ?? null,
+    offset: options?.offset ?? null,
+  })
+
+export const auditLogCleanup = () => invoke<number>('audit_log_cleanup')
 
 // 历史
 export const historyList = (
@@ -207,6 +318,19 @@ export const settingsGet = () => invoke<AppSettings>('settings_get')
 
 export const settingsSet = (settings: AppSettings) =>
   invoke<AppSettings>('settings_set', { settings })
+
+/** 当前运行档位与抓包 / 响应体预算（P-05） */
+export const performanceProfile = () => invoke<PerformanceProfile>('performance_profile')
+
+/** 企业策略：当前生效值、文件位置与解析错误（W4-2） */
+export const policyGet = () => invoke<PolicySnapshot>('policy_get')
+
+/** 管理员改完 policy.json 后热加载 */
+export const policyReload = () => invoke<PolicySnapshot>('policy_reload')
+
+/** 前端异常转后端日志（走统一脱敏与滚动落盘） */
+export const frontendLog = (level: string, message: string, context?: string) =>
+  invoke<void>('frontend_log', { payload: { level, message, context: context ?? null } })
 
 /** 探测 Python 解释器；path 为空时按设置项与默认候选自动探测 */
 export const pythonCheck = (path?: string) =>
@@ -294,6 +418,23 @@ export const projectImport = (path: string) => invoke<Project>('project_import',
 export const openapiExport = (projectId: number, path: string) =>
   invoke<void>('openapi_export', { projectId, path })
 
+// 接口文档导出（阶段一：Markdown / HTML）
+export const docsPrepare = (payload: DocsPreparePayload) =>
+  invoke<DocsPrepareResult>('docs_prepare', { payload })
+
+export const docsRender = (payload: DocsRenderPayload) =>
+  invoke<DocsRenderResult>('docs_render', { payload })
+
+export const docsExport = (payload: DocsExportPayload) =>
+  invoke<DocsExportResult>('docs_export', { payload })
+
+// 只读文档站：启动 / 停止 / 状态 / 刷新
+export const docsSiteStart = (payload: DocsSiteStartPayload) =>
+  invoke<DocsSiteStatus>('docs_site_start', { payload })
+export const docsSiteStop = () => invoke<DocsSiteStatus>('docs_site_stop')
+export const docsSiteStatus = () => invoke<DocsSiteStatus>('docs_site_status')
+export const docsSiteRefresh = () => invoke<DocsSiteStatus>('docs_site_refresh')
+
 // OpenAPI / Swagger 导入（projectId 为空时新建项目）
 export const openapiImport = (path: string, projectId?: number | null) =>
   invoke<Project>('openapi_import', { path, projectId: projectId ?? null })
@@ -301,8 +442,8 @@ export const openapiImport = (path: string, projectId?: number | null) =>
 // 自动更新
 export const updateCheck = () => invoke<UpdateInfo>('update_check')
 
-export const updateDownload = (urls: string[], fileName: string) =>
-  invoke<string>('update_download', { urls, fileName })
+export const updateDownload = (urls: string[], fileName: string, sha256?: string | null) =>
+  invoke<string>('update_download', { urls, fileName, sha256: sha256 ?? null })
 
 export const openExternal = (target: string) => invoke<void>('open_external', { target })
 
@@ -347,9 +488,25 @@ export const aiChatCancel = (requestId: string) =>
 export const aiModelsList = (providerId: number) =>
   invoke<string[]>('ai_models_list', { providerId })
 
-/** AI 生成的请求直接执行，与手动发送共用同一链路 */
-export const aiExecute = (payload: SendRequestPayload) =>
-  invoke<HttpResult>('ai_execute', { payload })
+/** AI 生成的请求直接执行，与手动发送共用同一链路；confirmed 用于权限确认 */
+export const aiExecute = (payload: SendRequestPayload, confirmed = false, traceId?: string | null) =>
+  invoke<HttpResult>('ai_execute', { payload, confirmed, traceId: traceId ?? null })
+
+/** 写工具 / 发送确认的审计落库（AI-01） */
+export interface AiConfirmAuditPayload {
+  tool: string
+  target?: string | null
+  allowed: boolean
+  mode?: string | null
+  traceId?: string | null
+}
+
+export const aiConfirmAudit = (payload: AiConfirmAuditPayload) =>
+  invoke<void>('ai_confirm_audit', { payload })
+
+/** 按 traceId 取消航仔正在执行的工具（AI-02）：中断在途 HTTP 请求 */
+export const toolCancel = (traceId: string) =>
+  invoke<boolean>('tool_cancel', { traceId })
 
 // AI 会话记录
 export const aiSessionList = (keyword?: string) =>
@@ -440,8 +597,9 @@ export const aiToolLogStats = (days = 30) =>
 export const aiToolLogClear = (sessionId?: number | null, days?: number | null) =>
   invoke<number>('ai_tool_log_clear', { sessionId: sessionId ?? null, days: days ?? null })
 
-// 模型用量统计
-export const aiUsageStats = (days = 30) => invoke<AiUsageStats>('ai_usage_stats', { days })
+// 模型用量统计；sinceMs 用于自然月等自定义窗口（优先于 days）
+export const aiUsageStats = (days = 30, sinceMs: number | null = null) =>
+  invoke<AiUsageStats>('ai_usage_stats', { days, sinceMs })
 
 // 用量明细：每次模型调用一条，分页返回，ok 为空表示不筛状态
 export const aiUsageLogs = (days = 30, page = 1, pageSize = 10, ok: boolean | null = null) =>
@@ -602,6 +760,88 @@ export const dbCheck = (deep = false) => invoke<CheckResult>('db_check', { deep 
 export const diagnosticsExport = (path: string) =>
   invoke<string>('diagnostics_export', { path })
 
+/* ---------- W2：异地加密备份（G-06） ---------- */
+
+export const backupTargetList = () => invoke<BackupTarget[]>('backup_target_list')
+
+/** 新建 / 修改备份目标；password 留空表示保留原密码 */
+export const backupTargetSave = (input: BackupTargetInput) =>
+  invoke<BackupTarget>('backup_target_save', { input })
+
+export const backupTargetDelete = (id: number) => invoke<void>('backup_target_delete', { id })
+
+export const backupTargetTest = (id: number) =>
+  invoke<BackupTargetTestReport>('backup_target_test', { id })
+
+export const backupTargetRemoteList = (id: number) =>
+  invoke<RemoteBackup[]>('backup_target_remote_list', { id })
+
+/** 上传加密备份（口令不落库，仅本次使用） */
+export const backupUpload = (id: number, passphrase: string) =>
+  invoke<BackupUploadResult>('backup_upload', { id, passphrase })
+
+/** 从异地备份恢复：写入待恢复标记，需重启应用生效 */
+export const backupRestoreFromTarget = (id: number, name: string, passphrase: string) =>
+  invoke<BackupItem>('backup_restore_from_target', { id, name, passphrase })
+
+/* ---------- W2：Mock Server（G-04） ---------- */
+
+export const mockRoutesList = (projectId: number) =>
+  invoke<MockRoute[]>('mock_routes_list', { projectId })
+
+export const mockRouteSave = (route: MockRouteInput) =>
+  invoke<MockRoute>('mock_route_save', { route })
+
+export const mockRouteDelete = (id: number) => invoke<void>('mock_route_delete', { id })
+
+/** 按项目请求批量补路由（不覆盖手工编辑） */
+export const mockRoutesGenerate = (projectId: number) =>
+  invoke<MockRoute[]>('mock_routes_generate', { projectId })
+
+export const mockRoutesClear = (projectId: number) =>
+  invoke<number>('mock_routes_clear', { projectId })
+
+export const mockStart = (payload: MockStartPayload) =>
+  invoke<MockStatus>('mock_start', { payload })
+
+export const mockStop = (projectId: number) => invoke<MockStatus>('mock_stop', { projectId })
+
+export const mockStatus = (projectId: number) => invoke<MockStatus>('mock_status', { projectId })
+
+export const mockStatuses = () => invoke<MockStatus[]>('mock_statuses')
+
+export const mockLogs = (projectId: number) => invoke<MockLog[]>('mock_logs', { projectId })
+
+export const mockLogsClear = (projectId: number) =>
+  invoke<void>('mock_logs_clear', { projectId })
+
+/* ---------- W2：导入导出补齐（G-07） ---------- */
+
+/** 导出 Postman Collection v2.1（响应示例已脱敏） */
+export const postmanExport = (projectId: number, path: string) =>
+  invoke<PostmanExportReport>('postman_export', { projectId, path })
+
+/** 导入 Bruno 工作目录（递归扫描 .bru） */
+export const brunoImport = (path: string, projectId?: number) =>
+  invoke<Project>('bruno_import', { path, projectId: projectId ?? null })
+
+/** 从 URL 拉取 OpenAPI / Swagger JSON 并导入 */
+export const openapiImportUrl = (payload: {
+  url: string
+  headers?: { key: string; value: string; enabled?: boolean }[]
+  projectId?: number | null
+  save?: boolean
+}) => invoke<Project>('openapi_import_url', { payload })
+
+export const openapiSourceList = (projectId: number) =>
+  invoke<OpenApiSource[]>('openapi_source_list', { projectId })
+
+export const openapiSourceDelete = (id: number) =>
+  invoke<void>('openapi_source_delete', { id })
+
+export const openapiSourceRefresh = (id: number) =>
+  invoke<Project>('openapi_source_refresh', { id })
+
 /* ---------- v1.0.8：密钥与主密钥 ---------- */
 
 export const secretsStatus = () => invoke<SecretStatus>('secrets_status')
@@ -628,6 +868,71 @@ export const secretsReset = (confirmed: boolean) =>
 /** 只读预检密钥包文件，避免导入时选错文件 */
 export const secretsInspectPack = (path: string) =>
   invoke<KeyPack>('secrets_inspect_pack', { path })
+
+/* ---------- W3：实时调试（SSE / WebSocket） ---------- */
+
+export const realtimeConnect = (payload: RealtimeConnectPayload) =>
+  invoke<RealtimeStatus>('realtime_connect', { payload })
+
+export const realtimeSend = (payload: RealtimeSendPayload) =>
+  invoke<void>('realtime_send', { payload })
+
+export const realtimeClose = (sessionId: string) =>
+  invoke<boolean>('realtime_close', { sessionId })
+
+export const realtimeStatus = (sessionId: string) =>
+  invoke<RealtimeStatus | null>('realtime_status', { sessionId })
+
+/* ---------- W3：GraphQL Schema（G-10） ---------- */
+
+export const graphqlIntrospect = (payload: GraphqlIntrospectPayload) =>
+  invoke<GraphqlSchemaEntry>('graphql_introspect', { payload })
+
+export const graphqlSchemaGet = (projectId: number, endpoint: string) =>
+  invoke<GraphqlSchemaEntry | null>('graphql_schema_get', { projectId, endpoint })
+
+export const graphqlSchemaList = (projectId: number) =>
+  invoke<GraphqlSchemaMeta[]>('graphql_schema_list', { projectId })
+
+export const graphqlSchemaDelete = (projectId: number, endpoint: string) =>
+  invoke<boolean>('graphql_schema_delete', { projectId, endpoint })
+
+/* ---------- W3：Git 友好工作区（G-11） ---------- */
+
+export interface WorkspaceCounts {
+  projects: number
+  collections: number
+  requests: number
+  environments: number
+}
+
+export interface WorkspaceExportResult {
+  path: string
+  counts: WorkspaceCounts
+  warnings: string[]
+}
+
+export interface WorkspaceConflict {
+  kind: string
+  id: number
+  name: string
+  reason: string
+}
+
+export interface WorkspaceImportResult {
+  created: WorkspaceCounts
+  updated: WorkspaceCounts
+  skipped: number
+  conflicts: WorkspaceConflict[]
+  warnings: string[]
+}
+
+export const workspaceExportDir = (payload: { path: string; projectIds?: number[] }) =>
+  invoke<WorkspaceExportResult>('workspace_export_dir', { payload })
+
+export const workspaceImportDir = (payload: { path: string; overwrite?: boolean }) =>
+  invoke<WorkspaceImportResult>('workspace_import_dir', { payload })
+
 
 /** 清掉日志脱敏用的敏感值缓存（切换环境后调用） */
 export const secretsClearCache = () => invoke<void>('secrets_clear_cache')

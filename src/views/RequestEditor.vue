@@ -4,6 +4,7 @@ import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
 import { open, save as saveFile } from '@tauri-apps/plugin-dialog'
 import { convertFileSrc } from '@tauri-apps/api/core'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import {
   ArrowLeftOutlined,
   ThunderboltOutlined,
@@ -15,14 +16,21 @@ import {
   CheckOutlined,
   EditOutlined,
   CodeOutlined,
+  FileTextOutlined,
   PlusOutlined,
   DownOutlined,
   SettingOutlined,
+  SearchOutlined,
+  HistoryOutlined,
 } from '@ant-design/icons-vue'
 import AiSparkIcon from '@/components/AiSparkIcon.vue'
 import KeyValueEditor from '@/components/KeyValueEditor.vue'
 import CodeArea from '@/components/CodeArea.vue'
+import ResponseBody from '@/components/ResponseBody.vue'
 import EnvironmentDrawer from '@/components/EnvironmentDrawer.vue'
+import DocsPreviewDrawer from '@/components/DocsPreviewDrawer.vue'
+import RequestEntityEditor from '@/components/RequestEntityEditor.vue'
+import RequestHistoryDrawer from '@/components/RequestHistoryDrawer.vue'
 import { useAiAssistStore } from '@/stores/aiAssist'
 import {
   requestAssertionPrompt,
@@ -39,13 +47,22 @@ import { setHandoff } from '@/stores/handoff'
 import { formatDateTime } from '@/utils/datetime'
 import { buildSnippets, type Snippet } from '@/utils/curl'
 import { formatJsonAsync } from '@/utils/formatJson'
+import { findMatches } from '@/utils/jsonHighlight'
+import { replaceAllLiteral } from '@/utils/bodyReplace'
 import { diffLines, diffStats, type DiffLine } from '@/utils/diff'
 import { readLastRequest, rememberLastRequest } from '@/utils/lastRequest'
+import {
+  countEntityFields,
+  mergeEntityEdits,
+  parseEntityDoc,
+  serializeEntityDoc,
+} from '@/utils/entitySchema'
 import * as api from '@/api'
 import type {
   CookieItem,
   Environment,
   FormField,
+  GraphqlSchemaEntry,
   HttpRequestDetail,
   HttpResult,
   KeyValueItem,
@@ -53,6 +70,8 @@ import type {
   RequestRun,
   RequestRunSummary,
   RequestSearchHit,
+  RealtimeEvent,
+  RealtimeStatus,
   SendRequestPayload,
 } from '@/types/models'
 import {
@@ -97,6 +116,7 @@ const form = ref<HttpRequestDetail>({
   collectionId: 0,
   name: '',
   method: 'GET',
+  protocol: 'http',
   url: '',
   headers: [],
   params: [],
@@ -122,13 +142,18 @@ const sending = computed(() => {
   if (!id) return false
   return sendingRequestIds.has(id) || workspace.isInflight(id)
 })
-const bodyPreEl = ref<HTMLElement | null>(null)
+const responseBodyRef = ref<{
+  openSearch: (initial?: string) => void
+  scrollToTop: () => void
+} | null>(null)
 const tabsScrollEl = ref<HTMLElement | null>(null)
 const activeTab = ref('params')
 const responseTab = ref('body')
 const insecure = ref(false)
 const envId = ref<number | null>(null)
 const envDrawerOpen = ref(false)
+const docsOpen = ref(false)
+const historyOpen = ref(false)
 
 /* ---------- 发送选项：协议 / 重定向 / 重试（v1.0.8） ----------
    这几个是「发一次怎么发」的开关，不属于接口定义本身，所以存本地偏好而不是写库，
@@ -317,6 +342,305 @@ watch(
   { deep: true },
 )
 
+/* ---------- W3：请求类型与实时调试（SSE / WebSocket） ----------
+   请求类型写在接口定义里（requests.protocol），和「发一次用 HTTP/1.1 还是 h2」
+   的发送选项是两回事，不要混用。 */
+const REQUEST_PROTOCOLS = [
+  { value: 'http', label: 'HTTP' },
+  { value: 'graphql', label: 'GraphQL' },
+  { value: 'sse', label: 'SSE' },
+  { value: 'websocket', label: 'WS' },
+]
+const requestProtocol = computed(() => form.value.protocol || 'http')
+const isRealtime = computed(
+  () => requestProtocol.value === 'sse' || requestProtocol.value === 'websocket',
+)
+const isGraphqlProtocol = computed(() => requestProtocol.value === 'graphql')
+
+const MAX_REALTIME_EVENTS = 5000
+const rtSessionId = ref('')
+const rtStatus = ref<RealtimeStatus | null>(null)
+const rtEvents = ref<RealtimeEvent[]>([])
+const rtInput = ref('')
+const rtBusy = ref(false)
+const rtAutoReconnect = ref(true)
+const rtPingMs = ref(30000)
+const rtListEl = ref<HTMLElement | null>(null)
+const rtUnlisteners: UnlistenFn[] = []
+
+const rtConnected = computed(
+  () => !!rtSessionId.value && (rtStatus.value?.state === 'open' || rtStatus.value?.state === 'connecting'),
+)
+const rtStateText = computed(() => {
+  const state = rtStatus.value?.state
+  if (!rtSessionId.value && !rtStatus.value) return '未连接'
+  return (
+    { connecting: '连接中', open: '已连接', closed: '已断开', error: '连接失败' }[state ?? ''] ??
+    state ??
+    '未连接'
+  )
+})
+
+function makeRealtimeSessionId() {
+  return `rt-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`
+}
+
+function scrollRealtimeToEnd() {
+  void nextTick(() => {
+    const el = rtListEl.value
+    if (el) el.scrollTop = el.scrollHeight
+  })
+}
+
+function onRealtimeEvent(event: RealtimeEvent) {
+  if (!event || event.sessionId !== rtSessionId.value) return
+  rtEvents.value.push(event)
+  if (rtEvents.value.length > MAX_REALTIME_EVENTS) {
+    rtEvents.value.splice(0, rtEvents.value.length - MAX_REALTIME_EVENTS)
+  }
+  if (rtStatus.value && ['connecting', 'open', 'closed', 'error'].includes(event.type)) {
+    rtStatus.value = {
+      ...rtStatus.value,
+      state: event.type,
+      error: event.error ?? rtStatus.value.error,
+      closeReason: event.closeReason ?? rtStatus.value.closeReason,
+    }
+  }
+  scrollRealtimeToEnd()
+}
+
+function onRealtimeStatus(status: RealtimeStatus) {
+  if (!status || status.sessionId !== rtSessionId.value) return
+  rtStatus.value = status
+}
+
+async function connectRealtime() {
+  if (!isRealtime.value || rtBusy.value) return
+  const url = renderRuntimeVars(form.value.url.trim())
+  if (!url) {
+    message.warning('请先填写连接地址')
+    return
+  }
+  // 连接使用的是当前编辑内容，先落库再连，避免切走丢改动
+  await flushSave()
+  rtEvents.value = []
+  rtStatus.value = null
+  const sessionId = makeRealtimeSessionId()
+  rtSessionId.value = sessionId
+  rtBusy.value = true
+  try {
+    const status = await api.realtimeConnect({
+      sessionId,
+      protocol: requestProtocol.value as 'sse' | 'websocket',
+      url,
+      headers: form.value.headers
+        .filter((item) => item.enabled && item.key.trim())
+        .map((item) => ({ ...item, value: renderRuntimeVars(item.value) })),
+      envId: envId.value,
+      autoReconnect: rtAutoReconnect.value,
+      pingIntervalMs: requestProtocol.value === 'websocket' ? rtPingMs.value : undefined,
+    })
+    if (rtSessionId.value === sessionId) rtStatus.value = status
+  } catch (e) {
+    if (rtSessionId.value === sessionId) {
+      rtSessionId.value = ''
+      message.error(String(e))
+    }
+  } finally {
+    rtBusy.value = false
+  }
+}
+
+async function closeRealtime(silent = false) {
+  const sessionId = rtSessionId.value
+  if (!sessionId) return
+  rtSessionId.value = ''
+  if (rtStatus.value) {
+    rtStatus.value = { ...rtStatus.value, state: 'closed', closeReason: '用户断开' }
+  }
+  try {
+    await api.realtimeClose(sessionId)
+  } catch {
+    /* 后端可能已自行关闭，忽略 */
+  }
+  if (!silent) message.info('已断开实时连接')
+}
+
+async function sendRealtime() {
+  const sessionId = rtSessionId.value
+  if (!sessionId || requestProtocol.value !== 'websocket') return
+  const text = rtInput.value
+  if (!text) return
+  try {
+    await api.realtimeSend({ sessionId, data: text, kind: 'text' })
+    rtInput.value = ''
+  } catch (e) {
+    message.error(String(e))
+  }
+}
+
+function clearRealtimeLog() {
+  rtEvents.value = []
+}
+
+function realtimePreview(event: RealtimeEvent): string {
+  if (event.type === 'message' || event.type === 'sent') {
+    if (event.messageType === 'binary') {
+      const bytes =
+        event.data && typeof event.data === 'object'
+          ? Number((event.data as { bytes?: number }).bytes ?? 0)
+          : 0
+      return `[二进制] ${fmtSize(bytes)}`
+    }
+    if (typeof event.data === 'string') return event.data
+    if (event.data === undefined || event.data === null) return ''
+    return JSON.stringify(event.data, null, 2)
+  }
+  if (event.type === 'reconnect') {
+    return `第 ${event.attempt ?? 1} 次重连 · ${event.reason || '流已结束'}`
+  }
+  if (event.type === 'notice') return event.message || ''
+  if (event.type === 'error') return event.error || event.closeReason || '连接异常'
+  if (event.type === 'closed') return event.closeReason || '连接已关闭'
+  return ''
+}
+
+watch(isRealtime, (next) => {
+  if (!next) void closeRealtime(true)
+})
+
+watch(
+  () => form.value.id,
+  () => {
+    // 切接口时先断开上一条实时连接，避免后台会话泄漏
+    void closeRealtime(true)
+  },
+)
+
+/* ---------- W3：GraphQL Schema 浏览器（G-10） ----------
+   Schema 按 (项目, endpoint) 缓存；请求头只在 introspection 时使用，不落库。 */
+const gqlQueryAreaRef = ref<{ insertText: (text: string) => void } | null>(null)
+const gqlSchema = ref<GraphqlSchemaEntry | null>(null)
+const gqlSchemaLoading = ref(false)
+const gqlSchemaError = ref('')
+const gqlSchemaOpen = ref(false)
+const gqlSchemaFilter = ref('')
+
+interface GqlFieldNode {
+  name: string
+  type: string
+  description?: string | null
+}
+interface GqlTypeNode {
+  name: string
+  kind: string
+  description?: string | null
+  fields: GqlFieldNode[]
+  values: string[]
+}
+
+function gqlTypeName(type: unknown): string {
+  if (!type || typeof type !== 'object') return ''
+  const node = type as { kind?: string; name?: string | null; ofType?: unknown }
+  if (node.kind === 'NON_NULL') return `${gqlTypeName(node.ofType)}!`
+  if (node.kind === 'LIST') return `[${gqlTypeName(node.ofType)}]`
+  return node.name || ''
+}
+
+const gqlTypes = computed<GqlTypeNode[]>(() => {
+  if (!gqlSchema.value) return []
+  try {
+    const parsed = JSON.parse(gqlSchema.value.schemaJson)
+    const schema = parsed?.data?.__schema ?? parsed?.__schema
+    if (!schema) return []
+    const list = Array.isArray(schema.types) ? schema.types : []
+    return list
+      .filter((type: { name?: string }) => !String(type.name ?? '').startsWith('__'))
+      .map(
+        (type: {
+          name?: string
+          kind?: string
+          description?: string | null
+          fields?: { name: string; description?: string | null; type?: unknown }[]
+          inputFields?: { name: string; description?: string | null; type?: unknown }[]
+          enumValues?: { name: string }[]
+        }): GqlTypeNode => ({
+          name: type.name ?? '',
+          kind: type.kind ?? '',
+          description: type.description ?? null,
+          fields: (type.fields ?? type.inputFields ?? []).map((field) => ({
+            name: field.name,
+            description: field.description ?? null,
+            type: gqlTypeName(field.type),
+          })),
+          values: (type.enumValues ?? []).map((value) => value.name),
+        }),
+      )
+      .filter((type: GqlTypeNode) => type.name)
+  } catch {
+    return []
+  }
+})
+
+const filteredGqlTypes = computed(() => {
+  const keyword = gqlSchemaFilter.value.trim().toLowerCase()
+  const types = keyword
+    ? gqlTypes.value.filter(
+        (type) =>
+          type.name.toLowerCase().includes(keyword) ||
+          type.fields.some((field) => field.name.toLowerCase().includes(keyword)),
+      )
+    : gqlTypes.value
+  return types.slice(0, 300)
+})
+
+async function fetchGraphqlSchema() {
+  if (!projectId.value) {
+    message.warning('当前接口未关联项目，无法缓存 Schema')
+    return
+  }
+  const endpoint = renderRuntimeVars(form.value.url.trim())
+  if (!endpoint) {
+    message.warning('请先填写 GraphQL 地址')
+    return
+  }
+  gqlSchemaLoading.value = true
+  gqlSchemaError.value = ''
+  try {
+    gqlSchema.value = await api.graphqlIntrospect({
+      projectId: projectId.value,
+      endpoint,
+      headers: form.value.headers
+        .filter((item) => item.enabled && item.key.trim())
+        .map((item) => ({ ...item, value: renderRuntimeVars(item.value) })),
+      envId: envId.value,
+    })
+    gqlSchemaOpen.value = true
+  } catch (e) {
+    gqlSchemaError.value = String(e)
+  } finally {
+    gqlSchemaLoading.value = false
+  }
+}
+
+async function loadCachedGraphqlSchema() {
+  if (!projectId.value) return
+  const endpoint = form.value.url.trim()
+  if (!endpoint.startsWith('http')) {
+    gqlSchema.value = null
+    return
+  }
+  try {
+    gqlSchema.value = await api.graphqlSchemaGet(projectId.value, endpoint)
+  } catch {
+    gqlSchema.value = null
+  }
+}
+
+function insertGraphqlField(name: string) {
+  gqlQueryAreaRef.value?.insertText(name)
+}
+
 /* ---------- 脚本执行结果 ---------- */
 const scriptLogs = ref<ScriptLog[]>([])
 const scriptAssertions = ref<ScriptAssertion[]>([])
@@ -380,6 +704,7 @@ function resetResponseState() {
   // 运行时变量是跨接口共享的（例如登录接口写入 token），切标签时保留
   responseTab.value = 'body'
   bodyView.value = 'pretty'
+  htmlPreview.value = false
   bodyAbsPath.value = ''
   bodyPreviewError.value = ''
   diffOpen.value = false
@@ -439,6 +764,8 @@ function restoreSnapshot(snapshot: RequestWorkspaceSnapshot) {
   scriptMs.value = snapshot.turn.ms
   responseTab.value = snapshot.responseTab
   bodyView.value = snapshot.bodyView
+  // 预览是临时态，不入现场快照：切回标签时统一从源码开始
+  htmlPreview.value = false
   activeTab.value = snapshot.activeTab
   bodyAbsPath.value = snapshot.bodyAbsPath
   bodyPreviewError.value = snapshot.bodyPreviewError
@@ -541,6 +868,30 @@ const bodyTypes = [
 
 const enabledParams = computed(() => form.value.params.filter((p) => p.enabled && p.key).length)
 const enabledHeaders = computed(() => form.value.headers.filter((h) => h.enabled && h.key).length)
+
+/** 发送时会被后端 faker 规则替换的表达式数量（URL / Header / Body 全算） */
+const fakerCount = computed(() => (JSON.stringify(form.value).match(/\{\{\s*faker:/gi) ?? []).length)
+const FAKER_SAMPLES = [
+  { label: '姓名', expr: '{{faker:name}}' },
+  { label: '邮箱', expr: '{{faker:email}}' },
+  { label: '手机号', expr: '{{faker:phone}}' },
+  { label: 'UUID', expr: '{{faker:uuid}}' },
+  { label: '日期', expr: '{{faker:date}}' },
+  { label: '整数', expr: '{{faker:int(1,100)}}' },
+  { label: '布尔', expr: '{{faker:bool}}' },
+  { label: '城市', expr: '{{faker:city}}' },
+  { label: '公司', expr: '{{faker:company}}' },
+  { label: '单词', expr: '{{faker:word}}' },
+]
+
+async function copyFaker(expr: string) {
+  try {
+    await navigator.clipboard.writeText(expr)
+    message.success(`已复制 ${expr}`)
+  } catch {
+    message.error('复制失败')
+  }
+}
 
 /* ---------- 认证 ---------- */
 const authKinds = [
@@ -912,6 +1263,7 @@ async function loadRequest(id: number) {
     }
     form.value = detail
     if (detail.bodyType === 'graphql') loadGraphqlBody()
+    if (detail.protocol === 'graphql') void loadCachedGraphqlSchema()
     formVersion = 0
     savedVersion = 0
     autoState.value = 'saved'
@@ -987,6 +1339,17 @@ function quickOpen(value: number) {
 }
 
 onMounted(async () => {
+  window.addEventListener('keydown', onGlobalKeydown)
+  try {
+    rtUnlisteners.push(
+      await listen<RealtimeEvent>('realtime:event', (event) => onRealtimeEvent(event.payload)),
+    )
+    rtUnlisteners.push(
+      await listen<RealtimeStatus>('realtime:status', (event) => onRealtimeStatus(event.payload)),
+    )
+  } catch {
+    /* 非 Tauri 环境（如单测）没有事件系统，忽略 */
+  }
   try {
     if (projectId.value && !store.environments.length) {
       store.environments = await api.envList(projectId.value)
@@ -1017,8 +1380,12 @@ onBeforeRouteLeave(async () => {
 
 onBeforeUnmount(() => {
   disposed = true
+  window.removeEventListener('keydown', onGlobalKeydown)
+  rtUnlisteners.splice(0).forEach((fn) => fn())
+  void closeRealtime(true)
   saveSnapshot()
   if (bodySizeTimer) window.clearTimeout(bodySizeTimer)
+  if (replaceTimer) window.clearTimeout(replaceTimer)
 })
 
 // 页面挂载期间，后台请求完成时自动回填；本组件自己发起的请求直接改视图，不重复回填
@@ -1195,6 +1562,81 @@ function execContext(stage: string) {
     { label: '请求', value: `${form.value.method} ${form.value.url || '（未填写 URL）'}` },
     { label: '环境', value: env?.name ?? '未选择' },
   ]
+}
+
+/* ---------- 接口实体（请求 / 返回字段树） ---------- */
+const requestEntityCount = computed(() => {
+  const doc = parseEntityDoc(form.value.requestEntity)
+  return doc ? countEntityFields(doc) : 0
+})
+const responseEntityCount = computed(() => {
+  const doc = parseEntityDoc(form.value.responseEntity)
+  return doc ? countEntityFields(doc) : 0
+})
+
+/**
+ * 手工发送成功后静默刷新实体。
+ *
+ * 后端已经把最新结构合并进数据库；这里再把本地尚未保存的说明 / 手工字段合并回来，
+ * 避免因为一次发送把用户正在填的内容冲掉。批量 / 套件 / 压测不会走到这里。
+ */
+async function refreshEntitiesAfterSend(ownerId: number) {
+  try {
+    const entities = await api.requestEntitiesGet(ownerId)
+    if (disposed || form.value.id !== ownerId) return
+    const nextRequest = mergeEntityEdits(
+      entities.requestEntity ?? null,
+      parseEntityDoc(form.value.requestEntity),
+    )
+    const nextResponse = mergeEntityEdits(
+      entities.responseEntity ?? null,
+      parseEntityDoc(form.value.responseEntity),
+    )
+    const requestRaw = nextRequest ? serializeEntityDoc(nextRequest) : null
+    const responseRaw = nextResponse ? serializeEntityDoc(nextResponse) : null
+    if (requestRaw !== (form.value.requestEntity ?? null)) {
+      form.value.requestEntity = requestRaw
+    }
+    if (responseRaw !== (form.value.responseEntity ?? null)) {
+      form.value.responseEntity = responseRaw
+    }
+    if (entities.warnings.length) {
+      message.warning(entities.warnings.slice(0, 3).join('；'))
+    }
+  } catch {
+    // best-effort：实体刷新失败不影响本次请求结果
+  }
+}
+
+/**
+ * 回滚成功后替换当前表单。
+ *
+ * 后端在回滚时已经把快照写回数据库并生成了一条 restore 版本；这里只同步内存，
+ * 关掉自动保存并抬高 hydrating，避免「打开页面又写一个相同版本」。
+ */
+async function onRevisionRestored(detail: HttpRequestDetail) {
+  if (!detail.id || detail.id !== form.value.id) return
+  if (saveTimer) {
+    window.clearTimeout(saveTimer)
+    saveTimer = undefined
+  }
+  hydrating = true
+  try {
+    bodyDrafts.value = parseBodyDrafts(detail.bodyMeta)
+    if (detail.bodyType && detail.bodyType !== 'none') {
+      bodyDrafts.value = { ...bodyDrafts.value, [detail.bodyType]: detail.body ?? '' }
+    }
+    form.value = detail
+    if (!form.value.auth) form.value.auth = emptyAuth()
+    formVersion = 0
+    savedVersion = 0
+    if (detail.bodyType === 'graphql') loadGraphqlBody()
+    syncTabMeta()
+    await nextTick()
+  } finally {
+    hydrating = false
+  }
+  autoState.value = 'saved'
 }
 
 async function send() {
@@ -1387,6 +1829,10 @@ async function send() {
           context: execContext('发送请求'),
         })
       }
+      // 手工发送成功：后端已在 record_run 旁路同步实体，这里静默刷新页签
+      if (ownerId && !incoming.error && !incoming.cancelled) {
+        void refreshEntitiesAfterSend(ownerId)
+      }
     }
 
     if (postCode) {
@@ -1500,16 +1946,16 @@ const timingRows = computed<TimingRow[]>(() => {
     })
     cursor += ms
   }
-  if (t.dnsMs && t.dnsMs > 0) push('dns', 'DNS 解析', t.dnsMs, '#8b5cf6', '域名解析耗时')
+  if (t.dnsMs && t.dnsMs > 0) push('dns', 'DNS 解析', t.dnsMs, 'var(--fm-purple)', '域名解析耗时')
   push(
     'connect',
     t.reusedConnection ? '连接（复用）' : 'TCP + TLS',
     t.connectMs,
-    '#0ea5e9',
+    'var(--fm-primary)',
     t.reusedConnection ? '复用了已有连接，未新建握手' : '含 TCP 与 TLS 握手',
   )
-  push('ttfb', '等待首字节', t.ttfbMs, '#f59e0b', '从请求发出到收到响应首字节')
-  push('download', '正文下载', t.downloadMs, '#10b981', '读取响应体的耗时')
+  push('ttfb', '等待首字节', t.ttfbMs, 'var(--fm-warning)', '从请求发出到收到响应首字节')
+  push('download', '正文下载', t.downloadMs, 'var(--fm-success)', '读取响应体的耗时')
   return rows
 })
 
@@ -1948,11 +2394,82 @@ const prettyLineCount = computed(() => {
 
 const bodyView = ref<'pretty' | 'raw'>('pretty')
 
+/** 响应是 HTML（WAF 拦截页、调试页很常见），可用沙箱 iframe 直接渲染 */
+const isHtmlResponse = computed(() => {
+  const current = result.value
+  if (!current || isBinaryBody.value || current.bodyOmitted || !current.body) return false
+  const type = headerOf(current.headers, 'content-type').toLowerCase()
+  if (type.includes('text/html') || type.includes('application/xhtml')) return true
+  // 不少服务端漏配 content-type，按开头标签兜底识别
+  const head = current.body.slice(0, 512).trimStart()
+  return /^<!doctype\s+html/i.test(head) || /^<html[\s>]/i.test(head)
+})
+
+/** 预览上限：再大就只给源码，整页排版没必要在响应面板里硬扛 */
+const HTML_PREVIEW_MAX = 2 * 1024 * 1024
+const htmlPreviewable = computed(
+  () => isHtmlResponse.value && (result.value?.body.length ?? 0) <= HTML_PREVIEW_MAX,
+)
+
+/** 预览是临时视图，不写进 bodyView：现场快照的类型仍只认 pretty / raw */
+const htmlPreview = ref(false)
+const htmlPreviewActive = computed(() => htmlPreview.value && htmlPreviewable.value)
+
+/** 工具栏视图：HTML 用「源码 / 预览」两段（非 JSON 的 Pretty 与 Raw 内容相同），其余仍是 Pretty / Raw */
+const responseView = computed<'pretty' | 'raw' | 'html'>({
+  get: () => {
+    if (htmlPreviewActive.value) return 'html'
+    return htmlPreviewable.value ? 'raw' : bodyView.value
+  },
+  set: (value) => {
+    htmlPreview.value = value === 'html'
+    // HTML 的「源码」只是临时视图，不覆盖 Pretty/Raw 偏好，免得影响后续 JSON 响应
+    if (value !== 'html' && !htmlPreviewable.value) bodyView.value = value
+  },
+})
+
+/** Body 页签角标：预览态不展示源码行数，改显示响应体大小 */
+const bodyTabBadge = computed(() => {
+  const current = result.value
+  if (!current) return '0'
+  if (htmlPreviewActive.value) return fmtSize(current.sizeBytes)
+  if (isBinaryBody.value) return fmtSize(current.bodyBytes || current.sizeBytes)
+  return prettyLineCount.value ? `${prettyLineCount.value} 行` : '0'
+})
+
+const responseBodyText = computed(() =>
+  bodyView.value === 'pretty' ? prettyBody.value : result.value?.body ?? '',
+)
+
+/** 响应正文只有以 { / [ 开头才按 JSON 着色，其余保持纯文本 */
+const responseLanguage = computed<'json' | 'plain'>(() => {
+  const text = responseBodyText.value.trimStart()
+  return text.startsWith('{') || text.startsWith('[') ? 'json' : 'plain'
+})
+
+function openResponseSearch() {
+  if (!result.value || isBinaryBody.value) return
+  // 预览是 iframe，搜索作用于源码：先退出预览
+  htmlPreview.value = false
+  if (responseTab.value !== 'body') responseTab.value = 'body'
+  nextTick(() => responseBodyRef.value?.openSearch())
+}
+
+/** Response 面板聚焦时 Ctrl/Cmd+F 打开搜索；输入框内保留原有查找行为 */
+function onGlobalKeydown(e: KeyboardEvent) {
+  if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey) return
+  if (e.key !== 'f' && e.key !== 'F') return
+  if (!result.value || isBinaryBody.value) return
+  const active = document.activeElement as HTMLElement | null
+  const tag = active?.tagName
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || active?.isContentEditable) return
+  e.preventDefault()
+  openResponseSearch()
+}
+
 // 新响应或切换 Pretty/Raw 后正文滚回顶部，避免停在上一次的滚动位置
 watch([result, bodyView], () => {
-  nextTick(() => {
-    if (bodyPreEl.value) bodyPreEl.value.scrollTop = 0
-  })
+  nextTick(() => responseBodyRef.value?.scrollToTop())
 })
 
 /* 字节数防抖：大 Body 每次按键都 new Blob 也是一笔可见开销 */
@@ -2003,6 +2520,53 @@ async function formatBody() {
   } finally {
     hide()
   }
+}
+
+/* ---------- Body 批量替换 ---------- */
+const replaceOpen = ref(false)
+const replaceFind = ref('')
+const replaceWith = ref('')
+const replaceCase = ref(false)
+const replaceCount = ref(0)
+let replaceTimer: number | undefined
+
+// 匹配数按 150ms 防抖统计，几 MB 的 Body 也不会每敲一个字就全量扫描
+watch(
+  [replaceFind, replaceCase, () => form.value.body],
+  () => {
+    if (replaceTimer) window.clearTimeout(replaceTimer)
+    replaceTimer = window.setTimeout(() => {
+      replaceTimer = undefined
+      replaceCount.value = replaceFind.value
+        ? findMatches(form.value.body, replaceFind.value, replaceCase.value).length
+        : 0
+    }, 150)
+  },
+  { immediate: true },
+)
+
+// 切到不支持的 Body 类型时收起替换条，避免误操作
+watch(
+  () => form.value.bodyType,
+  (type) => {
+    if (type !== 'json' && type !== 'raw') replaceOpen.value = false
+  },
+)
+
+function applyReplaceAll() {
+  if (!replaceFind.value) return
+  const { text, count } = replaceAllLiteral(
+    form.value.body,
+    replaceFind.value,
+    replaceWith.value,
+    replaceCase.value,
+  )
+  if (!count) {
+    message.info('没有找到要替换的内容')
+    return
+  }
+  form.value.body = text
+  message.success(`已替换 ${count} 处`)
 }
 
 async function copyBody() {
@@ -2231,6 +2795,14 @@ const responseHeaders = computed(() => {
             </template>
           </a-dropdown>
           <a-button @click="openCookies">Cookie</a-button>
+          <a-button :disabled="!form.id" @click="historyOpen = true">
+            <template #icon><HistoryOutlined /></template>
+            历史
+          </a-button>
+          <a-button :disabled="!form.id" @click="docsOpen = true">
+            <template #icon><FileTextOutlined /></template>
+            文档
+          </a-button>
           <a-button @click="openCode">
             <template #icon><CodeOutlined /></template>
             代码
@@ -2294,6 +2866,12 @@ const responseHeaders = computed(() => {
 
       <div class="url-bar">
         <div class="request-bar">
+          <a-select v-model:value="form.protocol" class="proto-select" :bordered="false">
+            <a-select-option v-for="item in REQUEST_PROTOCOLS" :key="item.value" :value="item.value">
+              {{ item.label }}
+            </a-select-option>
+          </a-select>
+          <span class="bar-divider" />
           <a-select v-model:value="form.method" class="method-select" :class="`m-${form.method}`" :bordered="false">
             <a-select-option v-for="m in methods" :key="m" :value="m">{{ m }}</a-select-option>
           </a-select>
@@ -2302,8 +2880,14 @@ const responseHeaders = computed(() => {
             v-model:value="form.url"
             class="url-input mono"
             :bordered="false"
-            placeholder="https://api.example.com/users 或 {{base_url}}/users"
-            @press-enter="send"
+            :placeholder="
+              requestProtocol === 'websocket'
+                ? 'ws://localhost:8080/socket'
+                : requestProtocol === 'sse'
+                  ? 'https://api.example.com/events（SSE 流地址）'
+                  : 'https://api.example.com/users 或 {{base_url}}/users'
+            "
+            @press-enter="isRealtime ? connectRealtime() : send()"
           />
           <span class="bar-divider" />
           <a-select
@@ -2328,17 +2912,47 @@ const responseHeaders = computed(() => {
               <template #icon><SettingOutlined /></template>
             </a-button>
           </a-tooltip>
-          <a-button type="primary" class="send-btn" :loading="sending" @click="send">
+          <a-button
+            type="primary"
+            class="send-btn"
+            :loading="isRealtime ? rtBusy : sending"
+            @click="isRealtime ? connectRealtime() : send()"
+          >
             <template #icon><SendOutlined /></template>
-            发送
+            {{ isRealtime ? (rtConnected ? '重连' : '连接') : '发送' }}
           </a-button>
-          <a-tooltip v-if="sending" title="停止本次请求（连接、等待或下载阶段都可以中断）">
+          <a-tooltip v-if="isRealtime && rtConnected" title="断开当前实时连接">
+            <a-button danger class="stop-btn" @click="closeRealtime()">断开</a-button>
+          </a-tooltip>
+          <a-tooltip
+            v-else-if="sending && !isRealtime"
+            title="停止本次请求（连接、等待或下载阶段都可以中断）"
+          >
             <a-button danger class="stop-btn" :loading="cancelling" @click="cancelSend">
               停止
             </a-button>
           </a-tooltip>
         </div>
-        <span class="url-tip">Enter 发送 · 支持环境变量</span>
+        <span class="url-tip">
+          <a-popover trigger="click" placement="bottomRight">
+            <template #content>
+              <div class="faker-panel">
+                <a-tag
+                  v-for="item in FAKER_SAMPLES"
+                  :key="item.expr"
+                  class="faker-tag"
+                  @click="copyFaker(item.expr)"
+                >
+                  {{ item.label }}
+                </a-tag>
+                <div class="faker-hint">点击复制表达式，粘贴到 URL / Header / Body；发送时生成随机值</div>
+              </div>
+            </template>
+            <a class="faker-entry">faker 变量</a>
+          </a-popover>
+          <span v-if="fakerCount" class="faker-count">· 将生成 {{ fakerCount }} 个随机值</span>
+          <span>Enter 发送 · 支持环境变量</span>
+        </span>
       </div>
 
       <div class="panes">
@@ -2476,7 +3090,51 @@ const responseHeaders = computed(() => {
                   >
                     格式化 JSON
                   </a-button>
+                  <a-button
+                    v-if="form.bodyType === 'json' || form.bodyType === 'raw'"
+                    size="small"
+                    type="link"
+                    :disabled="!form.body.trim()"
+                    @click="replaceOpen = !replaceOpen"
+                  >
+                    批量替换
+                  </a-button>
                   <span v-if="form.body" class="body-size mono">{{ fmtSize(bodySize) }}</span>
+                </div>
+
+                <div
+                  v-if="replaceOpen && (form.bodyType === 'json' || form.bodyType === 'raw')"
+                  class="replace-bar"
+                >
+                  <a-input
+                    v-model:value="replaceFind"
+                    size="small"
+                    allow-clear
+                    placeholder="查找内容"
+                    class="replace-find"
+                    @keydown.esc="replaceOpen = false"
+                  />
+                  <a-input
+                    v-model:value="replaceWith"
+                    size="small"
+                    allow-clear
+                    placeholder="替换为（留空即删除）"
+                    class="replace-with"
+                    @keydown.esc="replaceOpen = false"
+                  />
+                  <a-checkbox v-model:checked="replaceCase">区分大小写</a-checkbox>
+                  <span class="replace-count mono">
+                    {{ replaceFind ? `${replaceCount} 处匹配` : '输入查找内容' }}
+                  </span>
+                  <a-button
+                    size="small"
+                    type="primary"
+                    :disabled="!replaceFind || !replaceCount"
+                    @click="applyReplaceAll"
+                  >
+                    全部替换
+                  </a-button>
+                  <a-button size="small" type="text" @click="replaceOpen = false">关闭</a-button>
                 </div>
 
                 <div v-if="form.bodyType === 'multipart'" class="multipart">
@@ -2521,8 +3179,68 @@ const responseHeaders = computed(() => {
                 </div>
 
                 <div v-else-if="form.bodyType === 'graphql'" class="graphql">
+                  <div class="gql-schema-bar">
+                    <a-button size="small" :loading="gqlSchemaLoading" @click="fetchGraphqlSchema">
+                      获取 Schema
+                    </a-button>
+                    <a-button
+                      size="small"
+                      type="text"
+                      :disabled="!gqlSchema"
+                      @click="gqlSchemaOpen = !gqlSchemaOpen"
+                    >
+                      {{ gqlSchemaOpen ? '收起字段' : '浏览字段' }}
+                    </a-button>
+                    <span v-if="gqlSchema" class="header-hint">
+                      已缓存 · 点击字段名插入到光标处
+                    </span>
+                    <span v-else-if="gqlSchemaError" class="gql-error">{{ gqlSchemaError }}</span>
+                    <span v-else class="header-hint">未获取 Schema 时仍可直接编辑 Query</span>
+                  </div>
+                  <div v-if="gqlSchemaOpen && gqlSchema" class="gql-schema-panel">
+                    <a-input
+                      v-model:value="gqlSchemaFilter"
+                      size="small"
+                      placeholder="搜索类型 / 字段"
+                      allow-clear
+                    />
+                    <div class="gql-schema-list">
+                      <div v-for="type in filteredGqlTypes" :key="type.name" class="gql-schema-type">
+                        <div class="gql-type-head">
+                          <span class="gql-type-kind">{{ type.kind }}</span>
+                          <span class="gql-type-name">{{ type.name }}</span>
+                        </div>
+                        <div
+                          v-for="field in type.fields"
+                          :key="field.name"
+                          class="gql-field"
+                          :title="field.type"
+                          @click="insertGraphqlField(field.name)"
+                        >
+                          <span class="gql-field-name">{{ field.name }}</span>
+                          <span class="gql-field-type mono">{{ field.type }}</span>
+                        </div>
+                        <div
+                          v-for="value in type.values"
+                          :key="value"
+                          class="gql-field"
+                          @click="insertGraphqlField(value)"
+                        >
+                          <span class="gql-field-name">{{ value }}</span>
+                          <span class="gql-field-type mono">enum</span>
+                        </div>
+                      </div>
+                      <div v-if="!filteredGqlTypes.length" class="empty-hint">没有匹配的类型</div>
+                    </div>
+                  </div>
                   <div class="script-label">Query</div>
-                  <CodeArea v-model="gqlQuery" fill :rows="9" placeholder="query { user(id: 1) { id name } }" />
+                  <CodeArea
+                    ref="gqlQueryAreaRef"
+                    v-model="gqlQuery"
+                    fill
+                    :rows="9"
+                    placeholder="query { user(id: 1) { id name } }"
+                  />
                   <div class="script-label">Variables（JSON 对象，可留空）</div>
                   <CodeArea v-model="gqlVarsText" fill :rows="5" placeholder='{"id": 1}' />
                   <div v-if="gqlVarsError" class="gql-error">{{ gqlVarsError }}</div>
@@ -2598,10 +3316,124 @@ const responseHeaders = computed(() => {
                 </div>
               </div>
             </a-tab-pane>
+            <a-tab-pane key="requestEntity">
+              <template #tab>
+                请求实体
+                <span class="tab-count" :class="{ off: !requestEntityCount }">{{ requestEntityCount }}</span>
+              </template>
+              <div class="tab-body">
+                <RequestEntityEditor
+                  v-model="form.requestEntity"
+                  target="request"
+                  :request-id="form.id"
+                  :body="form.body"
+                  :body-type="form.bodyType"
+                />
+              </div>
+            </a-tab-pane>
           </a-tabs>
         </div>
 
-        <div class="res-pane fm-card">
+        <div v-if="isRealtime" class="res-pane fm-card realtime-pane">
+          <div class="res-head">
+            <span class="pane-title">
+              <span class="pane-dot res" />
+              {{ requestProtocol === 'websocket' ? 'WebSocket' : 'SSE' }} 实时消息
+            </span>
+            <span class="status-pill mono" :class="{ ok: rtStatus?.state === 'open', bad: rtStatus?.state === 'error' }">
+              {{ rtStateText }}
+            </span>
+            <template v-if="rtStatus">
+              <span class="meta-divider" />
+              <span class="meta mono">{{ rtStatus.messageCount }} 条</span>
+              <span class="meta-divider" />
+              <span class="meta mono">{{ fmtSize(rtStatus.bytes) }}</span>
+              <a-tooltip v-if="rtStatus.lastEventId" :title="`Last-Event-ID：${rtStatus.lastEventId}`">
+                <span class="proto-pill mono">Last-ID</span>
+              </a-tooltip>
+            </template>
+            <a-tooltip
+              v-if="rtStatus?.closeReason || rtStatus?.error"
+              :title="rtStatus?.error || rtStatus?.closeReason || ''"
+            >
+              <span class="proto-pill warn mono">{{ rtStatus?.error ? '出错' : '已关闭' }}</span>
+            </a-tooltip>
+            <span class="res-spacer" />
+            <a-checkbox
+              v-if="requestProtocol === 'sse'"
+              v-model:checked="rtAutoReconnect"
+              :disabled="rtConnected"
+            >
+              断线重连
+            </a-checkbox>
+            <a-select
+              v-else
+              v-model:value="rtPingMs"
+              size="small"
+              class="rt-ping"
+              :disabled="rtConnected"
+            >
+              <a-select-option :value="0">不心跳</a-select-option>
+              <a-select-option :value="15000">15s 心跳</a-select-option>
+              <a-select-option :value="30000">30s 心跳</a-select-option>
+              <a-select-option :value="60000">60s 心跳</a-select-option>
+            </a-select>
+            <a-button size="small" type="text" :disabled="!rtEvents.length" @click="clearRealtimeLog">
+              清空
+            </a-button>
+          </div>
+
+          <div v-if="!rtSessionId && !rtEvents.length" class="res-standby">
+            <div class="res-empty">
+              <div class="res-empty-icon">⇄</div>
+              <div class="res-empty-title">
+                {{ requestProtocol === 'websocket' ? '连接 WebSocket' : '订阅 SSE 流' }}
+              </div>
+              <div class="res-empty-desc">
+                填写地址后点「连接」。{{
+                  requestProtocol === 'websocket'
+                    ? '支持 ws:// 与 wss://，文本消息逐条显示；单连接最多 5000 条 / 10 MB。'
+                    : '使用 GET 建立流，支持 event / id / data / retry，断线按 Last-Event-ID 续传。'
+                }}
+              </div>
+            </div>
+          </div>
+          <div v-else class="realtime-body">
+            <div ref="rtListEl" class="realtime-list">
+              <div v-for="(event, index) in rtEvents" :key="index" class="realtime-item" :class="`t-${event.type}`">
+                <span class="rt-time mono">{{ formatDateTime(event.ts) }}</span>
+                <span class="rt-kind">
+                  <span v-if="event.protocol === 'websocket' && event.messageType === 'binary'" class="rt-tag">BIN</span>
+                  <span v-else-if="event.type === 'sent'" class="rt-tag sent">SENT</span>
+                  <span v-else-if="event.type === 'message'" class="rt-tag">MSG</span>
+                  <span v-else class="rt-tag sys">{{ event.type.toUpperCase() }}</span>
+                  <span v-if="event.event" class="rt-event-name">{{ event.event }}</span>
+                  <span v-if="event.id" class="rt-event-id mono">#{{ event.id }}</span>
+                </span>
+                <span class="rt-data mono">{{ realtimePreview(event) }}</span>
+              </div>
+              <div v-if="!rtEvents.length" class="empty-hint">已连接，等待消息…</div>
+            </div>
+            <div v-if="requestProtocol === 'websocket'" class="realtime-send">
+              <a-input
+                v-model:value="rtInput"
+                class="mono"
+                placeholder="发送文本消息（Enter 发送）"
+                :disabled="rtStatus?.state !== 'open'"
+                @press-enter="sendRealtime"
+              />
+              <a-button
+                type="primary"
+                :disabled="rtStatus?.state !== 'open' || !rtInput"
+                @click="sendRealtime"
+              >
+                发送
+              </a-button>
+            </div>
+          </div>
+        </div>
+
+        <div v-else class="res-pane fm-card">
           <div class="res-head">
             <span class="pane-title">
               <span class="pane-dot res" />
@@ -2653,15 +3485,25 @@ const responseHeaders = computed(() => {
             </span>
             <span class="res-spacer" />
             <template v-if="result && !result.error">
+              <a-button
+                v-if="!isBinaryBody && !htmlPreviewActive"
+                size="small"
+                type="text"
+                title="搜索响应（Ctrl+F）"
+                @click="openResponseSearch"
+              >
+                <template #icon><SearchOutlined /></template>
+              </a-button>
               <a-radio-group
                 v-if="!isBinaryBody"
-                v-model:value="bodyView"
+                v-model:value="responseView"
                 size="small"
                 button-style="solid"
                 class="view-toggle"
               >
-                <a-radio-button value="pretty">Pretty</a-radio-button>
-                <a-radio-button value="raw">Raw</a-radio-button>
+                <a-radio-button v-if="!htmlPreviewable" value="pretty">Pretty</a-radio-button>
+                <a-radio-button value="raw">{{ htmlPreviewable ? '源码' : 'Raw' }}</a-radio-button>
+                <a-radio-button v-if="htmlPreviewable" value="html">预览</a-radio-button>
               </a-radio-group>
               <a-button v-if="!isBinaryBody" size="small" type="text" @click="copyBody">复制</a-button>
               <a-button size="small" type="text" @click="isBinaryBody ? saveBinaryBody() : saveResponseBody()">
@@ -2671,10 +3513,20 @@ const responseHeaders = computed(() => {
             </template>
           </div>
 
-          <div v-if="!result" class="res-empty">
-            <div class="res-empty-icon">⇥</div>
-            <div class="res-empty-title">准备就绪</div>
-            <div class="res-empty-desc">填写 URL 后点「发送」或按 Enter 查看响应结果</div>
+          <div v-if="!result" class="res-standby">
+            <div v-if="!responseEntityCount" class="res-empty">
+              <div class="res-empty-icon">⇥</div>
+              <div class="res-empty-title">准备就绪</div>
+              <div class="res-empty-desc">填写 URL 后点「发送」或按 Enter 查看响应结果</div>
+            </div>
+            <div v-else class="res-entity-fallback">
+              <div class="res-entity-title">返回实体（暂无实时响应，显示上次保存的结构）</div>
+              <RequestEntityEditor
+                v-model="form.responseEntity"
+                target="response"
+                :request-id="form.id"
+              />
+            </div>
           </div>
           <template v-else>
             <a-alert v-if="result.error" type="error" :message="result.error" show-icon style="margin: 12px 14px" />
@@ -2682,13 +3534,7 @@ const responseHeaders = computed(() => {
               <a-tab-pane key="body">
                 <template #tab>
                   Body
-                  <span class="tab-count">{{
-                    isBinaryBody
-                      ? fmtSize(result.bodyBytes || result.sizeBytes)
-                      : prettyLineCount
-                        ? `${prettyLineCount} 行`
-                        : '0'
-                  }}</span>
+                  <span class="tab-count">{{ bodyTabBadge }}</span>
                 </template>
 
                 <!-- 二进制 / 超大响应：已落盘，不塞进文本框 -->
@@ -2739,8 +3585,24 @@ const responseHeaders = computed(() => {
                     点「另存为」导出的是完整文件。
                   </div>
                   <div v-else-if="result.truncated" class="truncate-hint">响应体超过 5MB，已截断显示</div>
-                  <div class="res-body-wrap">
-                    <pre ref="bodyPreEl" class="mono body-pre">{{ bodyView === 'pretty' ? prettyBody : result.body }}</pre>
+                  <div v-if="htmlPreviewActive" class="res-body-wrap">
+                    <div class="html-preview-note">
+                      沙箱预览：脚本、表单与弹窗已禁用；查看源码请切回「源码」
+                    </div>
+                    <iframe
+                      class="html-preview-frame"
+                      :srcdoc="result.body"
+                      sandbox=""
+                      referrerpolicy="no-referrer"
+                      :title="`HTML 响应预览 ${result.status}`"
+                    />
+                  </div>
+                  <div v-else class="res-body-wrap">
+                    <ResponseBody
+                      ref="responseBodyRef"
+                      :text="responseBodyText"
+                      :language="responseLanguage"
+                    />
                   </div>
                 </template>
               </a-tab-pane>
@@ -2883,6 +3745,19 @@ const responseHeaders = computed(() => {
                     </div>
                   </div>
                   <div v-if="scriptMs" class="test-time">脚本耗时 {{ scriptMs }} ms</div>
+                </div>
+              </a-tab-pane>
+              <a-tab-pane key="responseEntity">
+                <template #tab>
+                  返回实体
+                  <span class="tab-count" :class="{ off: !responseEntityCount }">{{ responseEntityCount }}</span>
+                </template>
+                <div class="tab-body">
+                  <RequestEntityEditor
+                    v-model="form.responseEntity"
+                    target="response"
+                    :request-id="form.id"
+                  />
                 </div>
               </a-tab-pane>
             </a-tabs>
@@ -3155,6 +4030,22 @@ const responseHeaders = computed(() => {
       @select="envId = $event"
       @changed="onEnvsChanged"
     />
+
+    <RequestHistoryDrawer
+      v-model:open="historyOpen"
+      :request-id="form.id ?? null"
+      :request-name="form.name"
+      @restored="onRevisionRestored"
+    />
+
+    <DocsPreviewDrawer
+      v-model:open="docsOpen"
+      scope="request"
+      :target-id="form.id || 0"
+      :project-id="projectId"
+      :project-name="projectName"
+      :default-environment-id="envId"
+    />
   </a-spin>
   </div>
 </template>
@@ -3236,7 +4127,7 @@ const responseHeaders = computed(() => {
 
 .tabs-scroll::-webkit-scrollbar-thumb {
   border: none;
-  border-radius: 4px;
+  border-radius: var(--fm-radius-sm);
   background: var(--fm-border-strong);
 }
 
@@ -3250,7 +4141,7 @@ const responseHeaders = computed(() => {
   padding: 0 8px 0 10px;
   border: 1px solid transparent;
   border-bottom: none;
-  border-radius: 7px 7px 0 0;
+  border-radius: var(--fm-radius-sm) var(--fm-radius-sm) 0 0;
   color: var(--fm-muted);
   font-size: 12px;
   white-space: nowrap;
@@ -3260,7 +4151,7 @@ const responseHeaders = computed(() => {
 }
 
 .req-tab:hover {
-  background: rgba(100, 116, 139, 0.08);
+  background: var(--fm-surface-alt);
   color: var(--fm-text-2);
 }
 
@@ -3268,7 +4159,7 @@ const responseHeaders = computed(() => {
   background: var(--fm-surface);
   border-color: var(--fm-border);
   color: var(--fm-text);
-  box-shadow: inset 0 1px 0 var(--fm-primary);
+  box-shadow: inset 0 2px 0 var(--fm-primary);
 }
 
 .tab-method {
@@ -3318,13 +4209,13 @@ const responseHeaders = computed(() => {
   width: 16px;
   height: 16px;
   flex-shrink: 0;
-  border-radius: 4px;
+  border-radius: var(--fm-radius-sm);
   font-size: 10px;
   color: var(--fm-muted);
 }
 
 .tab-close:hover {
-  background: rgba(100, 116, 139, 0.18);
+  background: var(--fm-border);
   color: var(--fm-danger);
 }
 
@@ -3440,17 +4331,16 @@ const responseHeaders = computed(() => {
   display: flex;
   align-items: center;
   gap: 2px;
-  height: 42px;
-  padding: 3px 3px 3px 4px;
-  border: 1px solid var(--fm-border-strong);
-  border-radius: 9px;
+  height: 38px;
+  padding: 2px 3px 2px 4px;
+  border: 1px solid var(--fm-border-control);
+  border-radius: var(--fm-radius);
   background: var(--fm-surface);
-  transition: border-color 0.16s, box-shadow 0.16s;
+  transition: border-color 0.16s;
 }
 
 .request-bar:focus-within {
   border-color: var(--fm-primary);
-  box-shadow: 0 0 0 3px var(--fm-primary-soft);
 }
 
 .method-select {
@@ -3459,9 +4349,22 @@ const responseHeaders = computed(() => {
   font-weight: 700;
 }
 
-.method-select :deep(.ant-select-selector) {
+.proto-select {
+  width: 92px;
+  flex-shrink: 0;
+  font-weight: 600;
+}
+
+.proto-select :deep(.ant-select-selector) {
+  height: 32px;
   box-shadow: none !important;
-  border-radius: 6px !important;
+  border-radius: var(--fm-radius-sm) !important;
+}
+
+.method-select :deep(.ant-select-selector) {
+  height: 32px;
+  box-shadow: none !important;
+  border-radius: var(--fm-radius-sm) !important;
   transition: background-color 0.14s ease;
 }
 
@@ -3512,7 +4415,7 @@ const responseHeaders = computed(() => {
 }
 
 .url-input :deep(.ant-input) {
-  height: 36px;
+  height: 32px;
 }
 
 .env-select {
@@ -3522,6 +4425,7 @@ const responseHeaders = computed(() => {
 }
 
 .env-select :deep(.ant-select-selector) {
+  height: 32px;
   box-shadow: none !important;
 }
 
@@ -3537,34 +4441,57 @@ const responseHeaders = computed(() => {
 }
 
 .send-btn {
-  height: 34px;
+  height: 32px;
   flex-shrink: 0;
-  border-radius: 8px;
+  border-radius: var(--fm-radius-sm);
   font-weight: 600;
-  background: linear-gradient(
-    135deg,
-    color-mix(in srgb, var(--fm-primary) 80%, #ffffff) 0%,
-    var(--fm-primary) 100%
-  );
   border: none;
-  box-shadow: 0 3px 10px color-mix(in srgb, var(--fm-primary) 32%, transparent);
-  transition: filter 0.16s ease, box-shadow 0.16s ease, transform 0.1s ease;
+  transition: filter 0.16s ease;
 }
 
 .send-btn:not(:disabled):hover {
   filter: brightness(1.07);
-  box-shadow: 0 5px 16px color-mix(in srgb, var(--fm-primary) 42%, transparent);
-  transform: translateY(-1px);
 }
 
 .send-btn:not(:disabled):active {
-  transform: translateY(0);
   filter: brightness(0.97);
 }
 
 .url-tip {
   flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   font-size: 10px;
+  color: var(--fm-muted);
+}
+
+.faker-entry {
+  font-size: 10px;
+  color: var(--fm-primary);
+  cursor: pointer;
+}
+
+.faker-count {
+  color: var(--fm-primary);
+}
+
+.faker-panel {
+  max-width: 260px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.faker-panel .faker-tag {
+  margin-inline-end: 0;
+  cursor: pointer;
+}
+
+.faker-hint {
+  width: 100%;
+  margin-top: 2px;
+  font-size: 11px;
   color: var(--fm-muted);
 }
 
@@ -3589,10 +4516,9 @@ const responseHeaders = computed(() => {
   flex-direction: column;
   overflow: hidden;
   border: 1px solid var(--fm-border);
-  border-radius: 10px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface);
-  box-shadow: var(--fm-shadow-sm);
-  transition: border-color 0.16s ease, box-shadow 0.16s ease;
+  transition: border-color 0.16s ease;
 }
 
 .req-pane:focus-within,
@@ -3678,7 +4604,7 @@ const responseHeaders = computed(() => {
   height: 16px;
   padding: 0 5px;
   margin-left: 5px;
-  border-radius: 5px;
+  border-radius: var(--fm-radius-sm);
   background: var(--fm-surface-alt);
   color: var(--fm-muted);
   font-size: 9.5px;
@@ -3786,6 +4712,173 @@ const responseHeaders = computed(() => {
   color: var(--fm-danger);
 }
 
+/* W3：GraphQL Schema 浏览器 */
+.gql-schema-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.gql-schema-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid var(--fm-border);
+  border-radius: var(--fm-radius-sm);
+  background: var(--fm-surface-alt);
+}
+
+.gql-schema-list {
+  max-height: 240px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.gql-schema-type {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.gql-type-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.gql-type-kind {
+  font-size: 10px;
+  padding: 0 4px;
+  border-radius: var(--fm-radius-sm);
+  color: var(--fm-primary);
+  background: var(--fm-primary-soft);
+}
+
+.gql-field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 1px 6px 1px 18px;
+  font-size: 12px;
+  cursor: pointer;
+  border-radius: var(--fm-radius-sm);
+}
+
+.gql-field:hover {
+  background: var(--fm-primary-soft);
+}
+
+.gql-field-type {
+  font-size: 11px;
+  color: var(--fm-text-3);
+}
+
+/* W3：实时调试面板 */
+.realtime-pane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.realtime-body {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+.realtime-list {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 6px 12px;
+  font-size: 12px;
+}
+
+.realtime-item {
+  display: flex;
+  gap: 8px;
+  padding: 2px 0;
+  border-bottom: 1px dashed var(--fm-border);
+}
+
+.realtime-item.t-error .rt-data {
+  color: var(--fm-danger);
+}
+
+.realtime-item.t-reconnect .rt-data,
+.realtime-item.t-notice .rt-data {
+  color: var(--fm-text-3);
+}
+
+.rt-time {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--fm-text-3);
+}
+
+.rt-kind {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.rt-tag {
+  font-size: 10px;
+  padding: 0 4px;
+  border-radius: var(--fm-radius-sm);
+  color: var(--fm-primary);
+  background: var(--fm-primary-soft);
+}
+
+.rt-tag.sent {
+  color: var(--fm-warning);
+  background: var(--fm-warning-soft);
+}
+
+.rt-tag.sys {
+  color: var(--fm-text-3);
+  background: var(--fm-surface-alt);
+}
+
+.rt-event-name,
+.rt-event-id {
+  font-size: 11px;
+  color: var(--fm-text-3);
+}
+
+.rt-data {
+  flex: 1;
+  min-width: 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: text;
+}
+
+.realtime-send {
+  display: flex;
+  gap: 8px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--fm-border);
+}
+
+.realtime-send .ant-input {
+  flex: 1;
+  height: 28px;
+}
+
+.rt-ping {
+  width: 108px;
+}
+
 .cookie-hint {
   font-size: 12px;
   color: var(--fm-muted);
@@ -3836,7 +4929,7 @@ const responseHeaders = computed(() => {
   max-height: 460px;
   overflow: auto;
   border: 1px solid var(--fm-border);
-  border-radius: 6px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface-alt);
 }
 
@@ -3896,6 +4989,32 @@ const responseHeaders = computed(() => {
   color: var(--fm-muted);
 }
 
+.replace-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: -4px 0 8px;
+  padding: 6px 8px;
+  border: 1px dashed var(--fm-border);
+  border-radius: var(--fm-radius);
+  background: var(--fm-surface-alt);
+}
+
+.replace-find {
+  width: 220px;
+}
+
+.replace-with {
+  width: 260px;
+}
+
+.replace-count {
+  font-size: 11px;
+  color: var(--fm-muted);
+  white-space: nowrap;
+}
+
 .body-input {
   font-size: 12px;
   line-height: 1.7;
@@ -3927,7 +5046,7 @@ const responseHeaders = computed(() => {
 .script-hint {
   margin-top: 10px;
   padding: 9px 11px;
-  border-radius: 7px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface-alt);
   font-size: 10.5px;
   line-height: 1.8;
@@ -3937,7 +5056,7 @@ const responseHeaders = computed(() => {
 .script-hint code {
   padding: 1px 4px;
   margin: 0 1px;
-  border-radius: 4px;
+  border-radius: var(--fm-radius-sm);
   background: var(--fm-surface);
   color: var(--fm-text-2);
   font-size: 10px;
@@ -3949,7 +5068,7 @@ const responseHeaders = computed(() => {
   gap: 4px;
   margin-left: 10px;
   padding: 2px 8px;
-  border-radius: 20px;
+  border-radius: 999px;
   background: var(--fm-success-soft);
   color: var(--fm-success);
   font-size: 10px;
@@ -3957,7 +5076,7 @@ const responseHeaders = computed(() => {
 }
 
 .assert-pill.bad {
-  background: var(--fm-danger-soft, #fdeaea);
+  background: var(--fm-danger-soft);
   color: var(--fm-danger);
 }
 
@@ -3967,7 +5086,7 @@ const responseHeaders = computed(() => {
 }
 
 .tab-count.bad {
-  background: var(--fm-danger-soft, #fdeaea);
+  background: var(--fm-danger-soft);
   color: var(--fm-danger);
 }
 
@@ -3990,7 +5109,7 @@ const responseHeaders = computed(() => {
   overflow: auto;
   white-space: pre-wrap;
   word-break: break-word;
-  font-family: 'JetBrains Mono', 'Cascadia Code', 'SFMono-Regular', Consolas, monospace;
+  font-family: var(--fm-font-mono);
   font-size: 11px;
   line-height: 1.6;
 }
@@ -4006,13 +5125,13 @@ const responseHeaders = computed(() => {
   align-items: baseline;
   gap: 8px;
   padding: 6px 9px;
-  border-radius: 6px;
+  border-radius: var(--fm-radius);
   background: var(--fm-success-soft);
   color: var(--fm-text-2);
 }
 
 .test-row.failed {
-  background: var(--fm-danger-soft, #fdeaea);
+  background: var(--fm-danger-soft);
 }
 
 .test-mark {
@@ -4064,7 +5183,7 @@ const responseHeaders = computed(() => {
   display: flex;
   gap: 8px;
   padding: 4px 8px;
-  border-radius: 5px;
+  border-radius: var(--fm-radius-sm);
   border-bottom: 1px dashed var(--fm-border);
 }
 
@@ -4081,7 +5200,7 @@ const responseHeaders = computed(() => {
   padding: 0 5px;
   height: 15px;
   line-height: 15px;
-  border-radius: 4px;
+  border-radius: var(--fm-radius-sm);
   background: var(--fm-surface-alt);
   color: var(--fm-muted);
   font-size: 9.5px;
@@ -4132,11 +5251,33 @@ const responseHeaders = computed(() => {
   gap: 10px;
   background: var(--fm-surface-alt);
   border-bottom: 1px solid var(--fm-border);
+  overflow: hidden;
+}
+
+/* 指标与操作按钮必须保持单行；空间不够时只压缩来源标签 */
+.res-head > * {
+  flex-shrink: 0;
+}
+
+.res-head > .proto-pill.run-source {
+  flex-shrink: 1;
+  min-width: 0;
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.res-head .status-pill,
+.res-head .meta,
+.res-head .assert-pill,
+.res-head .proto-pill {
+  white-space: nowrap;
 }
 
 .status-pill {
   padding: 1px 8px;
-  border-radius: 5px;
+  border-radius: var(--fm-radius-sm);
   font-size: 11.5px;
   font-weight: 700;
 }
@@ -4171,6 +5312,13 @@ const responseHeaders = computed(() => {
   color: var(--fm-muted);
 }
 
+.res-standby {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
 .res-empty {
   flex: 1;
   display: flex;
@@ -4183,9 +5331,9 @@ const responseHeaders = computed(() => {
 .res-empty-icon {
   width: 48px;
   height: 48px;
-  border-radius: 14px;
+  border-radius: var(--fm-radius-lg);
   background: var(--fm-surface-alt);
-  color: #c2ccdb;
+  color: var(--fm-muted);
   font-size: 22px;
   display: flex;
   align-items: center;
@@ -4205,6 +5353,19 @@ const responseHeaders = computed(() => {
   color: var(--fm-muted);
 }
 
+.res-entity-fallback {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px 14px;
+}
+
+.res-entity-title {
+  margin-bottom: 10px;
+  font-size: 12px;
+  color: var(--fm-muted);
+}
+
 .res-tabs {
   flex: 1;
   min-height: 0;
@@ -4219,18 +5380,21 @@ const responseHeaders = computed(() => {
   flex-direction: column;
 }
 
-.body-pre {
+/* HTML 预览：iframe 自己撑满 Body 区，页面背景由响应自己决定 */
+.html-preview-note {
+  flex-shrink: 0;
+  padding: 5px 14px;
+  font-size: 11px;
+  color: var(--fm-muted);
+  border-bottom: 1px dashed var(--fm-border);
+}
+
+.html-preview-frame {
   flex: 1;
   min-height: 0;
-  box-sizing: border-box;
-  margin: 0;
-  padding: 14px 16px;
-  font-size: 12.5px;
-  line-height: 1.75;
-  white-space: pre-wrap;
-  word-break: break-all;
-  overflow: auto;
-  color: var(--fm-text-2);
+  width: 100%;
+  border: 0;
+  display: block;
 }
 
 .truncate-hint {
@@ -4305,7 +5469,7 @@ const responseHeaders = computed(() => {
 .runs-count {
   min-width: 18px;
   padding: 0 5px;
-  border-radius: 9px;
+  border-radius: var(--fm-radius-sm);
   background: var(--fm-border);
   color: var(--fm-text-2);
   font-size: 10px;
@@ -4492,7 +5656,7 @@ const responseHeaders = computed(() => {
   overflow: auto;
   background: var(--fm-surface);
   border: 1px solid var(--fm-border);
-  border-radius: 4px;
+  border-radius: var(--fm-radius-sm);
   font-size: 11px;
   line-height: 1.6;
   white-space: pre-wrap;
@@ -4503,7 +5667,7 @@ const responseHeaders = computed(() => {
 .run-error {
   padding: 6px 8px;
   background: var(--fm-danger-soft);
-  border-radius: 4px;
+  border-radius: var(--fm-radius-sm);
   font-size: 11px;
   color: var(--fm-danger);
   word-break: break-all;
@@ -4610,13 +5774,36 @@ const responseHeaders = computed(() => {
   }
 }
 
+/* 窄窗口：请求 / 响应各占一半视口，避免 125%~200% 缩放下页面被撑爆 */
+@media (max-width: 1023px) {
+  .panes {
+    height: calc(100vh - 168px);
+    min-height: 380px;
+    padding: 8px 10px 10px;
+    gap: 8px;
+  }
+
+  .req-pane,
+  .res-pane {
+    min-height: 170px;
+  }
+
+  .topbar {
+    padding: 0 10px;
+  }
+
+  .request-bar {
+    padding: 0 10px;
+  }
+}
+
 /* ---------- 代码片段抽屉 ---------- */
 .code-hint {
   font-size: 11.5px;
   line-height: 1.75;
   color: var(--fm-muted);
   padding: 10px 12px;
-  border-radius: 9px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface-alt);
   border: 1px dashed var(--fm-border-strong);
   margin-bottom: 14px;
@@ -4649,16 +5836,16 @@ const responseHeaders = computed(() => {
   border-radius: 999px;
   font-size: 10.5px;
   line-height: 16px;
-  color: var(--fm-warning, #d97706);
-  background: color-mix(in srgb, var(--fm-warning, #d97706) 12%, transparent);
-  border: 1px solid color-mix(in srgb, var(--fm-warning, #d97706) 30%, transparent);
+  color: var(--fm-warning);
+  background: var(--fm-warning-soft);
+  border: 1px solid color-mix(in srgb, var(--fm-warning) 30%, transparent);
   cursor: help;
 }
 
 .code-block {
   margin: 0;
   padding: 14px 16px;
-  border-radius: 10px;
+  border-radius: var(--fm-radius);
   border: 1px solid var(--fm-border);
   background: var(--fm-surface-alt);
   font-size: 11.5px;
@@ -4688,7 +5875,6 @@ const responseHeaders = computed(() => {
   border-color: var(--fm-primary);
   border-style: solid;
   background: var(--fm-surface);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--fm-primary) 16%, transparent);
 }
 
 /* ---------- v1.0.8：发送选项 / 停止按钮 / 协议徽标 ---------- */
@@ -4744,14 +5930,14 @@ const responseHeaders = computed(() => {
 .send-opt-hint code {
   font-size: 11px;
   padding: 0 3px;
-  border-radius: 3px;
-  background: var(--fm-surface-2, rgba(0, 0, 0, 0.05));
+  border-radius: var(--fm-radius-sm);
+  background: var(--fm-surface-alt);
 }
 
 .send-opt-warn {
   font-size: 11px;
   line-height: 1.5;
-  color: #d97706;
+  color: var(--fm-warning);
 }
 
 .stop-btn {
@@ -4764,28 +5950,28 @@ const responseHeaders = computed(() => {
   height: 18px;
   line-height: 18px;
   font-size: 11px;
-  border-radius: 4px;
+  border-radius: var(--fm-radius-sm);
   color: var(--fm-text-2);
-  background: var(--fm-surface-2, rgba(0, 0, 0, 0.05));
-  border: 1px solid var(--fm-border, rgba(0, 0, 0, 0.08));
+  background: var(--fm-surface-alt);
+  border: 1px solid var(--fm-border);
 }
 
 .proto-pill.warn {
-  color: #d97706;
-  border-color: rgba(217, 119, 6, 0.4);
-  background: rgba(217, 119, 6, 0.1);
+  color: var(--fm-warning);
+  border-color: var(--fm-warning);
+  background: var(--fm-warning-soft);
 }
 
 .proto-pill.retry {
-  color: #2563eb;
-  border-color: rgba(37, 99, 235, 0.35);
-  background: rgba(37, 99, 235, 0.08);
+  color: var(--fm-primary);
+  border-color: var(--fm-primary);
+  background: var(--fm-primary-soft);
 }
 
 .proto-pill.run-source {
-  color: #7c3aed;
-  border-color: rgba(124, 58, 237, 0.35);
-  background: rgba(124, 58, 237, 0.08);
+  color: var(--fm-purple);
+  border-color: var(--fm-purple);
+  background: var(--fm-purple-soft);
 }
 
 /* ---------- v1.0.8：二进制响应 ---------- */
@@ -4799,10 +5985,14 @@ const responseHeaders = computed(() => {
 .binary-preview {
   flex: 0 0 auto;
   max-width: 46%;
-  border: 1px solid var(--fm-border, rgba(0, 0, 0, 0.08));
-  border-radius: 8px;
+  border: 1px solid var(--fm-border);
+  border-radius: var(--fm-radius);
   overflow: hidden;
-  background: repeating-conic-gradient(rgba(128, 128, 128, 0.12) 0% 25%, transparent 0% 50%) 50% / 16px 16px;
+  background: repeating-conic-gradient(
+      color-mix(in srgb, var(--fm-border-strong) 12%, transparent) 0% 25%,
+      transparent 0% 50%
+    )
+    50% / 16px 16px;
 }
 
 .binary-preview img {
@@ -4816,15 +6006,15 @@ const responseHeaders = computed(() => {
   flex: 0 0 auto;
   width: 96px;
   height: 96px;
-  border-radius: 10px;
+  border-radius: var(--fm-radius);
   display: flex;
   align-items: center;
   justify-content: center;
   font-weight: 700;
   letter-spacing: 1px;
   color: var(--fm-text-3);
-  background: var(--fm-surface-2, rgba(0, 0, 0, 0.05));
-  border: 1px dashed var(--fm-border, rgba(0, 0, 0, 0.15));
+  background: var(--fm-surface-alt);
+  border: 1px dashed var(--fm-border);
 }
 
 .binary-meta {
@@ -4856,7 +6046,7 @@ const responseHeaders = computed(() => {
 }
 
 .binary-desc.bad {
-  color: #dc2626;
+  color: var(--fm-danger);
 }
 
 .binary-path {
@@ -4864,8 +6054,8 @@ const responseHeaders = computed(() => {
   color: var(--fm-text-3);
   word-break: break-all;
   padding: 6px 8px;
-  border-radius: 5px;
-  background: var(--fm-surface-2, rgba(0, 0, 0, 0.04));
+  border-radius: var(--fm-radius-sm);
+  background: var(--fm-surface-alt);
 }
 
 .binary-actions {
@@ -4920,8 +6110,8 @@ const responseHeaders = computed(() => {
 .wf-track {
   position: relative;
   height: 16px;
-  border-radius: 4px;
-  background: var(--fm-surface-2, rgba(0, 0, 0, 0.05));
+  border-radius: var(--fm-radius-sm);
+  background: var(--fm-surface-alt);
   overflow: hidden;
 }
 
@@ -4929,7 +6119,7 @@ const responseHeaders = computed(() => {
   position: absolute;
   top: 0;
   height: 100%;
-  border-radius: 4px;
+  border-radius: var(--fm-radius-sm);
   min-width: 2px;
   transition: width 0.2s ease;
 }
@@ -4945,8 +6135,8 @@ const responseHeaders = computed(() => {
   flex-direction: column;
   gap: 4px;
   padding: 8px 10px;
-  border-radius: 6px;
-  background: var(--fm-surface-2, rgba(0, 0, 0, 0.04));
+  border-radius: var(--fm-radius);
+  background: var(--fm-surface-alt);
 }
 
 .timing-note {
@@ -4959,7 +6149,7 @@ const responseHeaders = computed(() => {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  border-top: 1px solid var(--fm-border, rgba(0, 0, 0, 0.07));
+  border-top: 1px solid var(--fm-border);
   padding-top: 10px;
 }
 
@@ -4984,11 +6174,11 @@ const responseHeaders = computed(() => {
 
 .hop-status {
   font-weight: 600;
-  color: #059669;
+  color: var(--fm-success);
 }
 
 .hop-status.bad {
-  color: #dc2626;
+  color: var(--fm-danger);
 }
 
 .hop-host {
@@ -5013,9 +6203,9 @@ const responseHeaders = computed(() => {
 .ignored-headers {
   margin-top: 10px;
   padding: 10px 12px;
-  border-radius: 6px;
-  background: rgba(217, 119, 6, 0.08);
-  border: 1px solid rgba(217, 119, 6, 0.25);
+  border-radius: var(--fm-radius);
+  background: var(--fm-warning-soft);
+  border: 1px solid var(--fm-warning);
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -5024,12 +6214,12 @@ const responseHeaders = computed(() => {
 .ignored-title {
   font-size: 12px;
   font-weight: 600;
-  color: #b45309;
+  color: var(--fm-warning);
 }
 
 .ignored-list {
   font-size: 11px;
-  color: #b45309;
+  color: var(--fm-warning);
   word-break: break-all;
 }
 

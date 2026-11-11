@@ -16,8 +16,8 @@
         "title": "AstroMan",
         "width": 1280,
         "height": 800,
-        "minWidth": 1024,
-        "minHeight": 680,
+        "minWidth": 900,
+        "minHeight": 560,
         "center": true
       }
     ],
@@ -52,7 +52,7 @@
         "silent": true
       },
       "nsis": {
-        "installMode": "currentUser",
+        "installMode": "both",
         "languages": [
           "SimpChinese",
           "English"

@@ -10,6 +10,16 @@ default-run = "astroman"
 name = "astroman_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+# 基准专用：只暴露 bench_api，不改变默认构建
+bench = []
+
+# 基线基准需要 bench_api，`--all-targets` 下默认跳过
+[[example]]
+name = "baseline"
+path = "examples/baseline.rs"
+required-features = ["bench"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -20,11 +30,13 @@ tauri-plugin-global-shortcut = "2"
 tauri-plugin-single-instance = "2"
 tauri-plugin-window-state = "2"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 reqwest = { version = "0.12", default-features = false, features = [
   "json", "stream", "native-tls", "gzip", "brotli", "deflate", "http2", "multipart", "socks"
 ] }
 futures-util = "0.3"
+# 实时调试 WebSocket（G-09）：native-tls 复用系统证书链
+tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
 base64 = "0.22"
 aes-gcm = "0.10"
 rusqlite = { version = "0.32", features = ["bundled"] }

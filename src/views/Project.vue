@@ -13,13 +13,26 @@ import {
   ExportOutlined,
   SearchOutlined,
   DownOutlined,
+  SafetyCertificateOutlined,
+  GlobalOutlined,
+  ApiOutlined,
 } from '@ant-design/icons-vue'
 import AiSparkIcon from '@/components/AiSparkIcon.vue'
+import DocsPreviewDrawer from '@/components/DocsPreviewDrawer.vue'
+import DocsSiteModal from '@/components/DocsSiteModal.vue'
+import ContractPanelDrawer from '@/components/ContractPanelDrawer.vue'
+import MockPanel from '@/components/MockPanel.vue'
+import type { DocScope } from '@/types/docs'
 import { useProjectStore } from '@/stores/project'
 import { useAiAssistStore } from '@/stores/aiAssist'
 import { projectAuditPrompt } from '@/utils/aiScenarios'
 import { MAX_REQUEST_TABS, useTabsStore } from '@/stores/tabs'
 import { formatDateTime } from '@/utils/datetime'
+import {
+  PROJECT_PAGE_THRESHOLD,
+  pageOfIndex,
+  projectPagination,
+} from '@/utils/tablePaging'
 import { buildCurl } from '@/utils/curl'
 import {
   forgetLastRequest,
@@ -79,6 +92,27 @@ const displayRows = computed<Array<RequestSummary | RequestSearchHit>>(() =>
   searchMode.value ? searchHits.value : requests.value,
 )
 
+/** 接口数超过阈值才分页；用户可手动全部展开（P-03） */
+const currentPage = ref(1)
+const showAllRows = ref(false)
+const pagination = computed(() => {
+  const base = projectPagination(displayRows.value.length, showAllRows.value)
+  if (!base) return false
+  return {
+    ...base,
+    current: currentPage.value,
+    onChange: (page: number) => {
+      currentPage.value = page
+    },
+  }
+})
+watch(
+  () => displayRows.value.length,
+  () => {
+    currentPage.value = 1
+  },
+)
+
 let searchTimer: number | undefined
 watch(keyword, (value) => {
   if (searchTimer) window.clearTimeout(searchTimer)
@@ -94,6 +128,8 @@ watch(keyword, (value) => {
 async function runSearch() {
   const word = keyword.value.trim()
   if (!word) return
+  currentPage.value = 1
+  showAllRows.value = false
   searching.value = true
   try {
     searchHits.value = await api.requestSearch(projectId.value, word)
@@ -179,6 +215,10 @@ async function restoreSelection() {
 }
 
 async function scrollToRequest(id: number) {
+  // 分页时先切到目标行所在页，否则 DOM 里根本找不到这一行
+  const index = displayRows.value.findIndex((row) => row.id === id)
+  const page = projectPagination(displayRows.value.length, showAllRows.value)
+  if (index >= 0 && page) currentPage.value = pageOfIndex(index, page.pageSize)
   await nextTick()
   const row = tableWrap.value?.querySelector<HTMLElement>(`[data-row-key="${id}"]`)
   row?.scrollIntoView({ block: 'nearest' })
@@ -196,10 +236,13 @@ async function onSelect(keys: Array<string | number>) {
   const key = keys[0]
   if (key === undefined) return
   selectedKeys.value = [String(key)]
+  currentPage.value = 1
+  showAllRows.value = false
   await loadRequests(Number(key))
 }
 
 async function loadRequests(collectionId: number) {
+  currentPage.value = 1
   loadingRequests.value = true
   try {
     requests.value = await api.requestList(collectionId)
@@ -446,6 +489,23 @@ async function exportProject() {
 
 const importingApi = ref(false)
 
+/* ---------- 接口文档导出 ---------- */
+const docsOpen = ref(false)
+const docsScope = ref<DocScope>('project')
+const docsTargetId = ref(0)
+
+function openDocs(scope: DocScope, targetId: number) {
+  docsScope.value = scope
+  docsTargetId.value = targetId
+  docsOpen.value = true
+}
+
+/* ---------- 契约基线 ---------- */
+const contractOpen = ref(false)
+
+/* ---------- 只读文档站 ---------- */
+const docsSiteOpen = ref(false)
+
 /* ---------- 拖拽排序 ---------- */
 const dragCollectionId = ref<number | null>(null)
 const dragRequestId = ref<number | null>(null)
@@ -575,16 +635,111 @@ async function importApiFile() {
   }
 }
 
+const mockOpen = ref(false)
+
+/* ---------- W2：导入导出补齐（G-07） ---------- */
+const openapiUrlOpen = ref(false)
+const openapiUrlBusy = ref(false)
+const openapiUrlForm = ref({ url: '', token: '', save: true })
+
+async function importBruno() {
+  try {
+    const path = await open({
+      title: '选择 Bruno 工作目录（包含 .bru 文件）',
+      directory: true,
+      multiple: false,
+    })
+    if (!path) return
+    importingApi.value = true
+    const project = await api.brunoImport(String(path), projectId.value)
+    await store.refreshTree(project.id)
+    requests.value = []
+    selectedKeys.value = []
+    if (store.tree.length) {
+      selectedKeys.value = [String(store.tree[0].id)]
+      await loadRequests(store.tree[0].id)
+    }
+    message.success(`已从 Bruno 目录导入到项目「${project.name}」`)
+  } catch (e) {
+    message.error(String(e))
+  } finally {
+    importingApi.value = false
+  }
+}
+
+function openOpenapiUrl() {
+  openapiUrlForm.value = { url: '', token: '', save: true }
+  openapiUrlOpen.value = true
+}
+
+async function submitOpenapiUrl() {
+  const form = openapiUrlForm.value
+  const url = form.url.trim()
+  if (!url) {
+    message.warning('请填写 OpenAPI / Swagger JSON 地址')
+    return
+  }
+  const token = form.token.trim()
+  const headers = token
+    ? [{ key: 'Authorization', value: /^Bearer\s/i.test(token) ? token : `Bearer ${token}`, enabled: true }]
+    : []
+  openapiUrlBusy.value = true
+  try {
+    const project = await api.openapiImportUrl({
+      url,
+      headers,
+      projectId: projectId.value,
+      save: form.save,
+    })
+    await store.refreshTree(project.id)
+    requests.value = []
+    selectedKeys.value = []
+    if (store.tree.length) {
+      selectedKeys.value = [String(store.tree[0].id)]
+      await loadRequests(store.tree[0].id)
+    }
+    openapiUrlOpen.value = false
+    message.success(`已从 URL 导入到项目「${project.name}」`)
+  } catch (e) {
+    message.error(String(e))
+  } finally {
+    openapiUrlBusy.value = false
+  }
+}
+
+async function exportPostman() {
+  const safeName = (store.currentProject?.name || 'collection').replace(/[\\/:*?"<>|]/g, '_')
+  try {
+    const path = await save({
+      title: '导出 Postman Collection v2.1',
+      defaultPath: `${safeName}.postman_collection.json`,
+      filters: [{ name: 'Postman Collection', extensions: ['json'] }],
+    })
+    if (!path) return
+    const report = await api.postmanExport(projectId.value, path)
+    message.success(
+      `已导出 ${report.collections} 个集合 / ${report.requests} 个请求` +
+        (report.skipped.length ? `；${report.skipped.length} 项需手工补：${report.skipped.slice(0, 3).join('、')}` : ''),
+    )
+  } catch (e) {
+    message.error(String(e))
+  }
+}
+
 function onImportMenu({ key }: { key: string | number }) {
   if (importingApi.value) return
   if (key === 'curl') openCurl()
   else if (key === 'postman') void importApiFile()
   else if (key === 'openapi') void importOpenapiFile()
+  else if (key === 'bruno') void importBruno()
+  else if (key === 'openapi-url') openOpenapiUrl()
 }
 
 function onExportMenu({ key }: { key: string | number }) {
   if (key === 'project') void exportProject()
   else if (key === 'openapi') void exportOpenapi()
+  else if (key === 'postman') void exportPostman()
+  else if (key === 'docs') openDocs('project', projectId.value)
 }
 
 function requestRowProps(record: RequestSummary | RequestSearchHit) {
@@ -637,7 +792,7 @@ const columns = computed(() =>
           工作台
         </a-button>
         <span class="slash">/</span>
-        <span class="project-dot" :style="{ background: store.currentProject?.color || '#4d6bfe' }" />
+        <span class="project-dot" :style="{ background: store.currentProject?.color || 'var(--fm-primary)' }" />
         <div class="project-title">
           <span class="name">{{ store.currentProject?.name || '项目' }}</span>
           <span class="desc">{{ store.currentProject?.description || '本地项目' }}</span>
@@ -668,8 +823,10 @@ const columns = computed(() =>
           <template #overlay>
             <a-menu @click="onImportMenu">
               <a-menu-item key="curl">cURL 命令</a-menu-item>
-              <a-menu-item key="postman">Postman / Apifox / HAR</a-menu-item>
-              <a-menu-item key="openapi">OpenAPI / Swagger</a-menu-item>
+              <a-menu-item key="postman">Postman / Apifox / Insomnia / HAR</a-menu-item>
+              <a-menu-item key="openapi">OpenAPI / Swagger 文件</a-menu-item>
+              <a-menu-item key="openapi-url">OpenAPI / Swagger URL</a-menu-item>
+              <a-menu-item key="bruno">Bruno 目录</a-menu-item>
             </a-menu>
           </template>
         </a-dropdown>
@@ -682,10 +839,24 @@ const columns = computed(() =>
           <template #overlay>
             <a-menu @click="onExportMenu">
               <a-menu-item key="project">项目 JSON</a-menu-item>
+              <a-menu-item key="postman">Postman Collection v2.1</a-menu-item>
               <a-menu-item key="openapi">OpenAPI 3.0</a-menu-item>
+              <a-menu-item key="docs">接口文档（预览后导出）</a-menu-item>
             </a-menu>
           </template>
         </a-dropdown>
+        <a-button size="small" @click="mockOpen = true">
+          <template #icon><ApiOutlined /></template>
+          Mock
+        </a-button>
+        <a-button size="small" @click="contractOpen = true">
+          <template #icon><SafetyCertificateOutlined /></template>
+          契约
+        </a-button>
+        <a-button size="small" @click="docsSiteOpen = true">
+          <template #icon><GlobalOutlined /></template>
+          文档站
+        </a-button>
         <a-button size="small" @click="router.push(`/environment/${projectId}`)">
           <template #icon><SettingOutlined /></template>
           管理环境
@@ -724,6 +895,7 @@ const columns = computed(() =>
                 <FolderOutlined class="folder" />
                 <span class="node-title">{{ (node as TreeNode).title }}</span>
                 <span class="node-ops" @click.stop>
+                  <a @click="openDocs('collection', (node as TreeNode).raw.id)">文档</a>
                   <a @click="addCollection((node as TreeNode).raw)">+子集</a>
                   <a @click="renameCollection((node as TreeNode).raw)">改名</a>
                   <a class="danger" @click="deleteCollection((node as TreeNode).raw)">删除</a>
@@ -751,6 +923,15 @@ const columns = computed(() =>
             <span v-else-if="selectedCollection" class="count">{{ requests.length }} 个请求</span>
           </div>
           <div class="list-actions">
+            <a-button
+              v-if="displayRows.length > PROJECT_PAGE_THRESHOLD"
+              type="link"
+              size="small"
+              :title="showAllRows ? '恢复每页 50 条' : '一次渲染全部接口，低配机器可能卡顿'"
+              @click="showAllRows = !showAllRows"
+            >
+              {{ showAllRows ? '分页显示' : '全部展开' }}
+            </a-button>
             <a-input
               v-model:value="keyword"
               class="search-input"
@@ -779,7 +960,7 @@ const columns = computed(() =>
             v-if="displayRows.length"
             :data-source="displayRows"
             :columns="columns"
-            :pagination="false"
+            :pagination="pagination"
             row-key="id"
             size="middle"
             :custom-row="requestRowProps"
@@ -906,6 +1087,61 @@ const columns = computed(() =>
         @press-enter="submitCollection"
       />
     </a-modal>
+
+    <DocsPreviewDrawer
+      v-model:open="docsOpen"
+      :scope="docsScope"
+      :target-id="docsTargetId"
+      :project-id="projectId"
+      :project-name="store.currentProject?.name"
+      :default-environment-id="store.activeEnvironment?.id ?? null"
+    />
+
+    <ContractPanelDrawer
+      v-model:open="contractOpen"
+      :project-id="projectId"
+      :project-name="store.currentProject?.name"
+    />
+
+    <DocsSiteModal
+      v-model:open="docsSiteOpen"
+      :project-id="projectId"
+      :project-name="store.currentProject?.name"
+      :environment-id="store.activeEnvironment?.id ?? null"
+    />
+
+    <MockPanel
+      v-model:open="mockOpen"
+      :project-id="projectId"
+      :project-name="store.currentProject?.name"
+    />
+
+    <a-modal
+      v-model:open="openapiUrlOpen"
+      title="从 URL 导入 OpenAPI / Swagger"
+      width="560px"
+      :confirm-loading="openapiUrlBusy"
+      ok-text="拉取并导入"
+      cancel-text="取消"
+      @ok="submitOpenapiUrl"
+    >
+      <a-form layout="vertical" style="margin-top: 12px">
+        <a-form-item label="JSON 地址" required>
+          <a-input v-model:value="openapiUrlForm.url" placeholder="https://example.com/openapi.json" />
+        </a-form-item>
+        <a-form-item label="访问令牌（可选）">
+          <a-input-password
+            v-model:value="openapiUrlForm.token"
+            placeholder="Bearer Token；留空表示匿名访问"
+            autocomplete="off"
+          />
+        </a-form-item>
+        <a-form-item>
+          <a-checkbox v-model:checked="openapiUrlForm.save">保存来源，便于以后刷新</a-checkbox>
+        </a-form-item>
+        <div class="curl-tip">仅支持 JSON；YAML 文档请先转换为 JSON。</div>
+      </a-form>
+    </a-modal>
   </div>
 </template>
 
@@ -923,7 +1159,7 @@ const columns = computed(() =>
   align-items: center;
   justify-content: space-between;
   border-bottom: 1px solid var(--fm-border);
-  background: rgba(255, 255, 255, 0.86);
+  background: color-mix(in srgb, var(--fm-surface) 86%, transparent);
   backdrop-filter: blur(8px);
 }
 
@@ -939,7 +1175,7 @@ const columns = computed(() =>
 }
 
 .slash {
-  color: #d3dae6;
+  color: var(--fm-border-strong);
 }
 
 .project-dot {
@@ -947,7 +1183,7 @@ const columns = computed(() =>
   height: 9px;
   border-radius: 50%;
   flex-shrink: 0;
-  box-shadow: 0 0 0 3px rgba(60, 107, 136, 0.1);
+  box-shadow: 0 0 0 3px var(--fm-primary-soft);
 }
 
 .project-title {
@@ -1085,11 +1321,12 @@ const columns = computed(() =>
   align-items: center;
   gap: 7px;
   font-size: 13px;
-  min-height: 24px;
+  min-height: 28px;
+  line-height: 28px;
 }
 
 .folder {
-  color: #c0cad9;
+  color: var(--fm-muted);
   font-size: 12px;
   flex-shrink: 0;
 }
@@ -1131,7 +1368,7 @@ const columns = computed(() =>
   padding: 10px 14px;
   border-top: 1px solid var(--fm-border);
   font-size: 10px;
-  color: #b6c0ce;
+  color: var(--fm-muted);
 }
 
 .list-title {
@@ -1175,7 +1412,7 @@ const columns = computed(() =>
   background: var(--fm-surface-alt);
   border: 1px solid var(--fm-border);
   padding: 1px 7px;
-  border-radius: 5px;
+  border-radius: var(--fm-radius-sm);
 }
 
 .count {
@@ -1206,7 +1443,7 @@ const columns = computed(() =>
 }
 
 .table-wrap :deep(tr.last-opened-row > td:first-child) {
-  box-shadow: inset 3px 0 0 var(--fm-primary);
+  box-shadow: inset 2px 0 0 var(--fm-primary);
 }
 
 .table-wrap :deep(tr.last-opened-row:hover > td) {
@@ -1231,7 +1468,7 @@ const columns = computed(() =>
 }
 
 .req-icon {
-  color: #b6c0ce;
+  color: var(--fm-muted);
   font-size: 12px;
   flex-shrink: 0;
 }
@@ -1285,9 +1522,9 @@ const columns = computed(() =>
   width: 48px;
   height: 48px;
   margin: 0 auto 14px;
-  border-radius: 14px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface-alt);
-  color: #c2ccdb;
+  color: var(--fm-muted);
   font-size: 22px;
   display: flex;
   align-items: center;

@@ -38,8 +38,16 @@ export const captureLanIps = () => invoke<string[]>('capture_lan_ips')
 export const captureRepeat = (payload: CaptureRepeatPayload) =>
   invoke<CaptureRepeatResult>('capture_repeat', { ...payload } as Record<string, unknown>)
 
-export const captureExportHar = (path: string, ids?: number[]) =>
-  invoke<void>('capture_export_har', ids?.length ? { path, ids } : { path })
+export const captureExportHar = (
+  path: string,
+  ids?: number[],
+  metadataOnly = false,
+) =>
+  invoke<void>('capture_export_har', {
+    path,
+    ...(ids?.length ? { ids } : {}),
+    metadataOnly,
+  })
 
 export const captureExportZip = (path: string, ids?: number[]) =>
   invoke<void>('capture_export_zip', ids?.length ? { path, ids } : { path })

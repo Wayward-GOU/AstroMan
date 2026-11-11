@@ -12,8 +12,16 @@
     "build:mac": "node scripts/prepare-cli.mjs --target universal-apple-darwin && tauri build --target universal-apple-darwin --bundles dmg",
     "preview": "vite preview",
     "test": "vitest run",
+    "ai:eval": "vitest run --config vitest.eval.config.ts",
+    "e2e": "playwright test",
+    "e2e:smoke": "playwright test --project=smoke",
+    "e2e:visual": "playwright test --project=visual",
+    "e2e:update": "playwright test --project=visual --update-snapshots",
     "version:check": "node scripts/sync-version.mjs",
     "version:set": "node scripts/sync-version.mjs",
+    "sbom": "node scripts/gen-sbom.mjs",
+    "ui:check": "node scripts/check-hardcoded-color.mjs && vite-node scripts/check-contrast.ts",
+    "security:check": "node scripts/check-release-security.mjs",
     "tauri": "tauri"
   },
   "dependencies": {
@@ -30,6 +38,7 @@
     "vue-router": "^4.4.5"
   },
   "devDependencies": {
+    "@playwright/test": "^1.65.0",
     "@tauri-apps/cli": "^2.1.0",
     "@types/crypto-js": "^4.2.2",
     "@types/markdown-it": "^14.2.0",

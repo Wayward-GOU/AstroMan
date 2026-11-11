@@ -40,7 +40,8 @@ pub fn env_list(state: State<'_, AppState>, project_id: i64) -> Result<Vec<Envir
     let conn = state.pool.get().map_err(err)?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, project_id, name, is_active, COALESCE(script, '')
+            "SELECT id, project_id, name, is_active, COALESCE(script, ''),
+                    COALESCE(is_prod, 0)
              FROM environments WHERE project_id = ?1 ORDER BY id ASC",
         )
         .map_err(err)?;
@@ -52,6 +53,7 @@ pub fn env_list(state: State<'_, AppState>, project_id: i64) -> Result<Vec<Envir
                 name: row.get(2)?,
                 is_active: row.get::<_, i64>(3)? != 0,
                 script: row.get(4)?,
+                is_prod: row.get::<_, i64>(5)? != 0,
                 variables: Vec::new(),
             })
         })
@@ -100,6 +102,7 @@ pub fn env_create(
         name,
         is_active,
         script: String::new(),
+        is_prod: false,
         variables: Vec::new(),
     })
 }
@@ -112,6 +115,22 @@ pub fn env_script_save(state: State<'_, AppState>, id: i64, script: String) -> R
         .execute(
             "UPDATE environments SET script = ?1 WHERE id = ?2",
             params![script, id],
+        )
+        .map_err(err)?;
+    if changed == 0 {
+        return Err("环境不存在".to_string());
+    }
+    Ok(())
+}
+
+/// 标记环境是否为生产（AI-01）：生产环境无论权限模式都强制确认
+#[tauri::command]
+pub fn env_set_prod(state: State<'_, AppState>, id: i64, is_prod: bool) -> Result<(), String> {
+    let conn = state.pool.get().map_err(err)?;
+    let changed = conn
+        .execute(
+            "UPDATE environments SET is_prod = ?1 WHERE id = ?2",
+            params![if is_prod { 1 } else { 0 }, id],
         )
         .map_err(err)?;
     if changed == 0 {

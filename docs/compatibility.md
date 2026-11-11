@@ -23,7 +23,7 @@
 
 - **macOS 10.15 的界面降级**：Catalina 的 WebKit 不支持 `color-mix()`，个别半透明描边、选中底色会变淡或透明；功能正常，Big Sur / Monterey 及以上基本无差异。
 - **标准包与离线包**：标准安装包约 5MB，目标机器缺 WebView2 时会在安装过程联网补齐；断网、内网、LTSC / Server 机器请下载带 `offline` 的安装包（约 211MB，已内置 WebView2）。
-- **签名与兼容性无关**：安装包未做商业代码签名，Windows 首次运行可能弹 SmartScreen（选「更多信息 → 仍要运行」），macOS 会提示「无法验证开发者」（按下方 macOS 安装章节放行）。要做到双击零提示，需要 Apple Developer ID 公证与 Windows 代码签名证书。
+- **签名与兼容性无关**：默认构建不做商业代码签名，Windows 首次运行可能弹 SmartScreen（选「更多信息 → 仍要运行」），macOS 会提示「无法验证开发者」（按下方 macOS 安装章节放行）。要做到双击零提示，需要 Apple Developer ID 公证与 Windows 代码签名证书；配置方法见 [企业部署与交付](./enterprise.md#4-代码签名)。
 - **安装器兜底**：个别机器卡在「创建快捷方式」并报 `Exception Processing Message 0xc0000005`，通常是杀毒软件 / 安全卫士拦截了 shell 快捷方式创建；临时退出安全软件后重试，或直接用便携版 zip 解压运行。
 
 macOS 首次打开若出现下面这个提示（按钮只有「完成 / 移到废纸篓」），是系统对未公证应用的 Gatekeeper 拦截，**不是芯片架构不兼容**：
@@ -74,7 +74,46 @@ sudo codesign --force --deep --sign - /Applications/AstroMan.app
 open /Applications/AstroMan.app
 ```
 
-> Gatekeeper 只认 Apple 签发的 Developer ID 证书 + 公证票据，GitHub Actions 无法替代签发，只能执行 `codesign` / `notarytool`。如需彻底消除提示，准备 Apple Developer Program 账号后在 workflow 中配置 `APPLE_CERTIFICATE`、`APPLE_ID`、`APPLE_PASSWORD`、`APPLE_TEAM_ID` 等 secrets 即可。当前仓库已配置 ad-hoc 签名（`signingIdentity: "-"`），可避免系统把应用判定为「已损坏」。
+> Gatekeeper 只认 Apple 签发的 Developer ID 证书 + 公证票据，GitHub Actions 无法替代签发，只能执行 `codesign` / `notarytool`。如需彻底消除提示，准备 Apple Developer Program 账号后在 workflow 中配置 `APPLE_CERTIFICATE`、`APPLE_ID`、`APPLE_PASSWORD`、`APPLE_TEAM_ID` 等 secrets 即可。当前仓库已配置 ad-hoc 签名（`signingIdentity: "-"`），可避免系统把应用判定为「已损坏」。签名与公证的完整配置见 [企业部署与交付](./enterprise.md#4-代码签名)。
 
 ---
+
+## 兼容性回归矩阵（W4）
+
+| # | 环境 | 验证点 | 方式 | 状态 |
+|---|---|---|---|---|
+| 1 | Windows 10 1809 x64 | 安装、启动、WebView2、HTTPS 请求、抓包、更新检查 | 虚拟机手工回归 | 待人工回归 |
+| 2 | Windows 11 最新正式版 x64 | 同上 + 高 DPI / 多显示器 | 物理机手工回归 | 待人工回归 |
+| 3 | Windows 10 x86（32 位） | `AstroMan_*_x86-setup.exe` 安装与启动、抓包驱动 | 虚拟机手工回归 | 待人工回归 |
+| 4 | 无 Edge / 缺 WebView2 | 标准包联网补齐、离线包内置运行时；安装后 `app_info.webviewVersion` 非空 | 虚拟机断网 + 卸载 WebView2 后手工回归 | 待人工回归 |
+| 5 | 200% 缩放 / 最小窗口 | 900×560 等效宽度无整页横向滚动、地址栏与发送按钮可用、键盘焦点可见 | Playwright `e2e/enterprise.spec.ts` | 自动化通过 |
+| 6 | 纯键盘 | Tab 聚焦地址栏 → Enter 发送 → 响应渲染；焦点描边可见 | Playwright `e2e/enterprise.spec.ts` | 自动化通过 |
+| 7 | macOS 10.15 Catalina | 启动、`color-mix()` 降级、HTTPS 请求 | 旧版 macOS 手工回归 | 待人工回归 |
+
+补充口径：
+
+- 第 1–4、7 项依赖真实系统 / 虚拟机，本地 CI 无法替代；发版前按表逐项勾选，结果记在 Release 说明里。
+- 第 5 项等效 200% 缩放：应用最小窗口宽度 900 CSS px，200% 缩放下可视区约 450 CSS px；自动化用 900×560 视口验证不出现整页横向滚动，手工再按「显示设置 → 缩放 200%」复核一次。
+- 无 Edge 环境请优先用带 `offline` 的安装包；便携版不内置 WebView2，精简系统需先单独安装运行时。
+
+## 长稳与内存回归（W4）
+
+用 [scripts/measure-rss.ps1](../scripts/measure-rss.ps1) 采样「主进程 + WebView2 子进程」的 Working Set 合计，脚本只读性能计数器，对被测进程零侵入。
+
+```powershell
+# 1) 启动 AstroMan，先空转 5 分钟，采一条基线
+powershell -ExecutionPolicy Bypass -File scripts/measure-rss.ps1 -DurationSec 300 -Csv rss-idle.csv
+
+# 2) 执行 30 分钟混合负载，同时采样并按门禁判定
+powershell -ExecutionPolicy Bypass -File scripts/measure-rss.ps1 -DurationSec 1800 -IntervalMs 5000 -Csv rss-longrun.csv -MaxGrowthMb 120 -MaxPeakMb 800
+```
+
+混合负载建议覆盖：批量发送 200+ 请求、抓包录制 2 分钟后筛选 / 展开树 / 导出 HAR、打开大响应并切换 Pretty / Raw、运行一次压测并打开报告、导入一份大 OpenAPI / Postman 集合、切到航仔发一轮对话再切回。
+
+判定口径：
+
+- 末次样本相对首次的增长 ≤ 120 MB，峰值 ≤ 800 MB（按目标机型档位调整），超限脚本退出码 1；
+- 期间无崩溃、无未响应、无数据库 `E_BUSY`；
+- 连续两轮结果相差不超过 20%，视为无持续泄漏；
+- CSV 与结论附在发版记录里，便于下一版对比。
 

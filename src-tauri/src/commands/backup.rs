@@ -5,6 +5,9 @@ use std::path::PathBuf;
 use tauri::{AppHandle, Emitter, State};
 
 use crate::backup::{self, BackupItem, CheckResult};
+use crate::services::backup_target::{
+    self, BackupTarget, BackupTargetInput, BackupUploadResult, RemoteBackup, TargetTestReport,
+};
 use crate::state::AppState;
 
 /// 备份列表
@@ -76,14 +79,103 @@ pub fn db_check(state: State<'_, AppState>, deep: bool) -> Result<CheckResult, S
     backup::check(&state.pool, deep)
 }
 
-/// 导出诊断包到指定目录，返回目录路径
+/// 导出诊断包到指定路径，返回实际写入路径（D-01 / A-22）
 #[tauri::command]
 pub fn diagnostics_export(state: State<'_, AppState>, path: String) -> Result<String, String> {
     let target = PathBuf::from(path.trim());
     if target.as_os_str().is_empty() {
         return Err("请选择保存位置".to_string());
     }
-    backup::write_diagnostics(&state, &target)
+    let result = crate::services::diagnostics::export(state.inner(), &target)?;
+    Ok(result.path)
+}
+
+#[tauri::command]
+pub fn backup_target_list(state: State<'_, AppState>) -> Result<Vec<BackupTarget>, String> {
+    let conn = state.pool.get().map_err(crate::util::err)?;
+    backup_target::list(&conn)
+}
+
+/// 新建 / 修改异地备份目标；密码为空表示保留原值
+#[tauri::command]
+pub fn backup_target_save(
+    state: State<'_, AppState>,
+    input: BackupTargetInput,
+) -> Result<BackupTarget, String> {
+    let conn = state.pool.get().map_err(crate::util::err)?;
+    backup_target::save(&conn, input)
+}
+
+#[tauri::command]
+pub fn backup_target_delete(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    let conn = state.pool.get().map_err(crate::util::err)?;
+    backup_target::delete(&conn, id)
+}
+
+#[tauri::command]
+pub fn backup_target_test(state: State<'_, AppState>, id: i64) -> Result<TargetTestReport, String> {
+    let conn = state.pool.get().map_err(crate::util::err)?;
+    backup_target::test(&conn, id)
+}
+
+#[tauri::command]
+pub fn backup_target_remote_list(
+    state: State<'_, AppState>,
+    id: i64,
+) -> Result<Vec<RemoteBackup>, String> {
+    let conn = state.pool.get().map_err(crate::util::err)?;
+    backup_target::remote_list(&conn, id)
+}
+
+/// 上传加密备份：建快照 → 加密 → 推送；口令只在本命令内使用，不落库
+#[tauri::command]
+pub fn backup_upload(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: i64,
+    passphrase: String,
+) -> Result<BackupUploadResult, String> {
+    if state.policy().backup_must_encrypt() && passphrase.trim().is_empty() {
+        return Err(
+            "E_POLICY: 企业策略要求备份必须加密，请先设置备份口令（policy.json: forceEncryptBackup）"
+                .to_string(),
+        );
+    }
+    let _guard = state
+        .heavy_ops
+        .try_lock()
+        .ok_or_else(|| "E_BUSY: 正在执行其它重任务（备份 / 检查），请稍后重试".to_string())?;
+    let _ = app.emit(
+        "backup://progress",
+        serde_json::json!({ "phase": "snapshot", "percent": 10 }),
+    );
+    let result = backup_target::upload(&state.pool, &state.data_dir, id, &passphrase);
+    let _ = app.emit(
+        "backup://progress",
+        serde_json::json!({
+            "phase": if result.is_ok() { "done" } else { "error" },
+            "percent": 100
+        }),
+    );
+    result
+}
+
+/// 从异地备份恢复：下载 + 解密 + 校验 + 写待恢复标记；返回后前端应调用 app_restart
+#[tauri::command]
+pub fn backup_restore_from_target(
+    state: State<'_, AppState>,
+    id: i64,
+    name: String,
+    passphrase: String,
+) -> Result<BackupItem, String> {
+    backup_target::restore_from_target(
+        &state.pool,
+        &state.data_dir,
+        &state.config_file,
+        id,
+        &name,
+        &passphrase,
+    )
 }
 
 /// 只允许删除 / 恢复备份目录内的文件，避免前端传任意路径

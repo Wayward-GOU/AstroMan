@@ -1,0 +1,11 @@
+{
+  "id": "ai-16",
+  "title": "JSON 转实体类",
+  "input": "把这段 JSON 转成 Java 实体类：{\"id\":1,\"name\":\"demo\",\"tags\":[\"a\",\"b\"]}",
+  "expectTool": "toolbox_json_to_entity",
+  "acceptTools": ["tool_search"],
+  "forbiddenTools": ["toolbox_json_format", "toolbox_convert", "request_create"],
+  "expectArgs": {},
+  "expectedArtifact": "Java 实体类代码，字段与 JSON 对应，包含 id / name / tags",
+  "followUps": []
+}

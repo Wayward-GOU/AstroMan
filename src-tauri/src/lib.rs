@@ -1,8 +1,13 @@
 mod backup;
+#[cfg(feature = "bench")]
+pub mod bench_api;
 mod capture;
 pub mod cli;
 mod commands;
+mod contract;
 mod db;
+mod docs;
+mod entity;
 mod logging;
 mod models;
 mod net_probe;
@@ -12,6 +17,7 @@ mod prompts;
 mod python_exec;
 mod report_builder;
 mod secret;
+mod services;
 mod state;
 mod test_assert;
 mod test_dataset;
@@ -152,14 +158,29 @@ pub fn run() {
             // 日志落盘：数据目录确定后才能建写入器，因此放在 setup 里初始化
             let data_dir = state::resolve_data_dir(app.handle());
             env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+                .format(|buf, record| logging::format_json(buf, record))
                 .target(env_logger::Target::Pipe(Box::new(
                     logging::RollingWriter::new(data_dir.join("logs")),
                 )))
                 .init();
+            logging::install_panic_hook(&data_dir);
             log::info!("AstroMan 启动，数据目录：{}", data_dir.display());
 
             let state = state::AppState::new(app.handle())?;
+            // 审计只追加不修改：启动时顺手清理过期记录，避免长期运行后无限膨胀
+            if let Ok(conn) = state.pool.get() {
+                match services::audit::cleanup(&conn, services::audit::RETENTION_DAYS) {
+                    Ok(0) => {}
+                    Ok(removed) => log::info!("审计日志清理完成，删除 {removed} 条"),
+                    Err(error) => log::warn!("审计日志清理失败：{error}"),
+                }
+            }
             app.manage(state);
+            // CLI 通过 gui.pid 判断 GUI 是否在运行（单实例只能挡 GUI 多开）
+            let pid_file = app.state::<state::AppState>().data_dir.join("gui.pid");
+            if let Err(error) = std::fs::write(&pid_file, std::process::id().to_string()) {
+                log::warn!("写入 GUI 进程标记失败：{error}");
+            }
 
             // 启动后台任务：响应文件清理、自动备份（60s 后）、quick_check 自检
             let handle = app.handle().clone();
@@ -243,6 +264,13 @@ pub fn run() {
             commands::request::request_get,
             commands::request::request_save,
             commands::request::request_save_quick,
+            commands::revision::request_revision_list,
+            commands::revision::request_revision_get,
+            commands::revision::request_revision_diff,
+            commands::revision::request_revision_restore,
+            commands::revision::request_revision_snapshot,
+            commands::revision::request_revision_trace,
+            commands::revision::request_revision_rollback_trace,
             commands::request::request_delete,
             commands::request::request_reorder,
             commands::environment::env_list,
@@ -252,8 +280,47 @@ pub fn run() {
             commands::environment::env_plain_vars,
             commands::environment::env_var_save,
             commands::environment::env_script_save,
+            commands::environment::env_set_prod,
+            commands::docs::docs_prepare,
+            commands::docs::docs_render,
+            commands::docs::docs_export,
+            commands::graphql::graphql_introspect,
+            commands::graphql::graphql_schema_get,
+            commands::graphql::graphql_schema_list,
+            commands::graphql::graphql_schema_delete,
+            commands::docs_site::docs_site_start,
+            commands::docs_site::docs_site_stop,
+            commands::docs_site::docs_site_status,
+            commands::docs_site::docs_site_refresh,
+            commands::mock::mock_routes_list,
+            commands::mock::mock_route_save,
+            commands::mock::mock_route_delete,
+            commands::mock::mock_routes_generate,
+            commands::mock::mock_routes_clear,
+            commands::mock::mock_start,
+            commands::mock::mock_stop,
+            commands::mock::mock_status,
+            commands::mock::mock_statuses,
+            commands::mock::mock_logs,
+            commands::mock::mock_logs_clear,
+            commands::diagnostics::frontend_log,
+            commands::diagnostics::audit_log_list,
+            commands::diagnostics::audit_log_cleanup,
+            commands::entity::request_entities_get,
+            commands::entity::request_entity_generate,
+            commands::contract::contract_snapshot_create,
+            commands::contract::contract_snapshot_list,
+            commands::contract::contract_check,
+            commands::contract::contract_report,
             commands::http::send_http_request,
             commands::http::http_cancel,
+            commands::realtime::realtime_connect,
+            commands::realtime::realtime_send,
+            commands::realtime::realtime_close,
+            commands::realtime::realtime_status,
+            commands::workspace::workspace_export_dir,
+            commands::workspace::workspace_import_dir,
+            commands::tool_cancel::tool_cancel,
             commands::backup::backup_list,
             commands::backup::backup_create,
             commands::backup::backup_restore,
@@ -262,6 +329,13 @@ pub fn run() {
             commands::backup::backup_dir_path,
             commands::backup::db_check,
             commands::backup::diagnostics_export,
+            commands::backup::backup_target_list,
+            commands::backup::backup_target_save,
+            commands::backup::backup_target_delete,
+            commands::backup::backup_target_test,
+            commands::backup::backup_target_remote_list,
+            commands::backup::backup_upload,
+            commands::backup::backup_restore_from_target,
             commands::security::secrets_status,
             commands::security::secrets_unlock,
             commands::security::secrets_set_passphrase,
@@ -278,6 +352,7 @@ pub fn run() {
             commands::ai::ai_chat,
             commands::ai::ai_chat_cancel,
             commands::ai::ai_execute,
+            commands::ai::ai_confirm_audit,
             commands::ai::ai_models_list,
             commands::ai::ai_session_list,
             commands::ai::ai_session_create,
@@ -304,6 +379,9 @@ pub fn run() {
             commands::cookie::cookie_clear,
             commands::settings::settings_get,
             commands::settings::settings_set,
+            commands::settings::performance_profile,
+            commands::settings::policy_get,
+            commands::settings::policy_reload,
             commands::plan::plan_list,
             commands::plan::plan_get,
             commands::plan::plan_save,
@@ -361,10 +439,16 @@ pub fn run() {
             commands::transfer::project_import,
             commands::transfer::openapi_export,
             commands::transfer::openapi_import,
+            commands::transfer::postman_export,
             commands::update::update_check,
             commands::update::update_download,
             commands::update::open_external,
             commands::importer::api_import,
+            commands::importer::bruno_import,
+            commands::importer::openapi_import_url,
+            commands::importer::openapi_source_list,
+            commands::importer::openapi_source_delete,
+            commands::importer::openapi_source_refresh,
             commands::tools::tool_hash,
             commands::tools::tool_hmac,
             commands::tools::ip_lookup,
@@ -433,6 +517,12 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("启动 AstroMan 失败")
         .run(|app_handle, event| {
+            // 退出前停掉本地 Mock 监听线程，避免端口被占用到进程结束
+            if let tauri::RunEvent::Exit = &event {
+                let state = app_handle.state::<state::AppState>();
+                crate::services::mock::server::stop_all(&state.mock);
+                let _ = std::fs::remove_file(state.data_dir.join("gui.pid"));
+            }
             // macOS 点击 Dock 图标时把隐藏的主窗口重新显示出来
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen { .. } = event {

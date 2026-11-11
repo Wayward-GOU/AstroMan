@@ -177,6 +177,77 @@ export function captureTreeKeys(tree: CaptureHostTree[]): string[] {
   return keys
 }
 
+/** 抓包树各类行的固定高度（px）；域名行含 1px 分隔线 */
+export const CAPTURE_ROW_HEIGHT = { host: 29, folder: 25, flow: 27 } as const
+
+export interface CaptureWindowItem<T> {
+  row: T
+  /** 该行在整张列表里的 y 偏移，用于平铺渲染 */
+  top: number
+}
+
+export interface CaptureWindow<T> {
+  items: CaptureWindowItem<T>[]
+  /** 窗口第一行的 y 偏移，作为 translateY 使用 */
+  top: number
+  /** 整张列表的总高度，用于撑开滚动条 */
+  height: number
+}
+
+/**
+ * 虚拟滚动：按固定行高算出当前视口附近要渲染的行。
+ *
+ * 行高固定（域名 29 / 目录 25 / 请求 27），所以只需一次累计即可定位窗口，
+ * 5000 条流量也只渲染几十行 DOM。`overscan` 是上下额外保留的行数，
+ * 避免快速滚动时出现空白。
+ */
+export function captureTreeWindow<T extends { kind: keyof typeof CAPTURE_ROW_HEIGHT }>(
+  rows: T[],
+  scrollTop: number,
+  viewportHeight: number,
+  overscan = 8,
+): CaptureWindow<T> {
+  if (!rows.length) return { items: [], top: 0, height: 0 }
+
+  const tops: number[] = new Array(rows.length)
+  let height = 0
+  for (let index = 0; index < rows.length; index += 1) {
+    tops[index] = height
+    height += CAPTURE_ROW_HEIGHT[rows[index].kind]
+  }
+
+  const overscanPx = Math.max(0, overscan) * CAPTURE_ROW_HEIGHT.flow
+  const maxTop = Math.max(0, height - Math.max(0, viewportHeight))
+  const scrolled = Math.min(Math.max(0, scrollTop), maxTop)
+  const startY = Math.max(0, scrolled - overscanPx)
+  const endY = scrolled + Math.max(0, viewportHeight) + overscanPx
+
+  // 第一行：底边超过 startY；最后一行：顶边仍小于 endY
+  let low = 0
+  let high = rows.length
+  while (low < high) {
+    const mid = (low + high) >> 1
+    if (tops[mid] + CAPTURE_ROW_HEIGHT[rows[mid].kind] <= startY) low = mid + 1
+    else high = mid
+  }
+  const first = low
+  low = 0
+  high = rows.length
+  while (low < high) {
+    const mid = (low + high) >> 1
+    if (tops[mid] < endY) low = mid + 1
+    else high = mid
+  }
+  const last = low - 1
+  if (first > last || first >= rows.length) return { items: [], top: 0, height }
+
+  const items = rows.slice(first, last + 1).map((row, offset) => ({
+    row,
+    top: tops[first + offset],
+  }))
+  return { items, top: tops[first], height }
+}
+
 /** 请求叶子的显示名：最后一段路径，查询串保留用于区分同路径的多次请求 */
 export function captureFlowLabel(flow: CaptureFlow): string {
   const { pathname, query } = splitFlowPath(flow.path)

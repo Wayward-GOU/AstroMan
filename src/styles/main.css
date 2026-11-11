@@ -1,66 +1,37 @@
 /* ============ AstroMan 设计系统 ============ */
-:root {
-  --fm-primary: #4d6bfe;
-  --fm-primary-dark: #3b53e6;
-  --fm-primary-soft: #eef1ff;
-  --fm-success: #16a34a;
-  --fm-success-soft: #e8f8ee;
-  --fm-warning: #d97706;
-  --fm-warning-soft: #fdf3e2;
-  --fm-danger: #dc2626;
-  --fm-danger-soft: #fdeeee;
-  --fm-purple: #8b5cf6;
-  --fm-purple-soft: #f4f0fe;
-
-  /* HTTP 方法色：参照 Postman / Apifox 的高饱和区分色，各主题保持一致 */
-  --fm-method-get: #16a34a;
-  --fm-method-get-soft: #e5f7ec;
-  --fm-method-post: #e8890c;
-  --fm-method-post-soft: #fdf1df;
-  --fm-method-put: #2563eb;
-  --fm-method-put-soft: #e8effe;
-  --fm-method-patch: #9333ea;
-  --fm-method-patch-soft: #f5edfd;
-  --fm-method-delete: #dc2626;
-  --fm-method-delete-soft: #fdecec;
-  --fm-method-other: #64748b;
-  --fm-method-other-soft: #eef1f5;
-
-  --fm-bg: #f5f6fa;
-  --fm-surface: #ffffff;
-  --fm-surface-alt: #f2f4f9;
-  --fm-border: #e6e9f2;
-  --fm-border-strong: #ccd3e4;
-
-  --fm-text: #151b28;
-  --fm-text-2: #3a4256;
-  --fm-muted: #6b7490;
-
-  --fm-radius-sm: 6px;
-  --fm-radius: 8px;
-  --fm-radius-lg: 14px;
-  --fm-shadow-sm: 0 1px 2px rgba(23, 31, 56, 0.05);
-  --fm-shadow: 0 1px 2px rgba(23, 31, 56, 0.05), 0 2px 6px rgba(23, 31, 56, 0.04);
-  --fm-shadow-lg: 0 12px 28px rgba(23, 31, 56, 0.1);
-
-  --fm-sidebar: #f7f8fc;
-  --fm-sidebar-hover: #edf0f8;
-  --fm-sidebar-active: #e9edfe;
-  --fm-sidebar-text: #5f6b85;
-  --fm-sidebar-icon: #7b87a3;
-  --fm-sidebar-active-text: #4d6bfe;
-
-  --fm-code-bg: #fafbff;
-  --fm-gutter-bg: #f4f6fb;
-  --fm-json-key: #2563eb;
-  --fm-json-string: #16a34a;
-  --fm-json-number: #d97706;
-  --fm-json-bool: #9333ea;
-  --fm-json-punct: #8b94ad;
-}
+/* 令牌定义已收敛到 src/styles/tokens.css（静态令牌 + 首帧兜底），
+   主题颜色由 theme.ts 运行时写入 html 内联样式。此处不再定义 --fm-* 变量。 */
 
 * {
   box-sizing: border-box;
+}
+
+/* ---------- 键盘可达性 / 动效偏好 ---------- */
+/* Ant Design 的 .ant-input:focus 会把 outline 置空，键盘焦点会完全看不见；
+   这里用 !important 保证键盘用户在任何控件上都能看到焦点描边。 */
+:focus-visible {
+  outline: 2px solid var(--fm-primary) !important;
+  outline-offset: 2px !important;
+}
+
+html[data-motion='off'] *,
+html[data-motion='off'] *::before,
+html[data-motion='off'] *::after {
+  animation-duration: 0.001ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.001ms !important;
+  scroll-behavior: auto !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
 }
 
 html,
@@ -86,7 +57,7 @@ body {
 
 ::-webkit-scrollbar-thumb {
   background: var(--fm-border-strong);
-  border-radius: 8px;
+  border-radius: var(--fm-radius);
   border: 2px solid transparent;
   background-clip: content-box;
 }
@@ -106,51 +77,52 @@ body {
 
 /* ---------- 页面骨架 ---------- */
 .page {
-  padding: 18px 22px 30px;
+  padding: 22px 24px 30px;
   /* 宽屏铺满内容区，避免最大化后右侧留白 */
   max-width: none;
-  animation: fm-fade-in 0.24s ease;
+  animation: fm-fade-in 160ms ease;
 }
 
 .page-title {
-  font-size: 22px;
+  font-family: var(--fm-font-serif);
+  font-size: 28px;
   line-height: 1.3;
-  font-weight: 700;
-  letter-spacing: -0.2px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
   margin: 0;
 }
 
 .page-subtitle {
   color: var(--fm-muted);
-  font-size: 13px;
-  margin: 6px 0 0;
+  font-size: 12px;
+  margin: 7px 0 0;
 }
 
 .fm-card {
   background: var(--fm-surface);
   border: 1px solid var(--fm-border);
   border-radius: var(--fm-radius);
-  box-shadow: var(--fm-shadow);
 }
 
 .section-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin: 30px 0 14px;
+  margin: 24px 0 12px;
 }
 
 .section-title {
-  font-size: 15px;
+  font-size: 16px;
   font-weight: 600;
   margin: 0;
-  letter-spacing: -0.1px;
+  letter-spacing: 0.02em;
 }
 
 .section-desc {
   font-size: 12px;
   color: var(--fm-muted);
   margin-top: 3px;
+  line-height: 1.7;
 }
 
 .empty-hint {
@@ -178,11 +150,9 @@ body {
 @keyframes fm-fade-in {
   from {
     opacity: 0;
-    transform: translateY(6px);
   }
   to {
     opacity: 1;
-    transform: none;
   }
 }
 
@@ -233,113 +203,124 @@ body {
   border-color: transparent;
 }
 
-/* ---------- Ant Design 统一微调 ---------- */
+/* ---------- Ant Design 统一微调（「深空钛」） ---------- */
 .ant-btn {
   font-weight: 500;
   box-shadow: none;
-  transition: background-color 0.16s, border-color 0.16s, color 0.16s, box-shadow 0.2s;
+  transition:
+    background-color var(--fm-dur-fast) var(--fm-ease),
+    border-color var(--fm-dur-fast) var(--fm-ease),
+    color var(--fm-dur-fast) var(--fm-ease);
 }
 
-/* 主按钮：轻微渐变 + 主题色光晕，更接近 Apifox / Postman 的现代按钮质感
-   ghost 按钮（type="primary" ghost）文字本身就是主题色，必须保持透明背景，否则会和渐变底色撞色 */
+/* 主按钮：纯色实底，去渐变去光晕。仪器上的按钮不该发光。 */
 .ant-btn-primary.ant-btn-primary:not(.ant-btn-background-ghost):not(:disabled) {
-  background: linear-gradient(
-    135deg,
-    color-mix(in srgb, var(--fm-primary) 82%, #ffffff) 0%,
-    var(--fm-primary) 100%
-  );
-  box-shadow: 0 2px 8px color-mix(in srgb, var(--fm-primary) 30%, transparent);
+  background: var(--fm-primary);
+  box-shadow: none;
 }
-
-.ant-btn-primary.ant-btn-primary:not(.ant-btn-background-ghost):not(:disabled):hover {
-  background: linear-gradient(
-    135deg,
-    color-mix(in srgb, var(--fm-primary) 72%, #ffffff) 0%,
-    color-mix(in srgb, var(--fm-primary) 88%, #000000) 100%
-  );
-  box-shadow: 0 4px 14px color-mix(in srgb, var(--fm-primary) 38%, transparent);
-}
-
+.ant-btn-primary.ant-btn-primary:not(.ant-btn-background-ghost):not(:disabled):hover,
 .ant-btn-primary.ant-btn-primary:not(.ant-btn-background-ghost):not(:disabled):active {
   background: var(--fm-primary-dark);
-  box-shadow: 0 1px 4px color-mix(in srgb, var(--fm-primary) 30%, transparent);
 }
-
 .ant-btn-primary:not(.ant-btn-background-ghost):disabled {
   background: color-mix(in srgb, var(--fm-primary) 45%, transparent);
 }
 
+/* 默认按钮：悬停只加深描边并铺一层极浅底，不位移 */
 .ant-btn-default:not(:disabled):hover {
-  border-color: var(--fm-primary);
-  color: var(--fm-primary);
+  border-color: var(--fm-border-strong);
+  color: var(--fm-text);
+  background: var(--fm-surface-alt);
 }
 
 .ant-input,
 .ant-input-affix-wrapper,
 .ant-select .ant-select-selector {
-  transition: border-color 0.16s, box-shadow 0.16s;
+  border-color: var(--fm-border-control);
+  transition: border-color var(--fm-dur-fast) var(--fm-ease);
 }
 
+/* 聚焦：只改描边，去掉 AntD 的 3px 外发光环 */
 .ant-input:focus,
 .ant-input-focused,
 .ant-input-affix-wrapper-focused,
 .ant-select-focused .ant-select-selector {
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--fm-primary) 14%, transparent);
+  box-shadow: none;
+  border-color: var(--fm-primary);
 }
 
 .ant-tabs-top > .ant-tabs-nav {
-  margin-bottom: 10px;
+  margin-bottom: var(--fm-gap-2);
 }
-
 .ant-tabs-top > .ant-tabs-nav::before {
   border-bottom-color: var(--fm-border);
 }
-
 .ant-tabs-tab {
-  padding: 10px 2px !important;
-  font-size: 13px;
+  padding: 9px 2px !important;
+  font-size: 12.5px;
 }
-
-.ant-table {
-  font-size: 13px;
-}
-
-.ant-table-thead > tr > th {
-  background: var(--fm-surface-alt) !important;
-  color: var(--fm-muted) !important;
-  font-size: 12px !important;
-  font-weight: 600 !important;
-  border-bottom: 1px solid var(--fm-border) !important;
-}
-
-.ant-table-tbody > tr > td {
-  border-bottom: 1px solid var(--fm-border) !important;
-}
-
-.ant-table-tbody > tr:hover > td {
-  background: var(--fm-surface-alt) !important;
-}
-
-.ant-modal-content {
-  border-radius: 12px;
-  padding: 22px 24px;
-}
-
-.ant-modal-title {
+.ant-tabs-tab-active .ant-tabs-tab-btn {
   font-weight: 600;
 }
 
+.ant-table {
+  font-size: 12px;
+}
+.ant-table-thead > tr > th {
+  background: var(--fm-surface-alt) !important;
+  color: var(--fm-muted) !important;
+  font-family: var(--fm-font-mono);
+  font-size: 9.5px !important;
+  font-weight: 400 !important;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  border-bottom: 1px solid var(--fm-text) !important;
+}
+.ant-table-tbody > tr > td {
+  border-bottom: 1px solid var(--fm-border) !important;
+  padding-top: 8px !important;
+  padding-bottom: 8px !important;
+}
+.ant-table-tbody > tr:hover > td {
+  background: var(--fm-surface-alt) !important;
+}
+/* 去掉 AntD 首末单元格的圆角补偿 */
+.ant-table-thead > tr > th:first-child,
+.ant-table-thead > tr > th:last-child,
+.ant-table-tbody > tr > td:first-child,
+.ant-table-tbody > tr > td:last-child {
+  border-radius: 0 !important;
+}
+
+.ant-modal-content {
+  border-radius: var(--fm-radius-lg);
+  padding: 20px 22px;
+  box-shadow: var(--fm-shadow-lg);
+}
+.ant-modal-title {
+  font-family: var(--fm-font-serif);
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
 .ant-modal-footer {
-  margin-top: 20px;
+  margin-top: var(--fm-gap-4);
 }
 
 .ant-tree {
   background: transparent;
-  font-size: 13px;
+  font-size: 12.5px;
 }
-
 .ant-tree .ant-tree-node-content-wrapper {
-  border-radius: 7px;
+  min-height: 28px;
+  line-height: 28px;
+  border-radius: var(--fm-radius-sm);
+}
+.ant-tree .ant-tree-node-content-wrapper.ant-tree-node-selected,
+.ant-tree .ant-tree-treenode-selected .ant-tree-node-content-wrapper {
+  background: var(--fm-primary-soft);
+  box-shadow: inset 2px 0 0 var(--fm-primary);
+  color: var(--fm-primary);
 }
 
 .ant-menu-light .ant-menu-item-selected {
@@ -349,21 +330,29 @@ body {
 }
 
 .ant-tag {
-  border-radius: 6px;
-  font-size: 11px;
+  border-radius: var(--fm-radius-sm);
+  font-family: var(--fm-font-mono);
+  font-size: 10.5px;
   line-height: 18px;
 }
-
 .ant-tooltip-inner {
-  font-size: 12px;
+  border-radius: var(--fm-radius-sm);
+  font-size: 11.5px;
 }
-
 .ant-alert {
-  border-radius: 10px;
+  border-radius: var(--fm-radius);
 }
-
 .ant-spin-container::after {
   border-radius: var(--fm-radius);
+}
+
+/* 弹层：去投影改描边，只有遮罩层本身需要脱离平面 */
+.ant-dropdown-menu,
+.ant-select-dropdown,
+.ant-picker-dropdown .ant-picker-panel-container {
+  border: 1px solid var(--fm-border);
+  border-radius: var(--fm-radius);
+  box-shadow: var(--fm-shadow-lg);
 }
 
 /* ---------- Windows / macOS 平台差异化 ---------- */
@@ -412,26 +401,15 @@ html[data-platform='windows'] ::-webkit-scrollbar-thumb:hover {
   background-clip: content-box;
 }
 
-html[data-platform='macos'] .ant-btn {
-  border-radius: 7px;
-}
-
+html[data-platform='macos'] .ant-btn,
 html[data-platform='windows'] .ant-btn {
-  border-radius: 5px;
+  border-radius: var(--fm-radius);
 }
 
-html[data-platform='macos'] .ant-modal-content {
-  border-radius: 14px;
-  padding: 20px 22px;
-}
-
+html[data-platform='macos'] .ant-modal-content,
 html[data-platform='windows'] .ant-modal-content {
-  border-radius: 8px;
-  padding: 22px 24px;
-}
-
-html[data-platform='macos'] .page {
-  padding: 20px 24px 30px;
+  border-radius: var(--fm-radius-lg);
+  padding: 20px 22px;
 }
 
 /* 更新弹窗中的发布说明预览 */
@@ -448,5 +426,5 @@ html[data-platform='macos'] .page {
   color: var(--fm-text-2);
   background: var(--fm-surface-alt);
   border: 1px solid var(--fm-border);
-  border-radius: 8px;
+  border-radius: var(--fm-radius);
 }

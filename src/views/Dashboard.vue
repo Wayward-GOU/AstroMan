@@ -1,5 +1,5 @@
 ﻿<script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
 import { open, save } from '@tauri-apps/plugin-dialog'
@@ -7,15 +7,10 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import {
   ArrowRightOutlined,
   ThunderboltOutlined,
-  DeploymentUnitOutlined,
   FolderOpenOutlined,
-  DatabaseOutlined,
   ImportOutlined,
   DownOutlined,
   ToolOutlined,
-  LineChartOutlined,
-  FundProjectionScreenOutlined,
-  SettingOutlined,
   ApiOutlined,
   GlobalOutlined,
   SafetyCertificateOutlined,
@@ -23,22 +18,24 @@ import {
   PlayCircleOutlined,
   FileTextOutlined,
   ExperimentOutlined,
-  ScheduleOutlined,
   PlusOutlined,
 } from '@ant-design/icons-vue'
 import AiSparkIcon from '@/components/AiSparkIcon.vue'
 import PageHeader from '@/components/PageHeader.vue'
 import { notesCreate, notesCounts, notesList, notesToggle } from '@/api/notes'
+import { captureStatus } from '@/api/capture'
 import { formatDueLabel, parseQuickNote } from '@/utils/notesQuickParse'
 import type { NoteCounts, NoteSummary } from '@/types/notes'
 import { useProjectStore } from '@/stores/project'
 import { useAiAssistStore } from '@/stores/aiAssist'
+import { useHangzaiTaskStore } from '@/stores/hangzaiTask'
 import { dashboardInsightPrompt } from '@/utils/aiScenarios'
 import * as api from '@/api'
-import type { DashboardMetrics, StorageInfo, WorkspaceStats } from '@/types/models'
+import type { DashboardMetrics, RequestSearchHit, StorageInfo, WorkspaceStats } from '@/types/models'
 
 const router = useRouter()
 const store = useProjectStore()
+const hangzai = useHangzaiTaskStore()
 
 const loading = ref(true)
 const createOpen = ref(false)
@@ -132,31 +129,92 @@ function aiInsight() {
 }
 const storage = ref<StorageInfo | null>(null)
 const appVersion = ref('')
+const proxyOn = ref<boolean | null>(null)
+const captureRunning = ref(false)
+const modelLabel = ref('未配置')
+const guideOpen = ref(false)
 
 const recentProject = computed(() => {
   if (!store.projects.length) return null
   return [...store.projects].sort((a, b) => b.updatedAt - a.updatedAt)[0]
 })
 
-const headerSubtitle = computed(() =>
-  stats.value
-    ? `${stats.value.projectCount} 个项目 · ${stats.value.requestCount} 个接口 · 数据全部保存在本机`
-    : '本地 API 调试、抓包、压测与工具箱，数据不出这台电脑',
-)
+const activeProjects = computed(() => {
+  const weekAgo = Date.now() - 7 * 86_400_000
+  return store.projects.filter((project) => project.updatedAt >= weekAgo).length
+})
+
+interface RecentProjectRow {
+  id: number
+  name: string
+  description: string
+  count: number | null
+  last: RequestSearchHit | null
+  updatedAt: number
+}
+
+const recentProjects = ref<RecentProjectRow[]>([])
+
+async function loadRecentProjects() {
+  const list = [...store.projects]
+    .sort((a, b) => b.updatedAt - a.updatedAt)
+    .slice(0, 5)
+  recentProjects.value = list.map((project) => ({
+    id: project.id,
+    name: project.name,
+    description: project.description ?? '',
+    count: null,
+    last: null,
+    updatedAt: project.updatedAt,
+  }))
+  await Promise.all(
+    list.map(async (project) => {
+      try {
+        const requests = await api.requestOptions(project.id)
+        const row = recentProjects.value.find((item) => item.id === project.id)
+        if (!row) return
+        row.count = requests.length
+        row.last = requests.reduce<RequestSearchHit | null>(
+          (latest, item) => (!latest || item.updatedAt > latest.updatedAt ? item : latest),
+          null,
+        )
+      } catch {
+        // 浏览器预览或后端未就绪：保留空值，表格显示「—」
+      }
+    }),
+  )
+}
+
+const todayRequests = computed(() => {
+  const days = metrics.value?.days ?? []
+  return days.length ? days[days.length - 1] : null
+})
+
+const headerSubtitle = computed(() => {
+  const s = stats.value
+  if (!s) return '本地 API 调试、抓包、压测与工具箱，数据不出这台电脑'
+  const today = todayRequests.value?.total ?? 0
+  return `${s.projectCount} 个项目 · ${s.requestCount} 个接口 · 今天已发送 ${fmtInt(today)} 次请求`
+})
 
 const kpis = computed(() => {
   const s = stats.value
   const project = recentProject.value
+  const today = todayRequests.value
   const openProject = () => {
     if (project) router.push(`/project/${project.id}`)
     else createOpen.value = true
   }
+  const todayNote = !today || today.total === 0
+    ? '今天还没有请求'
+    : `成功率 ${((today.success / today.total) * 100).toFixed(1)}%`
   return [
     {
       key: 'project',
       label: '项目',
       value: s?.projectCount ?? store.projects.length,
-      note: '按项目组织接口',
+      note: `${activeProjects.value} 个本周活跃`,
+      up: false,
       go: () => router.push('/projects'),
     },
     {
@@ -164,95 +222,58 @@ const kpis = computed(() => {
       label: '接口',
       value: s?.requestCount ?? null,
       note: s ? `分布在 ${s.collectionCount} 个集合` : '正在统计',
+      up: false,
       go: openProject,
     },
     {
-      key: 'collection',
-      label: '集合',
-      value: s?.collectionCount ?? null,
-      note: '支持无限嵌套',
-      go: openProject,
-    },
-    {
-      key: 'environment',
-      label: '环境',
-      value: s?.environmentCount ?? null,
-      note: '变量与密钥管理',
-      go: goEnvironment,
-    },
-    {
-      key: 'report',
-      label: '压测报告',
-      value: s?.reportCount ?? null,
-      note: s ? `近 7 天新增 ${s.recentReports} 份` : '结束后自动生成',
-      go: () => router.push('/stress'),
-    },
-    {
-      key: 'history',
-      label: '历史请求',
-      value: s?.historyCount ?? null,
-      note: s ? `近 7 天 ${s.recentHistory} 次` : '本机保留最近 100000 条',
+      key: 'today',
+      label: '今日请求',
+      value: today?.total ?? null,
+      note: todayNote,
+      up: Boolean(today && today.total > 0),
       go: () => router.push('/history'),
+    },
+    {
+      key: 'todo',
+      label: '待办',
+      value: noteCounts.value.open,
+      note: noteCounts.value.overdue > 0
+        ? `${noteCounts.value.overdue} 项已逾期`
+        : `今天到期 ${noteCounts.value.dueToday} 项`,
+      up: false,
+      go: () => router.push('/notes'),
     },
   ]
 })
 
 const launches = computed(() => [
   {
+    key: 'stress',
+    title: '发起压测',
+    desc: '固定 / 阶梯并发，SLA 判定',
+    icon: ThunderboltOutlined,
+    go: () => router.push('/stress'),
+  },
+  {
     key: 'capture',
-    title: '抓包分析',
-    desc: 'HTTPS 解密、域名分组与改参重发',
+    title: '开始抓包',
+    desc: '本机 MITM · 断点 · 弱网',
     icon: GlobalOutlined,
     go: () => router.push('/capture'),
   },
   {
     key: 'automation',
-    title: '自动化测试',
-    desc: '测试场景：套件、断言、Python 与回归报告',
+    title: '跑测试套件',
+    desc: '断言 · Python 钩子 · 报告',
     icon: ExperimentOutlined,
     go: () => router.push('/automation'),
   },
   {
-    key: 'stress',
-    title: '发起压测',
-    desc: '选择接口，配置并发、时长与 SLA',
-    icon: ThunderboltOutlined,
-    go: () => router.push('/stress'),
-  },
-  {
-    key: 'reports',
-    title: '压测报告',
-    desc: '分位、阶段汇总与逐请求明细',
-    icon: FundProjectionScreenOutlined,
-    go: () => router.push('/stress'),
-  },
-  {
-    key: 'tools',
-    title: '工具箱',
-    desc: 'JSON、加解密、时间戳等离线工具',
-    icon: ToolOutlined,
-    go: () => router.push('/tools'),
-  },
-  {
-    key: 'monitor',
-    title: '系统监视',
-    desc: 'CPU、内存、磁盘与本机 IP',
-    icon: LineChartOutlined,
-    go: () => router.push('/monitor'),
-  },
-  {
-    key: 'environment',
-    title: '环境变量',
-    desc: '统一管理 base_url 与 token',
-    icon: DeploymentUnitOutlined,
-    go: goEnvironment,
-  },
-  {
-    key: 'settings',
-    title: '数据与设置',
-    desc: '存储位置、主题与版本信息',
-    icon: SettingOutlined,
-    go: goSettings,
+    key: 'ai',
+    title: '问航仔',
+    desc: '写接口、发请求、查报告',
+    icon: AiSparkIcon,
+    go: () => router.push({ name: 'ai' }),
   },
 ])
 
@@ -500,6 +521,67 @@ const steps = computed(() => [
   },
 ])
 
+const pathDone = computed(() => {
+  const s = stats.value
+  if (!s) return 0
+  const flags = [
+    s.projectCount > 0,
+    s.environmentCount > 0,
+    s.requestCount > 0,
+    s.historyCount > 0,
+    s.reportCount > 0,
+  ]
+  let done = 0
+  for (const flag of flags) {
+    if (!flag) break
+    done += 1
+  }
+  return done
+})
+
+const pathNext = computed(() => steps.value[Math.min(pathDone.value, steps.value.length - 1)])
+
+function openGuide() {
+  guideOpen.value = true
+  void nextTick(() => {
+    document.getElementById('guide')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  })
+}
+
+function closeGuide() {
+  guideOpen.value = false
+}
+
+function pad2(value: number) {
+  return String(value).padStart(2, '0')
+}
+
+function methodClass(method: string) {
+  const value = method.toLowerCase()
+  if (value === 'get' || value === 'post' || value === 'put' || value === 'patch') return value
+  if (value === 'delete' || value === 'del') return 'delete'
+  return 'other'
+}
+
+function shortPath(url: string) {
+  try {
+    const parsed = new URL(url)
+    return `${parsed.pathname}${parsed.search}` || '/'
+  } catch {
+    return url.replace(/^[a-z]+:\/\/[^/]+/i, '') || url
+  }
+}
+
+function formatRelative(ts: number) {
+  const diff = Date.now() - ts
+  if (diff < 60_000) return '刚刚'
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时前`
+  if (diff < 172_800_000) return '昨天'
+  if (diff < 7 * 86_400_000) return `${Math.floor(diff / 86_400_000)} 天前`
+  return new Date(ts).toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' })
+}
+
 const tips = [
   {
     title: '变量引用与优先级',
@@ -693,17 +775,31 @@ onMounted(async () => {
     loading.value = false
   }
 
-  const [st, storageInfo, info, dash] = await Promise.allSettled([
+  const [st, storageInfo, info, dash, cap, providers] = await Promise.allSettled([
     api.workspaceStats(),
     api.storageInfo(),
     api.appInfo(),
     api.dashboardMetrics(),
+    captureStatus(),
+    api.aiProviderList(),
   ])
   if (st.status === 'fulfilled') stats.value = st.value
   if (storageInfo.status === 'fulfilled') storage.value = storageInfo.value
   if (info.status === 'fulfilled') appVersion.value = info.value.version
   if (dash.status === 'fulfilled') metrics.value = dash.value
+  if (cap.status === 'fulfilled') {
+    proxyOn.value = cap.value.sysproxyOn
+    captureRunning.value = cap.value.state === 'running'
+  }
+  if (providers.status === 'fulfilled') {
+    const list = providers.value
+    const target = list.find((item) => item.isDefault) ?? list[0]
+    if (target) {
+      modelLabel.value = `${target.model || target.name}${target.hasKey === false ? ' · 未配置密钥' : ' · 已配置'}`
+    }
+  }
 
+  await loadRecentProjects()
   await loadNotes()
   document.addEventListener('visibilitychange', onNotesVisible)
   try {
@@ -748,6 +844,7 @@ async function refreshStats() {
   const [s, m] = await Promise.allSettled([api.workspaceStats(), api.dashboardMetrics()])
   if (s.status === 'fulfilled') stats.value = s.value
   if (m.status === 'fulfilled') metrics.value = m.value
+  await loadRecentProjects()
 }
 
 function removeProject(id: number, name: string) {
@@ -899,13 +996,14 @@ function fmtBytes(value: number) {
 
     <!-- 总览 -->
     <section class="console fm-card">
-      <div class="console-main">
-        <div class="console-eyebrow">
-          <span class="pulse-dot" />
-          <span>本地工作区</span>
-          <span class="meta-dot" />
-          <span class="mono">{{ storage ? fmtBytes(storage.dbSize + storage.walSize) : '—' }}</span>
-          <span class="meta-dot" />
+      <div class="grid-bg" aria-hidden="true" />
+      <div class="console-left">
+        <div class="console-status">
+          <span class="dot" />
+          <span>本地工作区 · 已就绪</span>
+          <span class="sep" />
+          <span>{{ storage ? fmtBytes(storage.dbSize + storage.walSize) : '—' }}</span>
+          <span class="sep" />
           <span>{{ storage?.isCustom ? '自定义数据目录' : '默认数据目录' }}</span>
         </div>
         <h2 class="console-title">本地工作区已就绪</h2>
@@ -920,108 +1018,143 @@ function fmtBytes(value: number) {
           <a-button :disabled="!recentProject" @click="goEnvironment">环境变量</a-button>
           <a-button @click="router.push('/stress')">查看报告</a-button>
         </div>
-        <div class="console-meta">
-          <DatabaseOutlined />
-          <span>AstroMan v{{ appVersion || '1.0.0' }}</span>
-          <span class="meta-dot" />
-          <a @click="goSettings">数据位置与设置</a>
-        </div>
       </div>
 
-      <div class="kpi-grid">
-        <button v-for="item in kpis" :key="item.key" class="kpi" @click="item.go()">
+      <div class="kpis">
+        <button v-for="item in kpis" :key="item.key" type="button" class="kpi" @click="item.go()">
           <span class="kpi-label">{{ item.label }}</span>
-          <span class="kpi-value mono">{{ item.value == null ? '—' : fmtInt(item.value) }}</span>
-          <span class="kpi-note">{{ item.note }}</span>
+          <b class="kpi-value">
+            {{ item.value == null ? '—' : item.key === 'todo' ? pad2(item.value) : fmtInt(item.value) }}
+          </b>
+          <em class="kpi-note" :class="{ up: item.up }">{{ item.note }}</em>
         </button>
       </div>
     </section>
 
-    <!-- 今日待办 -->
-    <section class="notes-card fm-card">
-      <div class="notes-card-main">
-        <div class="notes-card-head">
-          <span class="notes-card-icon"><ScheduleOutlined /></span>
-          <div class="notes-card-title">
-            <h3>今日待办</h3>
-            <p>随手记下，到点提醒；截图也能直接生成待办</p>
-          </div>
-          <button type="button" class="notes-open" @click="router.push('/notes')">
-            打开记事本
-            <ArrowRightOutlined />
-          </button>
-        </div>
-        <div class="notes-stats">
-          <span class="notes-stat">
-            <strong :class="{ danger: noteCounts.overdue > 0 }">{{ noteCounts.overdue }}</strong>
-            逾期
-          </span>
-          <span class="notes-stat">
-            <strong>{{ noteCounts.dueToday }}</strong>
-            今天到期
-          </span>
-          <span class="notes-stat">
-            <strong>{{ noteCounts.open }}</strong>
-            未完成
-          </span>
-        </div>
-        <div class="notes-preview">
-          <label
+    <!-- 最近项目 + 今日待办 -->
+    <div class="cols">
+      <section class="panel fm-card">
+        <header>
+          <h3>最近项目<span>Recent / 5</span></h3>
+          <a @click="router.push('/projects')">全部 →</a>
+        </header>
+        <table class="tbl fm-table">
+          <thead>
+            <tr>
+              <th>项目</th>
+              <th>最近接口</th>
+              <th class="num">接口数</th>
+              <th class="num">更新</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr
+              v-for="row in recentProjects"
+              :key="row.id"
+              @click="router.push(`/project/${row.id}`)"
+            >
+              <td class="nm">{{ row.name }}</td>
+              <td>
+                <template v-if="row.last">
+                  <span class="fm-mt" :class="methodClass(row.last.method)">{{ row.last.method }}</span>
+                  <span class="path" :title="row.last.url">{{ shortPath(row.last.url) }}</span>
+                </template>
+                <span v-else class="muted">—</span>
+              </td>
+              <td class="num">{{ row.count == null ? '—' : fmtInt(row.count) }}</td>
+              <td class="num">{{ formatRelative(row.updatedAt) }}</td>
+            </tr>
+            <tr v-if="!recentProjects.length">
+              <td colspan="4" class="empty">还没有项目，先新建一个。</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="panel fm-card">
+        <header>
+          <h3>今日待办<span>Notes</span></h3>
+          <a @click="router.push('/notes')">记事本 →</a>
+        </header>
+        <div class="todo">
+          <div
             v-for="item in notePreview"
             :key="item.id"
-            class="notes-preview-row"
-            :class="{ overdue: item.dueAt !== null && item.dueAt < noteNow }"
+            class="row"
+            :class="{ done: item.status === 'done' }"
             @click="router.push('/notes')"
           >
-            <a-checkbox
-              :checked="item.status === 'done'"
-              @click.stop
-              @change="toggleNoteDone(item, Boolean(($event.target as HTMLInputElement)?.checked))"
+            <button
+              type="button"
+              class="box"
+              :class="{ on: item.status === 'done' }"
+              :aria-label="item.status === 'done' ? '标记未完成' : '标记完成'"
+              @click.stop="toggleNoteDone(item, item.status !== 'done')"
             />
-            <span class="notes-preview-title">{{ item.title || '未命名' }}</span>
-            <span v-if="item.dueAt" class="notes-preview-time">
+            <span class="todo-title">{{ item.title || '未命名' }}</span>
+            <span
+              v-if="item.dueAt"
+              class="time"
+              :class="{ late: item.dueAt < noteNow && item.status !== 'done' }"
+            >
               {{ formatDueLabel(item.dueAt, noteNow) }}
             </span>
-          </label>
-          <div v-if="!notePreview.length" class="notes-preview-empty">今天还没有待办，右侧记一笔。</div>
+          </div>
+          <div v-if="!notePreview.length" class="todo-empty">今天还没有待办，下面记一笔。</div>
         </div>
-      </div>
-      <div class="notes-quick">
-        <a-input
-          v-model:value="noteQuick"
-          placeholder="记一笔… 明天10点 交周报 #工作"
-          @keydown="onNoteQuickKeydown"
-        >
-          <template #suffix>
-            <a-spin v-if="noteSaving" size="small" />
-            <PlusOutlined v-else />
-          </template>
-        </a-input>
-        <div class="notes-quick-labels">
-          <span v-for="label in noteParsed.labels" :key="label" class="notes-quick-tag">
-            {{ label }}
-          </span>
-          <span v-if="!noteParsed.labels.length" class="notes-quick-hint">
-            回车保存，不带时间也会出现在「无截止」
-          </span>
+        <div class="quick">
+          <PlusOutlined class="quick-icon" />
+          <input
+            v-model="noteQuick"
+            class="quick-input"
+            placeholder="记一笔… 明天10点 交周报 #工作"
+            @keydown="onNoteQuickKeydown"
+          />
+          <a-spin v-if="noteSaving" size="small" />
+          <button
+            v-else
+            type="button"
+            class="quick-save"
+            :disabled="!noteQuick.trim()"
+            @click="saveNoteQuick"
+          >
+            记一笔
+          </button>
         </div>
-        <a-button type="primary" block :loading="noteSaving" @click="saveNoteQuick">
-          记一笔
-        </a-button>
-      </div>
-    </section>
+      </section>
+    </div>
 
     <!-- 快捷入口 -->
     <div class="launch-grid">
-      <button v-for="item in launches" :key="item.key" class="launch fm-card" @click="item.go()">
-        <span class="launch-icon"><component :is="item.icon" /></span>
-        <span class="launch-text">
-          <span class="launch-title">{{ item.title }}</span>
-          <span class="launch-desc">{{ item.desc }}</span>
+      <button v-for="item in launches" :key="item.key" type="button" class="launch fm-card" @click="item.go()">
+        <span class="launch-ic"><component :is="item.icon" /></span>
+        <span class="launch-body">
+          <b>{{ item.title }}</b>
+          <span>{{ item.desc }}</span>
         </span>
-        <ArrowRightOutlined class="launch-arrow" />
       </button>
     </div>
+
+    <!-- 上手路径 -->
+    <div class="pathband">
+      <span class="pl">上手路径</span>
+      <span class="pn">
+        10 节 · 已完成 <b>{{ pad2(pathDone) }}</b> 节 · 下一步「{{ pathNext.title }}」
+      </span>
+      <span class="gauge" aria-hidden="true">
+        <i
+          v-for="(step, index) in steps"
+          :key="step.key"
+          :class="{ on: index < pathDone, cur: index === pathDone }"
+        />
+      </span>
+      <span class="pnum">{{ pad2(pathDone) }} / 10</span>
+      <a class="plink" @click="guideOpen ? closeGuide() : openGuide()">
+        {{ guideOpen ? '收起使用说明 ↑' : '打开使用说明 →' }}
+      </a>
+    </div>
+
+    <div v-show="guideOpen" id="guide" class="guide">
 
     <!-- 测试场景介绍 -->
     <section class="runner-band suite-band fm-card">
@@ -1343,6 +1476,25 @@ function fmtBytes(value: number) {
       </div>
     </div>
 
+      <div class="guide-foot">
+        <a class="plink" @click="closeGuide">收起使用说明 ↑</a>
+      </div>
+    </div>
+
+    <!-- 底部状态条 -->
+    <div class="statusbar">
+      <span>SQLite · {{ storage ? fmtBytes(storage.dbSize + storage.walSize) : '—' }}</span>
+      <span class="d">│</span>
+      <span>
+        {{ captureRunning ? '抓包录制中' : proxyOn ? '系统代理 已接管' : '系统代理 未接管' }}
+      </span>
+      <span class="d">│</span>
+      <span>模型 {{ modelLabel }}</span>
+      <span class="d">│</span>
+      <span>航仔任务 {{ hangzai.active ? hangzai.phaseText : '空闲' }}</span>
+      <span class="right">AstroMan v{{ appVersion || '1.0.0' }} · 本地工作区</span>
+    </div>
+
     <a-modal
       v-model:open="createOpen"
       title="新建项目"
@@ -1366,66 +1518,70 @@ function fmtBytes(value: number) {
 <style scoped>
 /* ---------- 总览 ---------- */
 .console {
+  position: relative;
   display: grid;
-  grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr) 520px;
   overflow: hidden;
-  background:
-    radial-gradient(120% 150% at 0% 0%, var(--fm-primary-soft) 0%, transparent 58%),
-    var(--fm-surface);
+  background: var(--fm-surface);
 }
 
-.console-main {
-  padding: 22px 24px;
+.grid-bg {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(to right, var(--fm-border) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--fm-border) 1px, transparent 1px);
+  background-size: 26px 26px;
+  opacity: 0.4;
+  mask-image: linear-gradient(105deg, #000, transparent 62%);
+  -webkit-mask-image: linear-gradient(105deg, #000, transparent 62%);
+}
+
+.console-left {
+  position: relative;
+  padding: 24px 26px 22px;
   min-width: 0;
 }
 
-.console-eyebrow {
+.console-status {
   display: flex;
   align-items: center;
-  gap: 7px;
+  flex-wrap: wrap;
+  gap: 9px;
+  font-family: var(--fm-font-mono);
   font-size: 11px;
+  letter-spacing: 0.02em;
   color: var(--fm-muted);
 }
 
-.pulse-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
+.console-status .dot {
+  width: 5px;
+  height: 5px;
+  flex: none;
   background: var(--fm-success);
-  box-shadow: 0 0 0 0 rgba(63, 127, 95, 0.35);
-  animation: fm-pulse 2.6s ease-out infinite;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--fm-success) 14%, transparent);
 }
 
-@keyframes fm-pulse {
-  0% {
-    box-shadow: 0 0 0 0 rgba(63, 127, 95, 0.3);
-  }
-  70% {
-    box-shadow: 0 0 0 7px rgba(63, 127, 95, 0);
-  }
-  100% {
-    box-shadow: 0 0 0 0 rgba(63, 127, 95, 0);
-  }
-}
-
-.meta-dot {
-  width: 3px;
-  height: 3px;
-  border-radius: 50%;
-  background: var(--fm-border-strong);
+.console-status .sep {
+  width: 1px;
+  height: 9px;
+  background: var(--fm-border);
 }
 
 .console-title {
-  margin: 14px 0 8px;
-  font-size: 20px;
-  font-weight: 650;
-  letter-spacing: -0.2px;
-  line-height: 1.35;
+  margin: 16px 0 8px;
+  font-family: var(--fm-font-serif);
+  font-size: 23px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  line-height: 1.3;
+  color: var(--fm-text);
 }
 
 .console-desc {
-  margin: 0;
-  max-width: 520px;
+  margin: 0 0 18px;
+  max-width: 400px;
   font-size: 12.5px;
   line-height: 1.75;
   color: var(--fm-muted);
@@ -1435,145 +1591,466 @@ function fmtBytes(value: number) {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
-  margin-top: 18px;
 }
 
-.console-meta {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 16px;
-  font-size: 11px;
-  color: var(--fm-muted);
-}
-
-.console-meta a {
-  color: var(--fm-primary);
-}
-
-.kpi-grid {
+.kpis {
+  position: relative;
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   border-left: 1px solid var(--fm-border);
+  background: var(--fm-surface-alt);
 }
 
 .kpi {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  gap: 3px;
-  padding: 16px 18px;
-  border: none;
-  border-bottom: 1px solid var(--fm-border);
+  padding: 22px 20px;
+  border: 0;
   border-right: 1px solid var(--fm-border);
+  border-bottom: 1px solid var(--fm-border);
   background: transparent;
   text-align: left;
   cursor: pointer;
-  transition: background 0.16s;
+  transition: background var(--fm-dur-fast);
 }
 
-.kpi:nth-child(3n) {
-  border-right: none;
+.kpi:nth-child(2n) {
+  border-right: 0;
 }
 
-.kpi:nth-child(n + 4) {
-  border-bottom: none;
+.kpi:nth-child(n + 3) {
+  border-bottom: 0;
 }
 
 .kpi:hover {
-  background: var(--fm-surface-alt);
+  background: var(--fm-surface);
 }
 
 .kpi-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   font-size: 11px;
   color: var(--fm-muted);
 }
 
+.kpi-label::before {
+  content: '';
+  width: 3px;
+  height: 3px;
+  background: var(--fm-brass);
+}
+
 .kpi-value {
-  font-size: 23px;
-  font-weight: 600;
-  line-height: 1.25;
+  margin-top: 9px;
+  font-family: var(--fm-font-mono);
+  font-size: 30px;
+  font-weight: 500;
+  line-height: 1.15;
+  letter-spacing: -0.01em;
   color: var(--fm-text);
   font-variant-numeric: tabular-nums;
 }
 
 .kpi-note {
+  margin-top: 2px;
+  max-width: 100%;
+  font-family: var(--fm-font-mono);
+  font-style: normal;
   font-size: 10.5px;
   color: var(--fm-muted);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  max-width: 100%;
+}
+
+.kpi-note.up {
+  color: var(--fm-success);
+}
+
+/* ---------- 最近项目 + 今日待办 ---------- */
+.cols {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 372px;
+  gap: 16px;
+  align-items: start;
+  margin-top: 16px;
+}
+
+.panel {
+  overflow: hidden;
+}
+
+.panel > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--fm-border);
+}
+
+.panel > header h3 {
+  margin: 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--fm-text);
+}
+
+.panel > header h3 span {
+  margin-left: 8px;
+  font-family: var(--fm-font-mono);
+  font-size: 9.5px;
+  font-weight: 400;
+  letter-spacing: 0.14em;
+  color: var(--fm-muted);
+}
+
+.panel > header a {
+  font-family: var(--fm-font-mono);
+  font-size: 10.5px;
+  color: var(--fm-primary);
+  cursor: pointer;
+}
+
+.tbl th {
+  padding: 8px 16px;
+  background: var(--fm-surface-alt);
+  border-bottom: 1px solid var(--fm-border);
+}
+
+.tbl td {
+  padding: 9px 16px;
+}
+
+.tbl th.num {
+  text-align: right;
+}
+
+.tbl tbody tr {
+  cursor: pointer;
+}
+
+.tbl .path {
+  display: inline-block;
+  max-width: 240px;
+  margin-left: 7px;
+  font-family: var(--fm-font-mono);
+  font-size: 11px;
+  color: var(--fm-text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+
+.tbl .muted {
+  color: var(--fm-muted);
+}
+
+.tbl .empty {
+  padding: 22px 16px;
+  text-align: center;
+  font-size: 11.5px;
+  color: var(--fm-muted);
+}
+
+.todo {
+  display: flex;
+  flex-direction: column;
+}
+
+.todo .row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--fm-border);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.todo .row:last-child {
+  border-bottom: 0;
+}
+
+.todo .row:hover {
+  background: var(--fm-surface-alt);
+}
+
+.todo .box {
+  width: 12px;
+  height: 12px;
+  flex: none;
+  padding: 0;
+  border: 1px solid var(--fm-border-strong);
+  background: var(--fm-surface);
+  cursor: pointer;
+}
+
+.todo .box.on {
+  background: var(--fm-primary);
+  border-color: var(--fm-primary);
+}
+
+.todo .todo-title {
+  flex: 1;
+  min-width: 0;
+  color: var(--fm-text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.todo .row.done .todo-title {
+  color: var(--fm-muted);
+  text-decoration: line-through;
+}
+
+.todo .time {
+  margin-left: auto;
+  flex: none;
+  font-family: var(--fm-font-mono);
+  font-size: 10px;
+  color: var(--fm-muted);
+}
+
+.todo .time.late {
+  color: var(--fm-danger);
+}
+
+.todo-empty {
+  padding: 18px 16px;
+  font-size: 11.5px;
+  color: var(--fm-muted);
+}
+
+.quick {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 16px 14px;
+  padding: 6px 9px;
+  border: 1px solid var(--fm-border);
+  background: var(--fm-surface);
+  transition: border-color var(--fm-dur-fast);
+}
+
+.quick:focus-within {
+  border-color: var(--fm-primary);
+}
+
+.quick-icon {
+  flex: none;
+  color: var(--fm-primary);
+  font-size: 12px;
+}
+
+.quick-input {
+  flex: 1;
+  min-width: 0;
+  height: 20px;
+  border: 0;
+  background: transparent;
+  outline: none;
+  color: var(--fm-text);
+  font-size: 11.5px;
+}
+
+.quick-input::placeholder {
+  color: var(--fm-muted);
+}
+
+.quick-save {
+  flex: none;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--fm-primary);
+  font-family: var(--fm-font-mono);
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.quick-save:disabled {
+  color: var(--fm-muted);
+  cursor: default;
 }
 
 /* ---------- 快捷入口 ---------- */
 .launch-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(206px, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 12px;
-  margin-top: 14px;
+  margin-top: 16px;
 }
 
 .launch {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 11px;
-  padding: 13px 15px;
+  padding: 14px;
+  border: 1px solid var(--fm-border);
   text-align: left;
   cursor: pointer;
-  transition: border-color 0.16s, box-shadow 0.16s, transform 0.16s;
+  transition: border-color var(--fm-dur-fast), background var(--fm-dur-fast);
 }
 
 .launch:hover {
   border-color: var(--fm-border-strong);
-  box-shadow: var(--fm-shadow-lg);
-  transform: translateY(-1px);
+  background: var(--fm-surface-alt);
 }
 
-.launch-icon {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 34px;
-  height: 34px;
-  flex-shrink: 0;
-  border-radius: 9px;
-  background: var(--fm-primary-soft);
+.launch-ic {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  flex: none;
+  border: 1px solid var(--fm-border);
   color: var(--fm-primary);
-  font-size: 16px;
+  font-size: 14px;
 }
 
-.launch-text {
+.launch-body {
   display: flex;
   flex-direction: column;
-  gap: 2px;
   min-width: 0;
-  flex: 1;
 }
 
-.launch-title {
-  font-size: 13px;
+.launch-body b {
+  font-size: 12px;
   font-weight: 600;
+  color: var(--fm-text);
 }
 
-.launch-desc {
+.launch-body span {
+  margin-top: 3px;
   font-size: 10.5px;
+  line-height: 1.6;
   color: var(--fm-muted);
-  overflow: hidden;
-  text-overflow: ellipsis;
+}
+
+/* ---------- 上手路径 / 状态条 ---------- */
+.pathband {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  height: 48px;
+  margin-top: 16px;
+  padding: 0 16px;
+  border: 1px solid var(--fm-border);
+  background: var(--fm-surface);
+}
+
+.pathband .pl {
+  display: flex;
+  align-items: center;
+  height: 20px;
+  padding-right: 14px;
+  border-right: 1px solid var(--fm-border);
+  font-family: var(--fm-font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--fm-brass-text);
   white-space: nowrap;
 }
 
-.launch-arrow {
-  color: var(--fm-border-strong);
-  font-size: 11px;
-  transition: color 0.16s, transform 0.16s;
+.pathband .pn {
+  font-size: 12px;
+  color: var(--fm-muted);
+  white-space: nowrap;
 }
 
-.launch:hover .launch-arrow {
+.pathband .pn b {
+  font-weight: 600;
+  color: var(--fm-text);
+}
+
+.gauge {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  margin-left: auto;
+}
+
+.gauge i {
+  display: block;
+  width: 21px;
+  height: 5px;
+  background: var(--fm-surface-alt);
+  border: 1px solid var(--fm-border);
+}
+
+.gauge i.on {
+  background: var(--fm-primary);
+  border-color: var(--fm-primary);
+}
+
+.gauge i.cur {
+  height: 9px;
+  background: var(--fm-primary-soft);
+  border-color: var(--fm-primary);
+}
+
+.pnum {
+  font-family: var(--fm-font-mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  color: var(--fm-text-2);
+  white-space: nowrap;
+}
+
+.plink {
+  font-family: var(--fm-font-mono);
+  font-size: 10.5px;
   color: var(--fm-primary);
-  transform: translateX(1px);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.statusbar {
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  height: 28px;
+  margin: 16px -24px -30px;
+  padding: 0 16px;
+  border-top: 1px solid var(--fm-border);
+  background: var(--fm-surface-alt);
+  font-family: var(--fm-font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.02em;
+  color: var(--fm-muted);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.statusbar .d {
+  color: var(--fm-border-strong);
+  font-size: 9px;
+}
+
+.statusbar .right {
+  margin-left: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.guide {
+  margin-top: 22px;
+}
+
+.guide-foot {
+  display: flex;
+  justify-content: center;
+  padding: 16px 0 4px;
 }
 
 /* ---------- 产品介绍 ---------- */
@@ -1624,7 +2101,7 @@ function fmtBytes(value: number) {
 
 .intro-tags span {
   padding: 2px 9px;
-  border-radius: 20px;
+  border-radius: 999px;
   border: 1px solid var(--fm-border);
   background: var(--fm-surface-alt);
   font-size: 10.5px;
@@ -1643,7 +2120,7 @@ function fmtBytes(value: number) {
   gap: 2px;
   padding: 12px 14px;
   border: 1px solid var(--fm-border);
-  border-radius: 8px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface);
 }
 
@@ -1697,7 +2174,7 @@ function fmtBytes(value: number) {
   width: 30px;
   height: 30px;
   flex-shrink: 0;
-  border-radius: 8px;
+  border-radius: var(--fm-radius);
   background: var(--fm-primary-soft);
   color: var(--fm-primary);
   font-size: 15px;
@@ -1725,7 +2202,7 @@ function fmtBytes(value: number) {
 
 .feature-points span {
   padding: 2px 7px;
-  border-radius: 5px;
+  border-radius: var(--fm-radius-sm);
   background: var(--fm-surface-alt);
   font-size: 10px;
   color: var(--fm-text-2);
@@ -1922,7 +2399,7 @@ function fmtBytes(value: number) {
   margin: 8px 0 0;
   padding: 8px 10px;
   border: 1px solid var(--fm-border);
-  border-radius: 6px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface-alt);
   color: var(--fm-text);
   font-size: 11px;
@@ -1954,7 +2431,7 @@ function fmtBytes(value: number) {
   width: 26px;
   height: 26px;
   flex-shrink: 0;
-  border-radius: 7px;
+  border-radius: var(--fm-radius);
   background: var(--fm-primary-soft);
   color: var(--fm-primary);
   font-size: 10.5px;
@@ -2023,21 +2500,12 @@ function fmtBytes(value: number) {
   gap: 24px;
   margin-top: 16px;
   padding: 20px 22px;
-  background:
-    radial-gradient(120% 160% at 0% 0%, var(--fm-primary-soft) 0%, transparent 60%),
-    var(--fm-surface);
 }
 
-.suite-band {
-  background:
-    radial-gradient(110% 150% at 100% 0%, var(--fm-primary-soft) 0%, transparent 58%),
-    var(--fm-surface);
-}
-
+.suite-band,
 .capture-band {
-  background:
-    radial-gradient(110% 150% at 0% 100%, var(--fm-primary-soft) 0%, transparent 55%),
-    var(--fm-surface);
+  /* 平铺纸面，不再用径向光斑做装饰 */
+  background: var(--fm-surface);
 }
 
 .runner-eyebrow {
@@ -2074,7 +2542,7 @@ function fmtBytes(value: number) {
 
 .runner-tags span {
   padding: 2px 9px;
-  border-radius: 20px;
+  border-radius: 999px;
   border: 1px solid var(--fm-border);
   background: var(--fm-surface-alt);
   font-size: 10.5px;
@@ -2113,7 +2581,7 @@ function fmtBytes(value: number) {
   width: 24px;
   height: 24px;
   flex-shrink: 0;
-  border-radius: 6px;
+  border-radius: var(--fm-radius);
   background: var(--fm-primary-soft);
   color: var(--fm-primary);
   font-size: 10px;
@@ -2175,7 +2643,7 @@ function fmtBytes(value: number) {
   margin: 0;
   padding: 10px 12px;
   border: 1px solid var(--fm-border);
-  border-radius: 6px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface-alt);
   color: var(--fm-text);
   font-size: 11px;
@@ -2190,7 +2658,7 @@ function fmtBytes(value: number) {
   gap: 7px;
   padding: 10px 12px;
   border: 1px solid var(--fm-border);
-  border-radius: 6px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface-alt);
   font-size: 11px;
   color: var(--fm-text-2);
@@ -2215,7 +2683,7 @@ function fmtBytes(value: number) {
 
 .example-foot code {
   padding: 1px 5px;
-  border-radius: 4px;
+  border-radius: var(--fm-radius-sm);
   background: var(--fm-surface-alt);
   color: var(--fm-text-2);
   font-size: 10.5px;
@@ -2227,16 +2695,42 @@ function fmtBytes(value: number) {
 }
 
 /* ---------- 响应式 ---------- */
+@media (max-width: 1280px) {
+  .cols {
+    grid-template-columns: minmax(0, 1fr) 330px;
+  }
+}
+
 @media (max-width: 1180px) {
   .console {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .kpi-grid {
+  .kpis {
     border-left: none;
     border-top: 1px solid var(--fm-border);
   }
+}
 
+@media (max-width: 1080px) {
+  .cols {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .launch-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .pathband {
+    height: auto;
+    flex-wrap: wrap;
+    gap: 8px 14px;
+    padding: 10px 16px;
+  }
+
+  .gauge {
+    margin-left: 0;
+  }
 }
 
 @media (max-width: 980px) {
@@ -2265,8 +2759,8 @@ function fmtBytes(value: number) {
 }
 
 @media (max-width: 760px) {
-  .console-main {
-    padding: 18px 18px;
+  .console-left {
+    padding: 18px;
   }
 
   .intro-band {
@@ -2285,198 +2779,36 @@ function fmtBytes(value: number) {
     grid-template-columns: minmax(0, 1fr);
   }
 
+  .launch-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .kpi {
-    padding: 12px 14px;
+    padding: 16px 14px;
   }
 
   .kpi-value {
-    font-size: 20px;
+    font-size: 24px;
   }
 
   .help-grid {
     grid-template-columns: minmax(0, 1fr);
   }
+
+  .statusbar {
+    margin-left: -24px;
+    margin-right: -24px;
+    white-space: normal;
+    height: auto;
+    padding: 6px 16px;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .pulse-dot {
-    animation: none;
-  }
-
   .launch,
-  .project-card {
+  .project-card,
+  .kpi {
     transition: none;
   }
 }
-
-/* ---------- 今日待办 ---------- */
-.notes-card {
-  display: grid;
-  grid-template-columns: minmax(0, 1.5fr) minmax(260px, 0.8fr);
-  gap: 18px;
-  padding: 14px 16px;
-  margin-bottom: 14px;
-}
-
-@media (max-width: 860px) {
-  .notes-card {
-    grid-template-columns: 1fr;
-  }
-}
-
-.notes-card-main {
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.notes-card-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.notes-card-icon {
-  width: 28px;
-  height: 28px;
-  border-radius: 7px;
-  display: grid;
-  place-items: center;
-  background: var(--fm-primary-soft);
-  color: var(--fm-primary);
-  font-size: 14px;
-}
-
-.notes-card-title {
-  flex: 1;
-  min-width: 0;
-}
-
-.notes-card-title h3 {
-  margin: 0;
-  font-size: 13px;
-  font-weight: 600;
-}
-
-.notes-card-title p {
-  margin: 1px 0 0;
-  font-size: 11px;
-  color: var(--fm-muted);
-}
-
-.notes-open {
-  border: none;
-  background: transparent;
-  color: var(--fm-primary);
-  font-size: 11px;
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-  cursor: pointer;
-  padding: 0;
-}
-
-.notes-stats {
-  display: flex;
-  gap: 14px;
-}
-
-.notes-stat {
-  font-size: 11px;
-  color: var(--fm-muted);
-}
-
-.notes-stat strong {
-  font-size: 16px;
-  color: var(--fm-text);
-  margin-right: 3px;
-}
-
-.notes-stat strong.danger {
-  color: var(--fm-danger);
-}
-
-.notes-preview {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-}
-
-.notes-preview-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 4px 6px;
-  border-radius: var(--fm-radius-sm);
-  cursor: pointer;
-  font-size: 12px;
-}
-
-.notes-preview-row:hover {
-  background: var(--fm-surface-alt);
-}
-
-.notes-preview-title {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.notes-preview-time {
-  font-size: 10px;
-  color: var(--fm-muted);
-  flex-shrink: 0;
-}
-
-.notes-preview-row.overdue .notes-preview-time {
-  color: var(--fm-danger);
-}
-
-.notes-preview-empty {
-  font-size: 11px;
-  color: var(--fm-muted);
-  padding: 4px 6px;
-}
-
-.notes-quick {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  justify-content: center;
-  border-left: 1px solid var(--fm-border);
-  padding-left: 18px;
-}
-
-@media (max-width: 860px) {
-  .notes-quick {
-    border-left: none;
-    border-top: 1px solid var(--fm-border);
-    padding-left: 0;
-    padding-top: 12px;
-  }
-}
-
-.notes-quick-labels {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-  min-height: 18px;
-}
-
-.notes-quick-tag {
-  font-size: 10px;
-  color: var(--fm-primary);
-  background: var(--fm-primary-soft);
-  border-radius: 4px;
-  padding: 1px 6px;
-}
-
-.notes-quick-hint {
-  font-size: 10px;
-  color: var(--fm-muted);
-}
-
 </style>

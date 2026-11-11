@@ -11,6 +11,8 @@ import {
   BgColorsOutlined,
   CheckOutlined,
   FolderOpenOutlined,
+  ExportOutlined,
+  ImportOutlined,
   ReloadOutlined,
   LoginOutlined,
   SwapOutlined,
@@ -22,8 +24,10 @@ import {
   SafetyOutlined,
   CloudServerOutlined,
   ExperimentOutlined,
+  FileProtectOutlined,
 } from '@ant-design/icons-vue'
 import PageHeader from '@/components/PageHeader.vue'
+import RemoteBackupPanel from '@/components/RemoteBackupPanel.vue'
 import * as api from '@/api'
 import { themes, currentThemeId, setTheme } from '@/stores/theme'
 import { isMac, openDirLabel, platformLabel, shortcutText } from '@/utils/platform'
@@ -31,10 +35,13 @@ import { checkForUpdates, isAutoUpdateEnabled, setAutoUpdateEnabled } from '@/ut
 import { toolNames } from '@/utils/aiTools'
 import { scriptTimeoutMs, setScriptTimeoutMs, SCRIPT_TIMEOUT_RANGE } from '@/utils/scriptHost'
 import type {
+  AiProvider,
   AppInfo,
   AppSettings,
   BackupItem,
   CheckResult,
+  PerformanceProfile,
+  PolicySnapshot,
   PythonCheckResult,
   SecretStatus,
   StorageInfo,
@@ -59,7 +66,8 @@ const sections: Section[] = [
   { key: 'storage', label: '数据与存储', desc: '数据库位置、备份与隐私', icon: DatabaseOutlined },
   { key: 'backup', label: '备份与自检', desc: '快照、恢复、数据库体检', icon: CloudServerOutlined },
   { key: 'security', label: '密钥与加密', desc: '主密钥、口令、密钥包', icon: SafetyOutlined },
-  { key: 'network', label: '网络与安全', desc: '代理、客户端证书、Python 授权', icon: GlobalOutlined },
+  { key: 'network', label: '网络与安全', desc: '代理、客户端证书、Python 授权、运行档位与 AI 权限', icon: GlobalOutlined },
+  { key: 'policy', label: '企业策略', desc: 'policy.json 下发的只读能力开关', icon: FileProtectOutlined },
   { key: 'assistant', label: 'AI 助手', desc: '航仔与模型服务', icon: RobotOutlined },
   { key: 'update', label: '版本更新', desc: '检查并安装新版本', icon: CloudDownloadOutlined },
   { key: 'shortcuts', label: '快捷键与技巧', desc: '常用操作一览', icon: ThunderboltOutlined },
@@ -85,6 +93,7 @@ function selectSection(key: string) {
 const info = ref<AppInfo | null>(null)
 const storage = ref<StorageInfo | null>(null)
 const storageLoading = ref(false)
+const workspaceBusy = ref<'export' | 'import' | ''>('')
 
 const network = reactive<AppSettings>({
   proxyEnabled: false,
@@ -93,10 +102,94 @@ const network = reactive<AppSettings>({
   certPassword: '',
   pythonPath: '',
   pythonEnabled: false,
+  performanceMode: 'auto',
+  aiPermissionMode: 'confirm_write',
+  aiFallbackIds: '',
 })
 const networkLoading = ref(false)
+
+/* 摘要模型下拉：只列已配置的服务商，0 = 跟随主 provider */
+const providers = ref<AiProvider[]>([])
+const providersLoading = ref(false)
+const summaryProviderOptions = computed(() =>
+  providers.value
+    .filter((item) => typeof item.id === 'number')
+    .map((item) => ({ value: item.id as number, label: `${item.name} · ${item.model}` })),
+)
+
+/** 失败回退链：存逗号字符串，界面用数组；顺序即尝试顺序（AI-12） */
+const fallbackIds = computed<number[]>({
+  get: () =>
+    String(network.aiFallbackIds || '')
+      .split(',')
+      .map((item) => Number(item.trim()))
+      .filter((id) => Number.isInteger(id) && id > 0),
+  set: (value) => {
+    network.aiFallbackIds = value.join(',')
+  },
+})
+
+async function loadProviders() {
+  providersLoading.value = true
+  try {
+    providers.value = await api.aiProviderList()
+  } catch {
+    providers.value = []
+  } finally {
+    providersLoading.value = false
+  }
+}
+
 const pythonChecking = ref(false)
 const pythonCheckResult = ref<PythonCheckResult | null>(null)
+const performanceProfile = ref<PerformanceProfile | null>(null)
+const policy = ref<PolicySnapshot | null>(null)
+const policyLoading = ref(false)
+
+/** 策略里是否至少开了一个限制项，用于标签展示 */
+const policyActive = computed(() => {
+  const value = policy.value?.policy
+  if (!value) return false
+  return (
+    value.disableAi ||
+    value.disableCloudAi ||
+    value.disableLanServices ||
+    value.disableTelemetry ||
+    value.forceEncryptBackup ||
+    value.allowedImportFormats.length > 0 ||
+    value.retentionDays > 0
+  )
+})
+
+async function loadPolicy() {
+  policyLoading.value = true
+  try {
+    policy.value = await api.policyGet()
+  } catch (e) {
+    message.error(String(e))
+  } finally {
+    policyLoading.value = false
+  }
+}
+
+async function reloadPolicy() {
+  try {
+    policy.value = await api.policyReload()
+    if (policy.value?.error) {
+      message.warning('已重新读取，但策略文件格式有误，当前按默认策略运行')
+    } else {
+      message.success('企业策略已重新加载')
+    }
+  } catch (e) {
+    message.error(String(e))
+  }
+}
+
+const memoryText = computed(() => {
+  const bytes = performanceProfile.value?.totalMemoryBytes
+  if (!bytes) return ''
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(1)}GB`
+})
 
 async function checkPython() {
   pythonChecking.value = true
@@ -111,20 +204,24 @@ async function checkPython() {
 
 onMounted(async () => {
   try {
-    const [app, dir, settings] = await Promise.all([
+    const [app, dir, settings, profile] = await Promise.all([
       api.appInfo(),
       api.storageInfo(),
       api.settingsGet(),
+      api.performanceProfile(),
     ])
     info.value = app
     storage.value = dir
+    performanceProfile.value = profile
     Object.assign(network, settings)
   } catch (e) {
     message.error(String(e))
   }
   // 备份与密钥状态各自独立拉取：任一失败不阻塞设置页其它内容
+  void loadProviders()
   void loadBackups()
   void loadSecrets()
+  void loadPolicy()
 })
 
 async function saveNetwork() {
@@ -132,6 +229,7 @@ async function saveNetwork() {
   try {
     const saved = await api.settingsSet({ ...network })
     Object.assign(network, saved)
+    performanceProfile.value = await api.performanceProfile()
     message.success('设置已保存并立即生效')
   } catch (e) {
     message.error(String(e))
@@ -148,6 +246,80 @@ async function pickCert() {
     filters: [{ name: 'PKCS#12 证书', extensions: ['pfx', 'p12'] }],
   })
   if (typeof picked === 'string') network.certPath = picked
+}
+
+async function exportWorkspace() {
+  let picked: string | null = null
+  try {
+    const result = await open({
+      directory: true,
+      multiple: false,
+      title: '选择工作区导出目录',
+    })
+    picked = typeof result === 'string' ? result : null
+  } catch (e) {
+    message.error(String(e))
+    return
+  }
+  if (!picked) return
+  workspaceBusy.value = 'export'
+  try {
+    const result = await api.workspaceExportDir({ path: picked })
+    const { projects, collections, requests, environments } = result.counts
+    message.success(
+      `已导出 ${projects} 个项目 / ${collections} 个集合 / ${requests} 个请求 / ${environments} 个环境`,
+    )
+    if (result.warnings.length) {
+      Modal.warning({
+        title: '导出完成，但有需要注意的项',
+        content: result.warnings.join('；'),
+      })
+    }
+  } catch (e) {
+    message.error(String(e))
+  } finally {
+    workspaceBusy.value = ''
+  }
+}
+
+async function importWorkspace() {
+  let picked: string | null = null
+  try {
+    const result = await open({
+      directory: true,
+      multiple: false,
+      title: '选择工作区目录（含 manifest.json）',
+    })
+    picked = typeof result === 'string' ? result : null
+  } catch (e) {
+    message.error(String(e))
+    return
+  }
+  if (!picked) return
+  workspaceBusy.value = 'import'
+  try {
+    const result = await api.workspaceImportDir({ path: picked })
+    const created = result.created
+    const updated = result.updated
+    const summary = `新增 ${created.projects} 个项目 / ${created.requests} 个请求，更新 ${updated.projects} 个项目 / ${updated.requests} 个请求`
+    if (result.conflicts.length) {
+      const head = result.conflicts
+        .slice(0, 20)
+        .map((item) => `${item.kind} #${item.id} ${item.name}：${item.reason}`)
+        .join('；')
+      const tail = result.conflicts.length > 20 ? `；另有 ${result.conflicts.length - 20} 项` : ''
+      Modal.warning({
+        title: `导入完成，${result.conflicts.length} 项冲突未覆盖`,
+        content: `${head}${tail}`,
+      })
+    } else {
+      message.success(summary)
+    }
+  } catch (e) {
+    message.error(String(e))
+  } finally {
+    workspaceBusy.value = ''
+  }
 }
 
 async function copy(text?: string) {
@@ -577,6 +749,19 @@ function changeScriptTimeout(value: number | null) {
   message.success(`脚本超时已设为 ${scriptTimeout.value} ms`)
 }
 
+/* ---------- 动效偏好（无障碍） ---------- */
+const motionOff = ref(document.documentElement.dataset.motion === 'off')
+
+function toggleMotion(value: boolean) {
+  motionOff.value = value
+  try {
+    localStorage.setItem('fm-motion', value ? 'off' : 'on')
+  } catch {
+    // 存储不可用时仅本次生效
+  }
+  document.documentElement.dataset.motion = value ? 'off' : 'on'
+}
+
 /* ---------- 自动更新 ---------- */
 const autoUpdate = ref(isAutoUpdateEnabled())
 const updateLoading = ref(false)
@@ -657,15 +842,23 @@ async function openReleasePage() {
               >
                 <span
                   class="theme-preview"
-                  :style="{ background: item.swatches[0], borderColor: item.swatches[2] }"
+                  :style="{ background: item.swatches[0], borderColor: item.swatches[5] }"
                 >
-                  <span class="theme-side" :style="{ background: item.swatches[1] }" />
-                  <span class="theme-dot" :style="{ background: item.swatches[2] }" />
-                  <span class="theme-line" :style="{ background: item.swatches[3] }" />
+                  <span class="theme-side" :style="{ background: item.swatches[2] }" />
+                  <span
+                    class="theme-card"
+                    :style="{ background: item.swatches[1], borderColor: item.swatches[5] }"
+                  >
+                    <span class="theme-dot" :style="{ background: item.swatches[3] }" />
+                    <span class="theme-line" :style="{ background: item.swatches[4] }" />
+                    <span class="theme-line short" :style="{ background: item.swatches[4] }" />
+                  </span>
                 </span>
-                <span class="theme-name">{{ item.name }}</span>
+                <span class="theme-meta">
+                  <span class="theme-name">{{ item.name }}</span>
+                  <CheckOutlined v-if="currentThemeId === item.id" class="theme-check" />
+                </span>
                 <span class="theme-desc">{{ item.desc }}</span>
-                <CheckOutlined v-if="currentThemeId === item.id" class="theme-check" />
               </button>
             </div>
           </div>
@@ -681,6 +874,19 @@ async function openReleasePage() {
                 <kbd>{{ shortcutText('+') }}</kbd>
                 <kbd>{{ shortcutText('-') }}</kbd>
                 <kbd>{{ shortcutText('0') }}</kbd>
+              </div>
+            </div>
+          </div>
+
+          <div class="group">
+            <div class="group-title">动效</div>
+            <div class="row">
+              <div class="row-label">
+                <div class="row-title">关闭界面动画</div>
+                <div class="row-desc">关闭过渡与入场动画，低端机或晕动敏感场景使用；系统开启「减少动态效果」时也会自动生效</div>
+              </div>
+              <div class="row-control">
+                <a-switch :checked="motionOff" @change="toggleMotion" />
               </div>
             </div>
           </div>
@@ -766,6 +972,51 @@ async function openReleasePage() {
               <span>
                 更改位置后需要重启应用生效；选择「迁移数据」会把当前数据库完整复制到新目录，原目录文件保留，确认数据无误后可自行删除。
               </span>
+            </div>
+
+            <div class="group">
+              <div class="group-title">Git 友好工作区</div>
+              <div class="group-desc">
+                把项目、集合、请求与环境导出为可 diff 的 JSON 目录；敏感环境变量只写
+                <code v-pre>{{secret:NAME}}</code>
+                占位，导入后需要重新补值
+              </div>
+
+              <div class="row">
+                <div class="row-label">
+                  <div class="row-title">导出工作区</div>
+                  <div class="row-desc">选择目标目录，按 manifest + 项目结构写出，JSON 键顺序固定</div>
+                </div>
+                <div class="row-control">
+                  <a-button
+                    size="small"
+                    :loading="workspaceBusy === 'export'"
+                    :disabled="workspaceBusy !== ''"
+                    @click="exportWorkspace"
+                  >
+                    <template #icon><ExportOutlined /></template>
+                    导出
+                  </a-button>
+                </div>
+              </div>
+
+              <div class="row">
+                <div class="row-label">
+                  <div class="row-title">导入工作区</div>
+                  <div class="row-desc">选择包含 manifest.json 的目录，按 id 合并；内容冲突只报告、不覆盖</div>
+                </div>
+                <div class="row-control">
+                  <a-button
+                    size="small"
+                    :loading="workspaceBusy === 'import'"
+                    :disabled="workspaceBusy !== ''"
+                    @click="importWorkspace"
+                  >
+                    <template #icon><ImportOutlined /></template>
+                    导入
+                  </a-button>
+                </div>
+              </div>
             </div>
 
             <div class="group danger-group">
@@ -856,6 +1107,8 @@ async function openReleasePage() {
               </div>
             </a-spin>
           </div>
+
+          <RemoteBackupPanel />
 
           <div class="group">
             <div class="group-title">数据库体检</div>
@@ -1177,6 +1430,63 @@ async function openReleasePage() {
             </div>
           </div>
 
+          <div class="group">
+            <div class="group-title">运行档位</div>
+            <div class="group-desc">控制抓包保留条数与响应体内存预算；低内存档适合 4GB 办公机</div>
+
+            <div class="row">
+              <div class="row-label">
+                <div class="row-title">性能模式</div>
+                <div class="row-desc">
+                  自动：≤6GB 用低内存，≥16GB 用高档，其余标准；手动选择后不再随内存变化
+                </div>
+              </div>
+              <div class="row-control wide">
+                <a-select v-model:value="network.performanceMode" size="small" style="width: 200px">
+                  <a-select-option value="auto">自动（按内存）</a-select-option>
+                  <a-select-option value="low">低内存（4GB 档）</a-select-option>
+                  <a-select-option value="standard">标准</a-select-option>
+                </a-select>
+              </div>
+            </div>
+
+            <div v-if="performanceProfile" class="row">
+              <div class="row-label">
+                <div class="row-title">当前生效</div>
+                <div class="row-desc">
+                  档位 {{ performanceProfile.tier }}<template v-if="memoryText"> · 本机 {{ memoryText }}</template>
+                </div>
+              </div>
+              <div class="row-control wide">
+                <span class="mono">{{ performanceProfile.description }}</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="group">
+            <div class="group-title">AI 权限</div>
+            <div class="group-desc">
+              控制航仔能把操作执行到哪一步；生产环境无论哪种模式都会二次确认，无法跳过
+            </div>
+
+            <div class="row">
+              <div class="row-label">
+                <div class="row-title">AI 权限模式</div>
+                <div class="row-desc">
+                  只读：拒绝全部写工具与非只读请求；确认写：写操作与 POST / PUT / DELETE 需确认（默认）；
+                  受信：自建测试环境不再逐次确认，但写工具仍需确认
+                </div>
+              </div>
+              <div class="row-control wide">
+                <a-select v-model:value="network.aiPermissionMode" size="small" style="width: 220px">
+                  <a-select-option value="readonly">只读</a-select-option>
+                  <a-select-option value="confirm_write">确认写（默认）</a-select-option>
+                  <a-select-option value="trusted">受信（仅自建环境）</a-select-option>
+                </a-select>
+              </div>
+            </div>
+          </div>
+
           <div class="panel-footer">
             <span class="footer-hint">修改后需要点这里保存才会生效</span>
             <a-button type="primary" :loading="networkLoading" @click="saveNetwork">保存并生效</a-button>
@@ -1189,6 +1499,137 @@ async function openReleasePage() {
               Python 授权只影响「测试场景」里的前后置钩子、Python 用例与导入的套件包；未开启时这些脚本一律不执行，运行会给出明确原因。
             </span>
           </div>
+        </div>
+
+        <!-- ============ 企业策略 ============ -->
+        <div v-else-if="active === 'policy'" class="panel">
+          <a-spin :spinning="policyLoading">
+            <div class="group">
+              <div class="group-title">
+                企业策略
+                <span class="tag" :class="{ accent: policyActive }">
+                  {{ policyActive ? '已启用限制' : '默认（不限制）' }}
+                </span>
+              </div>
+              <div class="group-desc">
+                由管理员在数据目录下放置 policy.json 下发；这里只读展示。改完文件后点「重新读取」，无需重启应用。
+              </div>
+
+              <div class="row">
+                <div class="row-label">
+                  <div class="row-title">策略文件</div>
+                  <div class="row-desc mono">{{ policy?.path || '-' }}</div>
+                </div>
+                <div class="row-control">
+                  <a-button size="small" @click="copy(policy?.path)">
+                    <template #icon><CopyOutlined /></template>
+                    复制路径
+                  </a-button>
+                  <a-button size="small" @click="reloadPolicy">
+                    <template #icon><ReloadOutlined /></template>
+                    重新读取
+                  </a-button>
+                </div>
+              </div>
+
+              <div v-if="policy?.error" class="callout" style="color: var(--fm-danger)">
+                <SafetyCertificateOutlined />
+                <span>{{ policy.error }}</span>
+              </div>
+            </div>
+
+            <div class="group">
+              <div class="group-title">能力开关</div>
+              <div class="row">
+                <div class="row-label">
+                  <div class="row-title">AI 助手</div>
+                  <div class="row-desc">disableAi：关闭后航仔、模型列表与连通性测试都不再可用</div>
+                </div>
+                <div class="row-control">
+                  <span class="tag" :class="{ accent: policy?.policy.disableAi }">
+                    {{ policy?.policy.disableAi ? '已禁用' : '可用' }}
+                  </span>
+                </div>
+              </div>
+
+              <div class="row">
+                <div class="row-label">
+                  <div class="row-title">云端模型</div>
+                  <div class="row-desc">disableCloudAi：只允许 127.0.0.1 / localhost 上的本地模型</div>
+                </div>
+                <div class="row-control">
+                  <span class="tag" :class="{ accent: policy?.policy.disableCloudAi }">
+                    {{ policy?.policy.disableCloudAi ? '仅本地模型' : '允许云端' }}
+                  </span>
+                </div>
+              </div>
+
+              <div class="row">
+                <div class="row-label">
+                  <div class="row-title">局域网服务</div>
+                  <div class="row-desc">disableLanServices：关闭后 Mock / 文档站只能监听 127.0.0.1</div>
+                </div>
+                <div class="row-control">
+                  <span class="tag" :class="{ accent: policy?.policy.disableLanServices }">
+                    {{ policy?.policy.disableLanServices ? '仅本机' : '允许局域网' }}
+                  </span>
+                </div>
+              </div>
+
+              <div class="row">
+                <div class="row-label">
+                  <div class="row-title">对外遥测</div>
+                  <div class="row-desc">disableTelemetry：当前版本没有遥测，保留给后续版本</div>
+                </div>
+                <div class="row-control">
+                  <span class="tag" :class="{ accent: policy?.policy.disableTelemetry }">
+                    {{ policy?.policy.disableTelemetry ? '已禁用' : '未限制' }}
+                  </span>
+                </div>
+              </div>
+
+              <div class="row">
+                <div class="row-label">
+                  <div class="row-title">异地备份加密</div>
+                  <div class="row-desc">forceEncryptBackup：上传备份时必须设置口令，远端始终保存加密包</div>
+                </div>
+                <div class="row-control">
+                  <span class="tag" :class="{ accent: policy?.policy.forceEncryptBackup }">
+                    {{ policy?.policy.forceEncryptBackup ? '强制加密' : '按用户选择' }}
+                  </span>
+                </div>
+              </div>
+
+              <div class="row">
+                <div class="row-label">
+                  <div class="row-title">允许的导入格式</div>
+                  <div class="row-desc">allowedImportFormats：空表示不限制；可选 curl / postman / insomnia / openapi / har / bruno</div>
+                </div>
+                <div class="row-control">
+                  <span v-if="!policy?.policy.allowedImportFormats.length" class="tag">不限制</span>
+                  <span
+                    v-for="format in policy?.policy.allowedImportFormats ?? []"
+                    :key="format"
+                    class="tag accent"
+                  >
+                    {{ format }}
+                  </span>
+                </div>
+              </div>
+
+              <div class="row">
+                <div class="row-label">
+                  <div class="row-title">请求历史保留</div>
+                  <div class="row-desc">retentionDays：0 表示只按 10 万条上限保留</div>
+                </div>
+                <div class="row-control">
+                  <span class="tag" :class="{ accent: policy?.policy.retentionDays }">
+                    {{ policy?.policy.retentionDays ? `${policy.policy.retentionDays} 天` : '不按时间清理' }}
+                  </span>
+                </div>
+              </div>
+            </div>
+          </a-spin>
         </div>
 
         <!-- ============ AI 助手 ============ -->
@@ -1220,8 +1661,108 @@ async function openReleasePage() {
                 <a-button size="small" @click="router.push({ name: 'ai-usage' })">查看用量</a-button>
               </div>
             </div>
+            <div class="row">
+              <div class="row-label">
+                <div class="row-title">摘要模型</div>
+                <div class="row-desc">
+                  历史变长后异步压缩旧对话；未选择时跟随主模型，摘要失败自动回退主模型
+                </div>
+              </div>
+              <div class="row-control wide">
+                <a-select
+                  v-model:value="network.summaryProviderId"
+                  size="small"
+                  style="width: 260px"
+                  :loading="providersLoading"
+                  placeholder="跟随主模型"
+                >
+                  <a-select-option :value="0">跟随主模型</a-select-option>
+                  <a-select-option
+                    v-for="item in summaryProviderOptions"
+                    :key="item.value"
+                    :value="item.value"
+                  >
+                    {{ item.label }}
+                  </a-select-option>
+                </a-select>
+              </div>
+            </div>
+            <div class="row">
+              <div class="row-label">
+                <div class="row-title">备用模型</div>
+                <div class="row-desc">
+                  主模型在首字之前失败（限流 / 服务异常 / 网络错误）时按选择顺序切换，默认关闭；
+                  一旦已开始输出就不会中途换模型
+                </div>
+              </div>
+              <div class="row-control wide">
+                <a-select
+                  v-model:value="fallbackIds"
+                  mode="multiple"
+                  size="small"
+                  style="width: 320px"
+                  :loading="providersLoading"
+                  :max-tag-count="3"
+                  placeholder="不启用回退"
+                  allow-clear
+                >
+                  <a-select-option
+                    v-for="item in summaryProviderOptions"
+                    :key="item.value"
+                    :value="item.value"
+                  >
+                    {{ item.label }}
+                  </a-select-option>
+                </a-select>
+              </div>
+            </div>
+            <div class="row">
+              <div class="row-label">
+                <div class="row-title">月度预算</div>
+                <div class="row-desc">
+                  按自然月累计模型费用，0 表示不限制；金额以美元计（约 ¥7.2 / 美元）
+                </div>
+              </div>
+              <div class="row-control wide">
+                <a-input-number
+                  v-model:value="network.monthlyBudget"
+                  :min="0"
+                  :precision="2"
+                  :step="1"
+                  size="small"
+                  style="width: 160px"
+                />
+              </div>
+            </div>
+            <div class="row">
+              <div class="row-label">
+                <div class="row-title">预算提醒</div>
+                <div class="row-desc">用量达到预算 80% 时提示一次，不打断当前对话</div>
+              </div>
+              <div class="row-control">
+                <a-switch
+                  v-model:checked="network.budgetAlert"
+                  size="small"
+                  :disabled="!network.monthlyBudget"
+                />
+              </div>
+            </div>
+            <div class="row">
+              <div class="row-label">
+                <div class="row-title">用尽停止</div>
+                <div class="row-desc">关闭时只提醒；开启后预算用完会拒绝新的对话轮次</div>
+              </div>
+              <div class="row-control">
+                <a-switch
+                  v-model:checked="network.budgetHardStop"
+                  size="small"
+                  :disabled="!network.monthlyBudget"
+                />
+              </div>
+            </div>
             <div class="group-actions">
               <a-button type="primary" @click="router.push({ name: 'ai' })">打开航仔</a-button>
+              <a-button :loading="networkLoading" @click="saveNetwork">保存设置</a-button>
             </div>
           </div>
         </div>
@@ -1357,6 +1898,19 @@ async function openReleasePage() {
             <div class="row">
               <div class="row-label"><div class="row-title">运行系统</div></div>
               <div class="row-control">{{ platformLabel }}</div>
+            </div>
+            <div v-if="info?.webviewVersion" class="row">
+              <div class="row-label">
+                <div class="row-title">WebView2 / WebKit</div>
+                <div class="row-desc">渲染内核版本，排查兼容性问题时提供给支持人员</div>
+              </div>
+              <div class="row-control mono">{{ info.webviewVersion }}</div>
+            </div>
+            <div v-if="info?.dataDirRisks?.length" class="callout">
+              <SafetyCertificateOutlined />
+              <span>
+                数据目录风险：{{ info.dataDirRisks.join('；') }}
+              </span>
             </div>
             <div class="row">
               <div class="row-label">
@@ -1521,7 +2075,6 @@ async function openReleasePage() {
   border: 1px solid var(--fm-border);
   border-radius: var(--fm-radius-lg);
   background: var(--fm-surface);
-  box-shadow: var(--fm-shadow);
   overflow: hidden;
 }
 
@@ -1545,7 +2098,7 @@ async function openReleasePage() {
   width: 100%;
   padding: 9px 10px;
   border: none;
-  border-radius: 9px;
+  border-radius: var(--fm-radius-sm);
   background: transparent;
   text-align: left;
   cursor: pointer;
@@ -1559,14 +2112,14 @@ async function openReleasePage() {
 
 .nav-item.active {
   background: var(--fm-primary-soft);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--fm-primary) 22%, transparent);
+  box-shadow: inset 2px 0 0 var(--fm-primary);
 }
 
 .nav-ico {
   width: 26px;
   height: 26px;
   flex-shrink: 0;
-  border-radius: 7px;
+  border-radius: var(--fm-radius-sm);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1578,7 +2131,7 @@ async function openReleasePage() {
 
 .nav-item.active .nav-ico {
   background: var(--fm-primary);
-  color: #fff;
+  color: var(--fm-surface);
 }
 
 .nav-text {
@@ -1752,7 +2305,7 @@ async function openReleasePage() {
 }
 
 .mono {
-  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-family: var(--fm-font-mono);
   font-size: 11px;
 }
 
@@ -1780,7 +2333,7 @@ async function openReleasePage() {
   gap: 9px;
   margin-bottom: 20px;
   padding: 11px 13px;
-  border-radius: 10px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface-alt);
   border: 1px dashed var(--fm-border-strong);
   font-size: 11px;
@@ -1800,10 +2353,10 @@ async function openReleasePage() {
 }
 
 .callout code {
-  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-family: var(--fm-font-mono);
   font-size: 10.5px;
   padding: 1px 5px;
-  border-radius: 4px;
+  border-radius: var(--fm-radius-sm);
   background: var(--fm-bg);
   word-break: break-all;
 }
@@ -1811,7 +2364,7 @@ async function openReleasePage() {
 .hint {
   padding: 12px 14px;
   margin-bottom: 14px;
-  border-radius: 10px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface-alt);
   border: 1px dashed var(--fm-border-strong);
   font-size: 11.5px;
@@ -1837,7 +2390,7 @@ async function openReleasePage() {
   margin-top: 10px;
   padding: 9px 11px;
   border: 1px solid var(--fm-border);
-  border-radius: 8px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface-alt);
   font-size: 11px;
   line-height: 1.7;
@@ -1871,11 +2424,11 @@ async function openReleasePage() {
 kbd {
   display: inline-block;
   padding: 2px 7px;
-  border-radius: 5px;
+  border-radius: var(--fm-radius-sm);
   border: 1px solid var(--fm-border-strong);
   border-bottom-width: 2px;
   background: var(--fm-surface-alt);
-  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-family: var(--fm-font-mono);
   font-size: 10px;
   color: var(--fm-text-2);
 }
@@ -1888,17 +2441,16 @@ kbd {
 }
 
 .theme-item {
-  position: relative;
   display: flex;
   flex-direction: column;
   gap: 3px;
   padding: 10px;
   border: 1px solid var(--fm-border);
-  border-radius: 10px;
+  border-radius: var(--fm-radius);
   background: var(--fm-surface);
   text-align: left;
   cursor: pointer;
-  transition: border-color 0.16s, box-shadow 0.16s;
+  transition: border-color 0.16s;
 }
 
 .theme-item:hover {
@@ -1907,16 +2459,16 @@ kbd {
 
 .theme-item.active {
   border-color: var(--fm-primary);
-  box-shadow: 0 0 0 2px var(--fm-primary-soft);
+  box-shadow: inset 0 0 0 1px var(--fm-primary);
 }
 
 .theme-preview {
   position: relative;
   display: block;
-  height: 46px;
-  margin-bottom: 5px;
+  height: 56px;
+  margin-bottom: 6px;
   border: 1px solid;
-  border-radius: 6px;
+  border-radius: var(--fm-radius-sm);
   overflow: hidden;
 }
 
@@ -1925,26 +2477,51 @@ kbd {
   top: 0;
   left: 0;
   bottom: 0;
-  width: 14px;
+  width: 16px;
+}
+
+.theme-card {
+  position: absolute;
+  top: 9px;
+  left: 25px;
+  right: 9px;
+  bottom: 9px;
+  display: block;
+  border: 1px solid;
+}
+
+.theme-dot,
+.theme-card {
+  border-radius: var(--fm-radius-sm);
 }
 
 .theme-dot {
   position: absolute;
-  top: 10px;
-  left: 22px;
-  width: 20px;
-  height: 6px;
-  border-radius: 3px;
+  top: 7px;
+  left: 7px;
+  width: 18px;
+  height: 5px;
 }
 
 .theme-line {
   position: absolute;
-  top: 24px;
-  left: 22px;
-  right: 10px;
-  height: 4px;
-  border-radius: 2px;
-  opacity: 0.32;
+  top: 17px;
+  left: 7px;
+  right: 7px;
+  height: 3px;
+  border-radius: var(--fm-radius-sm);
+  opacity: 0.5;
+}
+
+.theme-line.short {
+  top: 23px;
+  right: 46%;
+}
+
+.theme-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .theme-name {
@@ -1959,10 +2536,7 @@ kbd {
 }
 
 .theme-check {
-  position: absolute;
-  top: 12px;
-  right: 12px;
-  font-size: 12px;
+  font-size: 11px;
   color: var(--fm-primary);
 }
 
@@ -2033,9 +2607,9 @@ kbd {
   align-items: center;
   gap: 12px;
   padding: 9px 11px;
-  border-radius: 7px;
-  border: 1px solid var(--fm-border, rgba(0, 0, 0, 0.07));
-  background: var(--fm-surface-2, rgba(0, 0, 0, 0.02));
+  border-radius: var(--fm-radius);
+  border: 1px solid var(--fm-border);
+  background: var(--fm-surface-alt);
 }
 
 .backup-main {
@@ -2054,37 +2628,37 @@ kbd {
   gap: 10px;
   margin-top: 4px;
   font-size: 11px;
-  color: var(--fm-text-3, #999);
+  color: var(--fm-muted);
 }
 
 .backup-kind {
   padding: 0 6px;
-  border-radius: 4px;
+  border-radius: var(--fm-radius-sm);
   font-size: 10px;
   line-height: 16px;
-  background: rgba(128, 128, 128, 0.14);
-  color: var(--fm-text-2, #666);
+  background: var(--fm-surface-alt);
+  color: var(--fm-text-2);
 }
 
 .backup-kind.kind-daily {
-  background: rgba(14, 165, 233, 0.14);
-  color: #0284c7;
+  background: var(--fm-primary-soft);
+  color: var(--fm-primary);
 }
 
 .backup-kind.kind-weekly {
-  background: rgba(139, 92, 246, 0.14);
-  color: #7c3aed;
+  background: var(--fm-purple-soft);
+  color: var(--fm-purple);
 }
 
 .backup-kind.kind-manual {
-  background: rgba(16, 185, 129, 0.14);
-  color: #059669;
+  background: var(--fm-success-soft);
+  color: var(--fm-success);
 }
 
 .backup-kind.kind-pre-restore,
 .backup-kind.kind-pre-migrate {
-  background: rgba(217, 119, 6, 0.14);
-  color: #b45309;
+  background: var(--fm-warning-soft);
+  color: var(--fm-warning);
 }
 
 .backup-actions {
@@ -2096,20 +2670,20 @@ kbd {
 .empty-line {
   padding: 14px 0;
   font-size: 12px;
-  color: var(--fm-text-3, #999);
+  color: var(--fm-muted);
 }
 
 .check-result {
   margin-top: 10px;
   padding: 9px 11px;
-  border-radius: 7px;
-  background: rgba(16, 185, 129, 0.1);
-  border: 1px solid rgba(16, 185, 129, 0.28);
+  border-radius: var(--fm-radius);
+  background: var(--fm-success-soft);
+  border: 1px solid var(--fm-success);
 }
 
 .check-result.bad {
-  background: rgba(220, 38, 38, 0.08);
-  border-color: rgba(220, 38, 38, 0.28);
+  background: var(--fm-danger-soft);
+  border-color: var(--fm-danger);
 }
 
 .check-line {
@@ -2117,11 +2691,11 @@ kbd {
   align-items: center;
   gap: 7px;
   font-size: 12px;
-  color: #047857;
+  color: var(--fm-success);
 }
 
 .check-result.bad .check-line {
-  color: #b91c1c;
+  color: var(--fm-danger);
 }
 
 .check-dot {
@@ -2137,7 +2711,7 @@ kbd {
   line-height: 1.6;
   white-space: pre-wrap;
   word-break: break-all;
-  color: #b91c1c;
+  color: var(--fm-danger);
   max-height: 160px;
   overflow: auto;
 }
@@ -2148,14 +2722,14 @@ kbd {
 }
 
 .tag.warn {
-  color: #b45309;
-  background: rgba(217, 119, 6, 0.12);
-  border-color: rgba(217, 119, 6, 0.3);
+  color: var(--fm-warning);
+  background: var(--fm-warning-soft);
+  border-color: var(--fm-warning);
 }
 
 .unit {
   font-size: 11px;
-  color: var(--fm-text-3, #999);
+  color: var(--fm-muted);
   margin-left: 6px;
 }
 
@@ -2171,7 +2745,7 @@ kbd {
 .modal-note {
   font-size: 12px;
   line-height: 1.7;
-  color: var(--fm-text-3, #999);
+  color: var(--fm-muted);
   margin: 0;
 }
 </style>

@@ -30,7 +30,7 @@ async function downloadAndInstall(info: UpdateInfo) {
   }
   const hide = message.loading('正在从 GitHub 下载安装包…', 0)
   try {
-    const path = await api.updateDownload(urls, info.assetName)
+    const path = await api.updateDownload(urls, info.assetName, info.assetSha256)
     hide()
     await api.openExternal(path)
     message.success(

@@ -1,0 +1,11 @@
+{
+  "id": "ai-08",
+  "title": "修改环境变量（已确认）",
+  "input": "项目 ID 1、环境 ID 3，把变量 baseUrl 改成 https://api.test.local。我已确认，直接保存。",
+  "expectTool": "env_var_save",
+  "acceptTools": [],
+  "forbiddenTools": ["env_delete", "env_create", "env_script_save"],
+  "expectArgs": { "projectId": 1, "envId": 3 },
+  "expectedArtifact": "环境 ID 3 的 baseUrl 更新为 https://api.test.local，其他变量保留",
+  "followUps": []
+}

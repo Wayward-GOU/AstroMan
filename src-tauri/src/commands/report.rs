@@ -1,5 +1,5 @@
 use crate::models::{
-    ErrorTypeCount, HistogramBucket, ReportDetail, ReportError, ReportRequestRecord,
+    ErrorTypeCount, HistogramBucket, ReclaimResult, ReportDetail, ReportError, ReportRequestRecord,
     ReportRequestsPage, ReportSample, StageSummary, StatusCount, StressReport,
 };
 use crate::state::AppState;
@@ -13,11 +13,12 @@ const REPORT_COLUMNS: &str =
     "id, plan_name, request_id, total_requests, success_count, error_count,
     avg_rt, min_rt, max_rt, p50_rt, p75_rt, p90_rt, p95_rt, p99_rt, p999_rt,
     stddev_rt, ttfb_avg, ttfb_p95, apdex, bytes_total, max_qps, avg_qps, target_rps,
-    error_rate, concurrency, status, start_time, end_time, created_at";
+    error_rate, concurrency, status, start_time, end_time, created_at,
+    plan_id, run_group_id";
 
 /// 详情查询在基础列之后追加的 JSON 列
 const JSON_COLUMNS: &str =
-    "config_json, stages_json, codes_json, histogram_json, error_types_json, scenario_text, summary_text";
+    "config_json, stages_json, codes_json, histogram_json, error_types_json, scenario_text, summary_text, slow_requests_json, body_histogram_json";
 
 fn map_report(row: &Row<'_>) -> rusqlite::Result<StressReport> {
     Ok(StressReport {
@@ -50,6 +51,8 @@ fn map_report(row: &Row<'_>) -> rusqlite::Result<StressReport> {
         start_time: row.get(26)?,
         end_time: row.get(27)?,
         created_at: row.get(28)?,
+        plan_id: row.get(29)?,
+        run_group_id: row.get(30)?,
     })
 }
 
@@ -74,17 +77,21 @@ fn load_detail(conn: &rusqlite::Connection, id: i64) -> Result<ReportDetail, Str
         types_text,
         scenario_text,
         summary_text,
+        slow_requests_text,
+        body_histogram_text,
     ) = conn
         .query_row(&sql, params![id], |row| {
             Ok((
                 map_report(row)?,
-                row.get::<_, Option<String>>(29)?,
-                row.get::<_, Option<String>>(30)?,
                 row.get::<_, Option<String>>(31)?,
                 row.get::<_, Option<String>>(32)?,
                 row.get::<_, Option<String>>(33)?,
                 row.get::<_, Option<String>>(34)?,
                 row.get::<_, Option<String>>(35)?,
+                row.get::<_, Option<String>>(36)?,
+                row.get::<_, Option<String>>(37)?,
+                row.get::<_, Option<String>>(38)?,
+                row.get::<_, Option<String>>(39)?,
             ))
         })
         .map_err(|e| match e {
@@ -95,7 +102,7 @@ fn load_detail(conn: &rusqlite::Connection, id: i64) -> Result<ReportDetail, Str
     let mut sample_stmt = conn
         .prepare(
             "SELECT elapsed_sec, concurrent, qps, avg_rt, p50_rt, p95_rt, p99_rt,
-                    ttfb_avg, bytes, success_count, error_count
+                    ttfb_avg, body_avg, body_p95, bytes, success_count, error_count
              FROM report_samples WHERE report_id = ?1 ORDER BY elapsed_sec ASC",
         )
         .map_err(err)?;
@@ -110,9 +117,11 @@ fn load_detail(conn: &rusqlite::Connection, id: i64) -> Result<ReportDetail, Str
                 p95_rt: row.get(5)?,
                 p99_rt: row.get(6)?,
                 ttfb_avg: row.get(7)?,
-                bytes: row.get::<_, i64>(8)?.max(0) as u64,
-                success_count: row.get::<_, i64>(9)?.max(0) as u64,
-                error_count: row.get::<_, i64>(10)?.max(0) as u64,
+                body_avg: row.get(8)?,
+                body_p95: row.get(9)?,
+                bytes: row.get::<_, i64>(10)?.max(0) as u64,
+                success_count: row.get::<_, i64>(11)?.max(0) as u64,
+                error_count: row.get::<_, i64>(12)?.max(0) as u64,
             })
         })
         .map_err(err)?
@@ -149,7 +158,9 @@ fn load_detail(conn: &rusqlite::Connection, id: i64) -> Result<ReportDetail, Str
         status_codes: parse_list::<StatusCount>(codes_text),
         error_types: parse_list::<ErrorTypeCount>(types_text),
         histogram: parse_list::<HistogramBucket>(histogram_text),
+        body_histogram: parse_list::<HistogramBucket>(body_histogram_text),
         stages: parse_list::<StageSummary>(stages_text),
+        slow_requests: parse_list::<crate::models::SlowRequest>(slow_requests_text),
         config: parse_value(config_text),
         scenario_text: scenario_text.filter(|text| !text.trim().is_empty()),
         summary_text: summary_text.filter(|text| !text.trim().is_empty()),
@@ -182,16 +193,28 @@ pub fn report_update_texts(
 }
 
 /// 清理某份报告的逐请求明细，保留全部汇总与采样数据
+///
+/// 明细往往是容量主体（单份报告可达十万级、上百 MB），删完必须压缩，否则文件大小不变。
 #[tauri::command]
-pub fn report_clear_details(state: State<'_, AppState>, id: i64) -> Result<u64, String> {
-    let conn = state.pool.get().map_err(err)?;
-    let removed = conn
-        .execute(
+pub fn report_clear_details(state: State<'_, AppState>, id: i64) -> Result<ReclaimResult, String> {
+    let removed = {
+        let conn = state.pool.get().map_err(err)?;
+        conn.execute(
             "DELETE FROM report_requests WHERE report_id = ?1",
             params![id],
         )
-        .map_err(err)?;
-    Ok(removed as u64)
+        .map_err(err)?
+    };
+    let (freed_bytes, compact_error) = if removed > 0 {
+        crate::db::compact_after_delete(&state)
+    } else {
+        (0, None)
+    };
+    Ok(ReclaimResult {
+        removed: removed as u64,
+        freed_bytes,
+        compact_error,
+    })
 }
 
 #[tauri::command]
@@ -214,11 +237,23 @@ pub fn report_get(state: State<'_, AppState>, id: i64) -> Result<ReportDetail, S
 }
 
 #[tauri::command]
-pub fn report_delete(state: State<'_, AppState>, id: i64) -> Result<(), String> {
-    let conn = state.pool.get().map_err(err)?;
-    conn.execute("DELETE FROM test_reports WHERE id = ?1", params![id])
-        .map_err(err)?;
-    Ok(())
+pub fn report_delete(state: State<'_, AppState>, id: i64) -> Result<ReclaimResult, String> {
+    let removed = {
+        let conn = state.pool.get().map_err(err)?;
+        conn.execute("DELETE FROM test_reports WHERE id = ?1", params![id])
+            .map_err(err)?
+    };
+    // 级联删除的明细会留下大量空闲页，不压缩的话库里空间不会回来
+    let (freed_bytes, compact_error) = if removed > 0 {
+        crate::db::compact_after_delete(&state)
+    } else {
+        (0, None)
+    };
+    Ok(ReclaimResult {
+        removed: removed as u64,
+        freed_bytes,
+        compact_error,
+    })
 }
 
 /// 导出为可离线归档的 JSON 报告文件

@@ -268,6 +268,7 @@ body {
 .meta > div { padding: 10px 13px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); }
 .meta dt { font-size: 9.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-4); font-weight: 700; margin: 0 0 3px; }
 .meta dd { margin: 0; font-size: 12px; font-weight: 600; color: var(--ink); font-variant-numeric: tabular-nums; }
+.meta dd.target-url { font-size: 12.5px; font-weight: 500; max-width: 100%; word-break: break-all; white-space: normal; }
 .meta dd small { display: block; font-size: 10.5px; font-weight: 400; color: var(--ink-3); margin-top: 2px; }
 
 /* ---- 目录 ---- */
@@ -302,6 +303,13 @@ body {
 .tbl .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .tbl .mono { font-family: var(--mono); font-size: 10.5px; }
 .tbl .break { word-break: break-all; }
+.tbl .url-cell { display: inline-flex; align-items: flex-start; gap: 6px; max-width: 100%; }
+.tbl .url-cell .mono { word-break: break-all; }
+button.copy {
+  flex: none; font-size: 9.5px; line-height: 1.4; color: var(--ink-3);
+  background: transparent; border: 1px solid var(--line); padding: 1px 5px; cursor: pointer;
+}
+button.copy:hover { color: var(--accent); border-color: var(--accent); }
 .tbl tbody tr.total td { font-weight: 700; background: #fafbfb; }
 .tbl caption { caption-side: top; text-align: left; font-size: 10.5px; color: var(--ink-3); padding-bottom: 6px; }
 .tbl.kv td:first-child { width: 36%; color: var(--ink-2); }
@@ -1081,8 +1089,46 @@ ${dims}
 function resolvedTargetUrl(detail: ReportDetail, requests: ReportRequestRecord[]): string {
   const raw = detail.config?.url?.trim() ?? ''
   if (raw && !raw.includes('{{')) return raw
+  const resolved = detail.config?.target?.resolvedUrl?.trim() ?? ''
+  if (resolved && !resolved.includes('{{')) return resolved
   const fromRecord = requests.find((item) => item.url)?.url?.trim() ?? ''
   return fromRecord || raw || '未记录'
+}
+
+/** 完整 URL 单元格：整行可换行 + 复制按钮（3.2.4） */
+function urlCell(url: string): string {
+  const text = url || '未记录'
+  return `<span class="url-cell"><span class="mono break">${escapeHtml(
+    text,
+  )}</span><button class="copy" type="button" data-copy="${escapeHtml(text)}">复制</button></span>`
+}
+
+/** 施压端能力卡片（3.7.2）：未检测时明确标注，不推断数值 */
+function capacityBlock(detail: ReportDetail): string {
+  const capacity = detail.config?.machineCapacity
+  if (!capacity?.maxQps) {
+    return `<div class="sub">施压端能力</div>
+<div class="note">未检测本机施压能力。可在「设置 → 本机施压能力」完成检测后重新压测；本报告不推断数值。</div>`
+  }
+  const usage = capacity.maxQps > 0 ? (detail.report.avgQps / capacity.maxQps) * 100 : 0
+  const limitText = `${capacity.reachedLimit === false ? '≥ ' : ''}${fmtInt(capacity.maxQps)} QPS`
+  const usageNote =
+    usage >= 80
+      ? '客户端接近能力上限，结论需谨慎。'
+      : usage < 50
+        ? '客户端余量充足，瓶颈不在施压端。'
+        : '客户端仍有余量，可结合目标侧指标判断瓶颈。'
+  return `<div class="sub">施压端能力</div>
+<div class="strip">
+  <div><span>客户端极限</span><b>${limitText}</b></div>
+  <div><span>本次平均</span><b>${fmtInt(detail.report.avgQps)} QPS</b></div>
+  <div><span>客户端负载占比</span><b>${fmtNum(usage, 1)}%</b></div>
+  <div><span>检测时间</span><b>${fmtTime(capacity.probedAt)}</b></div>
+  <div><span>CPU / 峰值</span><b>${capacity.cores ?? '—'} 核${
+    capacity.cpuPeak ? ` / ${fmtNum(capacity.cpuPeak, 1)} 核` : ''
+  }</b></div>
+</div>
+<div class="note">${usageNote}回环检测值，非目标系统容量，实际受网络 RTT 与目标侧影响。</div>`
 }
 
 function renderHtml(detail: ReportDetail, requests: ReportRequestRecord[] = []): string {
@@ -1272,14 +1318,21 @@ function renderHtml(detail: ReportDetail, requests: ReportRequestRecord[] = []):
     ]
   })
 
-  const slowRequests = [...requests].sort((a, b) => b.latencyMs - a.latencyMs).slice(0, 10)
-  const slowRows = slowRequests.map((item) => [
-    `<span class="mono">${(item.elapsedMs / 1000).toFixed(2)}s</span>`,
-    `<span class="mono break">${escapeHtml(clip(item.url, 120))}</span>`,
-    fmtNum(item.latencyMs, 0),
-    item.status ? `<span class="mono">${item.status}</span>` : '—',
-    item.success ? '<span style="color:var(--ok)">成功</span>' : '<span style="color:var(--bad)">失败</span>',
-  ])
+  // 定位模式没有全量明细，优先用报告自带的 TopN 慢请求
+  const slowRows = (
+    detail.slowRequests?.length
+      ? [...detail.slowRequests].sort((a, b) => b.latencyMs - a.latencyMs).slice(0, 10)
+      : [...requests].sort((a, b) => b.latencyMs - a.latencyMs).slice(0, 10)
+  ).map((item) => {
+    const ok = 'success' in item ? item.success : item.status > 0 && item.status < 400
+    return [
+      `<span class="mono">${(item.elapsedMs / 1000).toFixed(2)}s</span>`,
+      `<span class="mono break">${escapeHtml(item.url)}</span>`,
+      fmtNum(item.latencyMs, 0),
+      item.status ? `<span class="mono">${item.status}</span>` : '—',
+      ok ? '<span style="color:var(--ok)">成功</span>' : '<span style="color:var(--bad)">失败</span>',
+    ]
+  })
 
   /* ---- 组装 ---- */
   const cover = `<header class="cover">
@@ -1292,8 +1345,8 @@ function renderHtml(detail: ReportDetail, requests: ReportRequestRecord[] = []):
   <p class="cover-lead">${escapeHtml(grade.statement)}</p>
   <span class="badge ${grade.grade}">${escapeHtml(grade.label)}</span>
   <dl class="meta">
-    <div><dt>被测目标</dt><dd class="mono" style="font-size:11px;font-weight:500">${escapeHtml(
-      clip(resolvedTargetUrl(detail, requests), 46),
+    <div><dt>被测目标</dt><dd class="mono target-url">${escapeHtml(
+      resolvedTargetUrl(detail, requests),
     )}</dd></div>
     <div><dt>压测模式</dt><dd>${escapeHtml(modeText)}<small>${escapeHtml(
       recordModeLabel(recordMode),
@@ -1382,13 +1435,15 @@ ${kpiBlock(detail, qps)}
   <div><span>施压端</span><b>${escapeHtml(agent?.host ?? '未记录')}</b></div>
 </div>
 ${slaSection}
+${capacityBlock(detail)}
 <div class="sub">关键发现<span class="hint">按严重程度排序</span></div>
 ${findingsBlock(detail)}`,
   )
 
+  const targetUrl = resolvedTargetUrl(detail, requests)
   const targetRows = kvRows([
     ['请求方法', escapeHtml(config?.method ?? '—')],
-    ['请求地址', `<span class="mono break">${escapeHtml(clip(resolvedTargetUrl(detail, requests), 300))}</span>`],
+    ['请求地址', urlCell(targetUrl)],
     ['请求头 / URL 参数', `${config?.headers ?? 0} / ${config?.params ?? 0}`],
     ['请求体类型', escapeHtml(config?.bodyType ?? '无')],
     ['超时时间', config?.timeoutMs ? `${config.timeoutMs} ms` : '—'],
@@ -1685,6 +1740,34 @@ ${secC}
   <div style="margin-top:6px">本报告仅反映上述施压端、目标环境与参数组合下的实测结果，不代表目标系统的绝对容量上限。容量结论应在生产等价拓扑与真实数据量下复测确认。</div>
 </footer>
 </div>
+<script>
+document.addEventListener('click', function (event) {
+  var btn = event.target && event.target.closest ? event.target.closest('[data-copy]') : null;
+  if (!btn) return;
+  var text = btn.getAttribute('data-copy') || '';
+  var reset = function (label) {
+    btn.textContent = label;
+    setTimeout(function () { btn.textContent = '复制'; }, 1500);
+  };
+  var fallback = function () {
+    var cell = btn.parentElement ? btn.parentElement.querySelector('.mono') : null;
+    if (!cell) { reset('复制失败'); return; }
+    var range = document.createRange();
+    range.selectNodeContents(cell);
+    var selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+    var ok = false;
+    try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+    reset(ok ? '已复制' : '已选中');
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(function () { reset('已复制'); }, fallback);
+  } else {
+    fallback();
+  }
+});
+</script>
 </body>
 </html>`
 }

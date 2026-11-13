@@ -3,20 +3,20 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde_json::json;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 use crate::commands::http::base64_encode;
 use crate::models::{
-    ErrorTypeCount, HistogramBucket, RecordDetailMode, ReportError, ReportRequestRecord,
-    ReportSample, RequestAuth, StageSummary, StatusCount, StressConfig, StressDone, StressProgress,
-    StressReport, StressStage,
+    CapturePreset, ErrorTypeCount, HistogramBucket, RecordDetailMode, ReportError,
+    ReportRequestRecord, ReportSample, RequestAuth, SlowRequest, StageSummary, StatusCount,
+    StressConfig, StressDone, StressProgress, StressReport, StressStage,
 };
-use crate::state::{AppState, DbPool};
+use crate::state::{AppState, DbPool, StressJobDraft};
 use crate::util::{err, now_ms, render, strip_json_comments};
 
 /// 并发上限。前端 `MAX_CONCURRENT` 必须与之保持一致
@@ -49,6 +49,18 @@ const AUTO_DOWNGRADE_WINDOW: usize = 3;
 /// 长压测降低采样频率的阈值（秒）
 const SAMPLE_DECIMATE_2S_SEC: u64 = 2 * 3600;
 const SAMPLE_DECIMATE_5S_SEC: u64 = 6 * 3600;
+/// 固定并发快速压测上限（2h）；走压测计划可到 24h
+const MAX_FIXED_QUICK_SEC: u32 = 7_200;
+/// 固定并发（计划）与阶梯总时长上限（24h）
+const MAX_FIXED_PLAN_SEC: u32 = 86_400;
+/// 阶梯单阶段上限
+const MAX_STAGE_SEC: u32 = 3_600;
+/// 超过该时长必须显式确认长稳风险
+const LONG_RUN_ACK_SEC: u64 = 7_200;
+/// 定位模式默认保留的慢请求条数
+const DEFAULT_TOP_N: u32 = 200;
+/// 慢请求条数硬上限
+const MAX_TOP_N: u32 = 2_000;
 
 /// 运行期明细采集开关（可被 auto 降档动态修改）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +106,8 @@ struct Metrics {
     concurrent: AtomicU32,
     buckets: Vec<AtomicU64>,
     ttfb_buckets: Vec<AtomicU64>,
+    /// 响应体读取耗时（latency − ttfb）直方图：均值/分位数都从这里算
+    body_buckets: Vec<AtomicU64>,
     codes: Mutex<HashMap<u16, u64>>,
     error_kinds: Mutex<HashMap<String, i64>>,
 }
@@ -115,6 +129,7 @@ impl Metrics {
             concurrent: AtomicU32::new(0),
             buckets: (0..=MAX_RT_MS).map(|_| AtomicU64::new(0)).collect(),
             ttfb_buckets: (0..=MAX_TTFB_MS).map(|_| AtomicU64::new(0)).collect(),
+            body_buckets: (0..=MAX_RT_MS).map(|_| AtomicU64::new(0)).collect(),
             codes: Mutex::new(HashMap::new()),
             error_kinds: Mutex::new(HashMap::new()),
         }
@@ -145,6 +160,10 @@ impl Metrics {
         self.buckets[index].fetch_add(1, Ordering::Relaxed);
         let ttfb_index = ttfb_ms.min(MAX_TTFB_MS as u64) as usize;
         self.ttfb_buckets[ttfb_index].fetch_add(1, Ordering::Relaxed);
+        // body = 总耗时 − 首字节；分位数必须来自独立直方图，不能两个分位数相减
+        let body_ms = latency_ms.saturating_sub(ttfb_ms);
+        let body_index = body_ms.min(MAX_RT_MS as u64) as usize;
+        self.body_buckets[body_index].fetch_add(1, Ordering::Relaxed);
         if status > 0 {
             if let Ok(mut map) = self.codes.lock() {
                 *map.entry(status).or_insert(0) += 1;
@@ -233,6 +252,26 @@ impl Metrics {
         Self::percentile_in(&self.ttfb_buckets, self.count(), p)
     }
 
+    fn body_percentile(&self, p: f64) -> f64 {
+        Self::percentile_in(&self.body_buckets, self.count(), p)
+    }
+
+    /// 响应体读取耗时均值：直接从 body 直方图按桶值加权，避免再维护一个累加器
+    fn body_avg(&self) -> f64 {
+        let total = self.count();
+        if total == 0 {
+            return 0.0;
+        }
+        let mut sum = 0u64;
+        for (index, bucket) in self.body_buckets.iter().enumerate() {
+            let count = bucket.load(Ordering::Relaxed);
+            if count > 0 {
+                sum = sum.saturating_add(index as u64 * count);
+            }
+        }
+        sum as f64 / total as f64
+    }
+
     /// 由直方图计算总体标准差（按毫秒桶中值）
     fn stddev(&self) -> f64 {
         let total = self.count();
@@ -290,49 +329,60 @@ impl Metrics {
 
     /// 把逐毫秒直方图归并为便于阅读的区间
     fn histogram(&self) -> Vec<HistogramBucket> {
-        const RANGES: [(f64, f64, &str); 17] = [
-            (0.0, 10.0, "≤10ms"),
-            (10.0, 25.0, "10-25ms"),
-            (25.0, 50.0, "25-50ms"),
-            (50.0, 100.0, "50-100ms"),
-            (100.0, 200.0, "100-200ms"),
-            (200.0, 350.0, "200-350ms"),
-            (350.0, 500.0, "350-500ms"),
-            (500.0, 800.0, "0.5-0.8s"),
-            (800.0, 1000.0, "0.8-1s"),
-            (1000.0, 1500.0, "1-1.5s"),
-            (1500.0, 2000.0, "1.5-2s"),
-            (2000.0, 3000.0, "2-3s"),
-            (3000.0, 5000.0, "3-5s"),
-            (5000.0, 10000.0, "5-10s"),
-            (10000.0, 30000.0, "10-30s"),
-            (30000.0, 60000.0, "30-60s"),
-            (60000.0, f64::MAX, ">60s"),
-        ];
-        let mut result: Vec<HistogramBucket> = RANGES
-            .iter()
-            .map(|(min, max, label)| HistogramBucket {
-                label: (*label).to_string(),
-                min_ms: *min,
-                max_ms: *max,
-                count: 0,
-            })
-            .collect();
-        for (index, bucket) in self.buckets.iter().enumerate() {
-            let count = bucket.load(Ordering::Relaxed) as i64;
-            if count == 0 {
-                continue;
-            }
-            let value = index as f64;
-            for item in result.iter_mut() {
-                if value >= item.min_ms && value < item.max_ms {
-                    item.count += count;
-                    break;
-                }
+        buckets_to_ranges(&self.buckets)
+    }
+
+    /// 响应体读取耗时直方图（与总耗时共用区间）
+    fn body_histogram(&self) -> Vec<HistogramBucket> {
+        buckets_to_ranges(&self.body_buckets)
+    }
+}
+
+/// 总耗时 / 响应体耗时共用的区间定义
+const HISTOGRAM_RANGES: [(f64, f64, &str); 17] = [
+    (0.0, 10.0, "≤10ms"),
+    (10.0, 25.0, "10-25ms"),
+    (25.0, 50.0, "25-50ms"),
+    (50.0, 100.0, "50-100ms"),
+    (100.0, 200.0, "100-200ms"),
+    (200.0, 350.0, "200-350ms"),
+    (350.0, 500.0, "350-500ms"),
+    (500.0, 800.0, "0.5-0.8s"),
+    (800.0, 1000.0, "0.8-1s"),
+    (1000.0, 1500.0, "1-1.5s"),
+    (1500.0, 2000.0, "1.5-2s"),
+    (2000.0, 3000.0, "2-3s"),
+    (3000.0, 5000.0, "3-5s"),
+    (5000.0, 10000.0, "5-10s"),
+    (10000.0, 30000.0, "10-30s"),
+    (30000.0, 60000.0, "30-60s"),
+    (60000.0, f64::MAX, ">60s"),
+];
+
+fn buckets_to_ranges(buckets: &[AtomicU64]) -> Vec<HistogramBucket> {
+    let mut result: Vec<HistogramBucket> = HISTOGRAM_RANGES
+        .iter()
+        .map(|(min, max, label)| HistogramBucket {
+            label: (*label).to_string(),
+            min_ms: *min,
+            max_ms: *max,
+            count: 0,
+        })
+        .collect();
+    for (index, bucket) in buckets.iter().enumerate() {
+        let count = bucket.load(Ordering::Relaxed) as i64;
+        if count == 0 {
+            continue;
+        }
+        let value = index as f64;
+        for item in result.iter_mut() {
+            if value >= item.min_ms && value < item.max_ms {
+                item.count += count;
+                break;
             }
         }
-        result
     }
+    result
 }
 
 /// 运行时调度：阶梯加压时调整生效并发，限速时按秒发放令牌
@@ -370,6 +420,12 @@ struct RunCtx {
     cancel: Arc<AtomicBool>,
     errors: mpsc::Sender<ReportError>,
     records: mpsc::UnboundedSender<ReportRequestRecord>,
+    /// TopN 慢请求：轻量字段，不复制请求/响应内容
+    slow_tx: mpsc::UnboundedSender<SlowRequest>,
+    /// 保留的慢请求条数上限（0 = 不采集）
+    slow_limit: usize,
+    /// 只记录慢于该阈值的请求（0 = 不设阈值）
+    slow_threshold_ms: u64,
     /// 明细采集开关，auto 降档时会运行期修改
     capture: Arc<AtomicU8>,
     /// 单请求发送字节（请求行 + 头 + 体），压测期间请求内容静态，启动时算一次
@@ -428,6 +484,12 @@ fn build_url(
     if raw.is_empty() {
         return Err("URL 不能为空".to_string());
     }
+    // 残留模板不能交给 reqwest：'{{' 在 URL 里会被编码或直接失败，
+    // 表现为每个请求都报错却看不出原因，这里直接拒绝并点名变量。
+    let mut missing = find_unresolved(&raw);
+    if !missing.is_empty() {
+        return Err(format!("URL 仍有未解析变量：{}", missing.join("、")));
+    }
     if !raw.contains("://") {
         raw = format!("http://{raw}");
     }
@@ -442,8 +504,20 @@ fn build_url(
             if key.is_empty() {
                 continue;
             }
-            pairs.append_pair(&key, &render(&item.value, vars));
+            let value = render(&item.value, vars);
+            for name in find_unresolved(&key)
+                .into_iter()
+                .chain(find_unresolved(&value))
+            {
+                if !missing.iter().any(|item| item == &name) {
+                    missing.push(name);
+                }
+            }
+            pairs.append_pair(&key, &value);
         }
+    }
+    if !missing.is_empty() {
+        return Err(format!("URL 参数仍有未解析变量：{}", missing.join("、")));
     }
     // API Key 认证可以放在查询参数上（auth 已渲染，无需再次替换变量）
     if auth.kind == "apikey" && auth.add_to == "query" && !auth.key.trim().is_empty() {
@@ -904,6 +978,21 @@ async fn worker(ctx: Arc<RunCtx>, index: u32, workers: u32) {
             Capture::Sample => seq.is_multiple_of(SAMPLE_EVERY),
         };
         seq = seq.wrapping_add(1);
+        // 慢请求 TopN：与逐请求明细解耦，定位模式下只保留轻量字段
+        if ctx.slow_limit > 0 {
+            let ttfb_ms = attempt.ttfb_ms.min(latency_ms);
+            if ctx.slow_threshold_ms == 0 || latency_ms >= ctx.slow_threshold_ms {
+                let _ = ctx.slow_tx.send(SlowRequest {
+                    elapsed_ms: ctx.start.elapsed().as_millis() as i64,
+                    method: ctx.method.as_str().to_string(),
+                    url: attempt.url.clone(),
+                    status: attempt.status as i64,
+                    latency_ms: latency_ms as i64,
+                    ttfb_ms: ttfb_ms as i64,
+                    body_ms: latency_ms.saturating_sub(ttfb_ms) as i64,
+                });
+            }
+        }
         if should_record {
             let ttfb_ms = attempt.ttfb_ms.min(latency_ms);
             let _ = ctx.records.send(ReportRequestRecord {
@@ -985,25 +1074,282 @@ struct PreparedStress {
     stop_rate: Option<f64>,
     stop_min: u32,
     concurrent: i64,
+    /// 渲染后的目标 URL（注册表展示与同目标判定）
+    url_text: String,
+    target_key: String,
     errors_rx: mpsc::Receiver<ReportError>,
     records_rx: mpsc::UnboundedReceiver<ReportRequestRecord>,
+    slow_rx: mpsc::UnboundedReceiver<SlowRequest>,
+}
+
+/// 归一化本次运行：阶梯阶段、峰值并发、总时长
+///
+/// 固定并发上限按来源区分：快速压测 2h，压测计划 24h；阶梯单阶段固定 1h，
+/// 总时长可到 24h。超过 2h 的启动需要 `long_run_ack` 显式确认。
+fn plan_run(config: &StressConfig) -> (Vec<StressStage>, u32, u64) {
+    let stages: Vec<StressStage> = config
+        .stages
+        .iter()
+        .filter(|item| item.duration_sec > 0)
+        .map(|item| StressStage {
+            concurrent: item.concurrent.clamp(1, MAX_CONCURRENT),
+            duration_sec: item.duration_sec.clamp(1, MAX_STAGE_SEC),
+        })
+        .collect();
+    let peak = if stages.is_empty() {
+        config.concurrent.clamp(1, MAX_CONCURRENT)
+    } else {
+        stages
+            .iter()
+            .map(|item| item.concurrent)
+            .max()
+            .unwrap_or(1)
+    };
+    let total_sec = if stages.is_empty() {
+        let max = if config.plan_id.is_some() {
+            MAX_FIXED_PLAN_SEC
+        } else {
+            MAX_FIXED_QUICK_SEC
+        };
+        config.duration_sec.clamp(1, max) as u64
+    } else {
+        stages
+            .iter()
+            .map(|item| item.duration_sec as u64)
+            .sum::<u64>()
+            .clamp(1, MAX_FIXED_PLAN_SEC as u64)
+    };
+    (stages, peak, total_sec)
+}
+
+/// 同目标判定键：method + scheme://host:port + path（query 不参与）
+fn target_key_of(method: &str, url: &reqwest::Url) -> String {
+    let mut key = format!(
+        "{} {}://{}",
+        method.trim().to_uppercase(),
+        url.scheme(),
+        url.host_str().unwrap_or_default()
+    );
+    if let Some(port) = url.port_or_known_default() {
+        key.push_str(&format!(":{port}"));
+    }
+    key.push_str(url.path());
+    key
+}
+
+/// 采集预设 → (明细档位, TopN 条数)
+///
+/// - 容量：明细交给 auto 定档，只统计均值，不保留逐请求明细；
+/// - 定位：关闭 5 万条全量明细，改为保留 TopN 慢请求（阈值可配，0 = 全量候选）；
+/// - 自动：沿用旧行为，`topN > 0` 时额外保留慢请求。
+fn capture_plan(config: &StressConfig) -> (RecordDetailMode, u32) {
+    match config.capture_mode {
+        CapturePreset::Capacity => (RecordDetailMode::Auto, 0),
+        CapturePreset::Locate => (
+            RecordDetailMode::Off,
+            config.top_n.unwrap_or(DEFAULT_TOP_N).min(MAX_TOP_N),
+        ),
+        CapturePreset::Auto => (
+            config.record_detail,
+            config.top_n.unwrap_or(0).min(MAX_TOP_N),
+        ),
+    }
+}
+
+/// 解析后的环境（id 为空表示未绑定任何环境）
+struct ResolvedEnv {
+    id: Option<i64>,
+    name: Option<String>,
+}
+
+/// 环境解析优先级：显式 envId → 配置/计划/请求所属项目的激活环境
+///
+/// 显式指定的环境不存在时直接报错，避免静默回退到另一个环境导致压错目标。
+fn resolve_env(conn: &rusqlite::Connection, config: &StressConfig) -> Result<ResolvedEnv, String> {
+    if let Some(env_id) = config.env_id {
+        let name: Option<String> = conn
+            .query_row(
+                "SELECT name FROM environments WHERE id = ?1",
+                params![env_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(err)?;
+        return match name {
+            Some(name) => Ok(ResolvedEnv {
+                id: Some(env_id),
+                name: Some(name),
+            }),
+            None => Err(format!(
+                "所选环境不存在或已删除（envId={env_id}），请在运行栏重新选择环境"
+            )),
+        };
+    }
+
+    // 无显式环境：按计划 → 请求逐级找出所属项目
+    let mut project_id = config.project_id;
+    if project_id.is_none() {
+        if let Some(plan_id) = config.plan_id {
+            project_id = conn
+                .query_row(
+                    "SELECT project_id FROM test_plans WHERE id = ?1",
+                    params![plan_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(err)?;
+        }
+    }
+    if project_id.is_none() {
+        if let Some(request_id) = config.request_id {
+            project_id = conn
+                .query_row(
+                    "SELECT c.project_id FROM requests r
+                     JOIN collections c ON c.id = r.collection_id WHERE r.id = ?1",
+                    params![request_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(err)?;
+        }
+    }
+    let Some(project_id) = project_id else {
+        return Ok(ResolvedEnv {
+            id: None,
+            name: None,
+        });
+    };
+
+    let active: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT id, name FROM environments
+             WHERE project_id = ?1 AND is_active = 1 ORDER BY id ASC LIMIT 1",
+            params![project_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(err)?;
+    Ok(match active {
+        Some((id, name)) => ResolvedEnv {
+            id: Some(id),
+            name: Some(name),
+        },
+        None => ResolvedEnv {
+            id: None,
+            name: None,
+        },
+    })
+}
+
+/// 扫描渲染后文本中残留的 `{{变量}}` 名称（去重、保序）
+fn find_unresolved(text: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("{{") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else {
+            break;
+        };
+        let name = after[..end].trim();
+        if !name.is_empty() && !names.iter().any(|item| item == name) {
+            names.push(name.to_string());
+        }
+        rest = &after[end + 2..];
+    }
+    names
+}
+
+fn collect_unresolved_into(target: &mut Vec<String>, text: &str) {
+    for name in find_unresolved(text) {
+        if !target.iter().any(|item| item == &name) {
+            target.push(name);
+        }
+    }
+}
+
+/// 启动前检查 URL / 参数 / 请求头 / 请求体 / 认证中是否有未解析变量
+///
+/// `build_url` 也做同样校验（运行期零分配路径），这里提前给出可读错误，
+/// 并把缺失变量名、当前环境一次性告诉用户。
+fn check_unresolved(
+    config: &StressConfig,
+    vars: &HashMap<String, String>,
+    env_name: Option<&str>,
+) -> Result<(), String> {
+    let mut missing: Vec<String> = Vec::new();
+    collect_unresolved_into(&mut missing, &render(config.url.trim(), vars));
+    for item in &config.params {
+        if !item.enabled {
+            continue;
+        }
+        collect_unresolved_into(&mut missing, &render(item.key.trim(), vars));
+        collect_unresolved_into(&mut missing, &render(&item.value, vars));
+    }
+    for item in &config.headers {
+        if !item.enabled {
+            continue;
+        }
+        collect_unresolved_into(&mut missing, &render(item.key.trim(), vars));
+        collect_unresolved_into(&mut missing, &render(&item.value, vars));
+    }
+    if let Some(body) = &config.body {
+        collect_unresolved_into(&mut missing, &render(body, vars));
+    }
+    if let Some(auth) = &config.auth {
+        for value in [
+            &auth.token,
+            &auth.username,
+            &auth.password,
+            &auth.key,
+            &auth.value,
+            &auth.token_url,
+            &auth.client_id,
+            &auth.client_secret,
+            &auth.scope,
+        ] {
+            collect_unresolved_into(&mut missing, &render(value, vars));
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let env_label = match env_name {
+        Some(name) => format!("环境「{name}」"),
+        None => "当前未绑定环境".to_string(),
+    };
+    Err(format!(
+        "{} 缺少变量：{}。请补充变量或切换环境后重试",
+        env_label,
+        missing.join("、")
+    ))
 }
 
 /// 校验配置、渲染模板、构建客户端并准备 Cookie 快照；不依赖 Tauri 事件
-fn prepare_stress(state: &AppState, config: StressConfig) -> Result<PreparedStress, String> {
-    let mut vars = match config.env_id {
-        Some(env_id) => {
-            let conn = state.pool.get().map_err(err)?;
-            crate::commands::http::load_vars(&conn, env_id)?
-        }
+///
+/// `cancel` 由任务注册表发放：调用方先建取消位，任务登记成功后共用同一个 Arc。
+fn prepare_stress(
+    state: &AppState,
+    config: StressConfig,
+    cancel: Arc<AtomicBool>,
+) -> Result<PreparedStress, String> {
+    let conn = state.pool.get().map_err(err)?;
+    // 环境优先级：显式 envId → 计划/请求所属项目的激活环境（4.3）
+    let resolved_env = resolve_env(&conn, &config)?;
+    // 开始压测瞬间读取最近一次本机能力检测结果，写入报告快照（1.7.5）
+    let machine_capacity = crate::commands::capacity::latest_result(&conn).ok().flatten();
+    let mut vars = match resolved_env.id {
+        Some(env_id) => crate::commands::http::load_vars(&conn, env_id)?,
         None => HashMap::new(),
     };
+    drop(conn);
     // 运行期变量优先于环境变量
     for (key, value) in &config.vars {
         if !key.trim().is_empty() {
             vars.insert(key.clone(), value.clone());
         }
     }
+    // 变量未解析时直接阻止启动，避免整轮压测全是同一个错误（4.4 / 4.5）
+    check_unresolved(&config, &vars, resolved_env.name.as_deref())?;
 
     let method = reqwest::Method::from_bytes(config.method.trim().to_uppercase().as_bytes())
         .map_err(|_| format!("不支持的请求方法：{}", config.method))?;
@@ -1034,33 +1380,54 @@ fn prepare_stress(state: &AppState, config: StressConfig) -> Result<PreparedStre
         None
     };
 
-    state.stress_cancel.store(false, Ordering::SeqCst);
-
     // 固定并发或阶梯加压
-    let stages: Vec<StressStage> = config
-        .stages
-        .iter()
-        .filter(|item| item.duration_sec > 0)
-        .map(|item| StressStage {
-            concurrent: item.concurrent.clamp(1, MAX_CONCURRENT),
-            duration_sec: item.duration_sec.clamp(1, 3600),
-        })
-        .collect();
-
-    let peak = if stages.is_empty() {
-        config.concurrent.clamp(1, MAX_CONCURRENT)
-    } else {
-        stages.iter().map(|item| item.concurrent).max().unwrap_or(1)
+    let (stages, peak, total_sec) = plan_run(&config);
+    let target_key = target_key_of(&config.method, &prepared_url);
+    // 同主机不同路径的并发压测只警告不拦截（1.3.2）：同机施压会争抢连接与带宽
+    let same_host_warning = {
+        let others = state.stress_jobs.same_host_others(&target_key);
+        if others.is_empty() {
+            None
+        } else {
+            let list = others
+                .iter()
+                .map(|(id, name)| format!("#{id}（{name}）"))
+                .collect::<Vec<_>>()
+                .join("、");
+            Some(format!(
+                "同一主机上已有任务 {list} 在施压，同机并发会互相争抢连接与带宽；\
+这份结果不能当作单实例容量结论"
+            ))
+        }
     };
-    let total_sec = if stages.is_empty() {
-        config.duration_sec.clamp(1, 3600) as u64
-    } else {
-        stages
+    // 并发总和超过检测饱和并发的 80% 时追加警告，不硬拦（1.3.1）
+    let capacity_warning = machine_capacity.as_ref().and_then(|item| {
+        if item.saturation_concurrent == 0 {
+            return None;
+        }
+        let running: u32 = state
+            .stress_jobs
+            .snapshot()
             .iter()
-            .map(|item| item.duration_sec as u64)
-            .sum::<u64>()
-            .clamp(1, 7200)
-    };
+            .map(|job| job.concurrent)
+            .sum();
+        let total_target = running.saturating_add(peak);
+        let threshold = (item.saturation_concurrent as f64 * 0.8).round() as u32;
+        if total_target > threshold {
+            Some(format!(
+                "本次并发总和 {total_target} 已超过本机检测饱和并发 {} 的 80%（{threshold}），结果可能无法解释",
+                item.saturation_concurrent
+            ))
+        } else {
+            None
+        }
+    });
+    if total_sec > LONG_RUN_ACK_SEC && !config.long_run_ack {
+        return Err(format!(
+            "本次压测时长 {total_sec} 秒超过 2 小时，请先确认「已知悉同机施压风险」；\
+建议为长稳压测准备独立的施压机"
+        ));
+    }
 
     let name = config
         .name
@@ -1073,8 +1440,8 @@ fn prepare_stress(state: &AppState, config: StressConfig) -> Result<PreparedStre
         .unwrap_or(0);
     let target_rps = rate as f64;
 
-    // 明细采集定档：auto 按「预估 QPS」一次性定档，之后由运行期只降不升
-    let record_detail = config.record_detail;
+    // 明细采集定档：容量预设等价 auto；定位预设默认全量 + TopN
+    let (record_detail, top_n) = capture_plan(&config);
     let capture_mode = match record_detail {
         RecordDetailMode::Full => Capture::Full,
         RecordDetailMode::Sample => Capture::Sample,
@@ -1107,7 +1474,6 @@ fn prepare_stress(state: &AppState, config: StressConfig) -> Result<PreparedStre
         },
         rate,
     ));
-    let cancel = state.stress_cancel.clone();
     // 按当前配置构建客户端：连接超时、重定向策略可单独覆盖，代理与客户端证书沿用应用设置
     // 空闲连接上限按压测峰值并发放大，普通请求客户端不受影响
     let client = state.client_with_options(
@@ -1124,17 +1490,31 @@ fn prepare_stress(state: &AppState, config: StressConfig) -> Result<PreparedStre
 
     let (errors_tx, errors_rx) = mpsc::channel::<ReportError>(1024);
     let (records_tx, records_rx) = mpsc::unbounded_channel::<ReportRequestRecord>();
+    let (slow_tx, slow_rx) = mpsc::unbounded_channel::<SlowRequest>();
+    let slow_threshold_ms = config.slow_threshold_ms.unwrap_or(0);
 
     let config_snapshot = json!({
         "mode": if stages.is_empty() { "fixed" } else { "stages" },
         "method": config.method.clone(),
         // 报告要展示「实际压测的目标」：存渲染后的完整 URL（含变量替换与拼接的查询参数），
-        // 而不是 {{base_url}}/xxx 这样的模板原文
+        // 而不是 {{base_url}}/xxx 这样的模板原文；模板原文单独存 urlTemplate（3.5.1）
         "url": prepared_url.as_str().to_string(),
+        "urlTemplate": config.url.clone(),
+        "target": {
+            "requestId": config.request_id,
+            "method": config.method.clone(),
+            "urlTemplate": config.url.clone(),
+            "resolvedUrl": prepared_url.as_str().to_string(),
+            "capturedAt": now_ms(),
+        },
         "headers": config.headers.iter().filter(|h| h.enabled && !h.key.trim().is_empty()).count(),
         "params": config.params.iter().filter(|p| p.enabled && !p.key.trim().is_empty()).count(),
         "bodyType": config.body_type.clone(),
-        "envId": config.env_id,
+        // 解析后的环境与名称：换机器/换库后仍能看出当时用的是哪个环境（2.6.3）
+        "envId": resolved_env.id,
+        "envName": resolved_env.name.clone(),
+        "projectId": config.project_id,
+        "planId": config.plan_id,
         // 只记录认证方式与开关，绝不写入密钥值
         "authKind": if auth.kind.trim().is_empty() { "none" } else { auth.kind.as_str() },
         "apiKeyIn": auth.add_to.clone(),
@@ -1153,9 +1533,25 @@ fn prepare_stress(state: &AppState, config: StressConfig) -> Result<PreparedStre
         // 明细采集：请求模式与实际生效模式（auto 可能已降档）
         "recordDetail": capture_mode.label(),
         "recordDetailRequested": record_detail.label(),
+        "captureMode": config.capture_mode.label(),
+        "topN": top_n,
+        "slowThresholdMs": slow_threshold_ms,
+        "baselineReportId": config.baseline_report_id,
+        "machineCapacity": machine_capacity.as_ref().map(|item| json!({
+            "probedAt": item.probed_at,
+            "maxQps": item.max_qps,
+            "cores": item.cores,
+            "cpuPeak": item.cpu_peak,
+            "saturationConcurrent": item.saturation_concurrent,
+            "reachedLimit": item.reached_limit,
+        })),
+        "capacityWarning": capacity_warning,
+        "sameHostWarning": same_host_warning,
         "agent": collect_agent_info(),
     });
     let config_snapshot = config_snapshot.to_string();
+
+    let url_text = prepared_url.to_string();
 
     let ctx = Arc::new(RunCtx {
         client,
@@ -1171,6 +1567,9 @@ fn prepare_stress(state: &AppState, config: StressConfig) -> Result<PreparedStre
         cancel,
         errors: errors_tx,
         records: records_tx,
+        slow_tx,
+        slow_limit: top_n as usize,
+        slow_threshold_ms,
         capture,
         req_bytes,
     });
@@ -1187,8 +1586,11 @@ fn prepare_stress(state: &AppState, config: StressConfig) -> Result<PreparedStre
         stop_rate,
         stop_min,
         concurrent,
+        url_text,
+        target_key,
         errors_rx,
         records_rx,
+        slow_rx,
     })
 }
 
@@ -1196,6 +1598,7 @@ fn prepare_stress(state: &AppState, config: StressConfig) -> Result<PreparedStre
 async fn drive_stress(
     prepared: PreparedStress,
     pool: DbPool,
+    job_id: u64,
     progress: Option<&(dyn Fn(StressProgress) + Send + Sync)>,
     watch: Option<&Arc<AtomicBool>>,
 ) -> StressExecOutcome {
@@ -1211,8 +1614,11 @@ async fn drive_stress(
         stop_rate,
         stop_min,
         concurrent,
+        url_text: _,
+        target_key: _,
         mut errors_rx,
         mut records_rx,
+        mut slow_rx,
     } = prepared;
     let start = ctx.start;
     let deadline = ctx.deadline;
@@ -1228,6 +1634,11 @@ async fn drive_stress(
     let mut samples: Vec<ReportSample> = Vec::new();
     let mut errors: Vec<ReportError> = Vec::new();
     let mut requests: Vec<ReportRequestRecord> = Vec::new();
+    let mut slow_requests: Vec<SlowRequest> = Vec::new();
+    // 自动降档轨迹：报告里记录每次降档的时间点与当时 QPS（1.6.3）
+    let mut downgrade_trail: Vec<serde_json::Value> = Vec::new();
+    // 慢请求候选缓冲上限：定位模式低并发，留 8 倍余量避免每 tick 排序
+    let slow_cap = ctx.slow_limit.saturating_mul(8).max(64);
     let mut prev_total = 0u64;
     let mut prev_success = 0u64;
     let mut prev_errors = 0u64;
@@ -1279,6 +1690,16 @@ async fn drive_stress(
                 metrics.records_dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
+        while let Ok(item) = slow_rx.try_recv() {
+            if slow_requests.len() < slow_cap {
+                slow_requests.push(item);
+            }
+        }
+        if slow_requests.len() >= slow_cap {
+            // 只留最慢的 N 条，避免阈值=0 时无限堆积
+            slow_requests.sort_by_key(|item| std::cmp::Reverse(item.latency_ms));
+            slow_requests.truncate(ctx.slow_limit.max(1));
+        }
 
         let elapsed = start.elapsed().as_secs();
         let total = metrics.count();
@@ -1316,6 +1737,8 @@ async fn drive_stress(
                 p95_rt: metrics.percentile(0.95),
                 p99_rt: metrics.percentile(0.99),
                 ttfb_avg: metrics.ttfb_avg(),
+                body_avg: metrics.body_avg(),
+                body_p95: metrics.body_percentile(0.95),
                 bytes: bytes.saturating_sub(prev_bytes),
                 success_count: success.saturating_sub(prev_success),
                 error_count: failure.saturating_sub(prev_errors),
@@ -1339,10 +1762,22 @@ async fn drive_stress(
                         "实测 QPS 已达 {:.0}，已自动关闭逐请求明细（聚合指标不受影响）",
                         lowest
                     ));
+                    downgrade_trail.push(json!({
+                        "atSec": elapsed,
+                        "from": current.label(),
+                        "to": "off",
+                        "qps": (lowest * 10.0).round() / 10.0,
+                    }));
                     log::info!("压测自动降档：capture=off，qps={lowest:.0}");
                 } else if current == Capture::Full && lowest >= AUTO_SAMPLE_QPS {
                     ctx.capture.store(Capture::Sample as u8, Ordering::Relaxed);
                     notice = Some(format!("实测 QPS 已达 {:.0}，明细已切换为 1% 采样", lowest));
+                    downgrade_trail.push(json!({
+                        "atSec": elapsed,
+                        "from": current.label(),
+                        "to": "sample",
+                        "qps": (lowest * 10.0).round() / 10.0,
+                    }));
                     log::info!("压测自动降档：capture=sample，qps={lowest:.0}");
                 }
                 qps_window.clear();
@@ -1354,6 +1789,7 @@ async fn drive_stress(
             let delta: Vec<ReportSample> = samples[emitted.min(samples.len())..].to_vec();
             emitted = samples.len();
             sink(StressProgress {
+                job_id,
                 name: name.clone(),
                 running: true,
                 elapsed_sec: elapsed,
@@ -1421,6 +1857,14 @@ async fn drive_stress(
             requests.push(item);
         }
     }
+    while let Ok(item) = slow_rx.try_recv() {
+        if slow_requests.len() < slow_cap {
+            slow_requests.push(item);
+        }
+    }
+    // 最终 TopN：按总耗时降序取前 N 条
+    slow_requests.sort_by_key(|item| std::cmp::Reverse(item.latency_ms));
+    slow_requests.truncate(ctx.slow_limit);
 
     let elapsed = start.elapsed().as_secs_f64().max(0.001);
     let total = metrics.count();
@@ -1436,6 +1880,7 @@ async fn drive_stress(
     let max_qps = samples.iter().map(|s| s.qps).fold(0.0, f64::max);
 
     let histogram = metrics.histogram();
+    let body_histogram = metrics.body_histogram();
     let status_codes = metrics.status_codes();
     let stage_summaries = summarize_stages(&stages, &samples);
     let error_types = metrics.error_types();
@@ -1448,6 +1893,9 @@ async fn drive_stress(
             "errorsDropped": metrics.errors_dropped.load(Ordering::Relaxed),
             "recordsDropped": metrics.records_dropped.load(Ordering::Relaxed),
             "recordMode": Capture::from_u8(ctx.capture.load(Ordering::Relaxed)).label(),
+            // 自动降档轨迹：事后能解释「明细为何缺失」
+            "downgradeTrail": downgrade_trail,
+            "slowRequestCount": slow_requests.len(),
             "cpuPeakCores": (monitor.cpu_peak * 10.0).round() / 10.0,
             "memPeakMb": monitor.mem_peak_mb,
             "sampleIntervalSec": sample_step,
@@ -1456,6 +1904,8 @@ async fn drive_stress(
 
     let report = StressReport {
         id: 0,
+        plan_id: ctx.config.plan_id,
+        run_group_id: None,
         plan_name: name,
         request_id: ctx.config.request_id,
         total_requests: total as i64,
@@ -1502,6 +1952,8 @@ async fn drive_stress(
         stages: &stage_summaries,
         status_codes: &status_codes,
         histogram: &histogram,
+        body_histogram: &body_histogram,
+        slow_requests: &slow_requests,
         error_types: &error_types,
         config: &config_snapshot,
     };
@@ -1523,26 +1975,47 @@ pub async fn stress_start(
     state: State<'_, AppState>,
     app: AppHandle,
     config: StressConfig,
-) -> Result<(), String> {
-    if state.stress_running.swap(true, Ordering::SeqCst) {
-        return Err("已有压测任务正在运行，请先停止或等待结束".to_string());
+) -> Result<u64, String> {
+    if state.capacity.is_running() {
+        return Err(
+            "本机能力检测正在运行，检测期间不能启动压测；请等待检测结束或先取消检测".to_string(),
+        );
     }
-    let prepared = match prepare_stress(state.inner(), config) {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            state.stress_running.store(false, Ordering::SeqCst);
-            return Err(error);
-        }
+    let cancel = Arc::new(AtomicBool::new(false));
+    let prepared = prepare_stress(state.inner(), config.clone(), cancel)?;
+    let (max_jobs, max_total) = state.stress_limits();
+    let draft = StressJobDraft {
+        name: prepared.name.clone(),
+        target: prepared.url_text.clone(),
+        target_key: prepared.target_key.clone(),
+        plan_id: config.plan_id,
+        request_id: config.request_id,
+        concurrent: prepared.peak,
     };
+    // 任务数 / 并发之和 / 同目标三项校验在同一把锁内完成
+    let (job_id, _, overlaps) = state.stress_jobs.try_reserve(
+        draft,
+        max_jobs,
+        max_total,
+        config.ignore_overlap,
+    )?;
+    let mut prepared = prepared;
+    if !overlaps.is_empty() {
+        prepared.config_snapshot = with_overlap(&prepared.config_snapshot, &overlaps);
+    }
     let pool = state.pool.clone();
-    let running = state.stress_running.clone();
+    let registry = state.stress_jobs.clone();
     tauri::async_runtime::spawn(async move {
         let progress_app = app.clone();
+        // 每秒 QPS 同步回注册表，主窗口面板无需订阅事件也能显示实时速率
+        let progress_registry = registry.clone();
         let sink = move |progress: StressProgress| {
+            progress_registry.set_qps(job_id, progress.rps);
             let _ = progress_app.emit("stress:progress", &progress);
         };
-        let outcome = drive_stress(prepared, pool, Some(&sink), None).await;
-        running.store(false, Ordering::SeqCst);
+        let outcome = drive_stress(prepared, pool, job_id, Some(&sink), None).await;
+        // 报告已落库，任务从注册表移除；窗口仍可通过 done 事件展示结果
+        registry.finish(job_id);
         let elapsed_sec = outcome
             .report
             .end_time
@@ -1553,6 +2026,7 @@ pub async fn stress_start(
         let _ = app.emit(
             "stress:done",
             &StressDone {
+                job_id,
                 report_id: outcome.report_id,
                 name: outcome.report.plan_name.clone(),
                 status: outcome.report.status.clone(),
@@ -1565,28 +2039,40 @@ pub async fn stress_start(
         );
     });
 
-    Ok(())
+    Ok(job_id)
 }
 
-/// 套件内执行压测用例：与手工压测互斥，结束（含出错）后释放标记
+/// 套件内执行压测用例：与手工压测共用任务注册表，结束（含出错）后释放
 pub async fn run_stress_case(
     state: &AppState,
     config: StressConfig,
     watch: Option<&Arc<AtomicBool>>,
 ) -> Result<StressExecOutcome, String> {
-    if state.stress_running.swap(true, Ordering::SeqCst) {
-        return Err("已有压测任务正在运行（手工压测或另一个套件），请先停止或等待结束".to_string());
+    if state.capacity.is_running() {
+        return Err("本机能力检测正在运行，检测期间不能启动压测".to_string());
     }
-    let prepared = match prepare_stress(state, config) {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            state.stress_running.store(false, Ordering::SeqCst);
-            return Err(error);
-        }
+    let cancel = Arc::new(AtomicBool::new(false));
+    let prepared = prepare_stress(state, config.clone(), cancel)?;
+    let (max_jobs, max_total) = state.stress_limits();
+    let draft = StressJobDraft {
+        name: prepared.name.clone(),
+        target: prepared.url_text.clone(),
+        target_key: prepared.target_key.clone(),
+        plan_id: config.plan_id,
+        request_id: config.request_id,
+        concurrent: prepared.peak,
     };
+    let (job_id, _, overlaps) = state
+        .stress_jobs
+        .try_reserve(draft, max_jobs, max_total, config.ignore_overlap)
+        .map_err(|error| format!("压测任务无法启动：{error}"))?;
+    let mut prepared = prepared;
+    if !overlaps.is_empty() {
+        prepared.config_snapshot = with_overlap(&prepared.config_snapshot, &overlaps);
+    }
     let pool = state.pool.clone();
-    let outcome = drive_stress(prepared, pool, None, watch).await;
-    state.stress_running.store(false, Ordering::SeqCst);
+    let outcome = drive_stress(prepared, pool, job_id, None, watch).await;
+    state.stress_jobs.finish(job_id);
     Ok(outcome)
 }
 
@@ -1634,10 +2120,137 @@ fn summarize_stages(stages: &[StressStage], samples: &[ReportSample]) -> Vec<Sta
     result
 }
 
+/// 只停止指定任务；窗口 / 主面板的停止入口都走这里
 #[tauri::command]
-pub fn stress_stop(state: State<'_, AppState>) -> Result<(), String> {
-    state.stress_cancel.store(true, Ordering::SeqCst);
-    Ok(())
+pub fn stress_stop(state: State<'_, AppState>, job_id: u64) -> Result<(), String> {
+    if state.stress_jobs.cancel(job_id) {
+        Ok(())
+    } else {
+        Err(format!("压测任务 #{job_id} 不存在或已结束"))
+    }
+}
+
+/// 全部停止（退出确认后使用），返回被取消的任务数
+#[tauri::command]
+pub fn stress_stop_all(state: State<'_, AppState>) -> Result<usize, String> {
+    Ok(state.stress_jobs.cancel_all())
+}
+
+/// 运行中任务快照：主窗口面板与窗口恢复共用，不依赖任何窗口是否打开
+#[tauri::command]
+pub fn stress_jobs(state: State<'_, AppState>) -> Vec<crate::state::StressJobSummary> {
+    state.stress_jobs.snapshot()
+}
+
+/// 打开独立压测窗口（1.2.1）
+///
+/// 绑定任务的窗口 label 固定为 `stress-job-<jobId>`，重复打开时聚焦已有窗口；
+/// 只有计划没有任务时用 `stress-plan-<planId>`；都没有时用时间戳序号。
+/// 窗口只是视图：关闭不影响任务，重新打开时按 jobId 恢复进度。
+#[tauri::command]
+pub fn stress_open_window(
+    app: AppHandle,
+    plan_id: Option<i64>,
+    job_id: Option<u64>,
+    env_id: Option<i64>,
+) -> Result<String, String> {
+    open_stress_window(&app, plan_id, job_id, env_id)
+}
+
+/// 供命令与单实例回调共用的建窗实现
+pub fn open_stress_window(
+    app: &AppHandle,
+    plan_id: Option<i64>,
+    job_id: Option<u64>,
+    env_id: Option<i64>,
+) -> Result<String, String> {
+    let state = app.state::<AppState>();
+    let label = match (job_id, plan_id) {
+        (Some(id), _) => state
+            .stress_jobs
+            .window_label(id)
+            .unwrap_or_else(|| format!("stress-job-{id}")),
+        (None, Some(id)) => format!("stress-plan-{id}"),
+        (None, None) => format!("stress-{}", now_ms()),
+    };
+    let mut url = String::from("index.html#/stress?newWindow=1");
+    if let Some(id) = plan_id {
+        url.push_str(&format!("&planId={id}"));
+    }
+    if let Some(id) = job_id {
+        url.push_str(&format!("&jobId={id}"));
+    }
+    if let Some(id) = env_id {
+        url.push_str(&format!("&envId={id}"));
+    }
+
+    // 窗口标题优先取运行中任务名，其次取计划名
+    let title = job_id
+        .and_then(|id| {
+            state
+                .stress_jobs
+                .snapshot()
+                .into_iter()
+                .find(|job| job.id == id)
+                .map(|job| job.name)
+        })
+        .or_else(|| {
+            plan_id.and_then(|id| {
+                state
+                    .pool
+                    .get()
+                    .ok()
+                    .and_then(|conn| {
+                        conn.query_row("SELECT name FROM test_plans WHERE id = ?1", [id], |row| {
+                            row.get::<_, String>(0)
+                        })
+                        .optional()
+                        .ok()
+                        .flatten()
+                    })
+            })
+        })
+        .map(|name| format!("压测 · {name}"))
+        .unwrap_or_else(|| "压测".to_string());
+
+    if let Some(id) = job_id {
+        state.stress_jobs.set_window_label(id, &label);
+    }
+    // 已有窗口直接聚焦，避免重复建窗
+    if let Some(window) = app.get_webview_window(&label) {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+        return Ok(label);
+    }
+
+    // create_window 会阻塞等待主事件循环，放到独立线程 + 二次检查（同 quick.rs）
+    let handle = app.clone();
+    let thread_label = label.clone();
+    std::thread::spawn(move || {
+        if let Some(window) = handle.get_webview_window(&thread_label) {
+            let _ = window.show();
+            let _ = window.unminimize();
+            let _ = window.set_focus();
+            return;
+        }
+        match WebviewWindowBuilder::new(
+            &handle,
+            &thread_label,
+            WebviewUrl::App(url.into()),
+        )
+        .title(title)
+        .inner_size(1280.0, 860.0)
+        .min_inner_size(960.0, 640.0)
+        .build()
+        {
+            Ok(window) => {
+                let _ = window.set_focus();
+            }
+            Err(error) => log::warn!("创建压测窗口失败：{error}"),
+        }
+    });
+    Ok(label)
 }
 
 /// 把运行期指标合并进配置快照 JSON
@@ -1645,6 +2258,18 @@ fn with_runtime_metrics(snapshot: &str, metrics: serde_json::Value) -> String {
     let mut value: serde_json::Value = serde_json::from_str(snapshot).unwrap_or_else(|_| json!({}));
     if let Some(map) = value.as_object_mut() {
         map.insert("metrics".to_string(), metrics);
+    }
+    value.to_string()
+}
+
+/// 同目标叠加压测留痕：报告里必须能看出这份结果不能当单实例容量结论
+fn with_overlap(snapshot: &str, job_ids: &[u64]) -> String {
+    let mut value: serde_json::Value = serde_json::from_str(snapshot).unwrap_or_else(|_| json!({}));
+    if let Some(map) = value.as_object_mut() {
+        map.insert(
+            "overlap".to_string(),
+            json!({ "ignored": true, "with": job_ids }),
+        );
     }
     value.to_string()
 }
@@ -1657,6 +2282,10 @@ struct ReportPayload<'a> {
     stages: &'a [StageSummary],
     status_codes: &'a [StatusCount],
     histogram: &'a [HistogramBucket],
+    /// 响应体读取耗时直方图（body = latency - ttfb）
+    body_histogram: &'a [HistogramBucket],
+    /// TopN 慢请求
+    slow_requests: &'a [crate::models::SlowRequest],
     error_types: &'a [ErrorTypeCount],
     config: &'a str,
 }
@@ -1669,6 +2298,8 @@ fn save_report(pool: &DbPool, payload: ReportPayload<'_>) -> Result<i64, String>
     let stages_text = serde_json::to_string(payload.stages).map_err(err)?;
     let codes_text = serde_json::to_string(payload.status_codes).map_err(err)?;
     let histogram_text = serde_json::to_string(payload.histogram).map_err(err)?;
+    let body_histogram_text = serde_json::to_string(payload.body_histogram).map_err(err)?;
+    let slow_requests_text = serde_json::to_string(payload.slow_requests).map_err(err)?;
     let types_text = serde_json::to_string(payload.error_types).map_err(err)?;
 
     tx.execute(
@@ -1677,11 +2308,13 @@ fn save_report(pool: &DbPool, payload: ReportPayload<'_>) -> Result<i64, String>
              avg_rt, min_rt, max_rt, p50_rt, p75_rt, p90_rt, p95_rt, p99_rt, p999_rt,
              stddev_rt, ttfb_avg, ttfb_p95, apdex, bytes_total, max_qps, avg_qps, target_rps,
              error_rate, concurrency, status, config_json, stages_json, codes_json,
-             histogram_json, error_types_json, start_time, end_time, created_at)
-         VALUES (NULL, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+             histogram_json, error_types_json, start_time, end_time, created_at,
+             body_histogram_json, slow_requests_json, run_group_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
                  ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
-                 ?29, ?30, ?31, ?32, ?33)",
+                 ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37)",
         params![
+            report.plan_id,
             report.plan_name,
             report.request_id,
             report.total_requests,
@@ -1715,6 +2348,9 @@ fn save_report(pool: &DbPool, payload: ReportPayload<'_>) -> Result<i64, String>
             report.start_time,
             report.end_time,
             report.created_at,
+            body_histogram_text,
+            slow_requests_text,
+            report.run_group_id,
         ],
     )
     .map_err(err)?;
@@ -1726,8 +2362,8 @@ fn save_report(pool: &DbPool, payload: ReportPayload<'_>) -> Result<i64, String>
             .prepare(
                 "INSERT INTO report_samples
                     (report_id, elapsed_sec, concurrent, qps, avg_rt, p50_rt, p95_rt, p99_rt,
-                     ttfb_avg, bytes, success_count, error_count)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                     ttfb_avg, body_avg, body_p95, bytes, success_count, error_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             )
             .map_err(err)?;
         for sample in payload.samples {
@@ -1741,6 +2377,8 @@ fn save_report(pool: &DbPool, payload: ReportPayload<'_>) -> Result<i64, String>
                 sample.p95_rt,
                 sample.p99_rt,
                 sample.ttfb_avg,
+                sample.body_avg,
+                sample.body_p95,
                 sample.bytes as i64,
                 sample.success_count as i64,
                 sample.error_count as i64,
@@ -1915,5 +2553,61 @@ mod tests {
         assert_eq!(value["mode"], "fixed");
         assert_eq!(value["metrics"]["bytesSent"], 1024);
         assert_eq!(value["metrics"]["recordsDropped"], 3);
+    }
+
+    #[test]
+    fn find_unresolved_collects_unique_names() {
+        assert_eq!(
+            find_unresolved("{{base_url}}/api/{{id}}?token={{base_url}}"),
+            vec!["base_url".to_string(), "id".to_string()]
+        );
+        assert!(find_unresolved("http://127.0.0.1/api").is_empty());
+        // 未闭合的占位符按原文保留，不误判为变量
+        assert!(find_unresolved("{{base_url").is_empty());
+    }
+
+    #[test]
+    fn check_unresolved_blocks_startup_with_env_name() {
+        let config: StressConfig = serde_json::from_str(
+            r#"{"url":"{{base_url}}/api","headers":[{"key":"X-Token","value":"{{token}}","enabled":true}]}"#,
+        )
+        .unwrap();
+        let error = check_unresolved(&config, &HashMap::new(), Some("测试环境")).unwrap_err();
+        assert!(error.contains("测试环境"));
+        assert!(error.contains("base_url"));
+        assert!(error.contains("token"));
+
+        let mut vars = HashMap::new();
+        vars.insert("base_url".to_string(), "http://127.0.0.1".to_string());
+        vars.insert("token".to_string(), "abc".to_string());
+        assert!(check_unresolved(&config, &vars, Some("测试环境")).is_ok());
+    }
+
+    #[test]
+    fn target_key_ignores_query_but_keeps_path() {
+        let a = reqwest::Url::parse("http://127.0.0.1:8080/api/orders?id=1").unwrap();
+        let b = reqwest::Url::parse("http://127.0.0.1:8080/api/orders?id=2").unwrap();
+        let c = reqwest::Url::parse("http://127.0.0.1:8080/api/users").unwrap();
+        let key_a = target_key_of("get", &a);
+        assert_eq!(key_a, target_key_of("GET", &b));
+        assert_ne!(key_a, target_key_of("GET", &c));
+        assert!(key_a.ends_with("/api/orders"));
+    }
+
+    #[test]
+    fn capture_plan_modes_match_product_rules() {
+        let capacity: StressConfig = serde_json::from_str(
+            r#"{"url":"http://127.0.0.1/x","captureMode":"capacity"}"#,
+        )
+        .unwrap();
+        assert_eq!(capture_plan(&capacity), (RecordDetailMode::Auto, 0));
+
+        let locate: StressConfig =
+            serde_json::from_str(r#"{"url":"http://127.0.0.1/x","captureMode":"locate"}"#).unwrap();
+        assert_eq!(capture_plan(&locate), (RecordDetailMode::Off, 200));
+
+        let mut custom = locate.clone();
+        custom.top_n = Some(50);
+        assert_eq!(capture_plan(&custom), (RecordDetailMode::Off, 50));
     }
 }

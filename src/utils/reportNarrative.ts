@@ -246,6 +246,44 @@ export function buildFindings(detail: ReportDetail): Finding[] {
 
   const agent = config?.agent
   const metrics = config?.metrics
+
+  // 施压端能力联动（3.7.3）：达到检测极限 80% 时提示结论谨慎
+  const capacity = config?.machineCapacity
+  if (capacity?.maxQps && capacity.maxQps > 0) {
+    const usage = report.avgQps / capacity.maxQps
+    if (usage >= 0.8) {
+      findings.push({
+        level: 'warn',
+        title: `客户端负载已达检测极限的 ${pct(usage * 100, 0)}`,
+        detail: `本机回环检测极限 ${
+          capacity.reachedLimit === false ? '≥ ' : ''
+        }${Math.round(capacity.maxQps)} QPS，本次平均 ${Math.round(
+          report.avgQps,
+        )} QPS。客户端接近能力上限，结论需谨慎；建议关闭明细采集或拆分施压机后复测。`,
+      })
+    } else if (usage < 0.5) {
+      findings.push({
+        level: 'ok',
+        title: '客户端余量充足，瓶颈不在施压端',
+        detail: `本机检测极限 ${
+          capacity.reachedLimit === false ? '≥ ' : ''
+        }${Math.round(capacity.maxQps)} QPS，本次仅用到 ${pct(
+          usage * 100,
+          0,
+        )}。压力瓶颈应在本机之外的目标系统或网络上。`,
+      })
+    }
+  }
+
+  // 同主机叠加压测留痕（1.3.2）：只提示口径，不判失败
+  if (config?.sameHostWarning) {
+    findings.push({
+      level: 'warn',
+      title: '同主机叠加压测，容量结论需谨慎',
+      detail: `${config.sameHostWarning}。建议改串行执行后复测，或使用独立施压机再做容量结论。`,
+    })
+  }
+
   if (agent?.cpuCores && metrics?.cpuPeakCores) {
     const usage = metrics.cpuPeakCores / agent.cpuCores
     if (usage >= 0.8) {

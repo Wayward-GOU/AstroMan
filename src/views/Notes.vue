@@ -158,11 +158,11 @@ const settingsSaving = ref(false)
 const now = ref(Date.now())
 const compact = ref(false)
 const windowWidth = ref(window.innerWidth)
-/** 详情抽屉占页面一半；窄窗口留边，避免挤压正文 */
+/** 详情抽屉占页面八成；窄窗口留边，避免挤压正文 */
 const drawerWidth = computed(() =>
   compact.value
     ? Math.min(560, Math.max(320, windowWidth.value - 32))
-    : Math.max(520, Math.round(windowWidth.value * 0.5)),
+    : Math.max(520, Math.round(windowWidth.value * 0.8)),
 )
 
 interface UndoState {
@@ -1759,6 +1759,10 @@ onBeforeUnmount(() => {
   position: relative;
   flex-direction: column;
   gap: 4px;
+  /* 网格子项默认 min-width:auto，长 JSON/命令会把卡片撑破 */
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
   min-height: 96px;
   padding: 10px 10px 26px;
   border: 1px solid var(--fm-border);
@@ -1804,6 +1808,8 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   flex: 1;
+  min-width: 0;
+  max-width: 100%;
   padding-right: 18px;
 }
 
@@ -1812,6 +1818,9 @@ onBeforeUnmount(() => {
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
   font-weight: 500;
 }
 
@@ -1826,6 +1835,10 @@ onBeforeUnmount(() => {
   -webkit-box-orient: vertical;
   overflow: hidden;
   white-space: normal;
+  max-width: 100%;
+  /* 无空格的长串（JSON、命令行）必须允许任意位置换行，否则会横向溢出卡片 */
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .note-items.card .row-actions {

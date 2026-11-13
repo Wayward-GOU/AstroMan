@@ -1,4 +1,4 @@
-use crate::state::DbPool;
+use crate::state::{AppState, DbPool};
 use crate::util::err;
 
 mod seed;
@@ -18,7 +18,9 @@ mod seed;
 /// 12 = 协议广度（requests.protocol、GraphQL schema 表 graphql_schemas）
 /// 13 = AI 专项（ai_providers.native_tools / 单价 / 币种；设置项随 settings.json 落盘）
 /// 14 = AI 写操作回滚（request_revisions.trace_id）
-pub const DB_VERSION: i64 = 14;
+/// 15 = 压测 v1.1.1（plan 的 request_id 可空且 SET NULL、机器容量表、
+///      报告分组 / 响应体耗时直方图 / TopN 慢请求、采样响应体耗时）
+pub const DB_VERSION: i64 = 15;
 
 /// 每条连接都要应用的 SQLite 参数（P-06）。
 ///
@@ -42,6 +44,51 @@ pub fn connection_pragmas() -> String {
 /// 直接返回错误而不是继续写，避免旧代码用旧结构写坏新数据。
 const E_SCHEMA_FUTURE: &str = "E_SCHEMA: 数据库由更高版本的 AstroMan 创建，请升级应用；\
 如已降级，请从「设置 → 数据备份」恢复对应版本的备份";
+
+/// 主库与 WAL 的合计字节数，用来计算"这次清理到底释放了多少空间"
+pub fn total_size(state: &AppState) -> u64 {
+    let db = std::fs::metadata(&state.db_path)
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    let wal = std::fs::metadata(state.db_path.with_extension("db-wal"))
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    db + wal
+}
+
+/// 删除数据后回收磁盘空间
+///
+/// `DELETE` 只把页标成空闲，文件本身不会缩小；WAL 模式下空闲页还会继续留在日志里。
+/// 因此固定按「截断 WAL → VACUUM 重写主库 → 再截断 WAL」执行：VACUUM 产生的新页会先写进
+/// WAL，前后各截断一次才能让两个文件都真正变小。
+///
+/// 返回 (压缩前字节, 压缩后字节)；失败原样返回，由调用方决定提示方式。
+pub fn reclaim_space(state: &AppState) -> Result<(u64, u64), String> {
+    let before = total_size(state);
+    let conn = state.pool.get().map_err(err)?;
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .map_err(|error| format!("截断 WAL 失败：{error}"))?;
+    conn.execute_batch("VACUUM;")
+        .map_err(|error| format!("压缩数据库失败：{error}"))?;
+    // VACUUM 的写入都经过 WAL，不收尾的话文件大小等于没变
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .map_err(|error| format!("压缩后截断 WAL 失败：{error}"))?;
+    Ok((before, total_size(state)))
+}
+
+/// 清理命令统一用这个：压测运行中跳过压缩，其余情况拿重任务锁后回收空间
+///
+/// 返回 (释放字节, 失败原因)。数据删除本身已经提交，压缩失败不影响删除结果。
+pub fn compact_after_delete(state: &AppState) -> (u64, Option<String>) {
+    if !state.stress_jobs.is_empty() {
+        return (0, Some("压测正在运行，已跳过压缩；请压测结束后重新清理".into()));
+    }
+    let _guard = state.heavy_ops.lock();
+    match reclaim_space(state) {
+        Ok((before, after)) => (before.saturating_sub(after), None),
+        Err(error) => (0, Some(error)),
+    }
+}
 
 pub fn init(pool: &DbPool) -> Result<(), String> {
     {
@@ -220,6 +267,12 @@ const COLUMN_MIGRATIONS: &[(&str, &str, &str)] = &[
     ("ai_providers", "input_price", "REAL NOT NULL DEFAULT 0"),
     ("ai_providers", "output_price", "REAL NOT NULL DEFAULT 0"),
     ("ai_providers", "currency", "TEXT NOT NULL DEFAULT 'USD'"),
+    // v15：压测报告分组、响应体耗时直方图与 TopN 慢请求
+    ("test_reports", "run_group_id", "INTEGER"),
+    ("test_reports", "body_histogram_json", "TEXT"),
+    ("test_reports", "slow_requests_json", "TEXT"),
+    ("report_samples", "body_avg", "REAL DEFAULT 0"),
+    ("report_samples", "body_p95", "REAL DEFAULT 0"),
 ];
 
 fn column_exists(conn: &rusqlite::Connection, table: &str, column: &str) -> Result<bool, String> {
@@ -254,12 +307,78 @@ pub fn add_column_if_missing(
     Ok(true)
 }
 
+/// v15：重建 test_plans，把 request_id 改为可空并改用 `ON DELETE SET NULL`
+///
+/// SQLite 不支持修改已有外键动作，只能整表重建。重建期间必须先关闭外键：
+/// 否则 `DROP TABLE test_plans` 会按旧的 CASCADE 把 test_cases 的用例关联一并删掉。
+/// 计划在接口被删除后保留，界面回退展示 URL 模板。
+fn rebuild_test_plans_v15(conn: &rusqlite::Connection) -> Result<(), String> {
+    let fk_was_on = conn
+        .query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+        .map(|value| value != 0)
+        .unwrap_or(true);
+    conn.execute_batch("PRAGMA foreign_keys = OFF").map_err(err)?;
+    let result = (|| -> Result<(), String> {
+        let tx = conn.unchecked_transaction().map_err(err)?;
+        tx.execute_batch(
+            "DROP TABLE IF EXISTS test_plans_v15;
+             CREATE TABLE test_plans_v15 (
+                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                 project_id      INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                 request_id      INTEGER REFERENCES requests(id) ON DELETE SET NULL,
+                 name            TEXT NOT NULL,
+                 concurrent      INTEGER DEFAULT 10,
+                 duration_sec    INTEGER DEFAULT 60,
+                 ramp_up_sec     INTEGER DEFAULT 10,
+                 think_time_ms   INTEGER DEFAULT 0,
+                 timeout_ms      INTEGER DEFAULT 30000,
+                 params_config   TEXT,
+                 config_json     TEXT,
+                 created_at      INTEGER NOT NULL,
+                 updated_at      INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO test_plans_v15
+                 (id, project_id, request_id, name, concurrent, duration_sec, ramp_up_sec,
+                  think_time_ms, timeout_ms, params_config, config_json, created_at, updated_at)
+             SELECT id, project_id, request_id, name, concurrent, duration_sec, ramp_up_sec,
+                    think_time_ms, timeout_ms, params_config, config_json, created_at, updated_at
+             FROM test_plans;
+             DROP TABLE test_plans;
+             ALTER TABLE test_plans_v15 RENAME TO test_plans;",
+        )
+        .map_err(err)?;
+        tx.commit().map_err(err)?;
+        Ok(())
+    })();
+    if fk_was_on {
+        let _ = conn.execute_batch("PRAGMA foreign_keys = ON");
+    }
+    result?;
+    // 重建后做一次外键体检：只记日志，历史脏数据不应该阻断升级
+    if fk_was_on {
+        if let Ok(mut stmt) = conn.prepare("PRAGMA foreign_key_check") {
+            if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
+                let dirty = rows.filter_map(Result::ok).count();
+                if dirty > 0 {
+                    log::warn!("数据库存在 {dirty} 条外键不一致记录（升级不阻断）");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// 老版本数据库补列 + 补索引 + 版本号推进，整体包在一个事务里
 fn migrate(pool: &DbPool) -> Result<(), String> {
     let conn = pool.get().map_err(err)?;
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(err)?;
+
+    // v15 需要整表重建 test_plans：重建必须关掉外键且不能包在外层事务里
+    if version > 0 && version < 15 {
+        rebuild_test_plans_v15(&conn)?;
+    }
 
     {
         let tx = conn.unchecked_transaction().map_err(err)?;
@@ -277,7 +396,8 @@ fn migrate(pool: &DbPool) -> Result<(), String> {
             "CREATE INDEX IF NOT EXISTS idx_history_origin ON request_history(origin, created_at DESC);
              CREATE INDEX IF NOT EXISTS idx_runs_origin ON request_runs(origin, created_at DESC);
              CREATE INDEX IF NOT EXISTS idx_notes_status_done ON notes(status, done_at DESC);
-             CREATE INDEX IF NOT EXISTS idx_revisions_trace ON request_revisions(trace_id, id);",
+             CREATE INDEX IF NOT EXISTS idx_revisions_trace ON request_revisions(trace_id, id);
+             CREATE INDEX IF NOT EXISTS idx_reports_run_group ON test_reports(run_group_id, id DESC);",
         )
         .map_err(err)?;
         if version < 6 {
@@ -620,6 +740,102 @@ mod tests {
             )
             .unwrap();
         assert_eq!(left, 0, "删除请求必须级联删除版本历史");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upgrades_v14_plans_to_set_null_and_adds_capacity_table() {
+        let (dir, pool) = temp_pool("v15");
+        {
+            let conn = pool.get().unwrap();
+            // 模拟 v14：plan.request_id 非空且 CASCADE；同时存在引用计划的套件用例
+            conn.execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 CREATE TABLE projects (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+                     description TEXT, color TEXT, sort_order INTEGER DEFAULT 0,
+                     created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+                 CREATE TABLE collections (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                     parent_id INTEGER, name TEXT NOT NULL, sort_order INTEGER DEFAULT 0,
+                     created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+                 CREATE TABLE requests (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+                     name TEXT NOT NULL, method TEXT NOT NULL DEFAULT 'GET', url TEXT NOT NULL,
+                     created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+                 CREATE TABLE test_plans (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                     request_id INTEGER NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
+                     name TEXT NOT NULL, concurrent INTEGER DEFAULT 10,
+                     duration_sec INTEGER DEFAULT 60, ramp_up_sec INTEGER DEFAULT 10,
+                     think_time_ms INTEGER DEFAULT 0, timeout_ms INTEGER DEFAULT 30000,
+                     params_config TEXT, config_json TEXT,
+                     created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE test_cases (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT, suite_id INTEGER NOT NULL,
+                     name TEXT NOT NULL, sort_order INTEGER DEFAULT 0,
+                     plan_id INTEGER REFERENCES test_plans(id) ON DELETE SET NULL);
+                 INSERT INTO projects (name, created_at, updated_at) VALUES ('p', 1, 1);
+                 INSERT INTO collections (project_id, name, created_at, updated_at)
+                 VALUES (1, 'c', 1, 1);
+                 INSERT INTO requests (collection_id, name, url, created_at, updated_at)
+                 VALUES (1, 'r', 'http://127.0.0.1/x', 1, 1);
+                 INSERT INTO test_plans (project_id, request_id, name, created_at)
+                 VALUES (1, 1, '计划', 1);
+                 INSERT INTO test_cases (suite_id, name, plan_id) VALUES (1, '用例', 1);
+                 PRAGMA user_version = 14;",
+            )
+            .unwrap();
+        }
+        init(&pool).unwrap();
+        let conn = pool.get().unwrap();
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, DB_VERSION);
+
+        // 删除接口后计划保留，request_id 置空
+        conn.execute("DELETE FROM requests WHERE id = 1", [])
+            .unwrap();
+        let (plans, request_id): (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(request_id) FROM test_plans WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(plans, 1, "删除接口不能连计划一起删掉");
+        assert_eq!(request_id, None);
+        // 用例对计划的关联不能被重建过程误删
+        let plan_ref: Option<i64> = conn
+            .query_row("SELECT plan_id FROM test_cases WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(plan_ref, Some(1));
+
+        for (table, column) in [
+            ("test_reports", "run_group_id"),
+            ("test_reports", "body_histogram_json"),
+            ("test_reports", "slow_requests_json"),
+            ("report_samples", "body_avg"),
+            ("report_samples", "body_p95"),
+        ] {
+            assert!(has_column(&pool, table, column), "缺少列 {table}.{column}");
+        }
+        let capacity: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'machine_capacity'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(capacity, 1);
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
     }

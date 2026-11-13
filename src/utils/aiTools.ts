@@ -348,7 +348,7 @@ const SCHEMAS: Record<string, Record<string, ArgRule>> = {
     projectId: { kind: 'number', required: true },
     id: { kind: 'number', required: true },
   },
-  plan_list: { projectId: { kind: 'number', required: true } },
+  plan_list: { projectId: { kind: 'number' } },
   plan_get: { id: { kind: 'number', required: true } },
   plan_delete: { id: { kind: 'number', required: true } },
   plan_save: {
@@ -356,8 +356,8 @@ const SCHEMAS: Record<string, Record<string, ArgRule>> = {
     requestId: { kind: 'number' },
     name: { kind: 'string', required: true },
     mode: { kind: 'string', enum: ['fixed', 'stages'] },
-    concurrent: { kind: 'number', min: 1, max: 500 },
-    durationSec: { kind: 'number', min: 1, max: 3600 },
+    concurrent: { kind: 'number', min: 1, max: 5000 },
+    durationSec: { kind: 'number', min: 1, max: 86400 },
     rampUpSec: { kind: 'number', min: 0, max: 3600 },
     thinkTimeMs: { kind: 'number', min: 0, max: 600000 },
     targetRps: { kind: 'number', min: 1, max: 100000 },
@@ -367,6 +367,10 @@ const SCHEMAS: Record<string, Record<string, ArgRule>> = {
     slaErrorRate: { kind: 'number', min: 0 },
     slaMinRps: { kind: 'number', min: 0 },
     envId: { kind: 'number' },
+    captureMode: { kind: 'string', enum: ['auto', 'capacity', 'locate'] },
+    topN: { kind: 'number', min: 0, max: 5000 },
+    slowThresholdMs: { kind: 'number', min: 0 },
+    baselineReportId: { kind: 'number' },
   },
   stress_start: {
     requestId: { kind: 'number' },
@@ -378,8 +382,8 @@ const SCHEMAS: Record<string, Record<string, ArgRule>> = {
     bodyType: { kind: 'string', enum: BODY_TYPES },
     body: { kind: 'any' },
     envId: { kind: 'number' },
-    concurrent: { kind: 'number', min: 1, max: 500 },
-    durationSec: { kind: 'number', min: 1, max: 3600 },
+    concurrent: { kind: 'number', min: 1, max: 5000 },
+    durationSec: { kind: 'number', min: 1, max: 86400 },
     rampUpSec: { kind: 'number', min: 0, max: 3600 },
     thinkTimeMs: { kind: 'number', min: 0, max: 600000 },
     targetRps: { kind: 'number', min: 1, max: 100000 },
@@ -388,6 +392,11 @@ const SCHEMAS: Record<string, Record<string, ArgRule>> = {
     slaP99: { kind: 'number', min: 1 },
     slaErrorRate: { kind: 'number', min: 0 },
     slaMinRps: { kind: 'number', min: 0 },
+    captureMode: { kind: 'string', enum: ['auto', 'capacity', 'locate'] },
+    topN: { kind: 'number', min: 0, max: 5000 },
+    slowThresholdMs: { kind: 'number', min: 0 },
+    baselineReportId: { kind: 'number' },
+    longRunAck: { kind: 'boolean' },
   },
   stress_stop: {},
   run_batch: {
@@ -2611,12 +2620,15 @@ const SPECS: ToolSpec[] = [
   },
   {
     name: 'plan_list',
-    desc: '项目的压测计划列表（含关联请求名与本地时间）',
+    desc: '压测计划列表（含关联请求名与本地时间）；省略 projectId 时列出全部项目',
     handler: async (args) => {
-      const plans = await planList(needNum(args.projectId, 'projectId'))
+      const plans = await planList(optionalNum(args.projectId) ?? null)
       return plans.map((item) => ({
         计划名称: item.name,
+        项目: item.projectName || `#${item.projectId}`,
         关联请求: item.requestName || '未关联请求',
+        目标地址: item.resolvedUrl || item.urlTemplate || '—',
+        环境: item.envName || '未绑定',
         更新时间: fmtTime(item.updatedAt),
       }))
     },
@@ -2656,9 +2668,11 @@ const SPECS: ToolSpec[] = [
       const stages = toStages(args.stages)
       if (mode === 'stages' && !stages.length) throw new Error('梯度模式需要提供 stages 数组')
 
-      const concurrent = Math.min(500, Math.max(1, Math.round(optionalNum(args.concurrent) ?? 10)))
-      const durationSec = Math.min(3600, Math.max(1, Math.round(optionalNum(args.durationSec) ?? 30)))
+      const concurrent = Math.min(5000, Math.max(1, Math.round(optionalNum(args.concurrent) ?? 10)))
+      const durationSec = Math.min(86400, Math.max(1, Math.round(optionalNum(args.durationSec) ?? 30)))
       const sla = slaOf(args)
+      const captureMode =
+        args.captureMode === 'capacity' || args.captureMode === 'locate' ? args.captureMode : 'auto'
       const config = {
         settings: {
           mode,
@@ -2674,6 +2688,10 @@ const SPECS: ToolSpec[] = [
           stopMinRequests: 100,
           insecure: false,
           targetRps: Math.max(0, Math.round(optionalNum(args.targetRps) ?? 0)),
+          captureMode,
+          topN: Math.max(0, Math.round(optionalNum(args.topN) ?? 200)),
+          slowThresholdMs: Math.max(0, Math.round(optionalNum(args.slowThresholdMs) ?? 0)),
+          baselineReportId: optionalNum(args.baselineReportId) ?? null,
           slaEnabled: sla !== null,
           slaP95: sla?.p95Ms ?? 500,
           slaP99: sla?.p99Ms ?? 1000,
@@ -2735,13 +2753,15 @@ const SPECS: ToolSpec[] = [
       const stages = toStages(args.stages)
       const concurrent = stages.length
         ? Math.max(...stages.map((item) => item.concurrent))
-        : Math.min(500, Math.max(1, Math.round(optionalNum(args.concurrent) ?? 10)))
+        : Math.min(5000, Math.max(1, Math.round(optionalNum(args.concurrent) ?? 10)))
       const durationSec = stages.length
         ? stages.reduce((sum, item) => sum + item.durationSec, 0)
-        : Math.min(3600, Math.max(1, Math.round(optionalNum(args.durationSec) ?? 30)))
+        : Math.min(86400, Math.max(1, Math.round(optionalNum(args.durationSec) ?? 30)))
       const rampUpSec = Math.max(0, Math.round(optionalNum(args.rampUpSec) ?? 0))
       const thinkTimeMs = Math.max(0, Math.round(optionalNum(args.thinkTimeMs) ?? 0))
       const sla = slaOf(args)
+      const captureMode =
+        args.captureMode === 'capacity' || args.captureMode === 'locate' ? args.captureMode : 'auto'
 
       await stressStart({
         ...base,
@@ -2758,6 +2778,11 @@ const SPECS: ToolSpec[] = [
         stages,
         targetRps: optionalNum(args.targetRps) ?? null,
         sla,
+        captureMode,
+        topN: Math.max(0, Math.round(optionalNum(args.topN) ?? 200)),
+        slowThresholdMs: Math.max(0, Math.round(optionalNum(args.slowThresholdMs) ?? 0)),
+        baselineReportId: optionalNum(args.baselineReportId) ?? null,
+        longRunAck: args.longRunAck === true,
       })
       const shape = stages.length
         ? `${stages.length} 个阶段（峰值 ${concurrent} 并发，累计 ${durationSec}s）`

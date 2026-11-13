@@ -12,6 +12,8 @@ function sample(elapsedSec: number, qps: number, p95: number): ReportSample {
     p95Rt: p95,
     p99Rt: p95 * 1.2,
     ttfbAvg: 5,
+    bodyAvg: 3,
+    bodyP95: 4,
     bytes: 1000,
     successCount: Math.round(qps),
     errorCount: 0,

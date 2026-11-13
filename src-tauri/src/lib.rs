@@ -29,6 +29,7 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Emitter, Manager,
 };
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -68,6 +69,53 @@ fn pause_notes(app: &tauri::AppHandle, minutes: i64) {
         let _ = tray.set_tooltip(Some("AstroMan · 提醒已暂停"));
     }
     let _ = app.emit("notes:changed", serde_json::json!({ "reason": "settings" }));
+}
+
+/// 退出前检查运行中的压测：有任务先二次确认，确认后全部取消并等待收尾（1.2.5）
+fn exit_with_running_jobs(app: &tauri::AppHandle) {
+    let jobs = app.state::<state::AppState>().stress_jobs.snapshot();
+    if jobs.is_empty() {
+        app.exit(0);
+        return;
+    }
+    let lines: Vec<String> = jobs
+        .iter()
+        .map(|job| format!("• {} → {}", job.name, job.target))
+        .collect();
+    let message = format!(
+        "仍有 {} 个压测任务在运行：\n{}\n\n退出会先停止全部任务并等待收尾（最多 10 秒），已采集数据按「已停止」保存。",
+        jobs.len(),
+        lines.join("\n")
+    );
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let confirmed = app
+            .dialog()
+            .message(message)
+            .title("压测仍在运行")
+            .buttons(MessageDialogButtons::OkCancelCustom(
+                "全部停止并退出".into(),
+                "返回".into(),
+            ))
+            .blocking_show();
+        if !confirmed {
+            return;
+        }
+        let state = app.state::<state::AppState>();
+        let cancelled = state.stress_jobs.cancel_all();
+        log::info!("退出确认：已取消 {cancelled} 个压测任务，等待收尾");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !state.stress_jobs.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if !state.stress_jobs.is_empty() {
+            log::warn!(
+                "压测任务 10s 内未收尾，强制退出（剩余 {} 个）",
+                state.stress_jobs.len()
+            );
+        }
+        app.exit(0);
+    });
 }
 
 /// 系统托盘：左键点击显示主窗口，右键菜单可显示或退出
@@ -121,7 +169,7 @@ fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
             "notes-quick" => notes::quick::show(app),
             "notes-pause-hour" => pause_notes(app, 60),
             "notes-pause-today" => pause_notes(app, 0),
-            "quit" => app.exit(0),
+            "quit" => exit_with_running_jobs(app),
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -141,17 +189,35 @@ fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
 
 pub fn run() {
     tauri::Builder::default()
-        // 单实例必须最先注册：重复启动时不再开新进程，直接唤出已有窗口
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            show_main_window(app);
+        // 单实例必须最先注册：重复启动时不再开新进程，直接唤出已有窗口；
+        // `--stress-plan=12` 在已有进程内打开独立压测窗口，避免多进程争抢 SQLite / 端口 / 托盘
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            let plan_id = argv
+                .iter()
+                .find_map(|arg| arg.strip_prefix("--stress-plan="))
+                .and_then(|value| value.trim().parse::<i64>().ok());
+            match plan_id {
+                Some(id) => {
+                    show_main_window(app);
+                    let app = app.clone();
+                    // 建窗会阻塞主事件循环，放到独立线程（同 quick.rs）
+                    std::thread::spawn(move || {
+                        if let Err(error) = commands::stress::open_stress_window(&app, Some(id), None, None)
+                        {
+                            log::warn!("根据启动参数打开压测窗口失败：{error}");
+                        }
+                    });
+                }
+                None => show_main_window(app),
+            }
         }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         // 记住窗口尺寸/位置/最大化状态，下次启动原样恢复；
-        // 快速记录窗口每次居中弹出，不参与状态记忆
+        // 快速记录窗口每次居中弹出，压测窗口按任务动态创建，均不参与状态记忆
         .plugin(
             tauri_plugin_window_state::Builder::default()
-                .with_denylist(&["quick-capture"])
+                .with_denylist(&["quick-capture", "stress-*"])
                 .build(),
         )
         .setup(|app| {
@@ -196,21 +262,14 @@ pub fn run() {
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                 // 压测期间不抢连接：最多退让 5 次（每次 60s）
                 for _ in 0..5 {
-                    if !handle
-                        .state::<state::AppState>()
-                        .stress_running
-                        .load(std::sync::atomic::Ordering::SeqCst)
-                    {
+                    if handle.state::<state::AppState>().stress_jobs.is_empty() {
                         break;
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                 }
 
                 let state = handle.state::<state::AppState>();
-                if state
-                    .stress_running
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                {
+                if !state.stress_jobs.is_empty() {
                     log::info!("压测仍在运行，本次自动备份跳过");
                     return;
                 }
@@ -224,6 +283,46 @@ pub fn run() {
                 }
             });
 
+            // WAL 体量监管：检查点长期不推进时 -wal 会一直占着磁盘（实测堆积到 198MB）
+            let wal_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    let state = wal_handle.state::<state::AppState>();
+                    if !state.stress_jobs.is_empty() {
+                        continue;
+                    }
+                    let wal = std::fs::metadata(state.db_path.with_extension("db-wal"))
+                        .map(|meta| meta.len())
+                        .unwrap_or(0);
+                    if wal < 32 * 1024 * 1024 {
+                        continue;
+                    }
+                    let Ok(conn) = state.pool.get() else {
+                        continue;
+                    };
+                    // TRUNCATE 会等到读事务结束：被挡住时记日志，便于定位是谁长期占着快照
+                    match conn.query_row(
+                        "PRAGMA wal_checkpoint(TRUNCATE)",
+                        [],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, i64>(2)?,
+                            ))
+                        },
+                    ) {
+                        Ok((0, before, after)) => {
+                            log::info!("WAL 检查点完成：{before} → {after} frames")
+                        }
+                        Ok((busy, before, after)) => log::warn!(
+                            "WAL 检查点被事务阻塞：busy={busy}，共 {before} frames（已检查点 {after}）"
+                        ),
+                        Err(error) => log::warn!("WAL 检查点失败：{error}"),
+                    }
+                }
+            });
             app.manage(commands::winstats::WinStatsState::new());
             setup_tray(app.handle())?;
 
@@ -386,6 +485,11 @@ pub fn run() {
             commands::plan::plan_get,
             commands::plan::plan_save,
             commands::plan::plan_delete,
+            commands::plan::plan_duplicate,
+            commands::plan::plan_export,
+            commands::plan::plan_import_preview,
+            commands::plan::plan_import_apply,
+            commands::plan::plan_templates,
             commands::test_suite::test_suite_list,
             commands::test_suite::test_suite_get,
             commands::test_suite::test_suite_save,
@@ -425,6 +529,12 @@ pub fn run() {
             commands::run::run_clear,
             commands::stress::stress_start,
             commands::stress::stress_stop,
+            commands::stress::stress_stop_all,
+            commands::stress::stress_jobs,
+            commands::stress::stress_open_window,
+            commands::capacity::capacity_probe,
+            commands::capacity::capacity_get,
+            commands::capacity::capacity_cancel,
             commands::report::report_list,
             commands::report::report_get,
             commands::report::report_delete,
@@ -508,10 +618,13 @@ pub fn run() {
             commands::capture::capture_breakpoint_release_all,
         ])
         .on_window_event(|window, event| {
-            // 关闭主窗口时隐藏到托盘，从托盘菜单「退出 AstroMan」才会真正结束进程
+            // 只有主窗口关闭时隐藏到托盘；压测 / 快速记录等辅助窗口正常关闭，
+            // 压测任务归注册表所有，关窗只是关掉视图
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = window.hide();
+                if window.label() == "main" {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
             }
         })
         .build(tauri::generate_context!())
@@ -520,6 +633,12 @@ pub fn run() {
             // 退出前停掉本地 Mock 监听线程，避免端口被占用到进程结束
             if let tauri::RunEvent::Exit = &event {
                 let state = app_handle.state::<state::AppState>();
+                // 退出前把 WAL 合并回主库并截断，避免留一个几百 MB 的日志文件
+                if let Ok(conn) = state.pool.get() {
+                    if let Err(error) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+                        log::warn!("退出时截断 WAL 失败：{error}");
+                    }
+                }
                 crate::services::mock::server::stop_all(&state.mock);
                 let _ = std::fs::remove_file(state.data_dir.join("gui.pid"));
             }

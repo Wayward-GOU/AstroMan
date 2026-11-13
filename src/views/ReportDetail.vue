@@ -23,6 +23,7 @@ import * as api from '@/api'
 import type { ReportDetail, ReportRequestRecord, ReportRequestsPage } from '@/types/models'
 import { buildReportHtml, buildReportSheets } from '@/utils/reportExport'
 import { detectKnee, qpsOverview, scoreReport, selfCheck } from '@/utils/reportAnalytics'
+import { buildFindings, gradeReport, latencyDrift, type Finding } from '@/utils/reportNarrative'
 import { buildXlsx } from '@/utils/xlsx'
 
 const route = useRoute()
@@ -179,6 +180,8 @@ const errors = computed(() => detail.value?.errors ?? [])
 const statusCodes = computed(() => detail.value?.statusCodes ?? [])
 const errorTypes = computed(() => detail.value?.errorTypes ?? [])
 const histogram = computed(() => detail.value?.histogram ?? [])
+const bodyHistogram = computed(() => detail.value?.bodyHistogram ?? [])
+const slowRequests = computed(() => detail.value?.slowRequests ?? [])
 const stages = computed(() => detail.value?.stages ?? [])
 const config = computed(() => detail.value?.config ?? null)
 const metrics = computed(() => config.value?.metrics ?? null)
@@ -194,6 +197,143 @@ const knee = computed(() => (detail.value ? detectKnee(detail.value) : null))
 const score = computed(() => (detail.value ? scoreReport(detail.value) : null))
 const checks = computed(() => (detail.value ? selfCheck(detail.value) : []))
 const checksPassed = computed(() => checks.value.every((item) => item.pass))
+
+/* ---------- 关键发现与结论（3.4.1） ---------- */
+const findings = computed<Finding[]>(() => (detail.value ? buildFindings(detail.value) : []))
+const gradeInfo = computed(() => (detail.value ? gradeReport(detail.value) : null))
+
+const FINDING_TAG: Record<Finding['level'], string> = {
+  bad: 'P0',
+  warn: 'P1',
+  info: '提示',
+  ok: '正常',
+}
+
+/** 前后半程 RT 漂移：>15% warn、>40% bad（与导出报告同一口径） */
+const drift = computed(() => (detail.value ? latencyDrift(detail.value) : 0))
+const driftTone = computed(() => (drift.value > 0.4 ? 'bad' : drift.value > 0.15 ? 'warn' : 'ok'))
+
+/** 采样/计数/流量不自洽的项前置到顶部（3.4.3） */
+const biasChecks = computed(() => checks.value.filter((item) => !item.pass))
+
+/* ---------- 施压端能力快照（3.7.1） ---------- */
+const capacity = computed(() => config.value?.machineCapacity ?? null)
+const capacityUsage = computed(() => {
+  const snapshot = capacity.value
+  const avg = report.value?.avgQps ?? 0
+  if (!snapshot?.maxQps || avg <= 0) return null
+  return (avg / snapshot.maxQps) * 100
+})
+
+/* ---------- 目标地址兜底（3.5.2） ---------- */
+const targetUrlInfo = computed(() => {
+  const cfg = config.value
+  const raw = cfg?.url?.trim() ?? ''
+  const resolved = cfg?.target?.resolvedUrl?.trim() ?? ''
+  const isUnresolved = (text: string) => !text || text.includes('{{')
+  if (raw && !isUnresolved(raw)) {
+    return { url: raw, source: 'config' as const, note: '' }
+  }
+  if (resolved && !isUnresolved(resolved)) {
+    return { url: resolved, source: 'resolved' as const, note: '' }
+  }
+  const first = requestItems.value.find((item) => item.url && !isUnresolved(item.url))
+  if (first) {
+    return {
+      url: first.url,
+      source: 'record' as const,
+      note: '旧报告未保存解析后地址，这里取首条请求明细的 URL',
+    }
+  }
+  return {
+    url: '',
+    source: 'none' as const,
+    note: '未记录解析后地址，请重新压测',
+  }
+})
+
+/* ---------- 基线对比（3.4.4） ---------- */
+const baseline = ref<ReportDetail | null>(null)
+const baselineLoading = ref(false)
+
+async function loadBaseline() {
+  const id = config.value?.baselineReportId
+  if (!id || id === reportId.value) {
+    baseline.value = null
+    return
+  }
+  baselineLoading.value = true
+  try {
+    baseline.value = await api.reportGet(id)
+  } catch {
+    baseline.value = null
+  } finally {
+    baselineLoading.value = false
+  }
+}
+
+watch(
+  () => config.value?.baselineReportId,
+  () => {
+    void loadBaseline()
+  },
+)
+
+interface BaselineRow {
+  label: string
+  current: string
+  base: string
+  delta: string
+  tone: 'ok' | 'warn' | 'bad' | 'muted'
+}
+
+const baselineRows = computed<BaselineRow[]>(() => {
+  const current = report.value
+  const base = baseline.value?.report
+  if (!current || !base) return []
+  const ratio = (value: number, origin: number) =>
+    origin > 0 ? ((value - origin) / origin) * 100 : null
+  const deltaText = (value: number | null) =>
+    value === null ? '—' : `${value >= 0 ? '+' : ''}${value.toFixed(1)}%`
+  const latencyRow = (label: string, value: number, origin: number) => {
+    const pct = ratio(value, origin)
+    return {
+      label,
+      current: `${fmtNum(value)} ms`,
+      base: `${fmtNum(origin)} ms`,
+      delta: deltaText(pct),
+      tone: pct === null ? 'muted' : pct > 40 ? 'bad' : pct > 15 ? 'warn' : 'ok',
+    } as BaselineRow
+  }
+  const qpsPct = ratio(current.avgQps, base.avgQps)
+  const errPct = ratio(current.errorRate, base.errorRate)
+  return [
+    latencyRow('P95 延迟', current.p95Rt, base.p95Rt),
+    latencyRow('P99 延迟', current.p99Rt, base.p99Rt),
+    latencyRow('平均延迟', current.avgRt, base.avgRt),
+    {
+      label: '平均 QPS',
+      current: fmtNum(current.avgQps),
+      base: fmtNum(base.avgQps),
+      delta: deltaText(qpsPct),
+      tone: qpsPct === null ? 'muted' : qpsPct < -20 ? 'bad' : qpsPct < -5 ? 'warn' : 'ok',
+    },
+    {
+      label: '错误率',
+      current: `${current.errorRate.toFixed(2)}%`,
+      base: `${base.errorRate.toFixed(2)}%`,
+      delta: deltaText(errPct),
+      tone:
+        errPct === null
+          ? 'muted'
+          : current.errorRate - base.errorRate > 0.5
+            ? 'bad'
+            : current.errorRate - base.errorRate > 0.1
+              ? 'warn'
+              : 'ok',
+    },
+  ]
+})
 
 const recordModeText = computed(() => {
   const mode = metrics.value?.recordMode ?? config.value?.recordDetail
@@ -273,8 +413,12 @@ function clearDetails() {
     okType: 'danger',
     cancelText: '取消',
     async onOk() {
-      const removed = await api.reportClearDetails(report.value!.id)
-      message.success(`已清理 ${removed.toLocaleString()} 条明细`)
+      const result = await api.reportClearDetails(report.value!.id)
+      const freed = result.freedBytes > 0 ? `，释放 ${fmtBytes(result.freedBytes)}` : ''
+      message.success(`已清理 ${result.removed.toLocaleString()} 条明细${freed}`)
+      if (result.compactError) {
+        message.warning(`数据库压缩未完成：${result.compactError}`)
+      }
       await loadRequests()
     },
   })
@@ -411,6 +555,40 @@ const slaChecks = computed(() => {
 const slaPassed = computed(() => slaChecks.value.length === 0 || slaChecks.value.every((r) => r.pass))
 
 const maxHistogram = computed(() => Math.max(1, ...histogram.value.map((b) => b.count)))
+const maxBodyHistogram = computed(() => Math.max(1, ...bodyHistogram.value.map((b) => b.count)))
+const slowMaxLatency = computed(() =>
+  Math.max(1, ...slowRequests.value.map((item) => item.latencyMs)),
+)
+
+/** 按请求数加权的 Body 平均（逐秒采样点加权，旧报告无该字段时按 0 处理） */
+const avgBody = computed(() => {
+  let sum = 0
+  let weight = 0
+  for (const sample of samples.value) {
+    const count = sample.successCount + sample.errorCount
+    sum += (sample.bodyAvg || 0) * count
+    weight += count
+  }
+  return weight ? sum / weight : 0
+})
+
+/** Body P95 从报告层直方图算；分位数不能由两个分位数相减 */
+const p95Body = computed(() => {
+  const buckets = bodyHistogram.value
+  const total = buckets.reduce((acc, item) => acc + item.count, 0)
+  if (!total) {
+    return Math.max(0, ...samples.value.map((sample) => sample.bodyP95 || 0))
+  }
+  const target = total * 0.95
+  let acc = 0
+  for (const bucket of buckets) {
+    acc += bucket.count
+    if (acc >= target) {
+      return Number.isFinite(bucket.maxMs) ? (bucket.minMs + bucket.maxMs) / 2 : bucket.minMs
+    }
+  }
+  return 0
+})
 
 const maxCodeCount = computed(() => Math.max(1, ...statusCodes.value.map((s) => s.count)))
 const codeTotal = computed(() => statusCodes.value.reduce((sum, s) => sum + s.count, 0))
@@ -437,6 +615,16 @@ function fmtBytes(v: number | undefined | null) {
 
 function fmtTime(ts?: number | null) {
   return formatDateTime(ts)
+}
+
+/** 压测内相对时间：12.3s / 1m02s / 1h02m */
+function fmtDuration(ms?: number | null) {
+  if (!ms || ms < 0) return '0s'
+  const sec = ms / 1000
+  if (sec < 60) return `${sec.toFixed(1)}s`
+  const min = Math.floor(sec / 60)
+  if (min < 60) return `${min}m${String(Math.floor(sec % 60)).padStart(2, '0')}s`
+  return `${Math.floor(min / 60)}h${String(min % 60).padStart(2, '0')}m`
 }
 
 function codeTone(code: number) {
@@ -515,8 +703,9 @@ function remove() {
     okType: 'danger',
     cancelText: '取消',
     async onOk() {
-      await api.reportDelete(report.value!.id)
-      message.success('已删除')
+      const result = await api.reportDelete(report.value!.id)
+      const freed = result.freedBytes > 0 ? `，释放 ${fmtBytes(result.freedBytes)}` : ''
+      message.success(`已删除${freed}`)
       router.push('/stress')
     },
   })
@@ -586,9 +775,19 @@ function remove() {
               <span v-if="qps?.attainment != null" class="dot-sep">·</span>
               <span v-if="qps?.attainment != null">达成 {{ fmtNum(qps.attainment, 0) }}%</span>
             </div>
-            <div v-if="config?.url" class="target-line">
-              <span class="method-chip">{{ config.method || 'GET' }}</span>
-              <span class="target-url mono" :title="config.url">{{ config.url }}</span>
+            <div v-if="targetUrlInfo.url || targetUrlInfo.note" class="target-line">
+              <span class="method-chip">{{ config?.method || 'GET' }}</span>
+              <span
+                v-if="targetUrlInfo.url"
+                class="target-url mono"
+                :title="`${targetUrlInfo.url}（点击复制）`"
+                @click="copyText(targetUrlInfo.url, '地址')"
+                >{{ targetUrlInfo.url }}</span
+              >
+              <span v-else class="target-url missing">{{ targetUrlInfo.note }}</span>
+              <span v-if="targetUrlInfo.url && targetUrlInfo.note" class="target-note">
+                {{ targetUrlInfo.note }}
+              </span>
             </div>
           </div>
           <div class="verdict" :class="verdict.tone">
@@ -599,6 +798,48 @@ function remove() {
               <div class="verdict-title">{{ verdict.title }}</div>
               <div class="verdict-desc">{{ verdict.desc }}</div>
             </div>
+          </div>
+        </div>
+
+        <div class="fm-card findings-card">
+          <div class="card-head">
+            <div>
+              <div class="card-title">关键发现</div>
+              <div class="card-sub">按风险从高到低排列，映射 P0 / P1 与导出报告一致</div>
+            </div>
+            <span v-if="gradeInfo" class="grade-badge" :class="gradeInfo.grade">
+              {{ gradeInfo.label }}
+            </span>
+          </div>
+          <div v-if="gradeInfo" class="grade-statement">
+            {{ gradeInfo.statement }}
+            <span class="grade-reason">{{ gradeInfo.reason }}</span>
+          </div>
+
+          <div v-if="biasChecks.length" class="bias-banner">
+            <b>数据自洽性提示</b>
+            <span>
+              {{ biasChecks.map((item) => `${item.label}：${item.detail}`).join('；') }}
+            </span>
+          </div>
+
+          <div class="finding-list">
+            <div v-for="(item, index) in findings" :key="index" class="finding-row" :class="item.level">
+              <span class="finding-tag">{{ FINDING_TAG[item.level] }}</span>
+              <div class="finding-body">
+                <div class="finding-title">{{ item.title }}</div>
+                <div class="finding-detail">{{ item.detail }}</div>
+              </div>
+            </div>
+            <div v-if="!findings.length" class="inline-empty">样本不足，暂未生成关键发现</div>
+          </div>
+
+          <div class="drift-row">
+            <span class="drift-label">响应时间漂移（后半程 vs 前半程）</span>
+            <span class="drift-value mono" :class="driftTone">
+              {{ drift > 0 ? '+' : '' }}{{ (drift * 100).toFixed(1) }}%
+            </span>
+            <span class="drift-rule">&gt;15% 告警，&gt;40% 严重</span>
           </div>
         </div>
 
@@ -645,6 +886,94 @@ function remove() {
               <i>{{ apdexGrade.label }}</i>
             </span>
           </div>
+        </div>
+
+        <div class="fm-card capacity-card">
+          <div class="card-head">
+            <div>
+              <div class="card-title">施压端能力</div>
+              <div class="card-sub">客户端极限来自本机回环检测，只用于判断施压端余量</div>
+            </div>
+            <span v-if="capacity" class="capacity-badge">
+              客户端极限 {{ capacity.reachedLimit === false ? '≥ ' : '' }}{{ fmtNum(capacity.maxQps, 0) }} QPS
+            </span>
+            <span v-else class="capacity-badge muted">未检测本机施压能力</span>
+          </div>
+          <div v-if="capacity" class="capacity-grid">
+            <div class="capacity-cell">
+              <span>本次平均</span>
+              <b>{{ fmtNum(report.avgQps, 0) }} QPS</b>
+            </div>
+            <div class="capacity-cell">
+              <span>客户端负载占比</span>
+              <b :class="capacityUsage !== null && capacityUsage >= 80 ? 'bad' : 'ok'">
+                {{ capacityUsage === null ? '—' : `${capacityUsage.toFixed(1)}%` }}
+              </b>
+            </div>
+            <div class="capacity-cell">
+              <span>检测时间</span>
+              <b>{{ fmtTime(capacity.probedAt) }}</b>
+            </div>
+            <div class="capacity-cell">
+              <span>CPU 核数</span>
+              <b>{{ capacity.cores ?? '—' }} 核</b>
+            </div>
+            <div class="capacity-cell">
+              <span>检测峰值 CPU</span>
+              <b>{{ capacity.cpuPeak ? `${capacity.cpuPeak.toFixed(1)} 核` : '—' }}</b>
+            </div>
+            <div class="capacity-cell">
+              <span>饱和并发</span>
+              <b>{{ capacity.saturationConcurrent ?? '—' }}</b>
+            </div>
+          </div>
+          <div v-if="capacity" class="capacity-note">
+            回环检测值，非目标系统容量，实际受网络 RTT 与目标侧影响。
+            <template v-if="capacityUsage !== null && capacityUsage < 50">
+              客户端余量充足，瓶颈不在施压端。
+            </template>
+            <template v-else-if="capacityUsage !== null && capacityUsage >= 80">
+              客户端接近能力上限，结论需谨慎。
+            </template>
+          </div>
+          <div v-else class="capacity-note">
+            在「设置 → 本机施压能力」完成检测后，新生成的报告会自动带上该快照；导出报告不会推断数值。
+          </div>
+        </div>
+
+        <div v-if="config?.baselineReportId" class="fm-card baseline-card">
+          <div class="card-head">
+            <div>
+              <div class="card-title">基线对比</div>
+              <div class="card-sub">对照历史报告 #{{ config.baselineReportId }}，延迟上升或吞吐下降需关注</div>
+            </div>
+            <a-spin v-if="baselineLoading" size="small" />
+            <span v-else-if="!baseline" class="capacity-badge muted">基线报告不存在或已删除</span>
+          </div>
+          <template v-if="baseline">
+            <div class="baseline-head">
+              <span>{{ baseline.report.planName }}</span>
+              <span>{{ fmtTime(baseline.report.startTime) }}</span>
+              <span>并发 {{ baseline.report.concurrency }}</span>
+              <a-button type="link" size="small" @click="router.push(`/reports/${baseline!.report.id}`)">
+                查看基线
+              </a-button>
+            </div>
+            <div class="baseline-table">
+              <div class="baseline-row baseline-head-row">
+                <span>指标</span>
+                <span>本次</span>
+                <span>基线</span>
+                <span>变化</span>
+              </div>
+              <div v-for="row in baselineRows" :key="row.label" class="baseline-row">
+                <span class="baseline-label">{{ row.label }}</span>
+                <span class="mono">{{ row.current }}</span>
+                <span class="mono muted">{{ row.base }}</span>
+                <span class="mono" :class="row.tone">{{ row.delta }}</span>
+              </div>
+            </div>
+          </template>
         </div>
 
         <div class="fm-card text-card">
@@ -787,6 +1116,14 @@ function remove() {
                 <span class="p-value mono">{{ fmtNum(report.ttfbP95) }} ms</span>
               </div>
               <div class="extra-item">
+                <span class="p-label">Body 平均</span>
+                <span class="p-value mono">{{ fmtNum(avgBody) }} ms</span>
+              </div>
+              <div class="extra-item">
+                <span class="p-label">Body P95</span>
+                <span class="p-value mono">{{ fmtNum(p95Body) }} ms</span>
+              </div>
+              <div class="extra-item">
                 <span class="p-label">总传输字节</span>
                 <span class="p-value mono">{{ fmtBytes(report.bytesTotal) }}</span>
               </div>
@@ -878,6 +1215,25 @@ function remove() {
               </div>
             </div>
             <div v-else class="inline-empty">没有直方图数据</div>
+          </div>
+          <div class="fm-card chart-card">
+            <div class="chart-head">
+              <span class="chart-title">响应体读取耗时</span>
+              <span class="chart-sub">body = 总耗时 − TTFB，单位 ms</span>
+            </div>
+            <div v-if="bodyHistogram.length" class="histogram">
+              <div v-for="bucket in bodyHistogram" :key="bucket.label" class="hist-row">
+                <span class="hist-label">{{ bucket.label }}</span>
+                <div class="hist-track">
+                  <div
+                    class="hist-bar body"
+                    :style="{ width: `${(bucket.count / maxBodyHistogram) * 100}%` }"
+                  />
+                </div>
+                <span class="hist-count mono">{{ bucket.count.toLocaleString() }}</span>
+              </div>
+            </div>
+            <div v-else class="inline-empty">历史报告未记录响应体耗时直方图</div>
           </div>
         </div>
 
@@ -981,7 +1337,14 @@ function remove() {
             </div>
             <div class="config-item wide">
               <span class="c-label">请求 URL</span>
-              <span class="c-value mono">{{ config.url }}</span>
+              <span
+                v-if="targetUrlInfo.url"
+                class="c-value mono c-value-url"
+                :title="`${targetUrlInfo.url}（点击复制）`"
+                @click="copyText(targetUrlInfo.url, '地址')"
+                >{{ targetUrlInfo.url }}</span
+              >
+              <span v-else class="c-value mono c-value-url missing">{{ targetUrlInfo.note }}</span>
             </div>
             <div class="config-item">
               <span class="c-label">请求头</span>
@@ -1017,6 +1380,50 @@ function remove() {
             </div>
           </div>
           <div v-else class="inline-empty">历史报告未保存配置快照</div>
+        </div>
+
+        <div v-if="slowRequests.length" class="section-head">
+          <div>
+            <h2 class="section-title">TopN 慢请求</h2>
+            <div class="section-desc">
+              定位模式保留的最慢 {{ slowRequests.length }} 条请求，按总耗时降序
+            </div>
+          </div>
+        </div>
+        <div v-if="slowRequests.length" class="fm-card request-card">
+          <div class="data-table request-table">
+            <table>
+              <thead>
+                <tr>
+                  <th class="req-index">#</th>
+                  <th class="req-time">发生时间</th>
+                  <th class="req-method-col">方法</th>
+                  <th class="req-url-col">URL</th>
+                  <th>状态</th>
+                  <th>总耗时</th>
+                  <th>TTFB</th>
+                  <th>Body</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="(item, index) in slowRequests" :key="`${item.elapsedMs}-${index}`">
+                  <td class="req-index mono">{{ index + 1 }}</td>
+                  <td class="req-time mono">{{ fmtDuration(item.elapsedMs) }}</td>
+                  <td class="req-method-col">
+                    <span class="req-method">{{ item.method }}</span>
+                  </td>
+                  <td class="req-url-col mono" :title="item.url">{{ item.url }}</td>
+                  <td class="mono" :class="{ bad: item.status >= 400 }">{{ item.status || '-' }}</td>
+                  <td class="mono slow-cell">
+                    <span class="slow-bar" :style="{ width: `${(item.latencyMs / slowMaxLatency) * 100}%` }" />
+                    <span>{{ fmtNum(item.latencyMs, 0) }} ms</span>
+                  </td>
+                  <td class="mono">{{ fmtNum(item.ttfbMs, 0) }} ms</td>
+                  <td class="mono">{{ fmtNum(item.bodyMs, 0) }} ms</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
         </div>
 
         <div class="section-head">
@@ -1376,10 +1783,10 @@ function remove() {
 
 .target-line {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 8px;
   margin-top: 8px;
-  max-width: 560px;
+  max-width: 100%;
 }
 
 .method-chip {
@@ -1394,11 +1801,14 @@ function remove() {
 }
 
 .target-url {
-  font-size: 11px;
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  line-height: 1.5;
   color: var(--fm-text-2);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: normal;
+  word-break: break-all;
+  cursor: copy;
 }
 
 .verdict {
@@ -1801,6 +2211,28 @@ function remove() {
   border-radius: 999px;
   background: linear-gradient(90deg, var(--fm-primary), var(--fm-primary-dark));
   transition: width 0.3s ease;
+}
+
+.hist-bar.body {
+  background: linear-gradient(90deg, var(--fm-warning), var(--fm-danger));
+}
+
+/* TopN 慢请求：耗时条嵌在单元格里，直观看出最慢的那几条 */
+.slow-cell {
+  position: relative;
+  min-width: 110px;
+}
+
+.slow-bar {
+  position: absolute;
+  inset: 4px auto 4px 4px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--fm-danger) 18%, transparent);
+  pointer-events: none;
+}
+
+.slow-cell span:last-child {
+  position: relative;
 }
 
 .hist-count {
@@ -2208,6 +2640,18 @@ function remove() {
   white-space: nowrap;
 }
 
+/* 配置快照里的完整 URL：占满整行、可换行、点击复制（3.1.2） */
+.c-value-url {
+  grid-column: 1 / -1;
+  overflow: visible;
+  white-space: normal;
+  word-break: break-all;
+  font-weight: 500;
+  line-height: 1.55;
+  cursor: copy;
+  user-select: all;
+}
+
 .inline-empty {
   padding: 22px 0;
   text-align: center;
@@ -2451,6 +2895,260 @@ function remove() {
   line-height: 1.6;
   color: var(--fm-muted);
 }
+
+/* ---------- 关键发现 ---------- */
+.findings-card {
+  margin-top: 12px;
+}
+.grade-badge {
+  font-size: 11px;
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-weight: 600;
+}
+.grade-badge.pass {
+  color: var(--fm-success);
+  background: var(--fm-success-soft);
+}
+.grade-badge.conditional {
+  color: var(--fm-warning);
+  background: var(--fm-warning-soft);
+}
+.grade-badge.fail {
+  color: var(--fm-danger);
+  background: var(--fm-danger-soft);
+}
+.grade-statement {
+  font-size: 12.5px;
+  color: var(--fm-text);
+  line-height: 1.7;
+  margin-bottom: 10px;
+}
+.grade-reason {
+  color: var(--fm-muted);
+  font-size: 11.5px;
+  margin-left: 6px;
+}
+.bias-banner {
+  display: flex;
+  gap: 8px;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--fm-warning);
+  background: var(--fm-warning-soft);
+  border: 1px solid var(--fm-warning);
+  border-radius: var(--fm-radius-sm);
+}
+.bias-banner b {
+  white-space: nowrap;
+}
+.finding-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.finding-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--fm-border);
+  border-left-width: 3px;
+  border-radius: var(--fm-radius-sm);
+  background: var(--fm-surface-alt);
+}
+.finding-row.bad {
+  border-left-color: var(--fm-danger);
+}
+.finding-row.warn {
+  border-left-color: var(--fm-warning);
+}
+.finding-row.info {
+  border-left-color: var(--fm-primary);
+}
+.finding-row.ok {
+  border-left-color: var(--fm-success);
+}
+.finding-tag {
+  flex-shrink: 0;
+  min-width: 34px;
+  text-align: center;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: var(--fm-surface);
+  color: var(--fm-text-2);
+  border: 1px solid var(--fm-border);
+}
+.finding-row.bad .finding-tag {
+  color: var(--fm-danger);
+  border-color: var(--fm-danger);
+}
+.finding-row.warn .finding-tag {
+  color: var(--fm-warning);
+  border-color: var(--fm-warning);
+}
+.finding-row.ok .finding-tag {
+  color: var(--fm-success);
+  border-color: var(--fm-success);
+}
+.finding-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--fm-text);
+}
+.finding-detail {
+  font-size: 11.5px;
+  line-height: 1.65;
+  color: var(--fm-muted);
+  margin-top: 2px;
+}
+.drift-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--fm-border);
+  font-size: 12px;
+}
+.drift-label {
+  color: var(--fm-text-2);
+}
+.drift-value {
+  font-weight: 700;
+}
+.drift-value.ok {
+  color: var(--fm-success);
+}
+.drift-value.warn {
+  color: var(--fm-warning);
+}
+.drift-value.bad {
+  color: var(--fm-danger);
+}
+.drift-rule {
+  color: var(--fm-muted);
+  font-size: 11px;
+  margin-left: auto;
+}
+
+/* ---------- 施压端能力 ---------- */
+.capacity-card {
+  margin-top: 12px;
+}
+.capacity-badge {
+  font-size: 11px;
+  padding: 2px 10px;
+  border-radius: 999px;
+  color: var(--fm-primary);
+  background: var(--fm-primary-soft);
+  font-weight: 600;
+}
+.capacity-badge.muted {
+  color: var(--fm-muted);
+  background: var(--fm-surface-alt);
+  font-weight: 400;
+}
+.capacity-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 8px;
+}
+.capacity-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  border: 1px solid var(--fm-border);
+  background: var(--fm-surface-alt);
+}
+.capacity-cell span {
+  font-size: 10.5px;
+  color: var(--fm-muted);
+}
+.capacity-cell b {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fm-text);
+}
+.capacity-cell b.ok {
+  color: var(--fm-success);
+}
+.capacity-cell b.bad {
+  color: var(--fm-danger);
+}
+.capacity-note {
+  margin-top: 8px;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--fm-muted);
+}
+
+/* ---------- 基线对比 ---------- */
+.baseline-card {
+  margin-top: 12px;
+}
+.baseline-head {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  font-size: 11.5px;
+  color: var(--fm-muted);
+  margin-bottom: 8px;
+}
+.baseline-table {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--fm-border);
+}
+.baseline-row {
+  display: grid;
+  grid-template-columns: 1.2fr 1fr 1fr 1fr;
+  gap: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+  border-top: 1px solid var(--fm-border);
+}
+.baseline-row:first-child {
+  border-top: none;
+}
+.baseline-head-row {
+  font-size: 11px;
+  color: var(--fm-muted);
+  background: var(--fm-surface-alt);
+}
+.baseline-label {
+  color: var(--fm-text-2);
+}
+.baseline-row .muted {
+  color: var(--fm-muted);
+}
+.baseline-row .ok {
+  color: var(--fm-success);
+}
+.baseline-row .warn {
+  color: var(--fm-warning);
+}
+.baseline-row .bad {
+  color: var(--fm-danger);
+}
+.baseline-row .muted.tone {
+  color: var(--fm-muted);
+}
+.target-note {
+  font-size: 10.5px;
+  color: var(--fm-warning);
+  margin-left: 8px;
+}
+.target-url.missing,
+.c-value-url.missing {
+  color: var(--fm-warning);
+}
+
 @media (max-width: 1180px) {
   .text-grid {
     grid-template-columns: 1fr;

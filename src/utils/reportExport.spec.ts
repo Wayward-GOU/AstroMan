@@ -12,6 +12,8 @@ function makeSamples(count: number): ReportSample[] {
     p95Rt: 40,
     p99Rt: 80,
     ttfbAvg: 12,
+    bodyAvg: 8,
+    bodyP95: 10,
     bytes: 1024 * 200,
     successCount: 5000,
     errorCount: index % 10 === 0 ? 5 : 0,
@@ -193,6 +195,38 @@ describe('buildReportHtml · 正式报告结构', () => {
     expect(html).not.toContain('undefined')
     expect(html).not.toContain('NaN')
     expect(html).not.toContain('[object Object]')
+  })
+})
+
+describe('buildReportHtml · 施压端能力与长 URL', () => {
+  it('未检测本机能力时明确标注，不推断数值', () => {
+    const html = buildReportHtml(makeDetail(60), requests)
+    expect(html).toContain('未检测本机施压能力')
+  })
+
+  it('已检测时展示客户端极限与负载占比（3.7.2）', () => {
+    const detail = makeDetail(60)
+    detail.config = {
+      ...detail.config,
+      machineCapacity: { maxQps: 8000, reachedLimit: true, cores: 8, cpuPeak: 6.4, probedAt: 1_700_000_000_000 },
+    }
+    const html = buildReportHtml(detail, requests)
+    expect(html).toContain('客户端极限')
+    expect(html).toContain('8,000 QPS')
+    expect(html).toContain('客户端负载占比')
+    expect(html).toContain('回环检测值')
+  })
+
+  it('长 URL 完整保留，不截断（3.2.2 / 7.4）', () => {
+    const longUrl = `http://127.0.0.1:8080/api/orders?${Array.from(
+      { length: 12 },
+      (_, index) => `param${index}=value${index}`,
+    ).join('&')}`
+    const detail = makeDetail(60)
+    detail.config = { ...detail.config, url: longUrl }
+    const html = buildReportHtml(detail, requests)
+    // HTML 会转义 &，但只要未截断，转义后的完整地址仍应出现
+    expect(html).toContain(longUrl.replace(/&/g, '&amp;'))
   })
 })
 

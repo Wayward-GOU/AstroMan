@@ -400,6 +400,22 @@ pub struct HistoryStats {
 pub struct CleanupResult {
     pub history: u32,
     pub runs: u32,
+    /// 压缩后实际释放的字节（主库 + WAL）
+    pub freed_bytes: u64,
+    /// 压缩失败原因；数据删除已提交，不影响删除结果
+    pub compact_error: Option<String>,
+}
+
+/// 删除报告 / 明细后的空间回收结果
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReclaimResult {
+    /// 删除的行数
+    pub removed: u64,
+    /// 压缩后实际释放的字节（主库 + WAL）
+    pub freed_bytes: u64,
+    /// 压缩失败原因；数据删除已提交，不影响删除结果
+    pub compact_error: Option<String>,
 }
 
 /// 运行记录列表摘要：只带 2KB 预览与体积信息。
@@ -614,11 +630,40 @@ impl RecordDetailMode {
     }
 }
 
+/// 采集模式预设（v1.1.1）：把已有自动降档能力显式化
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CapturePreset {
+    /// 容量优先：明细按 QPS 自动降档，保证压测本身稳定
+    Capacity,
+    /// 定位优先：默认全量明细 + TopN 慢请求
+    Locate,
+    /// 沿用 `recordDetail` 的显式设置
+    #[default]
+    Auto,
+}
+
+impl CapturePreset {
+    pub fn label(&self) -> &'static str {
+        match self {
+            CapturePreset::Capacity => "capacity",
+            CapturePreset::Locate => "locate",
+            CapturePreset::Auto => "auto",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StressConfig {
     #[serde(default)]
     pub request_id: Option<i64>,
+    /// 所属项目：环境变量回退与计划保存用
+    #[serde(default)]
+    pub project_id: Option<i64>,
+    /// 来源计划：写入报告，便于按计划聚合
+    #[serde(default)]
+    pub plan_id: Option<i64>,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default = "default_method")]
@@ -678,6 +723,24 @@ pub struct StressConfig {
     /// 逐请求明细采集策略，默认 auto
     #[serde(default)]
     pub record_detail: RecordDetailMode,
+    /// 采集模式预设：capacity / locate / auto（默认 auto，沿用 record_detail）
+    #[serde(default)]
+    pub capture_mode: CapturePreset,
+    /// 定位模式保留的慢请求条数（默认 200，0 = 不保留）
+    #[serde(default)]
+    pub top_n: Option<u32>,
+    /// 只记录慢于该阈值的请求（毫秒），0 或空 = 不设阈值
+    #[serde(default)]
+    pub slow_threshold_ms: Option<u64>,
+    /// 同目标冲突时忽略并继续（报告会留痕）
+    #[serde(default)]
+    pub ignore_overlap: bool,
+    /// 手动计划选择的历史报告基线（3.4.4），随报告配置快照保存
+    #[serde(default)]
+    pub baseline_report_id: Option<i64>,
+    /// 超过 2 小时的长稳启动确认（未确认时拒绝启动）
+    #[serde(default)]
+    pub long_run_ack: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -691,6 +754,12 @@ pub struct ReportSample {
     pub p95_rt: f64,
     pub p99_rt: f64,
     pub ttfb_avg: f64,
+    /// 响应体读取耗时（latency - ttfb）均值
+    #[serde(default)]
+    pub body_avg: f64,
+    /// 响应体读取耗时 P95（来自独立直方图，不能用两个分位数相减）
+    #[serde(default)]
+    pub body_p95: f64,
     pub bytes: u64,
     pub success_count: u64,
     pub error_count: u64,
@@ -775,10 +844,57 @@ pub struct StageSummary {
     pub p95_rt: f64,
 }
 
+/// TopN 慢请求快照（v1.1.1）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlowRequest {
+    pub elapsed_ms: i64,
+    pub method: String,
+    pub url: String,
+    pub status: i64,
+    pub latency_ms: i64,
+    pub ttfb_ms: i64,
+    /// body = latency - ttfb
+    pub body_ms: i64,
+}
+
+/// 本机施压能力检测的逐档采样
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapacitySample {
+    pub concurrent: u32,
+    pub qps: f64,
+    pub avg_rt: f64,
+    pub p95_rt: f64,
+    /// 错误率（%）
+    pub error_rate: f64,
+    /// AstroMan 进程占用核数（不是整机 CPU 百分比）
+    pub cpu: f32,
+    pub mem_mb: u64,
+}
+
+/// 本机施压能力检测结果
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapacityResult {
+    pub probed_at: i64,
+    pub max_qps: f64,
+    pub saturation_concurrent: u32,
+    pub cpu_peak: f32,
+    pub mem_peak: u64,
+    pub cores: u32,
+    pub os: String,
+    /// true 表示已找到饱和点；false 表示 1024 并发仍未触顶
+    pub reached_limit: bool,
+    pub samples: Vec<CapacitySample>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct StressReport {
-    pub id: i64,
+pub struct StressReport {    pub id: i64,
+    pub plan_id: Option<i64>,
+    /// 同批多报告分组号
+    pub run_group_id: Option<i64>,
     pub plan_name: String,
     pub request_id: Option<i64>,
     pub total_requests: i64,
@@ -818,7 +934,13 @@ pub struct ReportDetail {
     pub status_codes: Vec<StatusCount>,
     pub error_types: Vec<ErrorTypeCount>,
     pub histogram: Vec<HistogramBucket>,
+    /// 响应体读取耗时直方图（v15）
+    #[serde(default)]
+    pub body_histogram: Vec<HistogramBucket>,
     pub stages: Vec<StageSummary>,
+    /// TopN 慢请求（定位模式）
+    #[serde(default)]
+    pub slow_requests: Vec<SlowRequest>,
     pub config: Option<serde_json::Value>,
     /// 用户可编辑的测试场景描述
     pub scenario_text: Option<String>,
@@ -829,6 +951,8 @@ pub struct ReportDetail {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StressProgress {
+    /// 任务号：多窗口 / 多任务下前端按它过滤事件
+    pub job_id: u64,
     pub name: String,
     pub running: bool,
     pub elapsed_sec: u64,
@@ -854,6 +978,7 @@ pub struct StressProgress {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StressDone {
+    pub job_id: u64,
     pub report_id: Option<i64>,
     pub name: String,
     pub status: String,

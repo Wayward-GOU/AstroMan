@@ -126,6 +126,8 @@ pub fn data_cleanup(
         return Ok(CleanupResult {
             history: history_count,
             runs: runs_count,
+            freed_bytes: 0,
+            compact_error: None,
         });
     }
 
@@ -139,16 +141,21 @@ pub fn data_cleanup(
     } else {
         0
     };
+    drop(conn);
 
-    // 删除后 SQLite 文件不会自动缩小，按需压缩一次回收空间
-    if vacuum.unwrap_or(false) && (history_count > 0 || runs_count > 0) {
-        if let Err(error) = conn.execute_batch("VACUUM;") {
-            log::warn!("压缩数据库失败（已忽略）：{error}");
-        }
-    }
+    // DELETE 只把页标成空闲，文件不会缩小；按需截断 WAL 并 VACUUM，把实际释放量返回给前端
+    let (freed_bytes, compact_error) = if vacuum.unwrap_or(false)
+        && (history_count > 0 || runs_count > 0)
+    {
+        crate::db::compact_after_delete(&state)
+    } else {
+        (0, None)
+    };
 
     Ok(CleanupResult {
         history: history_count,
         runs: runs_count,
+        freed_bytes,
+        compact_error,
     })
 }

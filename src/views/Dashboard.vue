@@ -31,7 +31,13 @@ import { useAiAssistStore } from '@/stores/aiAssist'
 import { useHangzaiTaskStore } from '@/stores/hangzaiTask'
 import { dashboardInsightPrompt } from '@/utils/aiScenarios'
 import * as api from '@/api'
-import type { DashboardMetrics, RequestSearchHit, StorageInfo, WorkspaceStats } from '@/types/models'
+import type {
+  DashboardMetrics,
+  RequestSearchHit,
+  StorageInfo,
+  StressJobSummary,
+  WorkspaceStats,
+} from '@/types/models'
 
 const router = useRouter()
 const store = useProjectStore()
@@ -582,6 +588,65 @@ function formatRelative(ts: number) {
   return new Date(ts).toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' })
 }
 
+/* ---------- 运行中的压测（1.2.4） ---------- */
+const stressJobs = ref<StressJobSummary[]>([])
+let stressTimer: number | null = null
+
+async function loadStressJobs() {
+  try {
+    stressJobs.value = await api.stressJobs()
+  } catch {
+    stressJobs.value = []
+  }
+}
+
+function stressElapsed(sec: number) {
+  const h = Math.floor(sec / 3600)
+  const m = Math.floor((sec % 3600) / 60)
+  const s = sec % 60
+  return h ? `${h}:${pad2(m)}:${pad2(s)}` : `${m}:${pad2(s)}`
+}
+
+function focusStressJob(job: StressJobSummary) {
+  api.stressOpenWindow(job.planId, job.id).catch((e) => message.error(String(e)))
+}
+
+function stopStressJob(job: StressJobSummary) {
+  Modal.confirm({
+    title: `停止压测 #${job.id}`,
+    content: `确定停止「${job.name}」？已采集数据会按「已停止」保存为报告。`,
+    okText: '停止',
+    okType: 'danger',
+    async onOk() {
+      try {
+        await api.stressStop(job.id)
+        message.success('已发送停止指令')
+        await loadStressJobs()
+      } catch (e) {
+        message.error(String(e))
+      }
+    },
+  })
+}
+
+function stopAllStressJobs() {
+  Modal.confirm({
+    title: '全部停止',
+    content: `将停止 ${stressJobs.value.length} 个运行中的压测任务，确定继续？`,
+    okText: '全部停止',
+    okType: 'danger',
+    async onOk() {
+      try {
+        const count = await api.stressStopAll()
+        message.success(`已停止 ${count} 个任务`)
+        await loadStressJobs()
+      } catch (e) {
+        message.error(String(e))
+      }
+    },
+  })
+}
+
 const tips = [
   {
     title: '变量引用与优先级',
@@ -801,6 +866,10 @@ onMounted(async () => {
 
   await loadRecentProjects()
   await loadNotes()
+  await loadStressJobs()
+  stressTimer = window.setInterval(() => {
+    if (!document.hidden) void loadStressJobs()
+  }, 3000)
   document.addEventListener('visibilitychange', onNotesVisible)
   try {
     unlistenNotes = await listen('notes:changed', () => {
@@ -813,6 +882,8 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   document.removeEventListener('visibilitychange', onNotesVisible)
+  if (stressTimer) window.clearInterval(stressTimer)
+  stressTimer = null
   unlistenNotes?.()
   unlistenNotes = null
 })
@@ -1031,7 +1102,38 @@ function fmtBytes(value: number) {
       </div>
     </section>
 
-    <!-- 最近项目 + 今日待办 -->
+    <!-- 运行中的压测：无任务时整块隐藏 -->
+    <section v-if="stressJobs.length" class="panel fm-card stress-running">
+      <header>
+        <h3>运行中的压测<span>Running / {{ stressJobs.length }}</span></h3>
+        <div class="stress-head-actions">
+          <a @click="stopAllStressJobs">全部停止</a>
+          <a @click="router.push('/reports')">报告页 →</a>
+        </div>
+      </header>
+      <div class="stress-job-list">
+        <div v-for="job in stressJobs" :key="job.id" class="stress-job">
+          <div class="stress-job-main">
+            <b>#{{ job.id }} {{ job.name }}</b>
+            <span class="muted" :title="job.target">{{ job.target }}</span>
+          </div>
+          <div class="stress-job-meta">
+            <span class="mono">{{ stressElapsed(job.elapsedSec) }}</span>
+            <span class="mono">{{ job.qps }} QPS</span>
+            <span class="mono">并发 {{ job.concurrent }}</span>
+            <a-tag :color="job.status === 'stopping' ? 'orange' : 'green'">
+              {{ job.status === 'stopping' ? '停止中' : '运行中' }}
+            </a-tag>
+          </div>
+          <div class="stress-job-actions">
+            <a-button size="small" @click="focusStressJob(job)">窗口</a-button>
+            <a-button size="small" @click="router.push('/reports')">报告</a-button>
+            <a-button size="small" danger @click="stopStressJob(job)">停止</a-button>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <div class="cols">
       <section class="panel fm-card">
         <header>
@@ -1676,6 +1778,66 @@ function fmtBytes(value: number) {
   gap: 16px;
   align-items: start;
   margin-top: 16px;
+}
+
+/* ---------- 运行中的压测 ---------- */
+.stress-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.stress-head-actions a:first-child {
+  color: var(--fm-danger);
+}
+
+.stress-job {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--fm-border);
+}
+
+.stress-job:last-child {
+  border-bottom: none;
+}
+
+.stress-job-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.stress-job-main b {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--fm-text);
+}
+
+.stress-job-main .muted {
+  overflow: hidden;
+  font-family: var(--fm-font-mono);
+  font-size: 10.5px;
+  color: var(--fm-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stress-job-meta {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  font-family: var(--fm-font-mono);
+  font-size: 11px;
+  color: var(--fm-muted);
+}
+
+.stress-job-actions {
+  display: flex;
+  gap: 8px;
 }
 
 .panel {

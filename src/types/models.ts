@@ -211,6 +211,8 @@ export interface AppSettings {
   budgetHardStop?: boolean
   /** 失败回退链：逗号分隔的 provider id；空 = 关闭（AI-12） */
   aiFallbackIds?: string
+  /** 跨任务并发之和上限（默认 1000，硬上限 2000） */
+  stressMaxConcurrent?: number
 }
 
 /** 企业策略（policy.json / W4-2） */
@@ -290,9 +292,24 @@ export interface PythonCheckResult {
 export interface PlanSummary {
   id: number
   projectId: number
+  projectName?: string | null
   requestId?: number | null
   requestName?: string | null
+  /** 接口已删除或计划未绑定接口 */
+  requestMissing: boolean
   name: string
+  method?: string | null
+  /** URL 模板（可能含 {{变量}}） */
+  urlTemplate?: string | null
+  /** 解析后地址 */
+  resolvedUrl?: string | null
+  envId?: number | null
+  envName?: string | null
+  mode: 'fixed' | 'stages' | string
+  stagesSummary: string
+  lastRunAt?: number | null
+  lastStatus?: string | null
+  reportCount: number
   updatedAt: number
 }
 
@@ -303,6 +320,44 @@ export interface TestPlan {
   name: string
   config: unknown
   updatedAt: number
+}
+
+/** 计划目标快照（config_json.target） */
+export interface PlanTargetSnapshot {
+  requestId?: number | null
+  method?: string | null
+  urlTemplate?: string | null
+  resolvedUrl?: string | null
+  capturedAt?: number | null
+}
+
+export interface PlanImportMatch {
+  planName: string
+  requestId?: number | null
+  requestMethod: string
+  requestUrl: string
+  envId?: number | null
+  envName?: string | null
+  missingVars: string[]
+  hasSensitive: boolean
+  warnings: string[]
+}
+
+export interface PlanImportPreview {
+  formatOk: boolean
+  includesSensitive: boolean
+  plans: PlanImportMatch[]
+}
+
+export interface PlanTemplate {
+  id: string
+  name: string
+  description: string
+  mode: 'fixed' | 'stages'
+  concurrent?: number
+  durationSec?: number
+  stages?: { concurrent: number; durationSec: number }[]
+  captureMode?: 'capacity' | 'locate' | 'auto'
 }
 
 /** 重试策略：仅幂等方法默认可重试 */
@@ -460,6 +515,17 @@ export interface HistoryStats {
 export interface CleanupResult {
   history: number
   runs: number
+  /** 压缩后实际释放的字节（主库 + WAL） */
+  freedBytes: number
+  /** 压缩失败原因；数据删除已提交，不影响删除结果 */
+  compactError?: string | null
+}
+
+/** 删除报告 / 明细后的空间回收结果 */
+export interface ReclaimResult {
+  removed: number
+  freedBytes: number
+  compactError?: string | null
 }
 
 export interface AppInfo {
@@ -836,6 +902,10 @@ export interface SlaTargets {
 
 export interface StressConfig {
   requestId?: number | null
+  /** 所属项目：环境变量回退与计划保存用 */
+  projectId?: number | null
+  /** 来源计划：写入报告，便于按计划聚合 */
+  planId?: number | null
   name?: string | null
   method: string
   url: string
@@ -844,6 +914,8 @@ export interface StressConfig {
   bodyType: string
   body?: string | null
   envId?: number | null
+  /** 运行期变量：优先级高于环境变量，不落库 */
+  vars?: Record<string, string>
   insecure?: boolean
   timeoutMs?: number
   connectTimeoutMs?: number
@@ -859,6 +931,37 @@ export interface StressConfig {
   sla?: SlaTargets | null
   /** 逐请求明细采集策略，默认 auto */
   recordDetail?: RecordDetailMode
+  /** 采集模式预设：容量 / 定位 / 自动 */
+  captureMode?: CapturePreset
+  /** 定位模式保留的慢请求条数（默认 200，0 = 不保留） */
+  topN?: number | null
+  /** 只记录慢于该阈值的请求（毫秒），0 或空 = 不设阈值 */
+  slowThresholdMs?: number | null
+  /** 同目标冲突时忽略并继续（报告会留痕） */
+  ignoreOverlap?: boolean
+  /** 手动计划选择的历史基线报告（3.4.4） */
+  baselineReportId?: number | null
+  /** 超过 2 小时的长稳启动确认 */
+  longRunAck?: boolean
+}
+
+/** capacity：容量模式；locate：定位模式；auto：沿用 recordDetail 并自动降档 */
+export type CapturePreset = 'capacity' | 'locate' | 'auto'
+
+/** 运行中的压测任务摘要（stress_jobs） */
+export interface StressJobSummary {
+  id: number
+  name: string
+  target: string
+  planId?: number | null
+  requestId?: number | null
+  concurrent: number
+  startedAt: number
+  elapsedSec: number
+  status: string
+  /** 最近一秒实时 QPS，运行中由注册表每秒刷新 */
+  qps?: number
+  windowLabel?: string | null
 }
 
 /** full：每请求记录；sample：1% 采样；off：不记录；auto：引擎按 QPS 定档 */
@@ -873,6 +976,10 @@ export interface ReportSample {
   p95Rt: number
   p99Rt: number
   ttfbAvg: number
+  /** 响应体耗时均值（body = latency - ttfb，v15） */
+  bodyAvg: number
+  /** 响应体耗时 P95（v15） */
+  bodyP95: number
   bytes: number
   successCount: number
   errorCount: number
@@ -915,6 +1022,10 @@ export interface StressReport {
   id: number
   planName: string
   requestId?: number | null
+  /** 来源计划（v15 由任务注册表写入） */
+  planId?: number | null
+  /** 同批多计划报告分组号 */
+  runGroupId?: number | null
   totalRequests: number
   successCount: number
   errorCount: number
@@ -974,11 +1085,20 @@ export interface StageSummary {
 export interface ReportConfigSnapshot {
   mode?: string
   method?: string
+  /** 解析后的完整地址 */
   url?: string
+  /** URL 模板原文（可能含 {{变量}}） */
+  urlTemplate?: string
+  /** 目标快照（3.5.1 双存地址） */
+  target?: PlanTargetSnapshot | null
   headers?: number
   params?: number
   bodyType?: string
   envId?: number | null
+  /** 解析后的环境名 */
+  envName?: string | null
+  projectId?: number | null
+  planId?: number | null
   timeoutMs?: number
   connectTimeoutMs?: number
   followRedirects?: boolean
@@ -993,10 +1113,66 @@ export interface ReportConfigSnapshot {
   recordDetail?: string
   /** 用户请求的采集模式（auto 可能已降档） */
   recordDetailRequested?: string
+  /** 采集预设 / TopN / 慢请求阈值 */
+  captureMode?: CapturePreset | string
+  topN?: number
+  slowThresholdMs?: number
+  /** 本机施压能力快照（1.7.5） */
+  machineCapacity?: MachineCapacitySnapshot | null
+  /** 开始压测时同主机已有其他任务在施压的警告（1.3.2，只留痕不拦截） */
+  sameHostWarning?: string | null
+  /** 手动计划选择的历史基线报告（3.4.4） */
+  baselineReportId?: number | null
   /** 施压端环境信息 */
   agent?: AgentInfo
   /** 运行期指标（发送字节、丢弃计数、资源峰值等） */
   metrics?: RuntimeMetrics
+}
+
+/** 压测配置带入的机器能力快照 */
+export interface MachineCapacitySnapshot {
+  probedAt?: number
+  maxQps?: number
+  cores?: number
+  cpuPeak?: number
+  saturationConcurrent?: number
+  reachedLimit?: boolean
+}
+
+/** 本机能力检测逐档采样 */
+export interface CapacitySample {
+  concurrent: number
+  qps: number
+  avgRt: number
+  p95Rt: number
+  errorRate: number
+  /** AstroMan 进程占用核数 */
+  cpu: number
+  memMb: number
+}
+
+/** 本机能力检测结果 */
+export interface CapacityResult {
+  probedAt: number
+  maxQps: number
+  saturationConcurrent: number
+  cpuPeak: number
+  memPeak: number
+  cores: number
+  os: string
+  /** false 表示 1024 并发仍未触顶，只能当 "≥ X QPS" 看 */
+  reachedLimit: boolean
+  samples: CapacitySample[]
+}
+
+/** 检测进度事件 */
+export interface CapacityProgress {
+  stage: number
+  concurrent: number
+  qps: number
+  cpu: number
+  mem: number
+  done: boolean
 }
 
 export interface AgentInfo {
@@ -1018,6 +1194,9 @@ export interface RuntimeMetrics {
   cpuPeakCores?: number
   memPeakMb?: number
   sampleIntervalSec?: number
+  /** 自动降档轨迹（1.6.3） */
+  downgradeTrail?: Array<{ atSec: number; from: string; to: string; qps: number }>
+  slowRequestCount?: number
 }
 
 export interface ReportDetail {
@@ -1027,15 +1206,33 @@ export interface ReportDetail {
   statusCodes: StatusCount[]
   errorTypes: ErrorTypeCount[]
   histogram: HistogramBucket[]
+  /** 响应体读取耗时直方图（v15） */
+  bodyHistogram?: HistogramBucket[]
   stages: StageSummary[]
   config?: ReportConfigSnapshot | null
+  /** TopN 慢请求快照（v15） */
+  slowRequests?: SlowRequest[]
   /** 可编辑的测试场景描述 */
   scenarioText?: string | null
   /** 可编辑的报告总结 */
   summaryText?: string | null
 }
 
+/** 慢请求快照：定位模式与长稳报告使用 */
+export interface SlowRequest {
+  elapsedMs: number
+  method: string
+  url: string
+  status: number
+  latencyMs: number
+  ttfbMs: number
+  /** 响应体耗时 = latency - ttfb */
+  bodyMs: number
+}
+
 export interface StressProgress {
+  /** 任务 ID：多窗口并行时前端按此过滤 */
+  jobId: number
   name: string
   running: boolean
   elapsedSec: number
@@ -1059,6 +1256,7 @@ export interface StressProgress {
 }
 
 export interface StressDone {
+  jobId: number
   reportId?: number | null
   name: string
   status: string

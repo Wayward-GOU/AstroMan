@@ -133,22 +133,34 @@ function columnName(index: number): string {
 
 const MAX_CELL_TEXT = 32000
 
-function cellXml(value: CellValue, ref: string): string {
+/** URL 列宽上限：完整地址优先，避免 60 字符硬截断（3.3.1） */
+const MAX_URL_WIDTH = 120
+
+function looksLikeUrl(text: string): boolean {
+  return /^[a-z][a-z0-9+.-]*:\/\//i.test(text.trim())
+}
+
+function cellXml(value: CellValue, ref: string, wrap: boolean): string {
   if (value === null || value === undefined || value === '') return ''
   if (typeof value === 'number' && Number.isFinite(value)) {
     return `<c r="${ref}"><v>${value}</v></c>`
   }
   const text = String(value)
   const clipped = text.length > MAX_CELL_TEXT ? `${text.slice(0, MAX_CELL_TEXT)}…` : text
-  return `<c r="${ref}" t="inlineStr"><is><t xml:space="preserve">${escapeXml(clipped)}</t></is></c>`
+  // s="1" 为 styles.xml 中的自动换行样式，用于 URL 这类长文本列
+  const style = wrap ? ' s="1"' : ''
+  return `<c r="${ref}"${style} t="inlineStr"><is><t xml:space="preserve">${escapeXml(clipped)}</t></is></c>`
 }
 
 function sheetXml(sheet: XlsxSheet): string {
   const lengths: number[] = []
+  const urlColumns = new Set<number>()
   sheet.rows.forEach((row) => {
     row.forEach((cell, index) => {
       const text = cell === null || cell === undefined ? '' : String(cell)
-      const width = Math.min(60, Math.max(8, [...text].length * 1.8))
+      if (looksLikeUrl(text)) urlColumns.add(index)
+      const cap = urlColumns.has(index) ? MAX_URL_WIDTH : 60
+      const width = Math.min(cap, Math.max(8, [...text].length * 1.8))
       lengths[index] = Math.max(lengths[index] ?? 0, width)
     })
   })
@@ -161,7 +173,9 @@ function sheetXml(sheet: XlsxSheet): string {
   const rows = sheet.rows
     .map((row, rowIndex) => {
       const cells = row
-        .map((cell, colIndex) => cellXml(cell, `${columnName(colIndex)}${rowIndex + 1}`))
+        .map((cell, colIndex) =>
+          cellXml(cell, `${columnName(colIndex)}${rowIndex + 1}`, urlColumns.has(colIndex)),
+        )
         .join('')
       return `<row r="${rowIndex + 1}">${cells}</row>`
     })
@@ -185,7 +199,7 @@ export function buildXlsx(sheets: XlsxSheet[]): Uint8Array {
     {
       name: '[Content_Types].xml',
       content: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>${names
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>${names
         .map(
           (_name, index) =>
             `<Override PartName="/xl/worksheets/sheet${index + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`,
@@ -215,7 +229,21 @@ export function buildXlsx(sheets: XlsxSheet[]): Uint8Array {
           (_name, index) =>
             `<Relationship Id="rId${index + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${index + 1}.xml"/>`,
         )
-        .join('')}</Relationships>`,
+        .join('')}<Relationship Id="rId${names.length + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>`,
+    },
+    {
+      name: 'xl/styles.xml',
+      content: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>
+<fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>
+<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>
+<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+<cellXfs count="2">
+<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>
+<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>
+</cellXfs>
+</styleSheet>`,
     },
   ]
 

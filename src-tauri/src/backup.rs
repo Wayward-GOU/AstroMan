@@ -412,10 +412,7 @@ fn free_space(path: &Path) -> Option<u64> {
 /// 自动备份：启动 60s 后调用；距上次成功备份不足 24h 就跳过
 pub fn auto_backup(state: &AppState) -> Result<Option<BackupItem>, String> {
     // 压测 / 批量运行期间不抢连接与 IO（4.0.2）
-    if state
-        .stress_running
-        .load(std::sync::atomic::Ordering::SeqCst)
-    {
+    if !state.stress_jobs.is_empty() {
         return Ok(None);
     }
     let last = {

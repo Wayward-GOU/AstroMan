@@ -14,6 +14,7 @@ import {
   FolderOpenOutlined,
   SaveOutlined,
   DeleteOutlined,
+  DesktopOutlined,
 } from '@ant-design/icons-vue'
 import AiSparkIcon from '@/components/AiSparkIcon.vue'
 import PageHeader from '@/components/PageHeader.vue'
@@ -25,14 +26,18 @@ import { useErrorDialogStore } from '@/stores/errorDialog'
 import { stressPlanPrompt } from '@/utils/aiScenarios'
 import * as api from '@/api'
 import type {
+  CapturePreset,
   Environment,
   HttpRequestDetail,
   PlanSummary,
+  PlanTemplate,
   RecordDetailMode,
   ReportSample,
   RequestSearchHit,
   StressDone,
+  StressJobSummary,
   StressProgress,
+  StressReport,
   StressStage,
 } from '@/types/models'
 
@@ -42,6 +47,14 @@ const projectStore = useProjectStore()
 
 const requestId = computed(() => Number(route.query.requestId || 0))
 const projectId = computed(() => Number(route.query.projectId || 0))
+/** 单实例/多窗口入口参数：计划、任务、环境（1.2.1） */
+const routePlanId = computed(() => Number(route.query.planId || 0))
+const routeJobId = computed(() => Number(route.query.jobId || 0))
+const routeEnvId = computed(() => Number(route.query.envId || 0))
+const newWindow = computed(() => route.query.newWindow === '1' || route.query.newWindow === 'true')
+
+/** 本窗口绑定的压测任务；事件与停止都按它过滤（1.1.2） */
+const jobId = ref<number | null>(null)
 
 const request = ref<HttpRequestDetail | null>(null)
 const environments = ref<Environment[]>([])
@@ -80,6 +93,16 @@ function renderPreviewUrl(text: string): string {
     plainVars.value[key] ?? raw,
   )
 }
+
+/** 预览里仍未解析的变量名：环境未确定或有缺失时不允许开始（4.6） */
+const unresolvedVars = computed(() => {
+  const source = selectedChoice.value?.url ?? request.value?.url ?? ''
+  const names = new Set<string>()
+  for (const match of renderPreviewUrl(source).matchAll(/\{\{\s*([\w.-]+)\s*\}\}/g)) {
+    names.add(match[1])
+  }
+  return [...names]
+})
 
 const requestSelectOptions = computed(() =>
   choices.value.map((item) => ({
@@ -141,6 +164,21 @@ function aiPlan() {
     source: 'request',
     hint: `${request.value.method} ${request.value.url} · 当前 ${settings.concurrent} 并发 × ${settings.durationSec}s`,
   })
+}
+
+/** 压测页头部 Tab：压测 / 计划 / 报告（2.1.3） */
+function switchStressTab(key: string | number) {
+  if (key === 'plans') router.push('/plans')
+  else if (key === 'reports') router.push('/reports')
+}
+
+/** 把当前任务放到独立窗口查看；未绑定时按当前计划开新窗口（1.2.1） */
+async function openJobWindow() {
+  try {
+    await api.stressOpenWindow(activePlanId.value, jobId.value, envId.value)
+  } catch (e) {
+    message.error(String(e))
+  }
 }
 
 async function openConfig() {
@@ -325,6 +363,12 @@ const HIGH_CONCURRENT_HINT = 1000
 const settings = reactive({
   mode: 'fixed' as 'fixed' | 'stages',
   recordDetail: 'auto' as RecordDetailMode,
+  /** 采集预设：容量 / 定位 / 自动（1.6） */
+  captureMode: 'auto' as CapturePreset,
+  /** 定位模式保留的慢请求条数 */
+  topN: 200,
+  /** 只记录慢于该阈值的请求（毫秒），0 = 不设阈值 */
+  slowThresholdMs: 0,
   concurrent: 20,
   durationSec: 30,
   rampUpSec: 5,
@@ -342,7 +386,83 @@ const settings = reactive({
   slaP99: 1000,
   slaErrorRate: 1,
   slaMinRps: 0,
+  /** 基线对比：选择历史低并发报告（3.4.4） */
+  baselineReportId: null as number | null,
+  /** 超过 2 小时必须确认（1.4.1） */
+  longRunAck: false,
 })
+
+/** 本次运行忽略同目标检查（1.3.2），仅本次有效 */
+const ignoreOverlap = ref(false)
+
+/** 长稳压测阈值：超过必须勾选风险确认 */
+const LONG_RUN_SECONDS = 7200
+const totalSecondsForAck = computed(() => totalSeconds.value)
+const longRunNeeded = computed(() => totalSecondsForAck.value > LONG_RUN_SECONDS)
+/** 固定并发时长上限：绑定计划后放到 24h，快速压测维持 2h（1.4） */
+const fixedDurationMax = computed(() => (activePlanId.value ? 86400 : 7200))
+
+/* ---------- 计划模板 ---------- */
+const planTemplates = ref<PlanTemplate[]>([])
+
+/** 基线对比候选：历史报告（3.4.4），优先展示当前接口/计划的历史 */
+const baselineReports = ref<StressReport[]>([])
+
+async function loadBaselineReports() {
+  try {
+    baselineReports.value = await api.reportList(200)
+  } catch {
+    baselineReports.value = []
+  }
+}
+
+const baselineOptions = computed(() => {
+  const list = baselineReports.value.filter((item) => {
+    const sameRequest = targetRequestId.value ? item.requestId === targetRequestId.value : true
+    const samePlan = activePlanId.value ? item.planId === activePlanId.value : true
+    return sameRequest || samePlan
+  })
+  const source = list.length ? list : baselineReports.value
+  return source.slice(0, 50).map((item) => ({
+    value: item.id,
+    label: `#${item.id} ${item.planName} · ${item.concurrency} 并发 · P95 ${fmt(item.p95Rt)}ms · QPS ${fmt(item.avgQps)}`,
+  }))
+})
+
+function setBaseline(id: number | null) {
+  settings.baselineReportId = id ?? null
+}
+
+async function loadTemplates() {
+  try {
+    planTemplates.value = await api.planTemplates()
+  } catch {
+    planTemplates.value = []
+  }
+}
+
+/** 应用模板到当前配置（2.5） */
+function applyTemplate(template: PlanTemplate) {
+  settings.mode = template.mode
+  if (template.mode === 'stages' && template.stages?.length) {
+    stages.value = template.stages.map((item) => ({ ...item }))
+  }
+  if (template.mode === 'fixed') {
+    if (template.concurrent) settings.concurrent = template.concurrent
+    if (template.durationSec) settings.durationSec = template.durationSec
+  }
+  if (template.captureMode) settings.captureMode = template.captureMode
+  if (longRunNeeded.value) settings.longRunAck = false
+  if (longRunNeeded.value && !activePlanId.value) {
+    message.info('该模板超过 2 小时，请先保存为计划再运行')
+  }
+  message.success(`已应用模板「${template.name}」`)
+}
+
+function applyTemplateById(id: string) {
+  const template = planTemplates.value.find((item) => item.id === id)
+  if (template) applyTemplate(template)
+}
 
 const stages = ref<StressStage[]>([
   { concurrent: 10, durationSec: 30 },
@@ -375,6 +495,8 @@ onMounted(async () => {
   try {
     unlisteners.push(
       await listen<StressProgress>('stress:progress', (event) => {
+        // 多窗口并行：只接收本窗口绑定任务的进度（1.1.2）
+        if (jobId.value && event.payload.jobId !== jobId.value) return
         progress.value = event.payload
         // 后端只下发增量采样点，这里累积成完整序列供图表使用
         if (event.payload.samples?.length) {
@@ -385,6 +507,7 @@ onMounted(async () => {
     )
     unlisteners.push(
       await listen<StressDone>('stress:done', (event) => {
+        if (jobId.value && event.payload.jobId !== jobId.value) return
         done.value = event.payload
         running.value = false
         stopping.value = false
@@ -406,17 +529,9 @@ onMounted(async () => {
   }
 
   try {
-    if (!requestId.value) {
-      loading.value = false
-      return
-    }
-    if (projectId.value) {
-      activeProjectId.value = projectId.value
-      environments.value = await api.envList(projectId.value)
-      const active = environments.value.find((env) => env.isActive) ?? environments.value[0]
-      envId.value = active?.id ?? null
-    }
-    request.value = await api.requestGet(requestId.value)
+    await initFromQuery()
+    void loadTemplates()
+    void loadBaselineReports()
   } catch (e) {
     message.error(String(e))
   } finally {
@@ -424,11 +539,125 @@ onMounted(async () => {
   }
 })
 
+/** 解析入口参数：计划 / 任务 / 环境（1.2.1、4.2） */
+async function initFromQuery() {
+  // 恢复任务视图：任务归注册表，窗口只是视图，不重跑（1.2.5）
+  if (routeJobId.value) {
+    jobId.value = routeJobId.value
+    await restoreJob(routeJobId.value)
+    return
+  }
+  if (routePlanId.value) {
+    await openPlan(routePlanId.value)
+    return
+  }
+  if (!requestId.value) return
+  request.value = await api.requestGet(requestId.value)
+  // 请求详情不一定带 projectId，路由参数优先
+  const pid = projectId.value || (request.value as { projectId?: number } | null)?.projectId || 0
+  if (pid) {
+    activeProjectId.value = pid
+    environments.value = await api.envList(pid)
+    envId.value = pickEnvId(environments.value, routeEnvId.value)
+    await loadPlainVars(envId.value)
+  }
+}
+
+/** 拉取当前环境的非敏感变量，供 URL 预览与未解析检测使用 */
+async function loadPlainVars(envIdValue: number | null) {
+  plainVars.value = {}
+  if (!envIdValue) return
+  try {
+    plainVars.value = await api.envPlainVars(envIdValue)
+  } catch {
+    /* 预览拿不到变量就保留模板原文 */
+  }
+}
+
+/** 环境优先级：路由 envId → 显式计划 env → 项目激活环境（4.2） */
+function pickEnvId(list: Environment[], preferred?: number | null): number | null {
+  if (preferred && list.some((env) => env.id === preferred)) return preferred
+  const active = list.find((env) => env.isActive) ?? list[0]
+  return active?.id ?? null
+}
+
+/** 重新打开同一任务：恢复任务信息并继续接收进度 */
+async function restoreJob(id: number) {
+  const jobs = await api.stressJobs()
+  const job = jobs.find((item) => item.id === id)
+  if (!job) {
+    message.warning('该压测任务已结束，可在报告页查看结果')
+    return
+  }
+  running.value = true
+  progress.value = {
+    jobId: id,
+    name: job.name,
+    running: true,
+    elapsedSec: job.elapsedSec,
+    total: 0,
+    success: 0,
+    errors: 0,
+    rps: 0,
+    avgRt: 0,
+    p95Rt: 0,
+    p99Rt: 0,
+    concurrent: job.concurrent,
+    stageIndex: 0,
+    activeConcurrent: job.concurrent,
+    statusCodes: [],
+    samples: [],
+    recordMode: 'auto',
+  }
+  if (job.requestId) {
+    request.value = await api.requestGet(job.requestId)
+  }
+  if (job.planId) {
+    activePlanId.value = job.planId
+    planName.value = job.name
+  }
+}
+
+/** 从计划载入压测页（2.3.1） */
+async function openPlan(planIdValue: number) {
+  const plan = await api.planGet(planIdValue)
+  targetProjectId.value = plan.projectId
+  activeProjectId.value = plan.projectId
+  environments.value = await api.envList(plan.projectId)
+  modalEnvironments.value = environments.value
+  const config = plan.config as {
+    settings?: Record<string, unknown>
+    stages?: StressStage[]
+    envId?: number | null
+    captureMode?: CapturePreset
+    topN?: number
+    slowThresholdMs?: number
+  } | null
+  if (config?.settings) Object.assign(settings, config.settings)
+  if (config?.captureMode) settings.captureMode = config.captureMode
+  if (config?.topN != null) settings.topN = config.topN
+  if (config?.slowThresholdMs != null) settings.slowThresholdMs = config.slowThresholdMs
+  if (Array.isArray(config?.stages) && config.stages.length) {
+    settings.mode = 'stages'
+    stages.value = config.stages.map((item) => ({
+      concurrent: Number(item.concurrent) || 1,
+      durationSec: Number(item.durationSec) || 1,
+    }))
+  }
+  modalEnvId.value = pickEnvId(environments.value, routeEnvId.value || config?.envId || null)
+  envId.value = modalEnvId.value
+  await loadPlainVars(envId.value)
+  activePlanId.value = plan.id
+  planName.value = plan.name
+  if (plan.requestId) {
+    targetRequestId.value = plan.requestId
+    request.value = await api.requestGet(plan.requestId)
+  }
+}
+
 onBeforeUnmount(() => {
   for (const off of unlisteners) off()
-  if (running.value) {
-    api.stressStop().catch(() => undefined)
-  }
+  // 关闭窗口不中断任务：任务归注册表，窗口只是视图（1.2.5）
 })
 
 const liveSamples = ref<ReportSample[]>([])
@@ -526,10 +755,61 @@ function fmt(v: number | undefined | null, digits = 1) {
   return v >= 1000 ? v.toFixed(0) : v.toFixed(digits)
 }
 
+/** 同主机不同路径只警告不拦截（1.3.2）；后端会再判一次并写进报告快照 */
+async function warnSameHost() {
+  const raw = request.value?.url?.trim()
+  if (!raw) return
+  let target: URL
+  try {
+    target = new URL(raw)
+  } catch {
+    // URL 含未解析变量时前端无法比较主机，交给后端判定
+    return
+  }
+  try {
+    const jobs = await api.stressJobs()
+    const list = jobs
+      .filter((job) => {
+        try {
+          const running = new URL(job.target)
+          return running.protocol === target.protocol && running.host === target.host
+        } catch {
+          return false
+        }
+      })
+      .map((job) => `#${job.id} ${job.name}`)
+    if (list.length) {
+      message.warning(
+        `同一主机已有任务 ${list.join('、')} 在施压，同机并发会互相争抢连接与带宽；本次结果不能当作单实例容量结论`,
+      )
+    }
+  } catch {
+    /* 拿不到运行中任务时不做提示，后端仍会校验 */
+  }
+}
+
 async function start() {
   if (!request.value) return
   if (!request.value.url.trim()) {
     message.warning('请先回到请求编辑器填写 URL')
+    return
+  }
+  if (!envId.value) {
+    message.warning('请先选择环境：环境未确定时不允许开始压测')
+    return
+  }
+  if (unresolvedVars.value.length) {
+    message.warning(
+      `当前环境缺少变量：${unresolvedVars.value.join('、')}，请补充变量或切换环境`,
+    )
+    return
+  }
+  if (totalSeconds.value > LONG_RUN_SECONDS && !activePlanId.value) {
+    message.warning('超过 2 小时的长稳压测必须保存为计划后运行，请先点「保存计划」')
+    return
+  }
+  if (totalSeconds.value > LONG_RUN_SECONDS && !settings.longRunAck) {
+    message.warning('本次压测超过 2 小时，请先勾选「已知悉同机施压风险」')
     return
   }
 
@@ -557,6 +837,8 @@ async function start() {
     }
   }
 
+  await warnSameHost()
+
   progress.value = null
   done.value = null
   stopping.value = false
@@ -564,8 +846,10 @@ async function start() {
   liveSamples.value = []
 
   try {
-    await api.stressStart({
+    const id = await api.stressStart({
       requestId: request.value.id,
+      projectId: targetProjectId.value ?? activeProjectId.value ?? undefined,
+      planId: activePlanId.value ?? undefined,
       name: request.value.name,
       method: request.value.method,
       url: request.value.url,
@@ -587,6 +871,15 @@ async function start() {
       stages: settings.mode === 'stages' ? stages.value.map((item) => ({ ...item })) : [],
       targetRps: settings.targetRps > 0 ? settings.targetRps : null,
       recordDetail: settings.recordDetail,
+      captureMode: settings.captureMode,
+      topN: settings.captureMode === 'locate' ? settings.topN : null,
+      slowThresholdMs:
+        settings.captureMode === 'locate' && settings.slowThresholdMs > 0
+          ? settings.slowThresholdMs
+          : null,
+      ignoreOverlap: ignoreOverlap.value,
+      baselineReportId: settings.baselineReportId ?? null,
+      longRunAck: settings.longRunAck,
       sla: settings.slaEnabled
         ? {
             p95Ms: settings.slaP95 > 0 ? settings.slaP95 : null,
@@ -596,8 +889,33 @@ async function start() {
           }
         : null,
     })
+    // 先绑定任务号，避免第一帧进度事件被过滤掉
+    jobId.value = id
+    if (!routeJobId.value) {
+      void router.replace({ query: { ...route.query, jobId: String(id) } })
+    }
   } catch (e) {
     running.value = false
+    const text = String(e)
+    // 同目标冲突：给出「忽略并继续」入口（1.3.2）
+    if (text.includes('目标接口正在被任务')) {
+      Modal.confirm({
+        title: '同目标已有压测任务',
+        content: `${text}。同时施压会互相干扰，报告也不能作为单实例容量结论。`,
+        okText: '忽略并继续',
+        okType: 'danger',
+        cancelText: '取消',
+        onOk: async () => {
+          ignoreOverlap.value = true
+          try {
+            await start()
+          } finally {
+            ignoreOverlap.value = false
+          }
+        },
+      })
+      return
+    }
     errorDialog.show({
       title: '压测启动失败',
       error: e,
@@ -609,7 +927,8 @@ async function start() {
 async function stop() {
   stopping.value = true
   try {
-    await api.stressStop()
+    // 只停本窗口绑定任务；没有绑定时由后端按全部停止兜底
+    await api.stressStop(jobId.value)
   } catch (e) {
     message.error(String(e))
   }
@@ -639,6 +958,10 @@ function backToRequest() {
         <template #icon><AiSparkIcon /></template>
         AI 生成计划
       </a-button>
+      <a-button v-if="running && jobId" @click="openJobWindow">
+        <template #icon><DesktopOutlined /></template>
+        新窗口查看
+      </a-button>
       <a-button type="primary" :disabled="running" @click="openConfig">
         <template #icon><PlusOutlined /></template>
         新建压测
@@ -648,6 +971,17 @@ function backToRequest() {
         返回请求
       </a-button>
     </PageHeader>
+
+    <a-tabs
+      :active-key="'stress'"
+      size="small"
+      class="stress-top-tabs"
+      @change="switchStressTab"
+    >
+      <a-tab-pane key="stress" tab="压测" />
+      <a-tab-pane key="plans" tab="计划" />
+      <a-tab-pane key="reports" tab="报告" />
+    </a-tabs>
 
     <a-spin :spinning="loading">
       <div v-if="!request && !requestId" class="fm-card guide-empty">
@@ -684,6 +1018,27 @@ function backToRequest() {
           </div>
 
           <div class="form">
+            <div v-if="planTemplates.length" class="field">
+              <div class="label">计划模板</div>
+              <a-select
+                :value="null"
+                placeholder="选择模板快速填充并发与采集预设"
+                style="width: 100%"
+                :disabled="running"
+                @change="applyTemplateById"
+              >
+                <a-select-option
+                  v-for="template in planTemplates"
+                  :key="template.id"
+                  :value="template.id"
+                  :title="template.description"
+                >
+                  {{ template.name }}
+                </a-select-option>
+              </a-select>
+              <div class="hint">低并发基线 / 细化阶梯 / 长稳场景，应用后可继续微调</div>
+            </div>
+
             <div class="field">
               <div class="label">加压模式</div>
               <a-segmented
@@ -703,6 +1058,54 @@ function backToRequest() {
             </div>
 
             <div class="field">
+              <div class="label">采集预设</div>
+              <a-segmented
+                v-model:value="settings.captureMode"
+                :options="[
+                  { label: '自动', value: 'auto' },
+                  { label: '容量', value: 'capacity' },
+                  { label: '定位', value: 'locate' },
+                ]"
+                block
+                :disabled="running"
+              />
+              <div class="hint">
+                {{
+                  settings.captureMode === 'capacity'
+                    ? '容量模式按实测 QPS 自动降档，优先保证吞吐与稳定性'
+                    : settings.captureMode === 'locate'
+                      ? '定位模式保留最慢的 N 条请求，适合排查慢接口（建议低并发）'
+                      : '自动模式按下方「明细记录」与 QPS 阈值决定采集档位'
+                }}
+              </div>
+              <template v-if="settings.captureMode === 'locate'">
+                <div class="field-row capture-row">
+                  <div class="field">
+                    <div class="label">慢请求 TopN</div>
+                    <a-input-number
+                      v-model:value="settings.topN"
+                      :min="1"
+                      :max="2000"
+                      style="width: 100%"
+                      :disabled="running"
+                    />
+                  </div>
+                  <div class="field">
+                    <div class="label">只记录慢于（ms，0 = 不限）</div>
+                    <a-input-number
+                      v-model:value="settings.slowThresholdMs"
+                      :min="0"
+                      :max="120000"
+                      :step="100"
+                      style="width: 100%"
+                      :disabled="running"
+                    />
+                  </div>
+                </div>
+              </template>
+            </div>
+
+            <div v-if="settings.captureMode === 'auto'" class="field">
               <div class="label">明细记录</div>
               <a-select v-model:value="settings.recordDetail" :disabled="running" style="width: 100%">
                 <a-select-option value="auto">自动（按 QPS 降档，推荐）</a-select-option>
@@ -728,7 +1131,8 @@ function backToRequest() {
               <div class="field-row">
                 <div class="field">
                   <div class="label">压测时长（秒）</div>
-                  <a-input-number v-model:value="settings.durationSec" :min="1" :max="3600" style="width: 100%" />
+                  <a-input-number v-model:value="settings.durationSec" :min="1" :max="fixedDurationMax" style="width: 100%" />
+                  <div class="hint">快速压测最长 2 小时；更长时长请保存为压测计划（最长 24 小时）</div>
                 </div>
                 <div class="field">
                   <div class="label">预热时长（秒）</div>
@@ -801,16 +1205,30 @@ function backToRequest() {
             </div>
 
             <div class="field">
-              <div class="label">环境</div>
+              <div class="label">
+                环境
+                <span class="label-required">必选</span>
+              </div>
               <a-select v-model:value="envId" allow-clear placeholder="不使用环境变量" style="width: 100%">
                 <a-select-option v-for="env in environments" :key="env.id" :value="env.id">
                   {{ env.name }}
                 </a-select-option>
               </a-select>
               <div class="hint" v-pre>选择环境后会替换 URL 与 Headers 中的 {{变量}}</div>
+              <div v-if="unresolvedVars.length" class="hint warn">
+                当前环境缺少变量：{{ unresolvedVars.join('、') }}，补充变量或切换环境后才能开始
+              </div>
             </div>
 
             <a-checkbox v-model:checked="settings.insecure">忽略证书校验（自签证书）</a-checkbox>
+            <a-checkbox v-model:checked="ignoreOverlap">
+              忽略同目标冲突检查（仅本次有效，报告将标注不可作为单实例容量结论）
+            </a-checkbox>
+            <div v-if="longRunNeeded" class="long-run-ack">
+              <a-checkbox v-model:checked="settings.longRunAck">
+                已知悉同机施压风险（本次超过 2 小时，建议使用独立施压机）
+              </a-checkbox>
+            </div>
 
             <div class="sla-block">
               <div class="sla-head">
@@ -836,6 +1254,25 @@ function backToRequest() {
               </div>
               <div v-if="settings.slaEnabled" class="hint">报告生成时会逐项判定并给出是否达标</div>
             </div>
+
+            <div class="sla-block">
+              <div class="sla-head">
+                <span class="label">基线对比（可选）</span>
+              </div>
+              <a-select
+                :value="settings.baselineReportId ?? undefined"
+                :options="baselineOptions"
+                allow-clear
+                show-search
+                option-filter-prop="label"
+                placeholder="选择历史低并发报告作为基线"
+                style="width: 100%"
+                @change="setBaseline"
+              />
+              <div class="hint">
+                报告详情将对比 P95 / P99 / 平均 QPS / 错误率；建议选择同接口的低并发基线，对比才有意义
+              </div>
+            </div>
           </div>
 
           <div class="config-foot">
@@ -854,7 +1291,9 @@ function backToRequest() {
               <template #icon><StopOutlined /></template>
               {{ stopping ? '正在停止…' : '停止压测' }}
             </a-button>
-            <div class="leave-hint">离开本页会自动停止压测，已产生的数据仍会保存</div>
+            <div class="leave-hint">
+              离开或关闭本页不会中断压测；任务在后台继续，可在报告页查看结果，需要中止请点「停止压测」
+            </div>
           </div>
         </section>
 
@@ -999,6 +1438,13 @@ function backToRequest() {
           </div>
           <div class="plan-row">
             <a-select
+              :value="null"
+              placeholder="计划模板"
+              class="plan-template"
+              :options="planTemplates.map((item) => ({ value: item.id, label: item.name }))"
+              @change="applyTemplateById"
+            />
+            <a-select
               :value="activePlanId"
               allow-clear
               placeholder="载入已保存的压测计划"
@@ -1135,6 +1581,49 @@ function backToRequest() {
                   </div>
                 </div>
 
+                <div class="field">
+                  <div class="label">采集预设</div>
+                  <a-segmented
+                    v-model:value="settings.captureMode"
+                    :options="[
+                      { label: '自动', value: 'auto' },
+                      { label: '容量', value: 'capacity' },
+                      { label: '定位', value: 'locate' },
+                    ]"
+                    block
+                  />
+                  <div class="hint">
+                    {{
+                      settings.captureMode === 'capacity'
+                        ? '容量模式按实测 QPS 自动降档，优先保证吞吐与稳定性'
+                        : settings.captureMode === 'locate'
+                          ? '定位模式保留最慢的 N 条请求，适合排查慢接口（建议低并发）'
+                          : '自动模式按 QPS 阈值决定采集档位'
+                    }}
+                  </div>
+                  <div v-if="settings.captureMode === 'locate'" class="field-row">
+                    <div class="field">
+                      <div class="label">慢请求 TopN</div>
+                      <a-input-number
+                        v-model:value="settings.topN"
+                        :min="1"
+                        :max="2000"
+                        style="width: 100%"
+                      />
+                    </div>
+                    <div class="field">
+                      <div class="label">只记录慢于（ms，0 = 不限）</div>
+                      <a-input-number
+                        v-model:value="settings.slowThresholdMs"
+                        :min="0"
+                        :max="120000"
+                        :step="100"
+                        style="width: 100%"
+                      />
+                    </div>
+                  </div>
+                </div>
+
                 <template v-if="settings.mode === 'fixed'">
                   <div class="field-row">
                     <div class="field">
@@ -1152,9 +1641,10 @@ function backToRequest() {
                       <a-input-number
                         v-model:value="settings.durationSec"
                         :min="1"
-                        :max="3600"
+                        :max="86400"
                         style="width: 100%"
                       />
+                      <div class="hint">压测计划最长 24 小时；超过 2 小时需勾选风险确认</div>
                     </div>
                   </div>
                   <div class="field">
@@ -1343,6 +1833,20 @@ function backToRequest() {
                 <div v-if="settings.slaEnabled" class="hint">报告生成时会逐项判定并给出是否达标</div>
               </div>
             </div>
+
+            <!-- 长稳压测确认 -->
+            <div v-if="longRunNeeded" class="param-card long-run-card">
+              <div class="param-head">
+                <span class="param-title">长稳压测确认</span>
+                <span class="param-sub">Long Run</span>
+              </div>
+              <div class="param-body">
+                <a-checkbox v-model:checked="settings.longRunAck">
+                  已知悉同机施压风险：本次时长 {{ Math.round(totalSeconds / 60) }} 分钟，建议使用独立施压机
+                </a-checkbox>
+                <div class="hint">超过 2 小时的压测默认关闭明细采集，报告体积仍会随明细增长</div>
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -1350,7 +1854,7 @@ function backToRequest() {
       <template #footer>
         <div class="modal-foot">
           <span class="modal-foot-hint">
-            <InfoCircleOutlined /> 开始后立即进入实时监控，离开本页会自动停止压测
+            <InfoCircleOutlined /> 开始后进入实时监控；关闭或离开页面不会中断任务，需要中止请点「停止压测」
           </span>
           <div class="modal-foot-actions">
             <a-button @click="configOpen = false">取消</a-button>
@@ -2220,5 +2724,42 @@ function backToRequest() {
   .stats {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
+}
+
+/* 顶部 Tab：压测 / 计划 / 报告 */
+.stress-top-tabs {
+  margin: -8px 0 14px;
+}
+
+.stress-top-tabs :deep(.ant-tabs-nav) {
+  margin: 0;
+}
+
+.label-required {
+  margin-left: 6px;
+  font-size: 10px;
+  font-weight: 400;
+  color: var(--fm-danger);
+}
+
+.capture-row {
+  margin-top: 10px;
+}
+
+.long-run-ack {
+  margin-top: 2px;
+  padding: 8px 10px;
+  border: 1px dashed var(--fm-warning);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--fm-warning) 8%, transparent);
+}
+
+.long-run-card {
+  border-color: var(--fm-warning);
+}
+
+.plan-row .plan-template {
+  flex: 0 0 160px;
+  min-width: 140px;
 }
 </style>

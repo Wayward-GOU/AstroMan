@@ -44,7 +44,12 @@ const route = useRoute()
 const router = useRouter()
 const notesStore = useNotesStore()
 const hangzaiTask = useHangzaiTaskStore()
-const isBare = computed(() => Boolean(route.meta.bare))
+const isBare = computed(
+  () =>
+    Boolean(route.meta.bare) ||
+    // 独立压测窗口（stress-*）不显示主窗口侧边栏
+    (route.path === '/stress' && (route.query.newWindow === '1' || route.query.newWindow === 'true')),
+)
 
 let notesTicker: number | undefined
 let unlistenNotesChanged: UnlistenFn | null = null
@@ -449,6 +454,8 @@ onBeforeUnmount(() => {
 const activeKey = computed(() => {
   const path = route.path
   if (path.startsWith('/stress')) return 'stress'
+  if (path.startsWith('/plans')) return 'stress'
+  if (path.startsWith('/reports')) return 'stress'
   if (path.startsWith('/capture')) return 'capture'
   if (path.startsWith('/runner')) return 'runner'
   if (path.startsWith('/projects')) return 'projects'

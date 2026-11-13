@@ -18,6 +18,7 @@ import type {
   BackupTargetTestReport,
   BackupUploadResult,
   CheckResult,
+  CapacityResult,
   CleanupResult,
   CollectionNode,
   CookieItem,
@@ -44,6 +45,8 @@ import type {
   MockStatus,
   OpenApiSource,
   PlanSummary,
+  PlanImportPreview,
+  PlanTemplate,
   PerformanceProfile,
   PolicySnapshot,
   PostmanExportReport,
@@ -52,6 +55,7 @@ import type {
   RealtimeConnectPayload,
   RealtimeSendPayload,
   RealtimeStatus,
+  ReclaimResult,
   ReportDetail,
   ReportRequestsPage,
   RemoteBackup,
@@ -76,6 +80,7 @@ import type {
   TestSuiteSummary,
   RunDetail,
   StressConfig,
+  StressJobSummary,
   StressReport,
   TestPlan,
   UpdateInfo,
@@ -337,7 +342,9 @@ export const pythonCheck = (path?: string) =>
   invoke<PythonCheckResult>('python_check', { path: path?.trim() || null })
 
 // 压测计划
-export const planList = (projectId: number) => invoke<PlanSummary[]>('plan_list', { projectId })
+/** 省略 projectId = 全部项目（计划中心 2.1.1） */
+export const planList = (projectId?: number | null) =>
+  invoke<PlanSummary[]>('plan_list', { projectId: projectId ?? null })
 
 export const planGet = (id: number) => invoke<TestPlan>('plan_get', { id })
 
@@ -360,6 +367,20 @@ export const planSave = (plan: {
 
 export const planDelete = (id: number) => invoke<void>('plan_delete', { id })
 
+export const planDuplicate = (id: number) => invoke<TestPlan>('plan_duplicate', { id })
+
+/** 导出计划 JSON（astroman.stress-plan/v1），默认剔除敏感信息 */
+export const planExport = (planIds: number[], includeSensitive = false) =>
+  invoke<string>('plan_export', { planIds, includeSensitive })
+
+export const planImportPreview = (payload: string, projectId: number) =>
+  invoke<PlanImportPreview>('plan_import_preview', { payload, projectId })
+
+export const planImportApply = (payload: string, projectId: number) =>
+  invoke<number[]>('plan_import_apply', { payload, projectId })
+
+export const planTemplates = () => invoke<PlanTemplate[]>('plan_templates')
+
 // 本地文件读写（Runner 数据文件、导出结果、保存响应体）
 export const fileReadText = (path: string) => invoke<string>('file_read_text', { path })
 
@@ -374,16 +395,44 @@ export const ipLookup = (ip?: string) =>
   invoke<IpLookupInfo>('ip_lookup', { ip: ip?.trim() || null })
 
 // 压测
-export const stressStart = (config: StressConfig) => invoke<void>('stress_start', { config })
+/** 返回任务 ID：多窗口并行时用于过滤事件与按任务停止 */
+export const stressStart = (config: StressConfig) => invoke<number>('stress_start', { config })
 
-export const stressStop = () => invoke<void>('stress_stop')
+/** 停止指定任务；不传 jobId 时停止全部（保留旧调用习惯） */
+export const stressStop = (jobId?: number | null) =>
+  invoke<number>('stress_stop', { jobId: jobId ?? null })
+
+export const stressStopAll = () => invoke<number>('stress_stop_all')
+
+/** 运行中任务快照（主窗口面板与窗口恢复） */
+export const stressJobs = () => invoke<StressJobSummary[]>('stress_jobs')
+
+/** 新窗口打开压测页；重复打开同一任务会聚焦已有窗口 */export const stressOpenWindow = (
+  planId?: number | null,
+  jobId?: number | null,
+  envId?: number | null,
+) =>
+  invoke<string>('stress_open_window', {
+    planId: planId ?? null,
+    jobId: jobId ?? null,
+    envId: envId ?? null,
+  })
+
+// 本机施压能力检测（1.7.3）
+/** 运行检测；过程中通过 capacity:progress 推送逐档进度 */
+export const capacityProbe = () => invoke<CapacityResult>('capacity_probe')
+
+/** 读取最近一次检测结果（没有检测过返回 null） */
+export const capacityGet = () => invoke<CapacityResult | null>('capacity_get')
+
+export const capacityCancel = () => invoke<void>('capacity_cancel')
 
 // 压测报告
 export const reportList = (limit = 100) => invoke<StressReport[]>('report_list', { limit })
 
 export const reportGet = (id: number) => invoke<ReportDetail>('report_get', { id })
 
-export const reportDelete = (id: number) => invoke<void>('report_delete', { id })
+export const reportDelete = (id: number) => invoke<ReclaimResult>('report_delete', { id })
 
 export const reportExport = (id: number, path: string) =>
   invoke<void>('report_export', { id, path })
@@ -399,7 +448,8 @@ export const reportUpdateTexts = (id: number, scenarioText: string, summaryText:
   invoke<void>('report_update_texts', { id, scenarioText, summaryText })
 
 /** 清理某份报告的逐请求明细（保留汇总与采样） */
-export const reportClearDetails = (id: number) => invoke<number>('report_clear_details', { id })
+export const reportClearDetails = (id: number) =>
+  invoke<ReclaimResult>('report_clear_details', { id })
 
 /** 明细 / 错误 CSV 流式导出，返回写入行数 */
 export const reportExportDetailCsv = (id: number, kind: 'requests' | 'errors', path: string) =>

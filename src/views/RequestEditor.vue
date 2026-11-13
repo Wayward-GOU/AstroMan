@@ -2362,6 +2362,8 @@ async function openStress() {
     query: {
       requestId: String(form.value.id ?? requestId.value),
       projectId: projectId.value ? String(projectId.value) : undefined,
+      // 带上当前环境，压测页按「路由 envId → 计划 env → 项目激活环境」解析（4.2）
+      envId: envId.value ? String(envId.value) : undefined,
     },
   })
 }

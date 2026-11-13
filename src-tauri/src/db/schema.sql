@@ -77,10 +77,11 @@ CREATE TABLE IF NOT EXISTS env_variables (
 );
 
 -- 压测计划
+-- request_id 可空：接口被删除后计划保留，界面回退展示 URL 模板（v15）
 CREATE TABLE IF NOT EXISTS test_plans (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     project_id      INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    request_id      INTEGER NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
+    request_id      INTEGER REFERENCES requests(id) ON DELETE SET NULL,
     name            TEXT NOT NULL,
     concurrent      INTEGER DEFAULT 10,
     duration_sec    INTEGER DEFAULT 60,
@@ -129,6 +130,12 @@ CREATE TABLE IF NOT EXISTS test_reports (
     error_types_json TEXT,
     scenario_text  TEXT,
     summary_text   TEXT,
+    -- 同一次运行产生的多份报告（多窗口 / 套件）共用一个分组号（v15）
+    run_group_id   INTEGER,
+    -- 响应体耗时（body = latency - ttfb）直方图（v15）
+    body_histogram_json TEXT,
+    -- TopN 慢请求快照，JSON 数组（v15）
+    slow_requests_json  TEXT,
     start_time     INTEGER,
     end_time       INTEGER,
     created_at     INTEGER NOT NULL
@@ -146,6 +153,9 @@ CREATE TABLE IF NOT EXISTS report_samples (
     p95_rt        REAL DEFAULT 0,
     p99_rt        REAL DEFAULT 0,
     ttfb_avg      REAL DEFAULT 0,
+    -- 响应体耗时（latency - ttfb），v15
+    body_avg      REAL DEFAULT 0,
+    body_p95      REAL DEFAULT 0,
     bytes         INTEGER DEFAULT 0,
     success_count INTEGER DEFAULT 0,
     error_count   INTEGER DEFAULT 0
@@ -186,6 +196,21 @@ CREATE TABLE IF NOT EXISTS report_requests (
 );
 
 CREATE INDEX IF NOT EXISTS idx_report_requests_report ON report_requests(report_id, id);
+
+-- 本机容量探测结果（v15）：分级加压测出的吞吐上限，保留最近 10 次
+CREATE TABLE IF NOT EXISTS machine_capacity (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    probed_at             INTEGER NOT NULL,
+    max_qps               REAL NOT NULL DEFAULT 0,
+    saturation_concurrent INTEGER NOT NULL DEFAULT 0,
+    cpu_peak              REAL NOT NULL DEFAULT 0,
+    mem_peak              INTEGER NOT NULL DEFAULT 0,
+    cores                 INTEGER NOT NULL DEFAULT 0,
+    os                    TEXT NOT NULL DEFAULT '',
+    reached_limit         INTEGER NOT NULL DEFAULT 0,
+    samples_json          TEXT NOT NULL DEFAULT '[]'
+);
+CREATE INDEX IF NOT EXISTS idx_machine_capacity_probed ON machine_capacity(probed_at DESC);
 
 -- 请求历史（本地，最多保留最近 100000 条）
 CREATE TABLE IF NOT EXISTS request_history (

@@ -3,7 +3,7 @@ use r2d2_sqlite::SqliteConnectionManager;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::Manager;
@@ -53,6 +53,8 @@ pub struct AppSettings {
     pub budget_hard_stop: bool,
     /// 失败回退链：逗号分隔的 provider id，按顺序尝试；空 = 关闭（AI-12）
     pub ai_fallback_ids: String,
+    /// 压测跨任务并发之和上限，默认 1000，硬上限 2000（v1.1.1）
+    pub stress_max_concurrent: i64,
 }
 
 impl Default for AppSettings {
@@ -72,6 +74,7 @@ impl Default for AppSettings {
             budget_alert: true,
             budget_hard_stop: false,
             ai_fallback_ids: String::new(),
+            stress_max_concurrent: 1000,
         }
     }
 }
@@ -90,6 +93,237 @@ pub struct PolicyState {
     pub error: Option<String>,
 }
 
+/// 运行中的一个压测任务
+///
+/// 任务归注册表所有：窗口关闭不影响任务，重新打开窗口按 `jobId` 恢复展示。
+pub struct StressJob {
+    pub id: u64,
+    pub name: String,
+    /// 展示用目标（渲染后的 URL）
+    pub target: String,
+    /// 归一化目标键 method + scheme://host:port/path，用于同目标判定
+    pub target_key: String,
+    pub plan_id: Option<i64>,
+    pub request_id: Option<i64>,
+    /// 本次运行峰值并发（跨任务求和用）
+    pub concurrent: u32,
+    pub started_at: i64,
+    /// running / stopping
+    pub status: String,
+    /// 最新一次进度事件里的 QPS，主窗口面板展示用
+    pub qps: AtomicU32,
+    pub window_label: Option<String>,
+    pub cancel: Arc<AtomicBool>,
+}
+
+/// 注册表对外快照：主窗口面板与窗口恢复共用
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StressJobSummary {
+    pub id: u64,
+    pub name: String,
+    pub target: String,
+    pub plan_id: Option<i64>,
+    pub request_id: Option<i64>,
+    pub concurrent: u32,
+    pub started_at: i64,
+    pub elapsed_sec: u64,
+    pub status: String,
+    pub qps: u32,
+    pub window_label: Option<String>,
+}
+
+/// 新任务登记参数
+pub struct StressJobDraft {
+    pub name: String,
+    pub target: String,
+    pub target_key: String,
+    pub plan_id: Option<i64>,
+    pub request_id: Option<i64>,
+    pub concurrent: u32,
+}
+
+/// 压测任务注册表：取代原先全局唯一的 `stress_running` / `stress_cancel`
+pub struct StressJobRegistry {
+    next_id: AtomicU64,
+    jobs: parking_lot::Mutex<HashMap<u64, StressJob>>,
+}
+
+impl StressJobRegistry {
+    pub fn new() -> Self {
+        Self {
+            next_id: AtomicU64::new(1),
+            jobs: parking_lot::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 登记新任务：任务数、跨任务并发之和、同目标三项校验在同一把锁内完成，
+    /// 避免多个窗口同时通过校验后一起启动。
+    ///
+    /// 返回 (jobId, 取消位, 被忽略的冲突任务 id)；同目标冲突且未声明忽略时返回错误。
+    pub fn try_reserve(
+        &self,
+        draft: StressJobDraft,
+        max_jobs: usize,
+        max_total: u32,
+        ignore_overlap: bool,
+    ) -> Result<(u64, Arc<AtomicBool>, Vec<u64>), String> {
+        let mut jobs = self.jobs.lock();
+        if jobs.len() >= max_jobs {
+            return Err(format!(
+                "最多同时运行 {max_jobs} 个压测任务，请先停止其中一个"
+            ));
+        }
+        let total: u32 = jobs.values().map(|job| job.concurrent).sum();
+        if total.saturating_add(draft.concurrent) > max_total {
+            return Err(format!(
+                "跨任务并发之和将达 {}，超过上限 {max_total}；请调低并发或先停止其他任务",
+                total.saturating_add(draft.concurrent)
+            ));
+        }
+        let overlaps: Vec<u64> = jobs
+            .values()
+            .filter(|job| job.target_key == draft.target_key)
+            .map(|job| job.id)
+            .collect();
+        if !overlaps.is_empty() && !ignore_overlap {
+            return Err(format!(
+                "目标接口正在被任务 #{} 压测，同时施压会互相干扰；如确认继续请在配置中勾选「忽略同目标检查」",
+                overlaps[0]
+            ));
+        }
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let cancel = Arc::new(AtomicBool::new(false));
+        jobs.insert(
+            id,
+            StressJob {
+                id,
+                name: draft.name,
+                target: draft.target,
+                target_key: draft.target_key,
+                plan_id: draft.plan_id,
+                request_id: draft.request_id,
+                concurrent: draft.concurrent,
+                started_at: crate::util::now_ms(),
+                status: "running".to_string(),
+                qps: AtomicU32::new(0),
+                window_label: None,
+                cancel: cancel.clone(),
+            },
+        );
+        Ok((id, cancel, overlaps))
+    }
+
+    /// 任务结束（完成 / 取消 / 失败）后释放登记
+    pub fn finish(&self, id: u64) {
+        self.jobs.lock().remove(&id);
+    }
+
+    /// 按任务停止，返回是否命中
+    pub fn cancel(&self, id: u64) -> bool {
+        let mut jobs = self.jobs.lock();
+        match jobs.get_mut(&id) {
+            Some(job) => {
+                job.status = "stopping".to_string();
+                job.cancel.store(true, Ordering::SeqCst);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 全部停止（退出确认后使用），返回被取消的任务数
+    pub fn cancel_all(&self) -> usize {
+        let jobs = self.jobs.lock();
+        for job in jobs.values() {
+            job.cancel.store(true, Ordering::SeqCst);
+        }
+        jobs.len()
+    }
+
+    /// 绑定窗口 label（重复打开时聚焦已有窗口）
+    pub fn set_window_label(&self, id: u64, label: &str) {
+        if let Some(job) = self.jobs.lock().get_mut(&id) {
+            job.window_label = Some(label.to_string());
+        }
+    }
+
+    /// 把每秒进度里的 QPS 写回注册表：主窗口面板不订阅事件也能看到实时速率
+    pub fn set_qps(&self, id: u64, qps: f64) {
+        if let Some(job) = self.jobs.lock().get_mut(&id) {
+            job.qps.store(qps.max(0.0).round() as u32, Ordering::SeqCst);
+        }
+    }
+
+    pub fn window_label(&self, id: u64) -> Option<String> {
+        self.jobs
+            .lock()
+            .get(&id)
+            .and_then(|job| job.window_label.clone())
+    }
+
+    /// 同主机不同目标的运行中任务：只警告不拦截（1.3.2）
+    ///
+    /// 判定口径为 `scheme://host:port` 相同而完整目标键不同；同机同时施压会互相争抢
+    /// 连接与带宽，报告里需要留痕，但用户确认后允许继续。
+    pub fn same_host_others(&self, target_key: &str) -> Vec<(u64, String)> {
+        let host = host_prefix_of(target_key);
+        let mut items: Vec<(u64, String)> = self
+            .jobs
+            .lock()
+            .values()
+            .filter(|job| job.target_key != target_key && host_prefix_of(&job.target_key) == host)
+            .map(|job| (job.id, job.name.clone()))
+            .collect();
+        items.sort_by_key(|(id, _)| *id);
+        items
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.jobs.lock().is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.jobs.lock().len()
+    }
+
+    /// 运行中任务快照，按任务号升序
+    pub fn snapshot(&self) -> Vec<StressJobSummary> {
+        let now = crate::util::now_ms();
+        let jobs = self.jobs.lock();
+        let mut items: Vec<StressJobSummary> = jobs
+            .values()
+            .map(|job| StressJobSummary {
+                id: job.id,
+                name: job.name.clone(),
+                target: job.target.clone(),
+                plan_id: job.plan_id,
+                request_id: job.request_id,
+                concurrent: job.concurrent,
+                started_at: job.started_at,
+                elapsed_sec: (now - job.started_at).max(0) as u64 / 1000,
+                status: job.status.clone(),
+                qps: job.qps.load(Ordering::SeqCst),
+                window_label: job.window_label.clone(),
+            })
+            .collect();
+        items.sort_by_key(|item| item.id);
+        items
+    }
+}
+
+/// 从 `METHOD scheme://host:port/path` 中取出 `scheme://host:port`
+///
+/// 同主机判定忽略方法与路径：任何方法、任何路径落到同一主机端口都算同机施压。
+fn host_prefix_of(target_key: &str) -> String {
+    let rest = target_key.split_once(' ').map(|(_, tail)| tail).unwrap_or(target_key);
+    let scheme_end = rest.find("://").map(|idx| idx + 3).unwrap_or(0);
+    match rest[scheme_end..].find('/') {
+        Some(idx) => rest[..scheme_end + idx].to_string(),
+        None => rest.to_string(),
+    }
+}
+
 pub struct AppState {
     pub pool: DbPool,
     pub data_dir: PathBuf,
@@ -103,10 +337,10 @@ pub struct AppState {
     settings_file: PathBuf,
     settings: parking_lot::RwLock<AppSettings>,
     clients: parking_lot::RwLock<HttpClients>,
-    /// 压测运行中标记（同一时间只允许一个压测任务）
-    pub stress_running: Arc<AtomicBool>,
-    /// 压测停止信号
-    pub stress_cancel: Arc<AtomicBool>,
+    /// 压测任务注册表（多任务并行；空即空闲）
+    pub stress_jobs: Arc<StressJobRegistry>,
+    /// 本机施压能力检测（全局单例，与压测互斥）
+    pub capacity: crate::commands::capacity::CapacityState,
     /// AI 在途请求的取消标记：requestId → 取消位
     pub ai_cancels: Arc<parking_lot::Mutex<HashMap<String, Arc<AtomicBool>>>>,
     /// 套件运行的取消标记：runId → 取消位（按运行隔离，不用全局单例）
@@ -216,8 +450,8 @@ impl AppState {
             settings_file,
             settings: parking_lot::RwLock::new(settings),
             clients: parking_lot::RwLock::new(clients),
-            stress_running: Arc::new(AtomicBool::new(false)),
-            stress_cancel: Arc::new(AtomicBool::new(false)),
+            stress_jobs: Arc::new(StressJobRegistry::new()),
+            capacity: crate::commands::capacity::CapacityState::default(),
             ai_cancels: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             test_cancels: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             http_cancels: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -272,8 +506,8 @@ impl AppState {
             settings_file,
             settings: parking_lot::RwLock::new(settings),
             clients: parking_lot::RwLock::new(clients),
-            stress_running: Arc::new(AtomicBool::new(false)),
-            stress_cancel: Arc::new(AtomicBool::new(false)),
+            stress_jobs: Arc::new(StressJobRegistry::new()),
+            capacity: crate::commands::capacity::CapacityState::default(),
             ai_cancels: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             test_cancels: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             http_cancels: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -350,6 +584,14 @@ impl AppState {
         self.policy.read().policy.clone()
     }
 
+    /// 压测并行限制：(最多任务数, 跨任务并发之和上限)
+    pub fn stress_limits(&self) -> (usize, u32) {
+        /// 同时运行的任务数上限（产品口径固定 3）
+        const MAX_STRESS_JOBS: usize = 3;
+        let total = self.settings.read().stress_max_concurrent.clamp(1, 2000) as u32;
+        (MAX_STRESS_JOBS, total)
+    }
+
     /// 策略文件解析错误（没有错误时为 None）
     pub fn policy_error(&self) -> Option<String> {
         self.policy.read().error.clone()
@@ -403,6 +645,11 @@ impl AppState {
             next.monthly_budget = 0.0;
         }
         next.summary_provider_id = next.summary_provider_id.max(0);
+        // 压测并发上限：0 / 负数按默认 1000，超过硬上限按 2000
+        if next.stress_max_concurrent <= 0 {
+            next.stress_max_concurrent = 1000;
+        }
+        next.stress_max_concurrent = next.stress_max_concurrent.min(2000);
         let mut seen = std::collections::HashSet::new();
         next.ai_fallback_ids = next
             .ai_fallback_ids
@@ -835,5 +1082,115 @@ mod tests {
             "newer"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn draft(name: &str, target_key: &str, concurrent: u32) -> StressJobDraft {
+        StressJobDraft {
+            name: name.to_string(),
+            target: "http://127.0.0.1/api".to_string(),
+            target_key: target_key.to_string(),
+            plan_id: None,
+            request_id: None,
+            concurrent,
+        }
+    }
+
+    #[test]
+    fn registry_enforces_job_limit_and_total_concurrency() {
+        let registry = StressJobRegistry::new();
+        let (first, _, _) = registry
+            .try_reserve(draft("a", "GET http://h:80/a", 400), 2, 1000, false)
+            .unwrap();
+        let (second, _, _) = registry
+            .try_reserve(draft("b", "GET http://h:80/b", 400), 2, 1000, false)
+            .unwrap();
+        // 任务数上限
+        let error = registry
+            .try_reserve(draft("c", "GET http://h:80/c", 100), 2, 1000, false)
+            .unwrap_err();
+        assert!(error.contains("最多同时运行"));
+        // 跨任务并发之和上限
+        registry.finish(first);
+        let error = registry
+            .try_reserve(draft("c", "GET http://h:80/c", 700), 2, 1000, false)
+            .unwrap_err();
+        assert!(error.contains("超过上限"));
+        registry.finish(second);
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn registry_rejects_same_target_and_ignore_keeps_trace() {
+        let registry = StressJobRegistry::new();
+        let (_, _, overlaps) = registry
+            .try_reserve(draft("a", "GET http://h:80/api", 100), 3, 1000, false)
+            .unwrap();
+        assert!(overlaps.is_empty());
+        let error = registry
+            .try_reserve(draft("b", "GET http://h:80/api", 100), 3, 1000, false)
+            .unwrap_err();
+        assert!(error.contains("目标接口正在被任务"));
+        // 忽略同目标时允许启动，并把冲突任务 id 交给调用方留痕
+        let (id, cancel, overlaps) = registry
+            .try_reserve(draft("b", "GET http://h:80/api", 100), 3, 1000, true)
+            .unwrap();
+        assert_eq!(overlaps.len(), 1);
+        assert!(!cancel.load(std::sync::atomic::Ordering::SeqCst));
+        // 同 host 不同 path 不冲突
+        let (other, _, overlaps) = registry
+            .try_reserve(draft("c", "GET http://h:80/users", 100), 3, 1000, false)
+            .unwrap();
+        assert!(overlaps.is_empty());
+        // 按任务取消不影响其他任务
+        assert!(registry.cancel(id));
+        registry.finish(id);
+        assert_eq!(registry.snapshot().len(), 2);
+        registry.finish(other);
+    }
+
+    #[test]
+    fn registry_warns_same_host_without_blocking() {
+        let registry = StressJobRegistry::new();
+        let (a, _, _) = registry
+            .try_reserve(draft("a", "GET https://api.example.com:8443/users", 100), 3, 1000, false)
+            .unwrap();
+        let (b, _, _) = registry
+            .try_reserve(draft("b", "POST https://api.example.com:8443/orders", 100), 3, 1000, false)
+            .unwrap();
+        let (c, _, _) = registry
+            .try_reserve(draft("c", "GET https://other.example.com/users", 100), 3, 1000, false)
+            .unwrap();
+        // 同 scheme/host/port 不同 path 或方法只警告：列出对方任务
+        let others = registry.same_host_others("GET https://api.example.com:8443/orders");
+        assert_eq!(
+            others.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![a, b]
+        );
+        // 完全相同的目标由 try_reserve 拦截，不重复出现在警告里
+        assert!(registry
+            .same_host_others("GET https://api.example.com:8443/users")
+            .iter()
+            .all(|(id, _)| *id != a));
+        // 不同主机不告警
+        assert!(registry
+            .same_host_others("GET https://third.example.com/users")
+            .is_empty());
+        registry.finish(a);
+        registry.finish(b);
+        registry.finish(c);
+    }
+
+    #[test]
+    fn registry_tracks_qps_and_window_label() {
+        let registry = StressJobRegistry::new();
+        let (id, _, _) = registry
+            .try_reserve(draft("a", "GET http://h:80/a", 100), 3, 1000, false)
+            .unwrap();
+        registry.set_qps(id, 1234.6);
+        registry.set_window_label(id, "stress-1");
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot[0].qps, 1235);
+        assert_eq!(registry.window_label(id).as_deref(), Some("stress-1"));
+        registry.finish(id);
     }
 }

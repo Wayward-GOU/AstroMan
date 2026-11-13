@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch, type Component } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch, type Component } from 'vue'
 import { useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
 import { open, save as saveFile } from '@tauri-apps/plugin-dialog'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import {
   DatabaseOutlined,
   SafetyCertificateOutlined,
@@ -39,6 +40,8 @@ import type {
   AppInfo,
   AppSettings,
   BackupItem,
+  CapacityProgress,
+  CapacityResult,
   CheckResult,
   PerformanceProfile,
   PolicySnapshot,
@@ -105,6 +108,7 @@ const network = reactive<AppSettings>({
   performanceMode: 'auto',
   aiPermissionMode: 'confirm_write',
   aiFallbackIds: '',
+  stressMaxConcurrent: 1000,
 })
 const networkLoading = ref(false)
 
@@ -222,7 +226,63 @@ onMounted(async () => {
   void loadBackups()
   void loadSecrets()
   void loadPolicy()
+  void loadCapacity()
+  try {
+    unlistenCapacity = await listen<CapacityProgress>('capacity:progress', (event) => {
+      capacityProgress.value = event.payload
+    })
+  } catch {
+    unlistenCapacity = null
+  }
 })
+
+onBeforeUnmount(() => {
+  unlistenCapacity?.()
+  unlistenCapacity = null
+})
+
+/* ---------- 本机施压能力检测（1.7） ---------- */
+const capacity = ref<CapacityResult | null>(null)
+const capacityRunning = ref(false)
+const capacityProgress = ref<CapacityProgress | null>(null)
+let unlistenCapacity: UnlistenFn | null = null
+
+async function loadCapacity() {
+  try {
+    capacity.value = await api.capacityGet()
+  } catch {
+    capacity.value = null
+  }
+}
+
+function fmtCapacityQps(value: number) {
+  if (value >= 10000) return `${(value / 1000).toFixed(1)}k`
+  return Math.round(value).toLocaleString()
+}
+
+async function runCapacityProbe() {
+  if (capacityRunning.value) return
+  capacityRunning.value = true
+  capacityProgress.value = null
+  try {
+    capacity.value = await api.capacityProbe()
+    message.success('本机施压能力检测完成')
+  } catch (e) {
+    message.error(String(e))
+  } finally {
+    capacityRunning.value = false
+    capacityProgress.value = null
+  }
+}
+
+async function cancelCapacity() {
+  try {
+    await api.capacityCancel()
+    message.info('已请求取消检测')
+  } catch (e) {
+    message.error(String(e))
+  }
+}
 
 async function saveNetwork() {
   networkLoading.value = true
@@ -1459,6 +1519,74 @@ async function openReleasePage() {
               </div>
               <div class="row-control wide">
                 <span class="mono">{{ performanceProfile.description }}</span>
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="row-label">
+                <div class="row-title">跨任务并发上限</div>
+                <div class="row-desc">
+                  多窗口 / 多计划并行时所有任务并发之和的上限，硬上限 2000；单任务仍可到 5000
+                </div>
+              </div>
+              <div class="row-control wide">
+                <a-input-number
+                  v-model:value="network.stressMaxConcurrent"
+                  :min="1"
+                  :max="2000"
+                  :step="100"
+                  size="small"
+                  style="width: 200px"
+                />
+              </div>
+            </div>
+          </div>
+
+          <div class="group">
+            <div class="group-title">本机施压能力</div>
+            <div class="group-desc">
+              用进程内回环 HTTP 服务逐档探测本机可稳定产生的压力；检测期间所有窗口禁止启动压测
+            </div>
+
+            <div class="row">
+              <div class="row-label">
+                <div class="row-title">最近检测</div>
+                <div class="row-desc">
+                  <template v-if="capacity">
+                    {{ capacity.reachedLimit ? '饱和并发' : '≥ 并发' }}
+                    {{ capacity.saturationConcurrent }} ·
+                    {{ capacity.reachedLimit ? '≈' : '≥' }} {{ fmtCapacityQps(capacity.maxQps) }} QPS ·
+                    {{ capacity.cores }} 核 · {{ new Date(capacity.probedAt).toLocaleString('zh-CN') }}
+                  </template>
+                  <template v-else>还没有检测过。检测约 25 秒，期间会占满本机 CPU。</template>
+                </div>
+              </div>
+              <div class="row-control wide">
+                <a-button v-if="!capacityRunning" size="small" @click="runCapacityProbe">
+                  开始检测
+                </a-button>
+                <template v-else>
+                  <span class="mono capacity-progress">
+                    {{
+                      capacityProgress
+                        ? `${capacityProgress.concurrent} 并发 · ${Math.round(capacityProgress.qps)} QPS`
+                        : '准备中…'
+                    }}
+                  </span>
+                  <a-button size="small" danger @click="cancelCapacity">取消</a-button>
+                </template>
+              </div>
+            </div>
+
+            <div v-if="capacity?.samples.length" class="capacity-stages">
+              <div v-for="item in capacity.samples" :key="item.concurrent" class="capacity-stage">
+                <span class="mono">{{ item.concurrent }} 并发</span>
+                <span class="mono">{{ Math.round(item.qps) }} QPS</span>
+                <span class="mono">{{ item.avgRt.toFixed(1) }} / {{ item.p95Rt.toFixed(0) }} ms</span>
+                <span class="mono">{{ item.cpu.toFixed(1) }} 核</span>
+                <span v-if="item.errorRate > 0" class="capacity-error mono">
+                  {{ item.errorRate.toFixed(1) }}% 错误
+                </span>
               </div>
             </div>
           </div>
@@ -2734,8 +2862,7 @@ kbd {
 }
 
 /* ---------- v1.0.8：设置页弹窗 ---------- */
-.modal-body {
-  display: flex;
+.modal-body {  display: flex;
   flex-direction: column;
   gap: 10px;
   font-size: 13px;
@@ -2747,5 +2874,34 @@ kbd {
   line-height: 1.7;
   color: var(--fm-muted);
   margin: 0;
+}
+
+/* ---------- 本机施压能力检测 ---------- */
+.capacity-progress {
+  margin-right: 10px;
+  font-size: 11px;
+  color: var(--fm-muted);
+}
+
+.capacity-stages {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--fm-border);
+  background: var(--fm-surface-alt);
+}
+
+.capacity-stage {
+  display: grid;
+  grid-template-columns: 80px 90px 130px 70px 90px;
+  gap: 10px;
+  font-size: 10.5px;
+  color: var(--fm-text-2);
+}
+
+.capacity-error {
+  color: var(--fm-danger);
 }
 </style>

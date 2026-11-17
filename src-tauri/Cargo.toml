@@ -22,6 +22,8 @@ required-features = ["bench"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# 仅为测试二进制补 Common-Controls v6 清单，见 build.rs
+embed-resource = "3"
 
 [dependencies]
 tauri = { version = "2", features = ["compression", "tray-icon", "image-png", "protocol-asset"] }
@@ -90,3 +92,7 @@ codegen-units = 1
 lto = true
 opt-level = "z"
 strip = true
+
+[dev-dependencies]
+# 双机验收 harness：tauri::test 提供 noop_assets / mock 运行时，仅测试构建启用
+tauri = { version = "2", features = ["test"] }

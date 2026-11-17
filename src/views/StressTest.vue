@@ -27,6 +27,7 @@ import { stressPlanPrompt } from '@/utils/aiScenarios'
 import * as api from '@/api'
 import type {
   CapturePreset,
+  CapacityResult,
   Environment,
   HttpRequestDetail,
   PlanSummary,
@@ -103,6 +104,22 @@ const unresolvedVars = computed(() => {
   }
   return [...names]
 })
+
+/** 解析后的完整地址（4.6）：环境切换后立即更新，缺变量时保留模板原文 */
+const previewUrl = computed(() => {
+  const source = selectedChoice.value?.url ?? request.value?.url ?? ''
+  return renderPreviewUrl(source)
+})
+
+/** 最近一次本机能力检测结果（1.7.4）：压测页默认展示，不阻塞启动 */
+const capacity = ref<CapacityResult | null>(null)
+async function loadCapacity() {
+  try {
+    capacity.value = await api.capacityGet()
+  } catch {
+    capacity.value = null
+  }
+}
 
 const requestSelectOptions = computed(() =>
   choices.value.map((item) => ({
@@ -532,6 +549,7 @@ onMounted(async () => {
     await initFromQuery()
     void loadTemplates()
     void loadBaselineReports()
+    void loadCapacity()
   } catch (e) {
     message.error(String(e))
   } finally {
@@ -1218,6 +1236,15 @@ function backToRequest() {
               <div v-if="unresolvedVars.length" class="hint warn">
                 当前环境缺少变量：{{ unresolvedVars.join('、') }}，补充变量或切换环境后才能开始
               </div>
+              <div class="hint capacity-hint">
+                <template v-if="capacity">
+                  本机能力：{{ capacity.reachedLimit ? '≈' : '≥' }}
+                  {{ fmt(capacity.maxQps, 0) }} QPS · 饱和并发
+                  {{ capacity.saturationConcurrent }} · 检测于
+                  {{ new Date(capacity.probedAt).toLocaleString('zh-CN') }}
+                </template>
+                <template v-else>未检测本机施压能力，可在「设置 → 本机施压能力」完成检测</template>
+              </div>
             </div>
 
             <a-checkbox v-model:checked="settings.insecure">忽略证书校验（自签证书）</a-checkbox>
@@ -1545,6 +1572,13 @@ function backToRequest() {
               </span>
             </div>
             <div class="target-card-url mono" :title="selectedChoice.url">{{ selectedChoice.url }}</div>
+            <div
+              v-if="previewUrl && previewUrl !== selectedChoice.url"
+              class="target-card-url resolved mono"
+              :title="previewUrl"
+            >
+              解析后：{{ previewUrl }}
+            </div>
           </div>
           <div v-else-if="currentProject" class="hint">
             {{ currentProject.name }} · 共 {{ choices.length }} 个接口
@@ -2625,6 +2659,16 @@ function backToRequest() {
   line-height: 1.6;
   color: var(--fm-text-2);
   word-break: break-all;
+}
+
+.target-card-url.resolved {
+  margin-top: 4px;
+  border-style: dashed;
+  color: var(--fm-primary);
+}
+
+.capacity-hint {
+  color: var(--fm-muted);
 }
 
 .modal-fields {

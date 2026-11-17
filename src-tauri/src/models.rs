@@ -653,7 +653,7 @@ impl CapturePreset {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StressConfig {
     #[serde(default)]
@@ -664,6 +664,9 @@ pub struct StressConfig {
     /// 来源计划：写入报告，便于按计划聚合
     #[serde(default)]
     pub plan_id: Option<i64>,
+    /// 同批多计划报告分组号（1.3.3）：可选，缺省不归组
+    #[serde(default)]
+    pub run_group_id: Option<i64>,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default = "default_method")]

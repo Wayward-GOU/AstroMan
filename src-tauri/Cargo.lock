@@ -192,6 +192,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "embed-resource",
  "env_logger",
  "futures-util",
  "hmac",

@@ -20,7 +20,8 @@ mod seed;
 /// 14 = AI 写操作回滚（request_revisions.trace_id）
 /// 15 = 压测 v1.1.1（plan 的 request_id 可空且 SET NULL、机器容量表、
 ///      报告分组 / 响应体耗时直方图 / TopN 慢请求、采样响应体耗时）
-pub const DB_VERSION: i64 = 15;
+/// 16 = 分布式压测一期（cluster_jobs / cluster_workers，报告仍复用 test_reports）
+pub const DB_VERSION: i64 = 16;
 
 /// 每条连接都要应用的 SQLite 参数（P-06）。
 ///
@@ -836,6 +837,58 @@ mod tests {
             )
             .unwrap();
         assert_eq!(capacity, 1);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn creates_cluster_tables_and_cascades_workers() {
+        let (dir, pool) = temp_pool("cluster-v16");
+        init(&pool).unwrap();
+        // 重复初始化保持幂等
+        init(&pool).unwrap();
+        let conn = pool.get().unwrap();
+        for table in ["cluster_jobs", "cluster_workers"] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "缺少表 {table}");
+        }
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, DB_VERSION);
+
+        let now = crate::util::now_ms();
+        conn.execute(
+            "INSERT INTO cluster_jobs (created_at, status, master_node, plan_name, total_concurrent)
+             VALUES (?1, 'pairing', 'master', '集群计划', 8)",
+            params![now],
+        )
+        .unwrap();
+        let job_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO cluster_workers
+               (job_id, node_name, role, weight, concurrent, status, joined_at)
+             VALUES (?1, 'slave-1', 'slave', 1, 4, 'ready', ?2)",
+            params![job_id, now],
+        )
+        .unwrap();
+        // 任务删除后节点记录随之级联清理
+        conn.execute("DELETE FROM cluster_jobs WHERE id = ?1", params![job_id])
+            .unwrap();
+        let left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM cluster_workers WHERE job_id = ?1",
+                params![job_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0);
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
     }

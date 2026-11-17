@@ -363,6 +363,8 @@ fn enrich_plan_config(
     let Some(map) = config.as_object_mut() else {
         return Ok(());
     };
+    // 配置形态版本：v2 起固定写入 settings + stages + env + target 快照（2.2.1 / 6.2）
+    map.insert("schemaVersion".to_string(), json!(2));
 
     // 环境：显式 envId > 项目激活环境
     let env_id = map

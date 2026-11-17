@@ -14,6 +14,7 @@ const router = createRouter({
     { path: '/request/:id', name: 'request', component: () => import('@/views/RequestEditor.vue') },
     { path: '/environment/:projectId', name: 'environment', component: () => import('@/views/Environment.vue') },
     { path: '/stress', name: 'stress', component: () => import('@/views/StressTest.vue') },
+    { path: '/cluster', name: 'cluster', component: () => import('@/views/Cluster.vue') },
     { path: '/plans', name: 'plans', component: () => import('@/views/Plans.vue') },
     { path: '/capture', name: 'capture', component: () => import('@/views/Capture.vue') },
     { path: '/runner', name: 'runner', component: () => import('@/views/Runner.vue') },

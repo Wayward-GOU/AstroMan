@@ -21,6 +21,7 @@ import { reportReviewPrompt } from '@/utils/aiScenarios'
 import { formatDateTime } from '@/utils/datetime'
 import * as api from '@/api'
 import type { ReportDetail, ReportRequestRecord, ReportRequestsPage } from '@/types/models'
+import type { ClusterReportMeta } from '@/types/cluster'
 import { buildReportHtml, buildReportSheets } from '@/utils/reportExport'
 import { detectKnee, qpsOverview, scoreReport, selfCheck } from '@/utils/reportAnalytics'
 import { buildFindings, gradeReport, latencyDrift, type Finding } from '@/utils/reportNarrative'
@@ -182,10 +183,56 @@ const errorTypes = computed(() => detail.value?.errorTypes ?? [])
 const histogram = computed(() => detail.value?.histogram ?? [])
 const bodyHistogram = computed(() => detail.value?.bodyHistogram ?? [])
 const slowRequests = computed(() => detail.value?.slowRequests ?? [])
+/** 导出体积预估（1.4.3）：明细按 1KB 请求体 + 2KB 响应体上限估算 */
+const exportEstimate = computed(() => {
+  const data = detail.value
+  if (!data) return '-'
+  const mode = data.config?.recordDetail
+  const records = mode === 'off' ? 0 : Math.min(data.report.totalRequests, 50_000)
+  const bytes =
+    records * 3_200 +
+    (data.samples?.length ?? 0) * 160 +
+    (data.slowRequests?.length ?? 0) * 800 +
+    64 * 1024
+  if (bytes >= 1024 * 1024) return `≈ ${(bytes / 1024 / 1024).toFixed(1)} MB`
+  return `≈ ${Math.max(1, Math.round(bytes / 1024))} KB`
+})
 const stages = computed(() => detail.value?.stages ?? [])
 const config = computed(() => detail.value?.config ?? null)
 const metrics = computed(() => config.value?.metrics ?? null)
 const bytesSent = computed(() => metrics.value?.bytesSent ?? 0)
+
+/* ---------- 分布式压测元数据（V1.2 一期） ---------- */
+const cluster = computed<ClusterReportMeta | null>(() => config.value?.cluster ?? null)
+const clusterNodes = computed(() => cluster.value?.nodes ?? [])
+
+const CLUSTER_NODE_STATUS: Record<string, string> = {
+  pairing: '配对中',
+  pairReady: '已配对',
+  preparing: '下发中',
+  preflight: '预检中',
+  ready: '就绪',
+  running: '施压中',
+  done: '已完成',
+  lost: '失联',
+  left: '已退出',
+  rejected: '被拒绝',
+}
+
+function clusterStatusText(status: string) {
+  return CLUSTER_NODE_STATUS[status] ?? status
+}
+
+function clusterStatusTone(status: string) {
+  if (status === 'done') return 'ok'
+  if (status === 'lost' || status === 'rejected') return 'bad'
+  if (status === 'left') return 'warn'
+  return ''
+}
+
+function clusterRoleText(role: string) {
+  return role === 'master' ? '主节点' : '从节点'
+}
 
 /** QPS 指标组：平均 / 峰值 / 90% 分布 / 单并发 / 目标达成率，页面与导出同一口径 */
 const qps = computed(() =>
@@ -454,6 +501,18 @@ const durationSec = computed(() => {
   return Math.max(0, Math.round((report.value.endTime - report.value.startTime) / 1000))
 })
 
+/** 420 秒这类原始秒数对人不友好，概览按小时/分/秒展示 */
+const durationLabel = computed(() => {
+  const total = durationSec.value
+  if (total <= 0) return '—'
+  const hours = Math.floor(total / 3600)
+  const minutes = Math.floor((total % 3600) / 60)
+  const seconds = total % 60
+  if (hours > 0) return `${hours} 小时 ${String(minutes).padStart(2, '0')} 分`
+  if (minutes > 0) return `${minutes} 分 ${String(seconds).padStart(2, '0')} 秒`
+  return `${seconds} 秒`
+})
+
 const successRate = computed(() => 100 - (report.value?.errorRate ?? 0))
 
 const percentileRows = computed(() => {
@@ -507,7 +566,7 @@ const verdict = computed(() => {
   }
   return {
     title: '压测通过',
-    desc: `APDEX ${r.apdex.toFixed(3)}，错误率 ${r.errorRate.toFixed(2)}%`,
+    desc: `APDEX ${r.apdex.toFixed(3)} · 错误率 ${r.errorRate.toFixed(2)}%`,
     tone: 'ok',
   }
 })
@@ -598,7 +657,9 @@ const modeLabel = computed(() => (config.value?.mode === 'stages' ? '阶梯加�
 
 function fmtNum(v: number | undefined | null, digits = 1) {
   if (v === undefined || v === null || Number.isNaN(v)) return '-'
-  return v >= 1000 ? v.toFixed(0) : v.toFixed(digits)
+  // 千位分隔，避免 3870 / 3988 这类吞吐数字难以扫读
+  if (Math.abs(v) >= 1000) return v.toLocaleString('zh-CN', { maximumFractionDigits: 0 })
+  return v.toFixed(digits)
 }
 
 function fmtBytes(v: number | undefined | null) {
@@ -735,6 +796,8 @@ function remove() {
         </a-button>
         <template #overlay>
           <a-menu @click="onExportMenu">
+            <a-menu-item key="estimate" disabled>预估导出体积 {{ exportEstimate }}</a-menu-item>
+            <a-menu-divider />
             <a-menu-item key="json">JSON 归档（完整数据）</a-menu-item>
             <a-menu-item key="html">HTML 报告（可视化）</a-menu-item>
             <a-menu-item key="excel">Excel 表格（多工作表）</a-menu-item>
@@ -767,9 +830,9 @@ function remove() {
             <div class="meta-row">
               <span>开始于 {{ fmtTime(report.startTime) }}</span>
               <span class="dot-sep">·</span>
-              <span>耗时 {{ durationSec }} 秒</span>
+              <span>耗时 {{ durationLabel }}</span>
               <span class="dot-sep">·</span>
-              <span>峰值并发 {{ report.concurrency }}</span>
+              <span>峰值并发 {{ fmtNum(report.concurrency, 0) }}</span>
               <span v-if="qps?.target" class="dot-sep">·</span>
               <span v-if="qps?.target">目标 {{ fmtNum(qps.target, 0) }} QPS</span>
               <span v-if="qps?.attainment != null" class="dot-sep">·</span>
@@ -784,6 +847,14 @@ function remove() {
                 @click="copyText(targetUrlInfo.url, '地址')"
                 >{{ targetUrlInfo.url }}</span
               >
+              <span
+                v-if="targetUrlInfo.url"
+                class="target-copy"
+                title="复制地址"
+                @click="copyText(targetUrlInfo.url, '地址')"
+              >
+                <CopyOutlined />
+              </span>
               <span v-else class="target-url missing">{{ targetUrlInfo.note }}</span>
               <span v-if="targetUrlInfo.url && targetUrlInfo.note" class="target-note">
                 {{ targetUrlInfo.note }}
@@ -805,7 +876,7 @@ function remove() {
           <div class="card-head">
             <div>
               <div class="card-title">关键发现</div>
-              <div class="card-sub">按风险从高到低排列，映射 P0 / P1 与导出报告一致</div>
+              <div class="card-sub">按风险从高到低排列，P0/P1 标签与导出报告一致</div>
             </div>
             <span v-if="gradeInfo" class="grade-badge" :class="gradeInfo.grade">
               {{ gradeInfo.label }}
@@ -883,7 +954,7 @@ function remove() {
           <div class="metric-card fm-card">
             <span class="m-label">APDEX</span>
             <span class="m-value mono" :class="apdexGrade.tone">{{ report.apdex.toFixed(3) }}
-              <i>{{ apdexGrade.label }}</i>
+              <i class="m-tag" :class="apdexGrade.tone">{{ apdexGrade.label }}</i>
             </span>
           </div>
         </div>
@@ -954,7 +1025,7 @@ function remove() {
             <div class="baseline-head">
               <span>{{ baseline.report.planName }}</span>
               <span>{{ fmtTime(baseline.report.startTime) }}</span>
-              <span>并发 {{ baseline.report.concurrency }}</span>
+              <span>并发 {{ fmtNum(baseline.report.concurrency, 0) }}</span>
               <a-button type="link" size="small" @click="router.push(`/reports/${baseline!.report.id}`)">
                 查看基线
               </a-button>
@@ -1166,7 +1237,7 @@ function remove() {
                     :style="{ width: `${Math.max(2, (item.count / maxErrorTypeCount) * 100)}%` }"
                   />
                 </div>
-                <span class="code-count mono">{{ item.count }}</span>
+                <span class="code-count mono">{{ item.count.toLocaleString() }}</span>
                 <span class="code-ratio mono">
                   {{ report.errorCount > 0 ? ((item.count / report.errorCount) * 100).toFixed(1) : '0.0' }}%
                 </span>
@@ -1261,7 +1332,7 @@ function remove() {
               <tbody>
                 <tr v-for="(stage, i) in stages" :key="stage.index">
                   <td class="mono">{{ i + 1 }}</td>
-                  <td class="mono">{{ stage.concurrent }}</td>
+                  <td class="mono">{{ fmtNum(stage.concurrent, 0) }}</td>
                   <td class="mono">{{ stage.durationSec }}s</td>
                   <td class="mono">{{ stage.requests.toLocaleString() }}</td>
                   <td class="mono" :class="{ bad: stage.errors > 0 }">{{ stage.errors }}</td>
@@ -1380,6 +1451,99 @@ function remove() {
             </div>
           </div>
           <div v-else class="inline-empty">历史报告未保存配置快照</div>
+        </div>
+
+        <div v-if="cluster" class="fm-card table-card cluster-card">
+          <div class="card-head">
+            <div>
+              <div class="card-title">分布式压测</div>
+              <div class="card-sub">主从节点合并口径，页面数值为主节点汇聚结果</div>
+            </div>
+            <span v-if="cluster.incomplete" class="head-note cluster-note-bad">结果不完整</span>
+          </div>
+
+          <a-alert
+            v-if="cluster.incomplete"
+            type="warning"
+            show-icon
+            class="cluster-alert"
+            message="本次合并结果不完整"
+            :description="cluster.note || '有节点失联或提前退出，吞吐与延迟可能偏低。'"
+          />
+
+          <div class="config-grid">
+            <div class="config-item">
+              <span class="c-label">协议版本</span>
+              <span class="c-value mono">v{{ cluster.protocolVersion }}</span>
+            </div>
+            <div class="config-item">
+              <span class="c-label">主节点</span>
+              <span class="c-value mono">{{ cluster.masterNode || '—' }}</span>
+            </div>
+            <div class="config-item">
+              <span class="c-label">总并发</span>
+              <span class="c-value mono">{{ fmtNum(cluster.totalConcurrent, 0) }}</span>
+            </div>
+            <div class="config-item">
+              <span class="c-label">起跑时间</span>
+              <span class="c-value mono">{{ cluster.startedAt ? fmtTime(cluster.startedAt) : '—' }}</span>
+            </div>
+            <div class="config-item">
+              <span class="c-label">结束时间</span>
+              <span class="c-value mono">{{ cluster.finishedAt ? fmtTime(cluster.finishedAt) : '—' }}</span>
+            </div>
+            <div class="config-item">
+              <span class="c-label">丢弃采样</span>
+              <span class="c-value mono">{{ fmtNum(cluster.droppedSamples, 0) }} 条</span>
+            </div>
+          </div>
+
+          <div class="data-table cluster-nodes">
+            <table>
+              <thead>
+                <tr>
+                  <th>节点</th>
+                  <th class="col-narrow">角色</th>
+                  <th>地址</th>
+                  <th class="col-narrow">权重</th>
+                  <th class="col-narrow">分配并发</th>
+                  <th class="col-narrow">状态</th>
+                  <th>平均 QPS</th>
+                  <th>CPU 峰值</th>
+                  <th>内存峰值</th>
+                  <th>时钟偏移</th>
+                  <th class="col-narrow">丢弃采样</th>
+                  <th>施压窗口</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="(node, index) in clusterNodes" :key="`${node.name}-${index}`">
+                  <td>{{ node.name || '—' }}</td>
+                  <td class="mono">{{ clusterRoleText(node.role) }}</td>
+                  <td class="mono cluster-addr">{{ node.addr || '—' }}</td>
+                  <td class="mono">{{ fmtNum(node.weight, 2) }}</td>
+                  <td class="mono">{{ fmtNum(node.concurrent, 0) }}</td>
+                  <td class="mono" :class="clusterStatusTone(node.status)">
+                    {{ clusterStatusText(node.status) }}
+                  </td>
+                  <td class="mono">{{ fmtNum(node.qpsAvg) }}</td>
+                  <td class="mono">{{ node.cpuPeak ? `${node.cpuPeak.toFixed(2)} 核` : '未采集' }}</td>
+                  <td class="mono">{{ node.memPeakMb ? fmtBytes(node.memPeakMb * 1024 * 1024) : '未采集' }}</td>
+                  <td class="mono">
+                    {{ node.clockOffsetMs != null ? `${node.clockOffsetMs} ± ${node.clockUncertaintyMs} ms` : '—' }}
+                  </td>
+                  <td class="mono" :class="{ bad: node.droppedSamples > 0 }">{{ node.droppedSamples }}</td>
+                  <td class="mono cluster-window">
+                    {{ node.startMs ? fmtTime(node.startMs) : '—' }}
+                    <template v-if="node.endMs && node.startMs">
+                      · {{ fmtDuration(node.endMs - node.startMs) }}
+                    </template>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+            <div v-if="!clusterNodes.length" class="inline-empty">未记录节点明细</div>
+          </div>
         </div>
 
         <div v-if="slowRequests.length" class="section-head">
@@ -1726,7 +1890,8 @@ function remove() {
 .title-row {
   display: flex;
   align-items: center;
-  gap: 10px;
+  flex-wrap: wrap;
+  gap: 6px 10px;
 }
 
 .status-dot {
@@ -1771,9 +1936,11 @@ function remove() {
 .meta-row {
   display: flex;
   align-items: center;
-  gap: 8px;
+  flex-wrap: wrap;
+  gap: 4px 8px;
   margin-top: 8px;
   font-size: 11px;
+  line-height: 1.6;
   color: var(--fm-muted);
 }
 
@@ -1809,6 +1976,18 @@ function remove() {
   white-space: normal;
   word-break: break-all;
   cursor: copy;
+}
+
+.target-copy {
+  flex-shrink: 0;
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--fm-muted);
+  cursor: pointer;
+}
+
+.target-copy:hover {
+  color: var(--fm-primary);
 }
 
 .verdict {
@@ -1874,14 +2053,37 @@ function remove() {
   font-weight: 700;
   font-variant-numeric: tabular-nums;
   line-height: 1.3;
+  white-space: nowrap;
 }
 
 .m-value i {
   font-style: normal;
-  font-size: 9px;
+  font-size: 10px;
   font-weight: 500;
   color: var(--fm-muted);
-  margin-left: 2px;
+  margin-left: 4px;
+}
+
+/* APDEX 评级标签：与数值拉开间距，避免 1.000优秀 糊在一起 */
+.m-tag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 7px;
+  font-size: 10px;
+  font-weight: 600;
+  vertical-align: 1px;
+  background: var(--fm-success-soft);
+  color: var(--fm-success);
+}
+
+.m-tag.warn {
+  background: var(--fm-warning-soft);
+  color: var(--fm-warning);
+}
+
+.m-tag.bad {
+  background: var(--fm-danger-soft);
+  color: var(--fm-danger);
 }
 
 .m-value.warn {
@@ -2659,6 +2861,31 @@ function remove() {
   color: var(--fm-muted);
 }
 
+/* ---------- 分布式压测 ---------- */
+.cluster-card {
+  margin-top: 16px;
+}
+
+.cluster-alert {
+  margin: 4px 0 12px;
+}
+
+.cluster-note-bad {
+  color: var(--fm-danger);
+}
+
+.cluster-nodes {
+  margin-top: 12px;
+}
+
+.cluster-addr {
+  word-break: break-all;
+}
+
+.cluster-window {
+  white-space: nowrap;
+}
+
 /* ---------- 错误明细 ---------- */
 .section-head {
   display: flex;
@@ -2774,6 +3001,13 @@ function remove() {
 }
 
 @media (max-width: 1180px) {
+  .overview {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .verdict {
+    max-width: none;
+  }
   .metrics {
     grid-template-columns: repeat(4, minmax(0, 1fr));
   }
@@ -2788,6 +3022,18 @@ function remove() {
   }
   .percentile-grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 760px) {
+  .metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .percentile-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .drift-rule {
+    margin-left: 0;
   }
 }
 
@@ -2931,18 +3177,28 @@ function remove() {
 }
 .bias-banner {
   display: flex;
-  gap: 8px;
+  align-items: flex-start;
+  gap: 10px;
   padding: 8px 10px;
   margin-bottom: 10px;
   font-size: 11.5px;
   line-height: 1.6;
-  color: var(--fm-warning);
   background: var(--fm-warning-soft);
   border: 1px solid var(--fm-warning);
   border-radius: var(--fm-radius-sm);
 }
 .bias-banner b {
+  flex-shrink: 0;
+  padding: 0 7px;
+  font-size: 10.5px;
+  line-height: 1.7;
   white-space: nowrap;
+  color: var(--fm-warning);
+  border: 1px solid var(--fm-warning);
+  background: var(--fm-surface);
+}
+.bias-banner span {
+  color: var(--fm-text-2);
 }
 .finding-list {
   display: flex;
@@ -3009,7 +3265,8 @@ function remove() {
 .drift-row {
   display: flex;
   align-items: baseline;
-  gap: 10px;
+  flex-wrap: wrap;
+  gap: 4px 10px;
   margin-top: 12px;
   padding-top: 10px;
   border-top: 1px dashed var(--fm-border);
@@ -3017,6 +3274,7 @@ function remove() {
 }
 .drift-label {
   color: var(--fm-text-2);
+  font-weight: 500;
 }
 .drift-value {
   font-weight: 700;

@@ -104,6 +104,14 @@ import type {
   DocsSiteStartPayload,
   DocsSiteStatus,
 } from '@/types/docs'
+import type {
+  ClusterMasterSnapshot,
+  ClusterMasterStartPayload,
+  ClusterNodeWeight,
+  ClusterProtocolInfo,
+  ClusterSlaveConnectPayload,
+  ClusterSlaveSnapshot,
+} from '@/types/cluster'
 
 export { appInfo, projectList, projectCreate, projectUpdate, projectDelete } from './project'
 
@@ -426,6 +434,39 @@ export const capacityProbe = () => invoke<CapacityResult>('capacity_probe')
 export const capacityGet = () => invoke<CapacityResult | null>('capacity_get')
 
 export const capacityCancel = () => invoke<void>('capacity_cancel')
+
+// 分布式压测（V1.2 一期）：主从会话都常驻后端进程，页面只是视图
+export const clusterProtocolInfo = () => invoke<ClusterProtocolInfo>('cluster_protocol_info')
+
+export const clusterLocalAddresses = () => invoke<string[]>('cluster_local_addresses')
+
+export const clusterMasterCreate = (payload: ClusterMasterStartPayload) =>
+  invoke<ClusterMasterSnapshot>('cluster_master_create', { payload })
+
+export const clusterMasterSnapshot = (jobId: number) =>
+  invoke<ClusterMasterSnapshot>('cluster_master_snapshot', { jobId })
+
+export const clusterMasterSessions = () =>
+  invoke<ClusterMasterSnapshot[]>('cluster_master_sessions')
+
+export const clusterMasterPrepare = (jobId: number, weights: ClusterNodeWeight[] = []) =>
+  invoke<ClusterMasterSnapshot>('cluster_master_prepare', { jobId, weights })
+
+export const clusterMasterLaunch = (jobId: number) =>
+  invoke<ClusterMasterSnapshot>('cluster_master_launch', { jobId })
+
+export const clusterMasterAbort = (jobId: number, reason?: string | null) =>
+  invoke<ClusterMasterSnapshot>('cluster_master_abort', { jobId, reason: reason ?? null })
+
+export const clusterMasterClose = (jobId: number) =>
+  invoke<void>('cluster_master_close', { jobId })
+
+export const clusterSlaveConnect = (payload: ClusterSlaveConnectPayload) =>
+  invoke<ClusterSlaveSnapshot>('cluster_slave_connect', { payload })
+
+export const clusterSlaveSnapshot = () => invoke<ClusterSlaveSnapshot>('cluster_slave_snapshot')
+
+export const clusterSlaveDisconnect = () => invoke<void>('cluster_slave_disconnect')
 
 // 压测报告
 export const reportList = (limit = 100) => invoke<StressReport[]>('report_list', { limit })

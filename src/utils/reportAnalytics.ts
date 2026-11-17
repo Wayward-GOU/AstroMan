@@ -7,6 +7,9 @@ import type { ReportDetail, ReportSample, StageSummary } from '@/types/models'
  * 指标口径与《AstroMan压测能力提升与报告优化技术方案》4.0 节保持一致。
  */
 
+/** 整数千位分隔，用于吞吐/计数文案，与页面和导出报告一致 */
+const int = (value: number) => Math.round(value).toLocaleString('zh-CN')
+
 /** 线性插值分位数，values 需已升序 */
 export function percentileSorted(values: number[], p: number): number {
   if (!values.length) return 0
@@ -242,7 +245,7 @@ export function detectKnee(detail: ReportDetail): KneeResult {
       saturated: true,
       concurrent: capacity.concurrent,
       qps: capacity.qps,
-      note: `第 ${capacity.index} 阶段起吞吐不再增长而 P95 明显抬升，最大有效容量约 ${capacity.concurrent} 并发 / ${Math.round(
+      note: `第 ${capacity.index} 阶段起吞吐不再增长而 P95 明显抬升，最大有效容量约 ${capacity.concurrent} 并发 / ${int(
         capacity.qps,
       )} QPS`,
       stages: rows,
@@ -254,7 +257,7 @@ export function detectKnee(detail: ReportDetail): KneeResult {
     saturated: false,
     concurrent: best.concurrent,
     qps: best.qps,
-    note: `各阶段吞吐仍在增长，未检出饱和拐点；当前最高 ${best.concurrent} 并发 / ${Math.round(
+    note: `各阶段吞吐仍在增长，未检出饱和拐点；当前最高 ${best.concurrent} 并发 / ${int(
       best.qps,
     )} QPS，建议继续加压至吞吐不再增长`,
     stages: rows,
@@ -379,13 +382,13 @@ export function selfCheck(detail: ReportDetail): SelfCheckItem[] {
       key: 'count',
       label: '计数自洽（总请求 = 成功 + 失败）',
       pass: countOk,
-      detail: `${report.totalRequests} = ${report.successCount} + ${report.errorCount}`,
+      detail: `${int(report.totalRequests)} = ${int(report.successCount)} + ${int(report.errorCount)}`,
     },
     {
       key: 'samples',
       label: '采样自洽（Σ 每秒采样 ≈ 总请求）',
       pass: sampleOk,
-      detail: `采样合计 ${sumSuccess + sumErrors}，与总数相差 ${sampleGap}`,
+      detail: `采样合计 ${int(sumSuccess + sumErrors)}，与总数相差 ${int(sampleGap)}`,
     },
     {
       key: 'bytes',

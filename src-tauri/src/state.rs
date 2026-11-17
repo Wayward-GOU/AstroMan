@@ -339,6 +339,10 @@ pub struct AppState {
     clients: parking_lot::RwLock<HttpClients>,
     /// 压测任务注册表（多任务并行；空即空闲）
     pub stress_jobs: Arc<StressJobRegistry>,
+    /// 分布式压测主节点会话（多任务；空闲时不占资源）
+    pub cluster: crate::services::cluster::server::ClusterMaster,
+    /// 分布式压测从节点会话（同一进程只允许一个）
+    pub cluster_slave: crate::services::cluster::client::ClusterSlave,
     /// 本机施压能力检测（全局单例，与压测互斥）
     pub capacity: crate::commands::capacity::CapacityState,
     /// AI 在途请求的取消标记：requestId → 取消位
@@ -437,6 +441,9 @@ impl AppState {
         let clients = build_clients(&settings)?;
         let profile = crate::services::profile::active(&settings.performance_mode);
         let policy = crate::services::policy::load(&data_dir);
+        if let Err(error) = crate::services::cluster::server::recover_stale_jobs(&pool) {
+            log::warn!("清理上次遗留的集群任务失败：{error}");
+        }
 
         let capture =
             crate::capture::CaptureManager::new_with_limits(data_dir.clone(), profile.limits);
@@ -451,6 +458,8 @@ impl AppState {
             settings: parking_lot::RwLock::new(settings),
             clients: parking_lot::RwLock::new(clients),
             stress_jobs: Arc::new(StressJobRegistry::new()),
+            cluster: crate::services::cluster::server::ClusterMaster::default(),
+            cluster_slave: crate::services::cluster::client::ClusterSlave::default(),
             capacity: crate::commands::capacity::CapacityState::default(),
             ai_cancels: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             test_cancels: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -494,6 +503,9 @@ impl AppState {
         let secrets = crate::secret::SecretStore::bootstrap(&data_dir, &pool)?;
         crate::secret::install(secrets);
         let policy = crate::services::policy::load(&data_dir);
+        if let Err(error) = crate::services::cluster::server::recover_stale_jobs(&pool) {
+            log::warn!("清理上次遗留的集群任务失败：{error}");
+        }
         let capture =
             crate::capture::CaptureManager::new_with_limits(data_dir.clone(), profile.limits);
         Ok(Self {
@@ -507,6 +519,8 @@ impl AppState {
             settings: parking_lot::RwLock::new(settings),
             clients: parking_lot::RwLock::new(clients),
             stress_jobs: Arc::new(StressJobRegistry::new()),
+            cluster: crate::services::cluster::server::ClusterMaster::default(),
+            cluster_slave: crate::services::cluster::client::ClusterSlave::default(),
             capacity: crate::commands::capacity::CapacityState::default(),
             ai_cancels: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             test_cancels: Arc::new(parking_lot::Mutex::new(HashMap::new())),

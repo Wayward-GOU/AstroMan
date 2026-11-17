@@ -396,6 +396,7 @@ const SCHEMAS: Record<string, Record<string, ArgRule>> = {
     topN: { kind: 'number', min: 0, max: 5000 },
     slowThresholdMs: { kind: 'number', min: 0 },
     baselineReportId: { kind: 'number' },
+    runGroupId: { kind: 'number' },
     longRunAck: { kind: 'boolean' },
   },
   stress_stop: {},
@@ -2782,6 +2783,7 @@ const SPECS: ToolSpec[] = [
         topN: Math.max(0, Math.round(optionalNum(args.topN) ?? 200)),
         slowThresholdMs: Math.max(0, Math.round(optionalNum(args.slowThresholdMs) ?? 0)),
         baselineReportId: optionalNum(args.baselineReportId) ?? null,
+        runGroupId: optionalNum(args.runGroupId) ?? null,
         longRunAck: args.longRunAck === true,
       })
       const shape = stages.length

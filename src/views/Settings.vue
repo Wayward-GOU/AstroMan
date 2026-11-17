@@ -1589,6 +1589,9 @@ async function openReleasePage() {
                 </span>
               </div>
             </div>
+            <div v-if="capacity && !capacity.reachedLimit" class="capacity-limit-hint">
+              1024 并发下吞吐仍在增长且 CPU 未打满，当前结果只能视为下限；如需精确定位，可提高到 2048 并发复测。
+            </div>
           </div>
 
           <div class="group">
@@ -2903,5 +2906,11 @@ kbd {
 
 .capacity-error {
   color: var(--fm-danger);
+}
+
+.capacity-limit-hint {
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--fm-warning);
 }
 </style>

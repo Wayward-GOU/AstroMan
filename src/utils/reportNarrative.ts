@@ -41,6 +41,8 @@ export interface GradeResult {
 
 const pct = (value: number, digits = 2) => `${value.toFixed(digits)}%`
 const ms = (value: number) => `${value.toFixed(value >= 100 ? 0 : 1)} ms`
+/** 吞吐/计数类整数统一千位分隔，与页面指标卡和导出报告一致 */
+const int = (value: number) => Math.round(value).toLocaleString('zh-CN')
 
 /** 时间点格式化为 分:秒，用于错误窗口描述 */
 function clock(sec: number): string {
@@ -170,8 +172,8 @@ export function buildFindings(detail: ReportDetail): Finding[] {
   if (knee.saturated) {
     findings.push({
       level: 'warn',
-      title: `吞吐在约 ${knee.concurrent} 并发处饱和`,
-      detail: `饱和度拐点之后继续加压，QPS 不再增长而 P95 明显抬升，实测最大有效吞吐 ${Math.round(
+      title: `吞吐在约 ${knee.concurrent} 并发时饱和`,
+      detail: `饱和度拐点之后继续加压，QPS 不再增长而 P95 明显抬升，实测最大有效吞吐 ${int(
         knee.qps,
       )} req/s。该并发量即为当前部署下的容量上限参考值。`,
     })
@@ -179,7 +181,7 @@ export function buildFindings(detail: ReportDetail): Finding[] {
     findings.push({
       level: 'info',
       title: '未检出饱和拐点',
-      detail: `各阶段吞吐持续增长，最高 ${knee.concurrent} 并发 / ${Math.round(
+      detail: `各阶段吞吐持续增长，最高 ${knee.concurrent} 并发 / ${int(
         knee.qps,
       )} req/s。容量上限尚未触达，建议以更高并发复测以定位拐点。`,
     })
@@ -237,8 +239,8 @@ export function buildFindings(detail: ReportDetail): Finding[] {
   if (ninety.value > 0 && summary.maxQps > 0) {
     findings.push({
       level: 'info',
-      title: `90% 时间吞吐不低于 ${Math.round(ninety.value)} req/s`,
-      detail: `峰值 ${Math.round(summary.maxQps)} req/s，均值 ${Math.round(
+      title: `90% 时间吞吐不低于 ${int(ninety.value)} req/s`,
+      detail: `峰值 ${int(summary.maxQps)} req/s，均值 ${int(
         summary.avgQps,
       )} req/s。该值已剔除升压段与首末不完整采样（有效采样 ${ninety.used} 点，剔除 ${ninety.dropped} 点），比平均值更能代表稳定承载能力。`,
     })
@@ -257,7 +259,7 @@ export function buildFindings(detail: ReportDetail): Finding[] {
         title: `客户端负载已达检测极限的 ${pct(usage * 100, 0)}`,
         detail: `本机回环检测极限 ${
           capacity.reachedLimit === false ? '≥ ' : ''
-        }${Math.round(capacity.maxQps)} QPS，本次平均 ${Math.round(
+        }${int(capacity.maxQps)} QPS，本次平均 ${int(
           report.avgQps,
         )} QPS。客户端接近能力上限，结论需谨慎；建议关闭明细采集或拆分施压机后复测。`,
       })
@@ -267,7 +269,7 @@ export function buildFindings(detail: ReportDetail): Finding[] {
         title: '客户端余量充足，瓶颈不在施压端',
         detail: `本机检测极限 ${
           capacity.reachedLimit === false ? '≥ ' : ''
-        }${Math.round(capacity.maxQps)} QPS，本次仅用到 ${pct(
+        }${int(capacity.maxQps)} QPS，本次仅用到 ${pct(
           usage * 100,
           0,
         )}。压力瓶颈应在本机之外的目标系统或网络上。`,
@@ -361,7 +363,7 @@ export function buildAdvice(detail: ReportDetail): Advice[] {
     advice.push({
       priority: 'P1',
       title: '继续加压以确认目标吞吐可达',
-      detail: `实测平均 ${Math.round(report.avgQps)} req/s，尚未达到目标 ${Math.round(
+      detail: `实测平均 ${int(report.avgQps)} req/s，尚未达到目标 ${int(
         report.targetRps,
       )} req/s。当前压力下未见饱和，建议按 20% 步长继续提高并发或放开限速后复测。`,
     })

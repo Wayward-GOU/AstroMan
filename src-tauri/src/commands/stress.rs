@@ -16,6 +16,7 @@ use crate::models::{
     ReportRequestRecord, ReportSample, RequestAuth, SlowRequest, StageSummary, StatusCount,
     StressConfig, StressDone, StressProgress, StressReport, StressStage,
 };
+use crate::services::cluster::protocol::SamplePayload as ClusterSamplePayload;
 use crate::state::{AppState, DbPool, StressJobDraft};
 use crate::util::{err, now_ms, render, strip_json_comments};
 
@@ -378,6 +379,29 @@ fn buckets_to_ranges(buckets: &[AtomicU64]) -> Vec<HistogramBucket> {
         for item in result.iter_mut() {
             if value >= item.min_ms && value < item.max_ms {
                 item.count += count;
+                break;
+            }
+        }
+    }
+    result
+}
+
+/// 稀疏桶转区间直方图：集群合并后复用同一套区间，报告排版不变
+pub(crate) fn histogram_from_sparse(buckets: &[(u32, u64)]) -> Vec<HistogramBucket> {
+    let mut result: Vec<HistogramBucket> = HISTOGRAM_RANGES
+        .iter()
+        .map(|(min, max, label)| HistogramBucket {
+            label: (*label).to_string(),
+            min_ms: *min,
+            max_ms: *max,
+            count: 0,
+        })
+        .collect();
+    for (ms, count) in buckets {
+        let value = *ms as f64;
+        for item in result.iter_mut() {
+            if value >= item.min_ms && value < item.max_ms {
+                item.count += *count as i64;
                 break;
             }
         }
@@ -1062,11 +1086,11 @@ pub struct StressExecOutcome {
     pub message: Option<String>,
 }
 
-struct PreparedStress {
-    ctx: Arc<RunCtx>,
-    name: String,
+pub(crate) struct PreparedStress {
+    ctx: RunCtx,
+    pub(crate) name: String,
     stages: Vec<StressStage>,
-    peak: u32,
+    pub(crate) peak: u32,
     total_sec: u64,
     rate: u32,
     target_rps: f64,
@@ -1075,11 +1099,18 @@ struct PreparedStress {
     stop_min: u32,
     concurrent: i64,
     /// 渲染后的目标 URL（注册表展示与同目标判定）
-    url_text: String,
-    target_key: String,
+    pub(crate) url_text: String,
+    pub(crate) target_key: String,
     errors_rx: mpsc::Receiver<ReportError>,
     records_rx: mpsc::UnboundedReceiver<ReportRequestRecord>,
     slow_rx: mpsc::UnboundedReceiver<SlowRequest>,
+}
+
+impl PreparedStress {
+    /// 任务登记后才拿到注册表取消位：替换成同一个 Arc，停止按钮才能停掉引擎
+    pub(crate) fn replace_cancel(&mut self, cancel: Arc<AtomicBool>) {
+        self.ctx.cancel = cancel;
+    }
 }
 
 /// 归一化本次运行：阶梯阶段、峰值并发、总时长
@@ -1327,7 +1358,7 @@ fn check_unresolved(
 /// 校验配置、渲染模板、构建客户端并准备 Cookie 快照；不依赖 Tauri 事件
 ///
 /// `cancel` 由任务注册表发放：调用方先建取消位，任务登记成功后共用同一个 Arc。
-fn prepare_stress(
+pub(crate) fn prepare_stress(
     state: &AppState,
     config: StressConfig,
     cancel: Arc<AtomicBool>,
@@ -1549,11 +1580,17 @@ fn prepare_stress(
         "sameHostWarning": same_host_warning,
         "agent": collect_agent_info(),
     });
+    // 配置形态版本与批次号单独插入：json! 嵌套层数已接近宏递归上限（2.2.1 / 1.3.3 / 6.2）
+    let mut config_snapshot = config_snapshot;
+    if let Some(map) = config_snapshot.as_object_mut() {
+        map.insert("schemaVersion".to_string(), json!(2));
+        map.insert("runGroupId".to_string(), json!(config.run_group_id));
+    }
     let config_snapshot = config_snapshot.to_string();
 
     let url_text = prepared_url.to_string();
 
-    let ctx = Arc::new(RunCtx {
+    let ctx = RunCtx {
         client,
         method,
         config,
@@ -1572,7 +1609,7 @@ fn prepare_stress(
         slow_threshold_ms,
         capture,
         req_bytes,
-    });
+    };
 
     Ok(PreparedStress {
         ctx,
@@ -1594,6 +1631,59 @@ fn prepare_stress(
     })
 }
 
+/// 每秒外送采样：集群模式注入，单机模式不传
+pub(crate) type EngineSampleSink = Arc<dyn Fn(ClusterSamplePayload) + Send + Sync>;
+
+/// 引擎运行选项
+///
+/// 单机压测使用默认值；集群模式传入统一起跑时刻与采样外送回调。
+#[derive(Default)]
+pub(crate) struct EngineOptions {
+    /// 统一起跑时刻（epoch 毫秒）：到点后再建 worker 与 ticker
+    pub start_at_ms: Option<i64>,
+    /// 每秒采样外送：主节点合并本地与从节点曲线
+    pub sink: Option<EngineSampleSink>,
+}
+
+/// 不落库的引擎结果：单机报告包装与集群合并共用
+#[allow(dead_code)] // W4 合并模块会读取 sparse
+pub(crate) struct EngineOutcome {
+    pub report: StressReport,
+    pub samples: Vec<ReportSample>,
+    pub errors: Vec<ReportError>,
+    pub requests: Vec<ReportRequestRecord>,
+    pub slow_requests: Vec<SlowRequest>,
+    pub stages: Vec<StageSummary>,
+    pub status_codes: Vec<StatusCount>,
+    pub histogram: Vec<HistogramBucket>,
+    pub body_histogram: Vec<HistogramBucket>,
+    pub error_types: Vec<ErrorTypeCount>,
+    pub config_snapshot: String,
+    pub sparse: EngineSparseMetrics,
+    pub message: Option<String>,
+}
+
+/// 合并用逐毫秒桶与原始计数：百分位必须从桶重算，不能对分位数取平均
+#[allow(dead_code)] // W4 合并模块读取
+pub(crate) struct EngineSparseMetrics {
+    pub total: u64,
+    pub success: u64,
+    pub errors: u64,
+    pub bytes: u64,
+    pub bytes_sent: u64,
+    pub sum_rt_ms: u64,
+    pub sum_ttfb_ms: u64,
+    pub min_rt: f64,
+    pub max_rt: f64,
+    pub latency: Vec<(u32, u64)>,
+    pub ttfb: Vec<(u32, u64)>,
+    pub body: Vec<(u32, u64)>,
+    pub status_codes: Vec<(u16, u64)>,
+    pub error_types: Vec<(String, i64)>,
+    pub errors_dropped: u64,
+    pub records_dropped: u64,
+}
+
 /// 执行压测并落库；进度通过回调交给调用方（桌面端转 Tauri 事件）
 async fn drive_stress(
     prepared: PreparedStress,
@@ -1602,8 +1692,50 @@ async fn drive_stress(
     progress: Option<&(dyn Fn(StressProgress) + Send + Sync)>,
     watch: Option<&Arc<AtomicBool>>,
 ) -> StressExecOutcome {
+    let outcome = run_engine(
+        prepared,
+        job_id,
+        progress,
+        watch,
+        EngineOptions::default(),
+    )
+    .await;
+    let (report_id, save_message) = match save_report(
+        &pool,
+        ReportPayload {
+            report: &outcome.report,
+            samples: &outcome.samples,
+            errors: &outcome.errors,
+            requests: &outcome.requests,
+            stages: &outcome.stages,
+            status_codes: &outcome.status_codes,
+            histogram: &outcome.histogram,
+            body_histogram: &outcome.body_histogram,
+            slow_requests: &outcome.slow_requests,
+            error_types: &outcome.error_types,
+            config: &outcome.config_snapshot,
+        },
+    ) {
+        Ok(id) => (Some(id), None),
+        Err(error) => (None, Some(format!("报告保存失败：{error}"))),
+    };
+    StressExecOutcome {
+        report_id,
+        report: outcome.report,
+        message: save_message.or(outcome.message),
+    }
+}
+
+/// 只执行压测、不落库；集群模式通过 `options` 对齐起跑时刻并外送每秒采样
+pub(crate) async fn run_engine(
+    prepared: PreparedStress,
+    job_id: u64,
+    progress: Option<&(dyn Fn(StressProgress) + Send + Sync)>,
+    watch: Option<&Arc<AtomicBool>>,
+    options: EngineOptions,
+) -> EngineOutcome {
     let PreparedStress {
-        ctx,
+        mut ctx,
         name,
         stages,
         peak,
@@ -1620,6 +1752,19 @@ async fn drive_stress(
         mut records_rx,
         mut slow_rx,
     } = prepared;
+
+    // 统一起跑：主从两侧都在 atMs 之后才建 worker，采样时间轴才能对齐。
+    // 先睡到目标时刻，再用当前 Instant 重算起点与截止时间。
+    if let Some(at_ms) = options.start_at_ms {
+        let wait = at_ms.saturating_sub(now_ms());
+        if wait > 0 {
+            tokio::time::sleep(Duration::from_millis(wait as u64)).await;
+        }
+        ctx.start = Instant::now();
+        ctx.deadline = ctx.start + Duration::from_secs(total_sec);
+    }
+    let sink = options.sink;
+    let ctx = Arc::new(ctx);
     let start = ctx.start;
     let deadline = ctx.deadline;
     let cancel = ctx.cancel.clone();
@@ -1643,6 +1788,10 @@ async fn drive_stress(
     let mut prev_success = 0u64;
     let mut prev_errors = 0u64;
     let mut prev_bytes = 0u64;
+    // 集群采样外送：累计耗时与逐毫秒桶都需要按采样间隔取增量
+    let mut prev_sum_rt = 0u64;
+    let mut prev_sum_ttfb = 0u64;
+    let mut prev_latency = vec![0u64; metrics.buckets.len()];
     let mut left_sec = total_sec;
     let mut auto_stop: Option<String> = None;
     // 已下发到前端的采样点数量（进度事件只发增量）
@@ -1743,6 +1892,31 @@ async fn drive_stress(
                 success_count: success.saturating_sub(prev_success),
                 error_count: failure.saturating_sub(prev_errors),
             });
+
+            // 集群模式外送本秒增量：QPS / 计数 / 耗时累加 / 稀疏直方图
+            if let Some(sink) = &sink {
+                let sum_rt = metrics.sum_ms.load(Ordering::Relaxed);
+                let delta_rt = sum_rt.saturating_sub(prev_sum_rt);
+                prev_sum_rt = sum_rt;
+                let sum_ttfb = metrics.sum_ttfb.load(Ordering::Relaxed);
+                let delta_ttfb = sum_ttfb.saturating_sub(prev_sum_ttfb);
+                prev_sum_ttfb = sum_ttfb;
+                sink(ClusterSamplePayload {
+                    elapsed_sec: elapsed,
+                    concurrent: metrics.concurrent.load(Ordering::Relaxed),
+                    qps,
+                    avg_rt: metrics.avg(),
+                    ttfb_avg: metrics.ttfb_avg(),
+                    body_avg: metrics.body_avg(),
+                    bytes: bytes.saturating_sub(prev_bytes),
+                    success_count: success.saturating_sub(prev_success),
+                    error_count: failure.saturating_sub(prev_errors),
+                    sum_rt_ms: delta_rt,
+                    sum_ttfb_ms: delta_ttfb,
+                    latency_buckets: bucket_delta(&metrics.buckets, &mut prev_latency),
+                });
+            }
+
             prev_total = total;
             prev_success = success;
             prev_errors = failure;
@@ -1905,7 +2079,7 @@ async fn drive_stress(
     let report = StressReport {
         id: 0,
         plan_id: ctx.config.plan_id,
-        run_group_id: None,
+        run_group_id: ctx.config.run_group_id,
         plan_name: name,
         request_id: ctx.config.request_id,
         total_requests: total as i64,
@@ -1944,30 +2118,72 @@ async fn drive_stress(
         created_at: end_time,
     };
 
-    let payload = ReportPayload {
-        report: &report,
-        samples: &samples,
-        errors: &errors,
-        requests: &requests,
-        stages: &stage_summaries,
-        status_codes: &status_codes,
-        histogram: &histogram,
-        body_histogram: &body_histogram,
-        slow_requests: &slow_requests,
-        error_types: &error_types,
-        config: &config_snapshot,
+    // 合并用原始桶：百分位按桶重算，不能对各节点分位数取平均
+    let sparse = EngineSparseMetrics {
+        total,
+        success,
+        errors: failure,
+        bytes: metrics.bytes.load(Ordering::Relaxed),
+        bytes_sent: metrics.bytes_sent.load(Ordering::Relaxed),
+        sum_rt_ms: metrics.sum_ms.load(Ordering::Relaxed),
+        sum_ttfb_ms: metrics.sum_ttfb.load(Ordering::Relaxed),
+        min_rt: metrics.min(),
+        max_rt: metrics.max(),
+        latency: sparse_buckets(&metrics.buckets),
+        ttfb: sparse_buckets(&metrics.ttfb_buckets),
+        body: sparse_buckets(&metrics.body_buckets),
+        status_codes: status_codes
+            .iter()
+            .map(|item| (item.code.max(0) as u16, item.count.max(0) as u64))
+            .collect(),
+        error_types: error_types
+            .iter()
+            .map(|item| (item.error_type.clone(), item.count))
+            .collect(),
+        errors_dropped: metrics.errors_dropped.load(Ordering::Relaxed),
+        records_dropped: metrics.records_dropped.load(Ordering::Relaxed),
     };
-    let (report_id, message) = match save_report(&pool, payload) {
-        Ok(id) => (Some(id), None),
-        Err(error) => (None, Some(format!("报告保存失败：{error}"))),
-    };
-    let message = message.or(auto_stop);
 
-    StressExecOutcome {
-        report_id,
+    EngineOutcome {
         report,
-        message,
+        samples,
+        errors,
+        requests,
+        slow_requests,
+        stages: stage_summaries,
+        status_codes,
+        histogram,
+        body_histogram,
+        error_types,
+        config_snapshot,
+        sparse,
+        message: auto_stop,
     }
+}
+
+/// 全量桶转稀疏形式（只保留非零桶）
+fn sparse_buckets(buckets: &[AtomicU64]) -> Vec<(u32, u64)> {
+    buckets
+        .iter()
+        .enumerate()
+        .filter_map(|(index, bucket)| {
+            let count = bucket.load(Ordering::Relaxed);
+            (count > 0).then_some((index as u32, count))
+        })
+        .collect()
+}
+
+/// 按采样间隔取桶增量：集群每秒只传本秒新增的毫秒桶
+fn bucket_delta(buckets: &[AtomicU64], previous: &mut [u64]) -> Vec<(u32, u64)> {
+    let mut items = Vec::new();
+    for (index, bucket) in buckets.iter().enumerate() {
+        let value = bucket.load(Ordering::Relaxed);
+        if value > previous[index] {
+            items.push((index as u32, value - previous[index]));
+            previous[index] = value;
+        }
+    }
+    items
 }
 
 #[tauri::command]
@@ -1993,13 +2209,15 @@ pub async fn stress_start(
         concurrent: prepared.peak,
     };
     // 任务数 / 并发之和 / 同目标三项校验在同一把锁内完成
-    let (job_id, _, overlaps) = state.stress_jobs.try_reserve(
+    let (job_id, job_cancel, overlaps) = state.stress_jobs.try_reserve(
         draft,
         max_jobs,
         max_total,
         config.ignore_overlap,
     )?;
     let mut prepared = prepared;
+    // 停止按钮走注册表：必须把注册表的取消位换成引擎实际监听的那一个
+    prepared.ctx.cancel = job_cancel;
     if !overlaps.is_empty() {
         prepared.config_snapshot = with_overlap(&prepared.config_snapshot, &overlaps);
     }
@@ -2062,11 +2280,13 @@ pub async fn run_stress_case(
         request_id: config.request_id,
         concurrent: prepared.peak,
     };
-    let (job_id, _, overlaps) = state
+    let (job_id, job_cancel, overlaps) = state
         .stress_jobs
         .try_reserve(draft, max_jobs, max_total, config.ignore_overlap)
         .map_err(|error| format!("压测任务无法启动：{error}"))?;
     let mut prepared = prepared;
+    // 套件停止与手工停止共用注册表取消位
+    prepared.ctx.cancel = job_cancel;
     if !overlaps.is_empty() {
         prepared.config_snapshot = with_overlap(&prepared.config_snapshot, &overlaps);
     }
@@ -2274,23 +2494,24 @@ fn with_overlap(snapshot: &str, job_ids: &[u64]) -> String {
     value.to_string()
 }
 
-struct ReportPayload<'a> {
-    report: &'a StressReport,
-    samples: &'a [ReportSample],
-    errors: &'a [ReportError],
-    requests: &'a [ReportRequestRecord],
-    stages: &'a [StageSummary],
-    status_codes: &'a [StatusCount],
-    histogram: &'a [HistogramBucket],
+/// 报告落库入参：单机压测与集群合并共用同一套表结构
+pub(crate) struct ReportPayload<'a> {
+    pub report: &'a StressReport,
+    pub samples: &'a [ReportSample],
+    pub errors: &'a [ReportError],
+    pub requests: &'a [ReportRequestRecord],
+    pub stages: &'a [StageSummary],
+    pub status_codes: &'a [StatusCount],
+    pub histogram: &'a [HistogramBucket],
     /// 响应体读取耗时直方图（body = latency - ttfb）
-    body_histogram: &'a [HistogramBucket],
+    pub body_histogram: &'a [HistogramBucket],
     /// TopN 慢请求
-    slow_requests: &'a [crate::models::SlowRequest],
-    error_types: &'a [ErrorTypeCount],
-    config: &'a str,
+    pub slow_requests: &'a [crate::models::SlowRequest],
+    pub error_types: &'a [ErrorTypeCount],
+    pub config: &'a str,
 }
 
-fn save_report(pool: &DbPool, payload: ReportPayload<'_>) -> Result<i64, String> {
+pub(crate) fn save_report(pool: &DbPool, payload: ReportPayload<'_>) -> Result<i64, String> {
     let report = payload.report;
     let mut conn = pool.get().map_err(err)?;
     let tx = conn.transaction().map_err(err)?;
@@ -2609,5 +2830,41 @@ mod tests {
         let mut custom = locate.clone();
         custom.top_n = Some(50);
         assert_eq!(capture_plan(&custom), (RecordDetailMode::Off, 50));
+    }
+
+    #[test]
+    fn sparse_buckets_keeps_only_non_zero() {
+        let buckets = [
+            AtomicU64::new(0),
+            AtomicU64::new(3),
+            AtomicU64::new(0),
+            AtomicU64::new(7),
+        ];
+        assert_eq!(sparse_buckets(&buckets), vec![(1, 3), (3, 7)]);
+        assert!(sparse_buckets(&[]).is_empty());
+    }
+
+    #[test]
+    fn bucket_delta_returns_increments_between_samples() {
+        let buckets = [
+            AtomicU64::new(0),
+            AtomicU64::new(5),
+            AtomicU64::new(0),
+            AtomicU64::new(9),
+        ];
+        let mut previous = vec![0u64; buckets.len()];
+
+        // 首次发送：累积桶整体视作增量
+        assert_eq!(bucket_delta(&buckets, &mut previous), vec![(1, 5), (3, 9)]);
+        assert_eq!(previous, vec![0, 5, 0, 9]);
+
+        // 本秒只新增 2 / 1，旧桶不重复发送
+        buckets[2].store(2, Ordering::Relaxed);
+        buckets[3].store(10, Ordering::Relaxed);
+        assert_eq!(bucket_delta(&buckets, &mut previous), vec![(2, 2), (3, 1)]);
+        assert_eq!(previous, vec![0, 5, 2, 10]);
+
+        // 桶没有变化时不产生空增量
+        assert!(bucket_delta(&buckets, &mut previous).is_empty());
     }
 }

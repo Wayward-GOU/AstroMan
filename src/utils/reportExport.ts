@@ -67,8 +67,8 @@ function fmtDuration(start: number | null | undefined, end: number | null | unde
   const hour = Math.floor(seconds / 3600)
   const minute = Math.floor((seconds % 3600) / 60)
   const second = seconds % 60
-  if (hour) return `${hour} 小时 ${minute} 分`
-  return minute ? `${minute} 分 ${second} 秒` : `${second} 秒`
+  if (hour) return `${hour} 小时 ${String(minute).padStart(2, '0')} 分`
+  return minute ? `${minute} 分 ${String(second).padStart(2, '0')} 秒` : `${second} 秒`
 }
 
 function statusLabel(status: string): string {

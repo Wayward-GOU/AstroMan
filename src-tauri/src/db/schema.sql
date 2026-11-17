@@ -212,6 +212,49 @@ CREATE TABLE IF NOT EXISTS machine_capacity (
 );
 CREATE INDEX IF NOT EXISTS idx_machine_capacity_probed ON machine_capacity(probed_at DESC);
 
+-- 分布式压测任务（v16）：主节点视角一条任务，合并结果仍写 test_reports
+CREATE TABLE IF NOT EXISTS cluster_jobs (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at           INTEGER NOT NULL,
+    status               TEXT NOT NULL DEFAULT 'pairing',
+    master_node          TEXT NOT NULL DEFAULT '',
+    plan_id              INTEGER,
+    plan_name            TEXT NOT NULL DEFAULT '',
+    port                 INTEGER NOT NULL DEFAULT 17801,
+    config_json          TEXT NOT NULL DEFAULT '{}',
+    start_at_ms          INTEGER,
+    pair_code_expires_at INTEGER,
+    total_concurrent     INTEGER NOT NULL DEFAULT 0,
+    report_id            INTEGER,
+    incomplete           INTEGER NOT NULL DEFAULT 0,
+    message              TEXT,
+    finished_at          INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_cluster_jobs_created ON cluster_jobs(created_at DESC);
+
+-- 集群节点（v16）：每个任务下每个从节点一条，主节点自身也记一条 role=master
+CREATE TABLE IF NOT EXISTS cluster_workers (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id               INTEGER NOT NULL REFERENCES cluster_jobs(id) ON DELETE CASCADE,
+    node_name            TEXT NOT NULL,
+    addr                 TEXT NOT NULL DEFAULT '',
+    role                 TEXT NOT NULL DEFAULT 'slave',
+    weight               REAL NOT NULL DEFAULT 1,
+    concurrent           INTEGER NOT NULL DEFAULT 0,
+    status               TEXT NOT NULL DEFAULT 'pairing',
+    qps                  REAL NOT NULL DEFAULT 0,
+    cpu                  REAL NOT NULL DEFAULT 0,
+    mem                  INTEGER NOT NULL DEFAULT 0,
+    clock_offset_ms      REAL NOT NULL DEFAULT 0,
+    clock_uncertainty_ms REAL NOT NULL DEFAULT 0,
+    dropped_samples      INTEGER NOT NULL DEFAULT 0,
+    joined_at            INTEGER NOT NULL,
+    last_seen_at         INTEGER,
+    error                TEXT,
+    UNIQUE(job_id, node_name)
+);
+CREATE INDEX IF NOT EXISTS idx_cluster_workers_job ON cluster_workers(job_id, id);
+
 -- 请求历史（本地，最多保留最近 100000 条）
 CREATE TABLE IF NOT EXISTS request_history (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,

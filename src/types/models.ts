@@ -1,3 +1,5 @@
+import type { ClusterReportMeta } from './cluster'
+
 export interface Project {
   id: number
   name: string
@@ -906,6 +908,8 @@ export interface StressConfig {
   projectId?: number | null
   /** 来源计划：写入报告，便于按计划聚合 */
   planId?: number | null
+  /** 同批多计划报告分组号（1.3.3），缺省不归组 */
+  runGroupId?: number | null
   name?: string | null
   method: string
   url: string
@@ -1083,6 +1087,8 @@ export interface StageSummary {
 }
 
 export interface ReportConfigSnapshot {
+  /** 配置形态版本：v2 起包含 target / env / 采集预设快照（6.2） */
+  schemaVersion?: number
   mode?: string
   method?: string
   /** 解析后的完整地址 */
@@ -1099,6 +1105,7 @@ export interface ReportConfigSnapshot {
   envName?: string | null
   projectId?: number | null
   planId?: number | null
+  runGroupId?: number | null
   timeoutMs?: number
   connectTimeoutMs?: number
   followRedirects?: boolean
@@ -1127,6 +1134,8 @@ export interface ReportConfigSnapshot {
   agent?: AgentInfo
   /** 运行期指标（发送字节、丢弃计数、资源峰值等） */
   metrics?: RuntimeMetrics
+  /** 分布式压测元数据（V1.2 一期，主从节点与合并口径） */
+  cluster?: ClusterReportMeta | null
 }
 
 /** 压测配置带入的机器能力快照 */

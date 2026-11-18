@@ -3,6 +3,7 @@ import { computed, ref } from 'vue'
 import { message } from 'ant-design-vue'
 import { CopyOutlined, InboxOutlined } from '@ant-design/icons-vue'
 import CryptoJS from 'crypto-js'
+import { copyToClipboard } from '@/utils/clipboard'
 
 interface HashRow {
   label: string
@@ -112,7 +113,7 @@ function onDrop(event: DragEvent) {
 
 async function copy(value: string) {
   try {
-    await navigator.clipboard.writeText(value)
+    await copyToClipboard(value)
     message.success('已复制')
   } catch {
     message.error('复制失败，请手动选择文本')

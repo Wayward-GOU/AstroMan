@@ -26,6 +26,7 @@ import { buildReportHtml, buildReportSheets } from '@/utils/reportExport'
 import { detectKnee, qpsOverview, scoreReport, selfCheck } from '@/utils/reportAnalytics'
 import { buildFindings, gradeReport, latencyDrift, type Finding } from '@/utils/reportNarrative'
 import { buildXlsx } from '@/utils/xlsx'
+import { copyToClipboard } from '@/utils/clipboard'
 
 const route = useRoute()
 const router = useRouter()
@@ -98,7 +99,7 @@ function openRecord(item: ReportRequestRecord) {
 async function copyText(text: string, label: string) {
   if (!text) return
   try {
-    await navigator.clipboard.writeText(text)
+    await copyToClipboard(text)
     message.success(`已复制${label}`)
   } catch {
     message.error('复制失败')
@@ -241,6 +242,24 @@ const qps = computed(() =>
     : null,
 )
 const knee = computed(() => (detail.value ? detectKnee(detail.value) : null))
+
+/** 阶段汇总：叠加稳态 QPS 与扩展效率（口径与 HTML 导出一致） */
+const stageRows = computed(() => {
+  const steadyStages = knee.value?.stages ?? []
+  return stages.value.map((stage, index) => {
+    const steady = steadyStages[index]
+    const prev = stages.value[index - 1]
+    const concurGain =
+      prev && prev.concurrent > 0 ? (stage.concurrent - prev.concurrent) / prev.concurrent : null
+    return {
+      ...stage,
+      steadyQps: steady?.qps ?? null,
+      gain: steady?.gain ?? null,
+      efficiency:
+        steady && concurGain != null && concurGain > 0 ? steady.gain / concurGain : null,
+    }
+  })
+})
 const score = computed(() => (detail.value ? scoreReport(detail.value) : null))
 const checks = computed(() => (detail.value ? selfCheck(detail.value) : []))
 const checksPassed = computed(() => checks.value.every((item) => item.pass))
@@ -619,8 +638,16 @@ const slowMaxLatency = computed(() =>
   Math.max(1, ...slowRequests.value.map((item) => item.latencyMs)),
 )
 
-/** 按请求数加权的 Body 平均（逐秒采样点加权，旧报告无该字段时按 0 处理） */
-const avgBody = computed(() => {
+/** 旧报告没有 body_avg / body_p95 / body_histogram，不能按 0 展示 */
+const bodyMetricsAvailable = computed(
+  () =>
+    bodyHistogram.value.length > 0 ||
+    samples.value.some((sample) => sample.bodyAvg != null || sample.bodyP95 != null),
+)
+
+/** 按请求数加权的 Body 平均（逐秒采样点加权，旧报告无该字段时返回 null） */
+const avgBody = computed<number | null>(() => {
+  if (!bodyMetricsAvailable.value) return null
   let sum = 0
   let weight = 0
   for (const sample of samples.value) {
@@ -628,11 +655,12 @@ const avgBody = computed(() => {
     sum += (sample.bodyAvg || 0) * count
     weight += count
   }
-  return weight ? sum / weight : 0
+  return weight ? sum / weight : null
 })
 
 /** Body P95 从报告层直方图算；分位数不能由两个分位数相减 */
-const p95Body = computed(() => {
+const p95Body = computed<number | null>(() => {
+  if (!bodyMetricsAvailable.value) return null
   const buckets = bodyHistogram.value
   const total = buckets.reduce((acc, item) => acc + item.count, 0)
   if (!total) {
@@ -1188,11 +1216,11 @@ function remove() {
               </div>
               <div class="extra-item">
                 <span class="p-label">Body 平均</span>
-                <span class="p-value mono">{{ fmtNum(avgBody) }} ms</span>
+                <span class="p-value mono">{{ avgBody == null ? '—' : `${fmtNum(avgBody)} ms` }}</span>
               </div>
               <div class="extra-item">
                 <span class="p-label">Body P95</span>
-                <span class="p-value mono">{{ fmtNum(p95Body) }} ms</span>
+                <span class="p-value mono">{{ p95Body == null ? '—' : `${fmtNum(p95Body)} ms` }}</span>
               </div>
               <div class="extra-item">
                 <span class="p-label">总传输字节</span>
@@ -1312,7 +1340,7 @@ function remove() {
           <div class="card-head">
             <div>
               <div class="card-title">阶段汇总</div>
-              <div class="card-sub">阶梯加压各阶段的执行情况</div>
+              <div class="card-sub">阶梯加压各阶段的执行情况；扩展效率 = 吞吐增幅 ÷ 并发增幅</div>
             </div>
           </div>
           <div class="data-table">
@@ -1325,20 +1353,31 @@ function remove() {
                   <th>请求数</th>
                   <th>错误数</th>
                   <th>平均 QPS</th>
+                  <th>稳态 QPS</th>
                   <th>平均延迟</th>
                   <th>P95</th>
+                  <th>吞吐增幅</th>
+                  <th>扩展效率</th>
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="(stage, i) in stages" :key="stage.index">
+                <tr v-for="(stage, i) in stageRows" :key="stage.index">
                   <td class="mono">{{ i + 1 }}</td>
                   <td class="mono">{{ fmtNum(stage.concurrent, 0) }}</td>
                   <td class="mono">{{ stage.durationSec }}s</td>
                   <td class="mono">{{ stage.requests.toLocaleString() }}</td>
                   <td class="mono" :class="{ bad: stage.errors > 0 }">{{ stage.errors }}</td>
                   <td class="mono">{{ fmtNum(stage.avgQps) }}</td>
+                  <td class="mono">{{ stage.steadyQps == null ? '—' : fmtNum(stage.steadyQps) }}</td>
                   <td class="mono">{{ fmtNum(stage.avgRt) }} ms</td>
                   <td class="mono">{{ fmtNum(stage.p95Rt) }} ms</td>
+                  <td class="mono">{{ stage.gain == null ? '—' : `${(stage.gain * 100).toFixed(1)}%` }}</td>
+                  <td
+                    class="mono"
+                    :class="{ bad: stage.efficiency != null && stage.efficiency < 0.7 }"
+                  >
+                    {{ stage.efficiency == null ? '—' : `${(stage.efficiency * 100).toFixed(0)}%` }}
+                  </td>
                 </tr>
               </tbody>
             </table>

@@ -211,6 +211,7 @@ pub fn run() {
                 None => show_main_window(app),
             }
         }))
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         // 记住窗口尺寸/位置/最大化状态，下次启动原样恢复；

@@ -4,6 +4,7 @@ import { message } from 'ant-design-vue'
 import { CopyOutlined, DeleteOutlined, PlayCircleOutlined } from '@ant-design/icons-vue'
 import CodeArea from '@/components/CodeArea.vue'
 import { formatCodeByLanguage, type CodeLanguage, type FormatMode } from '@/tools/formatters'
+import { copyToClipboard } from '@/utils/clipboard'
 
 const language = ref<CodeLanguage>('js')
 const mode = ref<FormatMode>('pretty')
@@ -68,7 +69,7 @@ function loadSample() {
 async function copyOutput() {
   if (!output.value) return
   try {
-    await navigator.clipboard.writeText(output.value)
+    await copyToClipboard(output.value)
     message.success('已复制')
   } catch {
     message.error('复制失败')

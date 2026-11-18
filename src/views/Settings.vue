@@ -35,6 +35,7 @@ import { isMac, openDirLabel, platformLabel, shortcutText } from '@/utils/platfo
 import { checkForUpdates, isAutoUpdateEnabled, setAutoUpdateEnabled } from '@/utils/updater'
 import { toolNames } from '@/utils/aiTools'
 import { scriptTimeoutMs, setScriptTimeoutMs, SCRIPT_TIMEOUT_RANGE } from '@/utils/scriptHost'
+import { copyToClipboard } from '@/utils/clipboard'
 import type {
   AiProvider,
   AppInfo,
@@ -385,7 +386,7 @@ async function importWorkspace() {
 async function copy(text?: string) {
   if (!text) return
   try {
-    await navigator.clipboard.writeText(text)
+    await copyToClipboard(text)
     message.success('已复制')
   } catch {
     message.warning('当前环境不允许访问剪贴板')

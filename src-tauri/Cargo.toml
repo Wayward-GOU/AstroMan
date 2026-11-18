@@ -1,6 +1,6 @@
 [package]
 name = "astroman"
-version = "1.1.0"
+version = "1.1.1"
 description = "AstroMan - 本地 API 调试与压测工具"
 edition = "2021"
 # 新增 astroman-cli 后仍让 `cargo run`（tauri dev 使用）默认启动桌面端
@@ -27,6 +27,7 @@ embed-resource = "3"
 
 [dependencies]
 tauri = { version = "2", features = ["compression", "tray-icon", "image-png", "protocol-asset"] }
+tauri-plugin-clipboard-manager = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-single-instance = "2"

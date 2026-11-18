@@ -4,6 +4,7 @@ import { message } from 'ant-design-vue'
 import { CopyOutlined, EyeOutlined, FileTextOutlined, ThunderboltOutlined } from '@ant-design/icons-vue'
 import CodeArea from '@/components/CodeArea.vue'
 import { renderMarkdown } from '@/utils/markdown'
+import { copyToClipboard } from '@/utils/clipboard'
 
 const SAMPLE = `# AstroMan 工具箱
 
@@ -51,7 +52,7 @@ const stats = computed(() => {
 
 async function copy() {
   try {
-    await navigator.clipboard.writeText(view.value === 'html' ? html.value : source.value)
+    await copyToClipboard(view.value === 'html' ? html.value : source.value)
     message.success(view.value === 'html' ? '已复制 HTML' : '已复制 Markdown')
   } catch {
     message.error('复制失败，请手动选择文本')

@@ -10,6 +10,7 @@ import {
   ExportOutlined,
   EyeOutlined,
   ImportOutlined,
+  LineChartOutlined,
   PlayCircleOutlined,
   PlusOutlined,
   ReloadOutlined,
@@ -17,6 +18,7 @@ import {
   ThunderboltOutlined,
 } from '@ant-design/icons-vue'
 import PageHeader from '@/components/PageHeader.vue'
+import LineChart from '@/components/LineChart.vue'
 import { useProjectStore } from '@/stores/project'
 import * as api from '@/api'
 import type {
@@ -41,6 +43,25 @@ const selectedIds = ref<number[]>([])
 const detailOpen = ref(false)
 const detailLoading = ref(false)
 const detail = ref<TestPlan | null>(null)
+
+const trendOpen = ref(false)
+const trendPlan = ref<{ id: number; name: string } | null>(null)
+/** 趋势只取完成的报告，按时间正序，最多 20 次 */
+const trendReports = computed(() => {
+  const planId = trendPlan.value?.id
+  if (!planId) return []
+  return reports.value
+    .filter((item) => item.planId === planId && item.status === 'completed')
+    .sort((a, b) => a.createdAt - b.createdAt)
+    .slice(-20)
+})
+const trendLabels = computed(() => trendReports.value.map((item) => `R-${item.id}`))
+const trendQpsSeries = computed(() => [
+  { name: '平均 QPS', color: 'var(--fm-primary)', values: trendReports.value.map((item) => item.avgQps) },
+])
+const trendP95Series = computed(() => [
+  { name: 'P95', color: 'var(--fm-warning)', values: trendReports.value.map((item) => item.p95Rt) },
+])
 
 const importOpen = ref(false)
 const importing = ref(false)
@@ -152,6 +173,11 @@ function deletePlan(plan: PlanSummary) {
       }
     },
   })
+}
+
+function openTrend(plan: { id: number; name: string }) {
+  trendPlan.value = { id: plan.id, name: plan.name }
+  trendOpen.value = true
 }
 
 async function openDetail(plan: PlanSummary) {
@@ -442,6 +468,10 @@ onMounted(loadAll)
               </div>
             </div>
             <div class="detail-actions">
+              <a-button @click="openTrend({ id: detail.id, name: detail.name })">
+                <template #icon><LineChartOutlined /></template>
+                趋势
+              </a-button>
               <a-button @click="runPlan({ id: detail.id })">
                 <template #icon><PlayCircleOutlined /></template>
                 运行
@@ -489,6 +519,32 @@ onMounted(loadAll)
           <pre class="config-json">{{ JSON.stringify(detail.config, null, 2) }}</pre>
         </div>
       </a-spin>
+    </a-modal>
+
+    <!-- 计划趋势 -->
+    <a-modal
+      v-model:open="trendOpen"
+      :title="`计划趋势 · ${trendPlan?.name ?? ''}`"
+      :width="880"
+      :footer="null"
+    >
+      <div v-if="trendReports.length" class="trend-body">
+        <div class="trend-chart">
+          <div class="trend-head">
+            <span class="trend-title">平均 QPS</span>
+            <span class="trend-sub">最近 {{ trendReports.length }} 次完成的报告</span>
+          </div>
+          <LineChart :series="trendQpsSeries" :labels="trendLabels" unit="QPS" :height="180" :area="false" />
+        </div>
+        <div class="trend-chart">
+          <div class="trend-head">
+            <span class="trend-title">P95 响应时间</span>
+            <span class="trend-sub">观察延迟随版本迭代的变化</span>
+          </div>
+          <LineChart :series="trendP95Series" :labels="trendLabels" unit="ms" :height="180" :area="false" />
+        </div>
+      </div>
+      <div v-else class="detail-empty">该计划还没有已完成、可对比的报告</div>
     </a-modal>
 
     <!-- 导入预览 -->
@@ -740,6 +796,36 @@ onMounted(loadAll)
   color: var(--fm-muted);
   border: 1px dashed var(--fm-border);
   border-radius: 4px;
+}
+
+.trend-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.trend-chart {
+  padding: 10px 12px;
+  border: 1px solid var(--fm-border);
+  border-radius: 4px;
+  background: var(--fm-surface-alt);
+}
+
+.trend-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.trend-title {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.trend-sub {
+  font-size: 10.5px;
+  color: var(--fm-muted);
 }
 
 .config-json {

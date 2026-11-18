@@ -4,6 +4,7 @@ import { message } from 'ant-design-vue'
 import { CopyOutlined } from '@ant-design/icons-vue'
 import CodeArea from '@/components/CodeArea.vue'
 import { randomPassword } from '@/tools/calc'
+import { copyToClipboard } from '@/utils/clipboard'
 import {
   dedupeLines,
   duplicateLines,
@@ -125,7 +126,7 @@ async function copyText() {
     return
   }
   try {
-    await navigator.clipboard.writeText(text.value)
+    await copyToClipboard(text.value)
     message.success('已复制到剪贴板')
   } catch {
     message.error('复制失败，请手动选择文本')

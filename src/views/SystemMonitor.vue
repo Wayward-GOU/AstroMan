@@ -16,6 +16,7 @@ import PageHeader from '@/components/PageHeader.vue'
 import LineChart from '@/components/LineChart.vue'
 import * as api from '@/api'
 import type { MonitorLocalIp, MonitorProcess, MonitorSnapshot } from '@/types/models'
+import { copyToClipboard } from '@/utils/clipboard'
 
 const HISTORY_LIMIT = 90
 
@@ -289,7 +290,7 @@ const totalDiskFree = computed(() =>
 async function copyText(text?: string) {
   if (!text) return
   try {
-    await navigator.clipboard.writeText(text)
+    await copyToClipboard(text)
     message.success('已复制')
   } catch {
     message.warning('当前环境不允许访问剪贴板')

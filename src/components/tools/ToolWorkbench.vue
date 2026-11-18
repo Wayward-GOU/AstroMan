@@ -9,6 +9,7 @@ import {
 } from '@ant-design/icons-vue'
 import CodeArea from '@/components/CodeArea.vue'
 import type { OptionState, ToolDef } from '@/tools/types'
+import { copyToClipboard } from '@/utils/clipboard'
 
 const props = defineProps<{ tool: ToolDef }>()
 
@@ -83,7 +84,7 @@ function clearAll() {
 async function copyOutput() {
   if (!output.value) return
   try {
-    await navigator.clipboard.writeText(output.value)
+    await copyToClipboard(output.value)
     message.success('已复制到剪贴板')
   } catch {
     message.error('复制失败，请手动选择文本')

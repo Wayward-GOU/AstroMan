@@ -7,6 +7,7 @@ import { ThunderboltOutlined } from '@ant-design/icons-vue'
 import PageHeader from '@/components/PageHeader.vue'
 import { useProjectStore } from '@/stores/project'
 import * as api from '@/api'
+import { copyToClipboard } from '@/utils/clipboard'
 import type {
   ClusterMasterSnapshot,
   ClusterNodeInfo,
@@ -740,7 +741,7 @@ const nodeColumns = [
 
 async function copy(text: string) {
   try {
-    await navigator.clipboard.writeText(text)
+    await copyToClipboard(text)
     message.success(`已复制 ${text}`)
   } catch {
     message.warning('复制失败，请手动选择地址')

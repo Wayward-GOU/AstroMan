@@ -4,6 +4,7 @@ import { message } from 'ant-design-vue'
 import { CopyOutlined, LockOutlined, UnlockOutlined } from '@ant-design/icons-vue'
 import CodeArea from '@/components/CodeArea.vue'
 import { aesDecrypt, aesEncrypt } from '@/tools/crypto'
+import { copyToClipboard } from '@/utils/clipboard'
 
 const key = ref('')
 const mode = ref<'encrypt' | 'decrypt'>('encrypt')
@@ -34,7 +35,7 @@ async function run() {
 async function copyOutput() {
   if (!output.value) return
   try {
-    await navigator.clipboard.writeText(output.value)
+    await copyToClipboard(output.value)
     message.success('已复制')
   } catch {
     message.error('复制失败')

@@ -85,6 +85,7 @@ import {
 } from '@/utils/scriptRunner'
 import { runScriptJob } from '@/utils/scriptHost'
 import { POST_SCRIPT_EXAMPLES, PRE_SCRIPT_EXAMPLES } from '@/utils/scriptExamples'
+import { copyToClipboard } from '@/utils/clipboard'
 
 const route = useRoute()
 const router = useRouter()
@@ -870,7 +871,56 @@ const enabledParams = computed(() => form.value.params.filter((p) => p.enabled &
 const enabledHeaders = computed(() => form.value.headers.filter((h) => h.enabled && h.key).length)
 
 /** 发送时会被后端 faker 规则替换的表达式数量（URL / Header / Body 全算） */
-const fakerCount = computed(() => (JSON.stringify(form.value).match(/\{\{\s*faker:/gi) ?? []).length)
+/* faker 提示只在暂停输入后统计；原实现每次按键都 JSON.stringify 整个 form，
+   Body 一大就会卡住输入 */
+const FAKER_RE = /\{\{\s*faker:/gi
+const fakerCount = ref(0)
+let fakerCountTimer: number | undefined
+
+function refreshFakerCount() {
+  let count = 0
+  const scan = (text?: string | null) => {
+    if (text) count += (text.match(FAKER_RE) ?? []).length
+  }
+  const current = form.value
+  scan(current.url)
+  scan(current.body)
+  for (const item of current.params) {
+    scan(item.key)
+    scan(item.value)
+  }
+  for (const item of current.headers) {
+    scan(item.key)
+    scan(item.value)
+  }
+  if (current.auth) {
+    const auth = current.auth
+    scan(auth.token)
+    scan(auth.username)
+    scan(auth.password)
+    scan(auth.key)
+    scan(auth.value)
+    scan(auth.tokenUrl)
+    scan(auth.clientId)
+    scan(auth.clientSecret)
+    scan(auth.scope)
+  }
+  fakerCount.value = count
+}
+
+function scheduleFakerCount() {
+  if (fakerCountTimer) window.clearTimeout(fakerCountTimer)
+  fakerCountTimer = window.setTimeout(() => {
+    fakerCountTimer = undefined
+    refreshFakerCount()
+  }, 150)
+}
+
+watch(
+  () => [form.value.url, form.value.body, form.value.params, form.value.headers, form.value.auth],
+  scheduleFakerCount,
+  { deep: true, immediate: true },
+)
 const FAKER_SAMPLES = [
   { label: '姓名', expr: '{{faker:name}}' },
   { label: '邮箱', expr: '{{faker:email}}' },
@@ -886,7 +936,7 @@ const FAKER_SAMPLES = [
 
 async function copyFaker(expr: string) {
   try {
-    await navigator.clipboard.writeText(expr)
+    await copyToClipboard(expr)
     message.success(`已复制 ${expr}`)
   } catch {
     message.error('复制失败')
@@ -1386,6 +1436,7 @@ onBeforeUnmount(() => {
   saveSnapshot()
   if (bodySizeTimer) window.clearTimeout(bodySizeTimer)
   if (replaceTimer) window.clearTimeout(replaceTimer)
+  if (fakerCountTimer) window.clearTimeout(fakerCountTimer)
 })
 
 // 页面挂载期间，后台请求完成时自动回填；本组件自己发起的请求直接改视图，不重复回填
@@ -2098,7 +2149,7 @@ async function openBodyFolder() {
 async function copyBodyPath() {
   if (!bodyAbsPath.value) return
   try {
-    await navigator.clipboard.writeText(bodyAbsPath.value)
+    await copyToClipboard(bodyAbsPath.value)
     message.success('路径已复制')
   } catch {
     message.warning('复制失败，请手动选择路径')
@@ -2575,7 +2626,7 @@ async function copyBody() {
   const text = result.value?.body ?? ''
   if (!text) return
   try {
-    await navigator.clipboard.writeText(text)
+    await copyToClipboard(text)
     message.success('已复制响应体')
   } catch {
     message.error('复制失败')
@@ -2664,7 +2715,7 @@ function openCode() {
 
 async function copySnippet() {
   try {
-    await navigator.clipboard.writeText(activeCode.value)
+    await copyToClipboard(activeCode.value)
     message.success(
       isCodeEdited.value
         ? `已复制修改后的 ${activeSnippet.value.label} 代码`
@@ -3240,11 +3291,12 @@ const responseHeaders = computed(() => {
                     ref="gqlQueryAreaRef"
                     v-model="gqlQuery"
                     fill
+                    searchable
                     :rows="9"
                     placeholder="query { user(id: 1) { id name } }"
                   />
                   <div class="script-label">Variables（JSON 对象，可留空）</div>
-                  <CodeArea v-model="gqlVarsText" fill :rows="5" placeholder='{"id": 1}' />
+                  <CodeArea v-model="gqlVarsText" fill searchable :rows="5" placeholder='{"id": 1}' />
                   <div v-if="gqlVarsError" class="gql-error">{{ gqlVarsError }}</div>
                 </div>
 
@@ -3264,8 +3316,8 @@ const responseHeaders = computed(() => {
                   v-else-if="form.bodyType !== 'none'"
                   v-model="form.body"
                   fill
+                  searchable
                   :rows="14"
-                  :commentable="form.bodyType === 'json'"
                   :language="form.bodyType === 'json' ? 'json' : 'plain'"
                   placeholder='{"name":"fink"}'
                 />

@@ -3,6 +3,7 @@ import { computed, ref } from 'vue'
 import { message } from 'ant-design-vue'
 import { CopyOutlined, InboxOutlined } from '@ant-design/icons-vue'
 import CodeArea from '@/components/CodeArea.vue'
+import { copyToClipboard } from '@/utils/clipboard'
 
 const mode = ref<'encode' | 'decode'>('encode')
 const dataUrl = ref('')
@@ -74,7 +75,7 @@ function onDrop(event: DragEvent) {
 async function copy(text: string, label: string) {
   if (!text) return
   try {
-    await navigator.clipboard.writeText(text)
+    await copyToClipboard(text)
     message.success(`已复制${label}`)
   } catch {
     message.error('复制失败，请手动选择文本')

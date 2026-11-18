@@ -5,6 +5,7 @@ import { CopyOutlined, DeleteOutlined } from '@ant-design/icons-vue'
 import CodeArea from '@/components/CodeArea.vue'
 import { decodeJwt, type JwtParts } from '@/tools/crypto'
 import { formatDateTime } from '@/utils/datetime'
+import { copyToClipboard } from '@/utils/clipboard'
 
 const token = ref('')
 const error = ref('')
@@ -72,7 +73,7 @@ function loadSample() {
 async function copy(text: string) {
   if (!text) return
   try {
-    await navigator.clipboard.writeText(text)
+    await copyToClipboard(text)
     message.success('已复制')
   } catch {
     message.error('复制失败')

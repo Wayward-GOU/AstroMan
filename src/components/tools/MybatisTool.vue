@@ -3,6 +3,7 @@ import { computed, ref, watch } from 'vue'
 import { message } from 'ant-design-vue'
 import { CopyOutlined, DeleteOutlined, PlayCircleOutlined } from '@ant-design/icons-vue'
 import CodeArea from '@/components/CodeArea.vue'
+import { copyToClipboard } from '@/utils/clipboard'
 import {
   fillLogSql,
   parseMybatisLog,
@@ -175,7 +176,7 @@ watch(pretty, () => {
 async function copySql() {
   if (!sql.value) return
   try {
-    await navigator.clipboard.writeText(sql.value)
+    await copyToClipboard(sql.value)
     message.success('SQL 已复制')
   } catch {
     message.error('复制失败')

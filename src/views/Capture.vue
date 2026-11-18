@@ -52,6 +52,7 @@ import {
 } from '@/utils/captureTree'
 import CaptureInterceptDrawer from '@/components/CaptureInterceptDrawer.vue'
 import CaptureBreakpointModal from '@/components/CaptureBreakpointModal.vue'
+import { copyToClipboard } from '@/utils/clipboard'
 
 /** 树形列表的扁平化行：域名根 / 路径目录 / 请求叶子 */
 type TreeRow =
@@ -970,7 +971,7 @@ function regenerateCa() {
 async function copyText(text: string, label: string) {
   if (!text) return
   try {
-    await navigator.clipboard.writeText(text)
+    await copyToClipboard(text)
     message.success(`${label}已复制`)
   } catch {
     message.warning('当前环境不支持剪贴板')

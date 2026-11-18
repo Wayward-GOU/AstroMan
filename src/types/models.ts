@@ -1086,6 +1086,20 @@ export interface StageSummary {
   p95Rt: number
 }
 
+/** 外部监控指标点（3.6.1）：V1.1.1 只预留结构，不实现导入 */
+export interface ExternalMetricPoint {
+  /** 相对压测开始的时间（秒） */
+  t: number
+  v: number
+}
+
+export interface ExternalMetricSeries {
+  source: string
+  metric: string
+  unit: string
+  points: ExternalMetricPoint[]
+}
+
 export interface ReportConfigSnapshot {
   /** 配置形态版本：v2 起包含 target / env / 采集预设快照（6.2） */
   schemaVersion?: number
@@ -1126,6 +1140,8 @@ export interface ReportConfigSnapshot {
   slowThresholdMs?: number
   /** 本机施压能力快照（1.7.5） */
   machineCapacity?: MachineCapacitySnapshot | null
+  /** 外部监控指标（3.6.1 预留；旧报告没有该字段，读取时忽略） */
+  externalMetrics?: ExternalMetricSeries[] | null
   /** 开始压测时同主机已有其他任务在施压的警告（1.3.2，只留痕不拦截） */
   sameHostWarning?: string | null
   /** 手动计划选择的历史基线报告（3.4.4） */

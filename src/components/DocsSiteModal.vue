@@ -4,6 +4,7 @@ import { message } from 'ant-design-vue'
 import * as api from '@/api'
 import type { DocsSiteStatus } from '@/types/docs'
 import { formatDateTime } from '@/utils/datetime'
+import { copyToClipboard } from '@/utils/clipboard'
 
 const props = defineProps<{
   open: boolean
@@ -66,7 +67,7 @@ function link() {
 async function copy(text: string, tip = '已复制') {
   if (!text) return
   try {
-    await navigator.clipboard.writeText(text)
+    await copyToClipboard(text)
     message.success(tip)
   } catch (e) {
     message.error(`复制失败：${String(e)}`)

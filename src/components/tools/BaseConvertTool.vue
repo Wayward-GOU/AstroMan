@@ -3,6 +3,7 @@ import { computed, ref, watch } from 'vue'
 import { message } from 'ant-design-vue'
 import { CopyOutlined } from '@ant-design/icons-vue'
 import { baseConvert } from '@/tools/calc'
+import { copyToClipboard } from '@/utils/clipboard'
 
 const input = ref('255')
 const from = ref(10)
@@ -30,7 +31,7 @@ watch(from, () => {
 
 async function copy(value: string) {
   try {
-    await navigator.clipboard.writeText(value)
+    await copyToClipboard(value)
     message.success('已复制')
   } catch {
     message.error('复制失败')

@@ -16,6 +16,7 @@ import {
 } from '@ant-design/icons-vue'
 import * as api from '@/api'
 import type { MockLog, MockRoute, MockRouteInput, MockStatus } from '@/types/models'
+import { copyToClipboard } from '@/utils/clipboard'
 
 const props = defineProps<{
   open: boolean
@@ -239,7 +240,7 @@ async function clearLogs() {
 async function copy(value?: string | null) {
   if (!value) return
   try {
-    await navigator.clipboard.writeText(value)
+    await copyToClipboard(value)
     message.success('已复制')
   } catch {
     message.error('复制失败')

@@ -223,6 +223,7 @@ impl SecretStore {
             Some(ref key) => match verify_key(pool, key) {
                 Ok(()) => None,
                 Err(reason) => {
+                    let reason = explain_mismatch(pool, reason);
                     log::warn!("{reason}");
                     Some(reason)
                 }
@@ -279,6 +280,15 @@ impl SecretStore {
 
     pub fn source(&self) -> KeySource {
         self.inner.read().source
+    }
+
+    /// 当前主密钥的指纹（sha256 前 8 字节）。未解锁时返回 None。
+    ///
+    /// 备份模块用它判断「这份备份是不是本机这把钥匙加密的」；指纹只做提示，
+    /// 不构成安全边界（真正的边界是不导出主密钥）。
+    pub fn fingerprint(&self) -> Option<String> {
+        let inner = self.inner.read();
+        inner.key.as_ref().map(key_fingerprint)
     }
 
     fn current_key(&self) -> Result<[u8; KEY_LEN], String> {
@@ -801,6 +811,11 @@ pub fn store() -> Option<&'static SecretStore> {
     STORE.get()
 }
 
+/// 当前主密钥指纹；密钥模块未初始化或处于锁定状态时为 None
+pub fn current_key_fingerprint() -> Option<String> {
+    store().and_then(SecretStore::fingerprint)
+}
+
 /// 单元测试用：装一个固定的测试密钥（只装一次）
 #[cfg(test)]
 pub fn install_for_test() {
@@ -1086,6 +1101,24 @@ fn mismatch_reason() -> String {
         .to_string()
 }
 
+/// 如果当前库是从备份恢复来的，把「不匹配」的原因说得更具体：
+/// 用户需要知道是备份里的密文由另一台机器的钥匙加密，而不是本机钥匙串坏了。
+fn explain_mismatch(pool: &DbPool, fallback: String) -> String {
+    let Ok(conn) = pool.get() else {
+        return fallback;
+    };
+    let Some(source) = crate::db::meta_get(&conn, "restore.source") else {
+        return fallback;
+    };
+    if source.trim().is_empty() {
+        return fallback;
+    }
+    format!(
+        "E_KEY_MISMATCH: 从备份 `{source}` 恢复后密钥不匹配：备份里的加密字段由另一台机器/另一把主密钥加密，\
+当前主密钥解不开。请在「设置 → 安全」导入原机器的密钥包，或在各服务商、环境变量里重新填写一次"
+    )
+}
+
 /// 带校验信息写入：`key_check`（能直接验明文）+ 密钥指纹（老库兜底）
 fn write_key_meta(conn: &rusqlite::Connection, key: &[u8; KEY_LEN]) -> Result<(), String> {
     crate::db::meta_set(
@@ -1137,7 +1170,16 @@ fn verify_key(pool: &DbPool, key: &[u8; KEY_LEN]) -> Result<(), String> {
     let conn = pool.get().map_err(err)?;
     if let Some(check) = crate::db::meta_get(&conn, META_KEY_CHECK) {
         return match decrypt_with(key, KEY_CHECK_AAD, &check) {
-            Ok(text) if text == KEY_CHECK_TEXT => Ok(()),
+            Ok(text) if text == KEY_CHECK_TEXT => {
+                // 老库可能只有 key_check 没有指纹：校验通过后补写指纹，
+                // 否则之后创建的备份会一直显示「密钥未知」
+                if crate::db::meta_get(&conn, META_KEY_FP).is_none() {
+                    if let Err(error) = write_key_meta(&conn, key) {
+                        log::warn!("补写密钥指纹失败（不影响使用）：{error}");
+                    }
+                }
+                Ok(())
+            }
             _ => Err(mismatch_reason()),
         };
     }

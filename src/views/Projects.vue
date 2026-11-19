@@ -110,7 +110,7 @@ function remove(project: Project) {
 }
 
 function enter(project: Project) {
-  router.push(`/project/${project.id}`)
+  void router.push(`/project/${project.id}`)
 }
 
 onMounted(load)

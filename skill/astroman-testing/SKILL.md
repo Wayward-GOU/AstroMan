@@ -1,6 +1,6 @@
 ---
 name: astroman-testing
-description: AstroMan 的测试体系与质量门禁：vitest 前端纯函数用例、cargo test、cargo-tarpaulin 覆盖率门槛、CI 四道门禁（fmt / clippy / 版本一致性 / 覆盖率）与版本号同步脚本。加测试、改门禁、排查 CI 变红或本地测试诡异失败时使用。触发词：测试、单测、vitest、cargo test、覆盖率、tarpaulin、clippy、fmt、CI、门禁、版本号、version:check。
+description: AstroMan 的测试体系与质量门禁：vitest 前端纯函数用例、ESLint 前端静态门禁、cargo test、cargo-tarpaulin 覆盖率门槛、CI 五道门禁（lint / fmt / clippy / 版本一致性 / 覆盖率）与版本号同步脚本。加测试、改门禁、排查 CI 变红或本地测试诡异失败时使用。触发词：测试、单测、vitest、eslint、lint、cargo test、覆盖率、tarpaulin、clippy、fmt、CI、门禁、版本号、version:check。
 ---
 
 # 测试与质量门禁
@@ -110,11 +110,11 @@ cd src-tauri
 cargo tarpaulin --config tarpaulin.toml --engine llvm
 ```
 
-## 四、CI 四道门禁（`.github/workflows/ci.yml`）
+## 四、CI 五道门禁（`.github/workflows/ci.yml`）
 
 | job | 跑什么 | 关键点 |
 |---|---|---|
-| `frontend`（ubuntu） | `version:check` → `npm test` → `npm run build` | 版本不一致第一步就失败；类型错误由 build 拦 |
+| `frontend`（ubuntu） | `version:check` → `npm run lint` → `npm test` → `npm run build` | 版本不一致第一步就失败；lint 只做正确性规则，失败即停；类型错误由 build 拦 |
 | `rust`（windows） | `fmt --check` → `clippy -D warnings` → `cargo test --lib` → `cargo build --bin astroman-cli` | 先 `npm ci` + `npm run build` + `prepare-cli.mjs`，`externalBin` 要求 CLI 产物先存在 |
 | `coverage`（ubuntu） | `cargo tarpaulin --config tarpaulin.toml` | 需装 `libwebkit2gtk-4.1-dev`、`libgtk-3-dev`、`librsvg2-dev` 等；CLI 用 `prepare-cli.mjs --placeholder` 占位即可；报告 `if: always()` 上传为 `coverage-report` |
 
@@ -122,7 +122,8 @@ cargo tarpaulin --config tarpaulin.toml --engine llvm
 
 - **不要**把 clippy 和 test 塞进同一个 job：clippy 失败时看不到测试结果，排查成本翻倍
 - job 之间不共享产物，每个 job 都要自己 `npm ci` + `npm run build`
-- `cargo fmt` 与 `clippy` 是**阻断**门禁，不是提示
+- `cargo fmt` 与 `clippy` 是**阻断**门禁，不是提示；前端 `npm run lint` 同样阻断
+- lint 不引入 Prettier：格式化交给编辑器，CI 只管未使用变量、浮动 Promise、`v-for` 缺 key 这类正确性问题
 
 ## 五、版本号一致性
 

@@ -55,7 +55,7 @@ async function query() {
 
 function usePreset(ip: string) {
   queryIp.value = ip
-  query()
+  void query()
 }
 
 onMounted(query)

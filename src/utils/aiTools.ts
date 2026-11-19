@@ -2864,7 +2864,7 @@ const SPECS: ToolSpec[] = [
   },
   {
     name: 'test_suite_create',
-    desc: '新建测试套件（可在 config 中写 failFast / maxWorkers / cookieMode / vars 等套件配置）',
+    desc: '新建测试套件（可在 config 中写 failFast / cookieMode / vars / suiteTimeoutSec 等套件配置；并行配置暂不支持）',
     handler: async (args) => {
       const projectId = needNum(args.projectId, 'projectId')
       const name = str(args.name).trim()

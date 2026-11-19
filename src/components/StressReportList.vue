@@ -53,6 +53,7 @@ interface RiskTag {
 
 function riskTags(report: StressReport): RiskTag[] {
   const tags: RiskTag[] = []
+  if (report.status === 'interrupted') tags.push({ label: '不完整', tone: 'p0' })
   if (report.errorRate > 5) tags.push({ label: 'P0 稳定性', tone: 'p0' })
   else if (report.errorRate > 1) tags.push({ label: 'P1 错误', tone: 'p1' })
   if (report.avgRt > 0 && report.p99Rt / report.avgRt >= 3) tags.push({ label: 'P1 长尾', tone: 'p1' })
@@ -99,7 +100,18 @@ function remove(report: StressReport) {
 const selectedIds = ref<number[]>([])
 const compareOpen = ref(false)
 
+function statusLabel(status: string): string {
+  if (status === 'interrupted') return '运行中断'
+  if (status === 'stopped') return '已停止'
+  return '已完成'
+}
+
 function toggleSelect(id: number, checked: boolean) {
+  const target = reports.value.find((item) => item.id === id)
+  if (checked && target?.status === 'interrupted') {
+    message.warning('运行中断的报告不完整，不能参与横向对比')
+    return
+  }
   if (checked) {
     if (selectedIds.value.length >= 4) {
       message.warning('最多选择 4 份报告对比')
@@ -133,7 +145,7 @@ function compareMetricRows() {
     { label: '最大 QPS', values: list.map((item) => fmtNum(item.maxQps)) },
     { label: 'APDEX', values: list.map((item) => item.apdex.toFixed(3)) },
     { label: '并发', values: list.map((item) => String(item.concurrency)) },
-    { label: '状态', values: list.map((item) => (item.status === 'stopped' ? '已停止' : '已完成')) },
+    { label: '状态', values: list.map((item) => statusLabel(item.status)) },
     { label: '时间', values: list.map((item) => fmtTime(item.createdAt)) },
   ]
 }
@@ -159,12 +171,25 @@ function compareMetricRows() {
             <div class="report-title">
               <a-checkbox
                 :checked="selectedIds.includes(report.id)"
+                :disabled="report.status === 'interrupted'"
                 @change="toggleSelect(report.id, !selectedIds.includes(report.id))"
               />
-              <span class="status-dot" :class="{ stopped: report.status === 'stopped' }" />
+              <span
+                class="status-dot"
+                :class="{
+                  stopped: report.status === 'stopped',
+                  interrupted: report.status === 'interrupted',
+                }"
+              />
               <span class="name">{{ report.planName }}</span>
-              <span class="status-pill" :class="{ stopped: report.status === 'stopped' }">
-                {{ report.status === 'stopped' ? '已停止' : '已完成' }}
+              <span
+                class="status-pill"
+                :class="{
+                  stopped: report.status === 'stopped',
+                  interrupted: report.status === 'interrupted',
+                }"
+              >
+                {{ statusLabel(report.status) }}
               </span>
               <span
                 v-for="tag in riskTags(report)"
@@ -309,6 +334,9 @@ function compareMetricRows() {
 .status-dot.stopped {
   background: var(--fm-warning);
 }
+.status-dot.interrupted {
+  background: var(--fm-danger);
+}
 .name {
   font-size: 14px;
   font-weight: 600;
@@ -327,6 +355,10 @@ function compareMetricRows() {
 .status-pill.stopped {
   background: var(--fm-warning-soft);
   color: var(--fm-warning);
+}
+.status-pill.interrupted {
+  background: var(--fm-danger-soft);
+  color: var(--fm-danger);
 }
 .risk-tag {
   font-size: 10px;

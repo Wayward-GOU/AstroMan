@@ -2,7 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
-import dayjs, { type Dayjs } from 'dayjs'
+import dayjs from 'dayjs'
 import {
   AppstoreOutlined,
   BellOutlined,
@@ -66,13 +66,6 @@ import type { AiProvider } from '@/types/models'
 
 const router = useRouter()
 const store = useNotesStore()
-
-const SCOPES: { key: NoteScope; label: string }[] = [
-  { key: 'today', label: '今天' },
-  { key: 'week', label: '本周' },
-  { key: 'all', label: '全部' },
-  { key: 'done', label: '已完成' },
-]
 
 const KIND_OPTIONS: { key: NoteKind; label: string; desc: string }[] = [
   { key: 'todo', label: '待办', desc: '有明确动作，可设截止与提醒' },
@@ -745,16 +738,18 @@ function onVisibilityChange() {
 
 async function onExternalChange() {
   if (changeTimer) window.clearTimeout(changeTimer)
-  changeTimer = window.setTimeout(async () => {
-    await Promise.all([loadList(true, true), loadTags()])
-    // 卡片里点「稍后」也会走到这里，抽屉里的提醒时间要跟着刷新
-    if (selectedId.value !== null) {
-      try {
-        detail.value = await notesGet(selectedId.value)
-      } catch {
-        // 条目可能刚被删除，列表刷新已经处理
+  changeTimer = window.setTimeout(() => {
+    void (async () => {
+      await Promise.all([loadList(true, true), loadTags()])
+      // 卡片里点「稍后」也会走到这里，抽屉里的提醒时间要跟着刷新
+      if (selectedId.value !== null) {
+        try {
+          detail.value = await notesGet(selectedId.value)
+        } catch {
+          // 条目可能刚被删除，列表刷新已经处理
+        }
       }
-    }
+    })()
   }, 200)
 }
 

@@ -138,6 +138,9 @@ playwright-report/
 # 单元测试临时目录（util::test_dir 落在 target/test-tmp 下的残留）
 src-tauri/target/test-tmp/
 
+# Vite / Vitest 在部分环境下生成的临时配置快照
+*.timestamp-*.mjs
+
 # ---------------- 本地 IDE 状态与工作记忆（个人环境，不入库） ----------------
 .openidea/
 .workbuddy/

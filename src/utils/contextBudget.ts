@@ -72,7 +72,7 @@ export function clipToTokens(text: string, tokens: number): string {
   if (estimateTokens(text) <= tokens) return text
   // 先按比例估算字符数，再多退 10% 留余量
   const ratio = tokens / Math.max(1, estimateTokens(text))
-  let chars = Math.floor(text.length * ratio * 0.9)
+  const chars = Math.floor(text.length * ratio * 0.9)
   let cut = text.slice(0, chars)
   const fences = (cut.match(/```/g) ?? []).length
   if (fences % 2 === 1) {

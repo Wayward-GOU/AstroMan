@@ -19,7 +19,7 @@ description: AstroMan 抓包模块的开发与使用约定（HTTP/HTTPS 录制�
 | `src-tauri/src/capture/intercept.rs` | 断点 / 本地映射 / 弱网规则、持久化与挂起队列 |
 | `src-tauri/src/capture/store.rs` | 内存流量仓库（5000 条 / 128 MB body）、分组与查询 |
 | `src-tauri/src/capture/ca.rs` | 根证书生成、信任检测、一键安装、导出 |
-| `src-tauri/src/capture/sysproxy.rs` | Windows 系统代理接管/还原、崩溃残留清理 |
+| `src-tauri/src/capture/sysproxy.rs` | Windows / macOS 系统代理接管/还原、崩溃残留清理 |
 | `src-tauri/src/capture/har.rs` | HAR 1.2 渲染与导出 |
 | `src-tauri/src/capture/archive.rs` | ZIP 导出：index.html、HAR、summary.json、flows 明细 |
 | `src-tauri/src/capture/tests.rs` | 代理链路与重发的 Rust 单测 |
@@ -58,8 +58,10 @@ idle → starting → running → stopping → idle
 - `text/event-stream`（SSE）不缓冲 body；压缩响应（gzip / br / deflate）先解码再记录，解不开时按二进制处理。
 - `GET` / `HEAD` 不读请求体。
 - **静态资源默认也录制**：前端 `captureStart` 固定传 `captureStatic: true`。`captureStatic=false` 时会按扩展名跳过 js/css/图片/字体/音视频。
-- `ignorePatterns` 命中 host 或 path 即跳过；`sslHosts` 目前只是契约字段，尚未参与解密决策。前端两项都传空数组，也没有对应设置项——扩展前先补 UI 与 handler。
-- `CONNECT` 请求本身不记一条。
+- `ignorePatterns` 命中 host 或 path 即跳过；`sslHosts` 命中域名 / `host:port` / IPv4 CIDR 时不解密，直接 TCP 直通。
+- 证书固定类域名反复握手失败且没有任何成功请求时，本次录制会自动改为直通（见 §5）。
+- `upstreamProxy` 已接入上游代理：https 先建 `CONNECT` 隧道再做 TLS，http 以 absolute-form 转发；只接受 `http://`。
+- `CONNECT` 请求本身不记一条，直通流量只记隧道元信息。
 
 ## 4. 根证书（HTTPS 解密前提）
 
@@ -73,7 +75,7 @@ astroman-ca.json   创建时间 / 过期时间 / 指纹元数据
 
 - `capture_ca_info` 每次都会 `ensure`：不存在则自动生成；同时用系统证书库检测**当前这张证书**是否已信任。
 - `capture_ca_generate(force=true)` 重新生成。**旧证书随即失效**，已安装的旧证书必须重新安装。
-- `capture_ca_install`：Windows 走 `certutil -user -f -addstore Root`，装进「当前用户 → 受信任的根证书颁发机构」，不需要管理员权限。macOS / Linux 返回「请手动导入」。
+- `capture_ca_install`：Windows 走 `certutil -user -f -addstore Root`，装进「当前用户 → 受信任的根证书颁发机构」；macOS 走 `security add-trusted-cert -r trustRoot -k login.keychain-db`。两者都不需要管理员权限（macOS 可能弹钥匙串授权）。Linux 返回「请手动导入」。
 - `capture_ca_export(path)`：把 PEM 证书导出到用户选择的位置，供手机或其它设备安装。
 - 前端每 10 秒轮询一次信任状态（已信任后停止），装完证书通常几秒内变「CA 已信任」；外部卸载后点「刷新」重新检测。
 - Firefox 使用独立证书库与代理设置，需要单独导入证书、单独填代理；系统层面信任对它不生效。
@@ -81,11 +83,14 @@ astroman-ca.json   创建时间 / 过期时间 / 指纹元数据
 
 ## 5. 系统代理接管
 
-- 只改 **Windows 当前用户** 的 WinINET：`HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings` 的 `ProxyEnable` / `ProxyServer`。
+- Windows 改 **当前用户** 的 WinINET：`HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings` 的 `ProxyEnable` / `ProxyServer`。
+- macOS 通过 `networksetup` 改默认网卡对应服务的 HTTP / HTTPS 代理（`route get default` → `listnetworkserviceorder` 映射服务名），普通调用失败时用 `osascript` 弹一次管理员授权。
 - 开启前把原值备份到 `<数据目录>/capture-proxy-backup.json`，关闭时按备份还原；原值为空则删除键值。
-- 停止录制、代理线程退出、应用下次启动（`restore_stale`）都会尝试恢复，避免崩溃后系统断网。
-- macOS / Linux **不支持一键接管**，命令返回明确错误，需用户手动把系统代理指向 `127.0.0.1:端口`。
+- 停止录制、代理线程退出、应用下次启动（`restore_stale`，不再弹授权）都会尝试恢复，避免崩溃后系统断网。
+- Linux 暂不支持一键接管，命令返回明确错误，需用户手动把系统代理指向 `127.0.0.1:端口`。
 - 接管只影响走系统代理的程序；自己指定代理的 App、Firefox、HTTP/3（QUIC）流量不会经过这里。
+- **自动直通**：hudsucker 不回调 TLS 握手失败，`handler.rs` 的 `TlsFallback` 按「同一 SNI 至少 3 次握手、跨度 ≥ 2 秒、期间没有任何请求成功解出」判定为证书固定，本次录制内改为 TCP 直通并记一条 CONNECT 说明；停止录制后重置。有成功请求的域名永远不会被自动直通。
+- 接管前若根证书未信任，前端会先弹窗提醒，避免 HTTPS 全挂。
 
 ## 6. 手机抓包
 
@@ -106,7 +111,8 @@ astroman-ca.json   创建时间 / 过期时间 / 指纹元数据
 ## 7. 列表、详情与导出
 
 - 列表按 **host 分组**，组内按时间倒序；支持关键字过滤（域名 / 路径 / 方法 / 状态）、只看错误、展开 / 折叠、自动滚动。
-- 详情页签：概览（方法、URL、状态、耗时、大小、客户端地址）、请求（头 + body）、响应（头 + body）、原始报文。文本 body 可格式化 JSON、复制、另存；图片直接预览；二进制提示大小与类型。
+- 详情页签：概览（方法、URL、状态、耗时、大小、客户端地址）、请求（头 + body）、响应（头 + body）、原始报文。文本 body 可格式化 JSON、复制、另存；图片直接预览；`text/html` 可勾选「预览」在沙箱 iframe 中渲染（无脚本、无表单、无外部请求）；二进制提示大小与类型。
+- 单条流量**右键 → 复制为 cURL / 复制 URL**：cURL 含方法、完整 URL、请求头与 body，自动略去 `host` / `content-length` 等重算头，可直接贴终端或分享；直通流量与 `CONNECT` 没有明文，cURL 项置灰。
 - 导出 HAR：顶部「导出 HAR」= 当前全部流量；域名分组**右键 → 导出该分组 HAR**，只导出该 host 的流量。
 - 导出 ZIP：顶部「导出 ZIP」或分组右键「导出该分组 ZIP」，适合把流量直接交给别人查看。解压后结构固定：
 
@@ -167,7 +173,7 @@ astroman-ca.json   创建时间 / 过期时间 / 指纹元数据
 
 | 命令 | 入参（前端 camelCase） | 返回 |
 |---|---|---|
-| `capture_start` | `port?` `bindAddr?` `sslHosts?` `ignorePatterns?` `captureStatic?` `upstreamProxy?` | `CaptureStatus` |
+| `capture_start` | `port?` `bindAddr?` `sslHosts?` `ignorePatterns?` `captureStatic?` `upstreamProxy?` `archiveMode?` `archiveName?` `archiveExclude?` | `CaptureStatus` |
 | `capture_stop` | — | `CaptureStatus` |
 | `capture_status` | — | `CaptureStatus` |
 | `capture_flows` | `limit?` | `CaptureFlow[]` |
@@ -207,7 +213,7 @@ const result = await api.captureRepeat({ id: flow.id, method: 'POST', url, heade
 | 手机开代理后全部请求失败 | 手机没装 / 没信任 CA | 先装证书；iOS 还要打开「证书信任设置」 |
 | 手机填了 `127.0.0.1:8888` 抓不到 | 127.0.0.1 指向手机自己 | 监听切 `0.0.0.0`，代理填电脑局域网 IP |
 | 浏览器能抓、命令行走代理抓不到 | 程序没走系统代理 | 显式加 `curl -x http://127.0.0.1:8888`，或手动配置该程序 |
-| 某些页面加载不了 | HTTP/3（QUIC）绕过代理，或 App 做了证书固定 | 关闭浏览器 QUIC；pinning 流量无法解密 |
+| 某些页面加载不了 | HTTP/3（QUIC）绕过代理，或 App 做了证书固定 | 关闭浏览器 QUIC；证书固定域名会在多次握手失败后自动直通，也可手动加入直通名单 |
 | 微信小程序抓不到 | 微信绕过 Wi-Fi 代理 / 不认用户证书 | 自己的小程序走微信开发者工具；否则用 iPhone，Android 需 root |
 | 停止后电脑上不了网 | 系统代理未恢复 | 再点一次「恢复系统代理」，或重启应用触发 `restore_stale` |
 | 大响应 / 大文件没有 body | 超过 8 MB 不缓冲，超过 2 MB 只留前缀 | 用「保存 body」前先确认 `truncated` / `binary` |

@@ -7,13 +7,36 @@ import type {
 } from '@/types/models'
 import type { CellValue, XlsxSheet } from './xlsx'
 import { detectKnee, downsample, qpsOverview, scoreReport, selfCheck, type QpsOverview } from './reportAnalytics'
-import { buildAdvice, buildFindings, cdfPoints, gradeReport, type FindingLevel } from './reportNarrative'
+import {
+  alignMetric,
+  buildAdvice,
+  buildFindings,
+  cdfPoints,
+  externalMetricFindings,
+  gradeReport,
+  type FindingLevel,
+} from './reportNarrative'
 
 /* ---------- 通用格式化 ---------- */
+
+/** 外部指标曲线配色（与页面图表保持同一色系） */
+const EXTERNAL_CHART_COLORS = [
+  '#6b5b95',
+  '#b07d1a',
+  '#37628f',
+  '#a23333',
+  '#3f7a6e',
+  '#8a5a9e',
+  '#7a8b3f',
+  '#b05f8a',
+  '#2f7d8c',
+  '#8a5a3f',
+]
 
 const STATUS_LABELS: Record<string, string> = {
   completed: '已完成',
   stopped: '已手动停止',
+  interrupted: '运行中断（不完整）',
   running: '运行中',
 }
 
@@ -117,16 +140,6 @@ function apdexGrade(apdex: number): string {
   if (apdex >= 0.85) return '良好'
   if (apdex >= 0.7) return '一般'
   return '较差'
-}
-
-function durationSeconds(detail: ReportDetail): number {
-  const report = detail.report
-  if (!report.startTime || !report.endTime) return 1
-  return Math.max(1, (report.endTime - report.startTime) / 1000)
-}
-
-function bandwidthKb(bytes: number, seconds: number): string {
-  return `${(bytes / Math.max(1, seconds) / 1024).toFixed(1)} KB/s`
 }
 
 function errorRateOf(item: { successCount: number; errorCount: number }): number {
@@ -517,6 +530,9 @@ interface LineChartOptions {
   xs: number[]
   series: ChartSeries[]
   unit?: string
+  /** 右 Y 轴序列（外部指标），与左轴同一时间轴独立缩放 */
+  rightSeries?: ChartSeries[]
+  rightUnit?: string
   height?: number
   refLines?: Array<{ value: number; label: string; color?: string }>
   /** 高亮区间，例如升压期 */
@@ -535,13 +551,27 @@ interface LineChartOptions {
  * 描边与字号失真 —— 这是原版报告图表「看着不专业」的主因之一。
  */
 function lineChart(title: string, options: LineChartOptions): string {
-  const { xs, series, unit = '', height = 208, refLines = [], band, legend: showLegend = true } = options
+  const {
+    xs,
+    series,
+    unit = '',
+    rightSeries = [],
+    rightUnit = '',
+    height = 208,
+    refLines = [],
+    band,
+    legend: showLegend = true,
+  } = options
   const width = 760
-  const pad = { left: 58, right: 26, top: 18, bottom: 30 }
+  const pad = { left: 58, right: rightSeries.length ? 62 : 26, top: 18, bottom: 30 }
   const plotW = width - pad.left - pad.right
   const plotH = height - pad.top - pad.bottom
 
   const prepared = series.map((item) => ({ ...item, values: downsample(item.values, CHART_MAX_POINTS) }))
+  const preparedRight = rightSeries.map((item) => ({
+    ...item,
+    values: downsample(item.values, CHART_MAX_POINTS),
+  }))
   const pointsX = downsample(xs, CHART_MAX_POINTS)
   const dataMax = Math.max(
     1,
@@ -549,22 +579,32 @@ function lineChart(title: string, options: LineChartOptions): string {
     ...refLines.map((item) => item.value),
   )
   const yMax = options.yMax ?? niceMax(dataMax * 1.04)
+  const rightMax = preparedRight.length
+    ? niceMax(Math.max(1, ...preparedRight.flatMap((item) => item.values)) * 1.04)
+    : 1
   const t0 = pointsX[0] ?? 0
   const t1 = pointsX[pointsX.length - 1] ?? t0 + 1
   const span = t1 - t0 || 1
   const X = (time: number) => pad.left + ((time - t0) / span) * plotW
   const Y = (value: number) => pad.top + plotH - (Math.max(0, value) / yMax) * plotH
+  const Y2 = (value: number) => pad.top + plotH - (Math.max(0, value) / rightMax) * plotH
 
   const grids = Array.from({ length: 5 }, (_, index) => {
     const y = pad.top + (plotH / 4) * index
     const value = yMax * (1 - index / 4)
+    const rightTick = preparedRight.length
+      ? `<text x="${width - pad.right + 9}" y="${(y + 3.5).toFixed(1)}" text-anchor="start" font-size="9.5" fill="#9aa6ad">${axisNumber(
+          rightMax * (1 - index / 4),
+          rightMax,
+        )}</text>`
+      : ''
     return `<line x1="${pad.left}" y1="${y.toFixed(1)}" x2="${width - pad.right}" y2="${y.toFixed(
       1,
     )}" stroke="#eef1f3" stroke-width="1"/>
 <text x="${pad.left - 9}" y="${(y + 3.5).toFixed(1)}" text-anchor="end" font-size="9.5" fill="#9aa6ad">${axisNumber(
       value,
       yMax,
-    )}</text>`
+    )}</text>${rightTick}`
   }).join('')
 
   // X 轴刻度：最多 6 个，均匀取值
@@ -632,6 +672,19 @@ function lineChart(title: string, options: LineChartOptions): string {
     })
     .join('')
 
+  const rightLines = preparedRight
+    .filter((item) => item.values.length)
+    .map((item) => {
+      const segments = item.values.map((value, index) => {
+        const time = pointsX[Math.min(index, pointsX.length - 1)] ?? t0
+        return `${X(time).toFixed(1)},${Y2(value).toFixed(1)}`
+      })
+      return `<polyline fill="none" stroke="${item.color}" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" points="${segments.join(
+        ' ',
+      )}"/>`
+    })
+    .join('')
+
   const refs = refLines
     .map((item) => {
       const y = Y(item.value)
@@ -661,6 +714,13 @@ function lineChart(title: string, options: LineChartOptions): string {
               item.name,
             )}</span>`,
         )
+        .join('')}${preparedRight
+        .map(
+          (item) =>
+            `<span><i style="background:${item.color};color:${item.color}"></i>${escapeHtml(
+              item.name,
+            )}</span>`,
+        )
         .join('')}${
         refLines.length
           ? refLines
@@ -677,7 +737,13 @@ function lineChart(title: string, options: LineChartOptions): string {
 
   return `<figure class="fig">
 <div class="fig-h"><span class="fig-t">${escapeHtml(title)}</span>${
-    unit ? `<span class="fig-u">单位：${escapeHtml(unit)}</span>` : ''
+    unit || rightUnit
+      ? `<span class="fig-u">${
+          rightUnit
+            ? `单位：左轴 ${escapeHtml(unit)} / 右轴 ${escapeHtml(rightUnit)}`
+            : `单位：${escapeHtml(unit)}`
+        }</span>`
+      : ''
   }${options.note ? `<span class="fig-n">${escapeHtml(options.note)}</span>` : ''}</div>
 <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(title)}">
 <defs>${defs.join('')}</defs>
@@ -686,7 +752,7 @@ ${bandRect}${grids}
     pad.top + plotH
   }" stroke="#cfd7db" stroke-width="1"/>
 <line x1="${pad.left}" y1="${pad.top}" x2="${pad.left}" y2="${pad.top + plotH}" stroke="#cfd7db" stroke-width="1"/>
-${xAxis}${paths}${lines}${refs}
+${xAxis}${paths}${lines}${rightLines}${refs}
 </svg>${legendHtml}</figure>`
 }
 
@@ -997,7 +1063,7 @@ const LEVEL_LABELS: Record<FindingLevel, string> = {
 }
 
 function findingsBlock(detail: ReportDetail): string {
-  const findings = buildFindings(detail)
+  const findings = [...externalMetricFindings(detail), ...buildFindings(detail)]
   if (!findings.length) return '<div class="note">数据量不足，无法提炼关键发现。</div>'
   return `<div class="findings">${findings
     .map(
@@ -1137,7 +1203,6 @@ function renderHtml(detail: ReportDetail, requests: ReportRequestRecord[] = []):
   const metrics = config?.metrics
   const agent = config?.agent
   const samples = detail.samples ?? []
-  const seconds = durationSeconds(detail)
   const rows = downsample(samples, CHART_MAX_POINTS)
 
   const qps = qpsOverview(detail, { rampUpSec: config?.rampUpSec ?? 0 })
@@ -1202,6 +1267,23 @@ function renderHtml(detail: ReportDetail, requests: ReportRequestRecord[] = []):
   })
 
   const cdf = cdfChart('响应时间累积分布', cdfPoints(detail))
+
+  const external = report.externalMetrics ?? []
+  const externalChart = external.length
+    ? lineChart('外部指标（与压测时间轴对齐）', {
+        xs: rows.map((item) => item.elapsedSec),
+        series: [{ name: '实际 QPS', color: '#14655a', values: rows.map((item) => item.qps) }],
+        rightSeries: external.map((item, index) => ({
+          name: `${item.source} · ${item.metric} (${item.unit})`,
+          color: EXTERNAL_CHART_COLORS[index % EXTERNAL_CHART_COLORS.length],
+          values: alignMetric(item.points, rows.map((row) => row.elapsedSec)),
+        })),
+        unit: 'req/s',
+        rightUnit: [...new Set(external.map((item) => item.unit))].join(' / '),
+        height: 220,
+        note: `已导入 ${external.length} 条外部指标`,
+      })
+    : ''
 
   const ttfb = lineChart('首字节时间（TTFB）趋势', {
     xs: rows.map((item) => item.elapsedSec),
@@ -1533,7 +1615,7 @@ ${
     '04',
     '响应时间分析',
     'Latency Analysis',
-    `${latency}${cdf}
+    `${latency}${externalChart}${cdf}
 <div class="cols">
 <div><div class="sub">分位统计</div>${tableHtml(['分位', '响应时间'], percentileRows, [1], { kv: true })}</div>
 <div><div class="sub">响应时间分布<span class="hint">按区间计数</span></div>${
@@ -1801,6 +1883,17 @@ function percentileSheet(detail: ReportDetail): CellValue[][] {
   ]
 }
 
+/** 外部指标长表：来源 / 指标 / 单位 / 相对秒数 / 数值 */
+function externalSheet(detail: ReportDetail): CellValue[][] {
+  const rows: CellValue[][] = [['来源', '指标', '单位', '相对秒数', '数值']]
+  for (const series of detail.report.externalMetrics ?? []) {
+    for (const point of series.points) {
+      rows.push([series.source, series.metric, series.unit, point.t, point.v])
+    }
+  }
+  return rows
+}
+
 /** 生成 Excel 多工作表数据 */
 export function buildReportSheets(
   detail: ReportDetail,
@@ -2002,6 +2095,9 @@ export function buildReportSheets(
     { name: '优化建议', rows: advice },
     { name: '延迟分位', rows: percentileSheet(detail) },
     { name: '采样明细', rows: samples },
+    ...(detail.report.externalMetrics?.length
+      ? [{ name: '外部指标', rows: externalSheet(detail) }]
+      : []),
     { name: '请求明细', rows: requestSheet },
     { name: '响应时间分布', rows: histogram },
     { name: '状态码分布', rows: statusCodes },

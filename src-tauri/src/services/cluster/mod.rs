@@ -9,6 +9,8 @@
 use std::net::{IpAddr, UdpSocket};
 
 pub mod client;
+pub mod devices;
+pub mod discovery;
 pub mod host;
 pub mod merge;
 pub mod protocol;
@@ -35,7 +37,7 @@ pub fn local_addresses() -> Vec<String> {
     items
 }
 
-fn primary_lan_ip() -> Option<IpAddr> {
+pub(crate) fn primary_lan_ip() -> Option<IpAddr> {
     let socket = UdpSocket::bind(("0.0.0.0", 0)).ok()?;
     socket.connect(("223.5.5.5", 80)).ok()?;
     Some(socket.local_addr().ok()?.ip())

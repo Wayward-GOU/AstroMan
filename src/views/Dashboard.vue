@@ -2,7 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
-import { open, save } from '@tauri-apps/plugin-dialog'
+import { open } from '@tauri-apps/plugin-dialog'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import {
   ArrowRightOutlined,
@@ -208,7 +208,7 @@ const kpis = computed(() => {
   const project = recentProject.value
   const today = todayRequests.value
   const openProject = () => {
-    if (project) router.push(`/project/${project.id}`)
+    if (project) void router.push(`/project/${project.id}`)
     else createOpen.value = true
   }
   const todayNote = !today || today.total === 0
@@ -221,7 +221,7 @@ const kpis = computed(() => {
       value: s?.projectCount ?? store.projects.length,
       note: `${activeProjects.value} 个本周活跃`,
       up: false,
-      go: () => router.push('/projects'),
+      go: (): void => void router.push('/projects'),
     },
     {
       key: 'request',
@@ -237,7 +237,7 @@ const kpis = computed(() => {
       value: today?.total ?? null,
       note: todayNote,
       up: Boolean(today && today.total > 0),
-      go: () => router.push('/history'),
+      go: (): void => void router.push('/history'),
     },
     {
       key: 'todo',
@@ -247,7 +247,7 @@ const kpis = computed(() => {
         ? `${noteCounts.value.overdue} 项已逾期`
         : `今天到期 ${noteCounts.value.dueToday} 项`,
       up: false,
-      go: () => router.push('/notes'),
+      go: (): void => void router.push('/notes'),
     },
   ]
 })
@@ -258,28 +258,28 @@ const launches = computed(() => [
     title: '发起压测',
     desc: '固定 / 阶梯并发，SLA 判定',
     icon: ThunderboltOutlined,
-    go: () => router.push('/stress'),
+    go: (): void => void router.push('/stress'),
   },
   {
     key: 'capture',
     title: '开始抓包',
     desc: '本机 MITM · 断点 · 弱网',
     icon: GlobalOutlined,
-    go: () => router.push('/capture'),
+    go: (): void => void router.push('/capture'),
   },
   {
     key: 'automation',
     title: '跑测试套件',
     desc: '断言 · Python 钩子 · 报告',
     icon: ExperimentOutlined,
-    go: () => router.push('/automation'),
+    go: (): void => void router.push('/automation'),
   },
   {
     key: 'ai',
     title: '问航仔',
     desc: '写接口、发请求、查报告',
     icon: AiSparkIcon,
-    go: () => router.push({ name: 'ai' }),
+    go: (): void => void router.push({ name: 'ai' }),
   },
 ])
 
@@ -298,7 +298,7 @@ const features = computed(() => [
     title: '抓包分析',
     desc: '本机 MITM 代理录制 HTTP / HTTPS，按域名分组查看请求与响应；一键信任根证书、接管系统代理，手机同 Wi-Fi 也能抓。',
     points: ['HTTPS 解密与证书', '域名分组 / HAR / ZIP 导出', '改参重发与手机代理'],
-    go: () => router.push('/capture'),
+    go: (): void => void router.push('/capture'),
   },
   {
     key: 'automation',
@@ -306,7 +306,7 @@ const features = computed(() => [
     title: '自动化测试',
     desc: '把接口组合保存成测试套件，配好断言与变量链后可反复运行；支持 Python 钩子与压测用例，结果产出 HTML / JSON / JUnit。',
     points: ['HTTP / Python / 压测用例', '运行前预检与依赖跳过', 'CLI 同源执行与 CI 门禁'],
-    go: () => router.push('/automation'),
+    go: (): void => void router.push('/automation'),
   },
   {
     key: 'stress',
@@ -314,7 +314,7 @@ const features = computed(() => [
     title: '本地压测',
     desc: '参考 JMeter 的参数模型，支持固定并发与阶梯加压、目标 QPS 限速、SLA 阈值与自动停止。',
     points: ['并发 / 时长 / 思考时间', 'P95 · P99 · 错误率', '逐请求明细可导出'],
-    go: () => router.push('/stress'),
+    go: (): void => void router.push('/stress'),
   },
   {
     key: 'toolbox',
@@ -322,7 +322,7 @@ const features = computed(() => [
     title: '离线工具箱',
     desc: '日常开发常用工具集中在一处，全部在本地运行，不发起外部请求，也不写入压测或请求历史。',
     points: ['JSON 转换与格式化', '加密编码 / 时间戳', 'MyBatis 日志填充'],
-    go: () => router.push('/tools'),
+    go: (): void => void router.push('/tools'),
   },
   {
     key: 'privacy',
@@ -481,21 +481,21 @@ const steps = computed(() => [
     title: '抓一次真实流量',
     desc: '开始录制、信任根证书并接管系统代理，浏览器 / App 的请求会按域名分组出现；手机同 Wi-Fi 也能抓。',
     action: '打开抓包',
-    go: () => router.push('/capture'),
+    go: (): void => void router.push('/capture'),
   },
   {
     key: '05',
     title: '发起压测',
     desc: '配置并发与时长，结束后自动生成报告与逐请求明细。',
     action: '去压测',
-    go: () => router.push('/stress'),
+    go: (): void => void router.push('/stress'),
   },
   {
     key: '06',
     title: '沉淀回归套件',
     desc: '把常用接口保存成自动化测试套件，配好断言、变量链与失败策略后反复运行；示例项目已内置「示例回归（httpbin）」可直接试跑。',
     action: '打开自动化测试',
-    go: () => router.push('/automation'),
+    go: (): void => void router.push('/automation'),
   },
   {
     key: '07',
@@ -516,14 +516,14 @@ const steps = computed(() => [
     title: '用航仔 提效',
     desc: '在「航仔」里说一句话就能建项目、写接口、发请求、写签名脚本、查压测报告，并能导出执行记录。',
     action: '打开航仔',
-    go: () => router.push({ name: 'ai' }),
+    go: (): void => void router.push({ name: 'ai' }),
   },
   {
     key: '10',
     title: '数据与备份',
     desc: '数据默认存在本机 SQLite；设置页可查看路径、迁移目录，项目页可导出 JSON 备份。',
     action: '打开设置',
-    go: () => router.push('/settings'),
+    go: (): void => void router.push('/settings'),
   },
 ])
 
@@ -902,8 +902,8 @@ async function createProject() {
     newName.value = ''
     newDesc.value = ''
     await store.loadProjects()
-    refreshStats()
-    router.push(`/project/${p.id}`)
+    void refreshStats()
+    void router.push(`/project/${p.id}`)
   } catch (e) {
     message.error(String(e))
   } finally {
@@ -918,22 +918,6 @@ async function refreshStats() {
   await loadRecentProjects()
 }
 
-function removeProject(id: number, name: string) {
-  Modal.confirm({
-    title: `删除项目「${name}」？`,
-    content: '项目下的集合、请求与运行记录将一并删除，无法恢复。',
-    okText: '删除',
-    okType: 'danger',
-    cancelText: '取消',
-    async onOk() {
-      await api.projectDelete(id)
-      await store.loadProjects()
-      refreshStats()
-      message.success('已删除')
-    },
-  })
-}
-
 async function importProject() {
   try {
     const path = await open({
@@ -944,25 +928,9 @@ async function importProject() {
     if (!path) return
     const project = await api.projectImport(path)
     await store.loadProjects()
-    refreshStats()
+    void refreshStats()
     message.success(`已导入项目「${project.name}」`)
-    router.push(`/project/${project.id}`)
-  } catch (e) {
-    message.error(String(e))
-  }
-}
-
-async function exportProjectJson(id: number, name: string) {
-  const safeName = name.replace(/[\\/:*?"<>|]/g, '_')
-  try {
-    const path = await save({
-      title: '导出项目 JSON',
-      defaultPath: `${safeName}.astroman.json`,
-      filters: [{ name: 'AstroMan 项目文件', extensions: ['json'] }],
-    })
-    if (!path) return
-    await api.projectExport(id, path)
-    message.success(`项目「${name}」已导出，可发给他人用「导入项目 JSON」恢复`)
+    void router.push(`/project/${project.id}`)
   } catch (e) {
     message.error(String(e))
   }
@@ -981,12 +949,12 @@ async function importApiProject() {
     importingApi.value = true
     const project = await api.apiImport(path, null)
     await store.loadProjects()
-    refreshStats()
+    void refreshStats()
     message.success(`已导入「${project.name}」`)
     if (path.toLowerCase().endsWith('.har')) {
       message.info('HAR 中 Authorization / Cookie 已默认停用，上传文件字段与 base64 请求体未导入', 6)
     }
-    router.push(`/project/${project.id}`)
+    void router.push(`/project/${project.id}`)
   } catch (e) {
     message.error(String(e))
   } finally {
@@ -995,24 +963,24 @@ async function importApiProject() {
 }
 
 function onImportMenu(info: { key: string | number }) {
-  if (info.key === 'astroman') importProject()
-  else if (info.key === 'api') importApiProject()
+  if (info.key === 'astroman') void importProject()
+  else if (info.key === 'api') void importApiProject()
 }
 
 /* ---------- 跳转 ---------- */
 
 function goProject() {
-  if (recentProject.value) router.push(`/project/${recentProject.value.id}`)
+  if (recentProject.value) void router.push(`/project/${recentProject.value.id}`)
   else createOpen.value = true
 }
 
 function goEnvironment() {
-  if (recentProject.value) router.push(`/environment/${recentProject.value.id}`)
+  if (recentProject.value) void router.push(`/environment/${recentProject.value.id}`)
   else createOpen.value = true
 }
 
 function goSettings() {
-  router.push('/settings')
+  void router.push('/settings')
 }
 
 /* ---------- 格式化 ---------- */

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use tauri::{AppHandle, Emitter, State};
 
-use crate::backup::{self, BackupItem, CheckResult};
+use crate::backup::{self, BackupItem, CheckResult, RestorePlan};
 use crate::services::backup_target::{
     self, BackupTarget, BackupTargetInput, BackupUploadResult, RemoteBackup, TargetTestReport,
 };
@@ -31,15 +31,32 @@ pub fn backup_create(app: AppHandle, state: State<'_, AppState>) -> Result<Backu
     result
 }
 
-/// 请求恢复：只做校验 + 写标记，真正的替换在下次启动时完成
+/// 恢复预览：不写标记，只告诉前端密钥是否一致、会影响多少条密钥
+#[tauri::command]
+pub fn backup_restore_preview(
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<RestorePlan, String> {
+    let path = resolve_backup(&state, &name)?;
+    backup::restore_preview(&path)
+}
+
+/// 请求恢复：校验 + 密钥确认 + 写标记，真正的替换在下次启动时完成
 ///
+/// 密钥不一致时默认拒绝；前端带上 `acceptKeyMismatch=true` 才会排队。
 /// 返回后前端应立即调用 `app_restart`。
 #[tauri::command]
-pub fn backup_restore(state: State<'_, AppState>, name: String) -> Result<BackupItem, String> {
+pub fn backup_restore(
+    state: State<'_, AppState>,
+    name: String,
+    accept_key_mismatch: Option<bool>,
+) -> Result<RestorePlan, String> {
     let path = resolve_backup(&state, &name)?;
-    let item = backup::validate(&path)?;
-    backup::mark_restore(&state.config_file, &path)?;
-    Ok(item)
+    backup::prepare_restore(
+        &state.config_file,
+        &path,
+        accept_key_mismatch.unwrap_or(false),
+    )
 }
 
 /// 取消已排队的恢复（用户改主意时）
@@ -160,14 +177,15 @@ pub fn backup_upload(
     result
 }
 
-/// 从异地备份恢复：下载 + 解密 + 校验 + 写待恢复标记；返回后前端应调用 app_restart
+/// 从异地备份恢复：下载 + 解密 + 校验 + 密钥确认 + 写待恢复标记；返回后前端应调用 app_restart
 #[tauri::command]
 pub fn backup_restore_from_target(
     state: State<'_, AppState>,
     id: i64,
     name: String,
     passphrase: String,
-) -> Result<BackupItem, String> {
+    accept_key_mismatch: Option<bool>,
+) -> Result<RestorePlan, String> {
     backup_target::restore_from_target(
         &state.pool,
         &state.data_dir,
@@ -175,6 +193,7 @@ pub fn backup_restore_from_target(
         id,
         &name,
         &passphrase,
+        accept_key_mismatch.unwrap_or(false),
     )
 }
 

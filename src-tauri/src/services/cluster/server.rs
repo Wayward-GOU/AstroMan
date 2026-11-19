@@ -28,21 +28,27 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
+use super::devices;
+use super::discovery;
 use super::host::ClusterApp;
 use super::merge::{self, MergeNode, MergeRequest};
 use super::protocol::{
-    AbortPayload, ClusterMasterSnapshot, ClusterMessage, ClusterNodeInfo, DonePayload,
-    ErrorPayload, HelloAckPayload, HelloPayload, PingPayload, PongPayload, PreflightPayload,
+    AbortPayload, ClusterDevice, ClusterMasterSnapshot, ClusterMessage, ClusterNodeInfo,
+    DeviceCapability, DeviceListPayload, DonePayload, ErrorPayload, HelloAckPayload, HelloPayload,
+    Orchestration, PhaseStartPayload, PingPayload, PongPayload, PreflightPayload,
     PrepareAckPayload, PreparePayload, SamplePayload, StartPayload, TimeAckPayload,
     TimeProbePayload, CLOCK_SAMPLE_ROUNDS, DEFAULT_PORT, HEARTBEAT_MISSES, HEARTBEAT_SEC,
-    MAX_MESSAGE_BYTES, MAX_NODES, MAX_PAIR_CODE_TTL_SEC, MIN_PAIR_CODE_TTL_SEC, PAIR_CODE_DIGITS,
-    PAIR_CODE_TTL_SEC, PROTOCOL_VERSION,
+    MAX_MESSAGE_BYTES, MAX_NODES, MAX_PAIR_CODE_TTL_SEC, MIN_PAIR_CODE_TTL_SEC,
+    MIN_PROTOCOL_VERSION, PAIR_CODE_DIGITS, PAIR_CODE_TTL_SEC, PROTOCOL_VERSION,
+    RECONNECT_GRACE_SEC,
 };
 use crate::commands::stress::{
     prepare_stress, run_engine, save_report, EngineOptions, EngineOutcome, EngineSampleSink,
     PreparedStress, ReportPayload,
 };
-use crate::models::{ReportError, ReportRequestRecord, SlowRequest, StressConfig};
+use crate::models::{
+    CapacityResult, ReportError, ReportRequestRecord, SlowRequest, StressConfig, StressStage,
+};
 use crate::state::{DbPool, StressJobDraft};
 use crate::util::{err, now_ms};
 
@@ -78,6 +84,12 @@ pub struct ClusterMasterStartPayload {
     /// 主节点自身在集群中的显示名
     #[serde(default)]
     pub master_name: Option<String>,
+    /// 监听网卡：缺省 0.0.0.0；跨网段时可绑定指定内网地址
+    #[serde(default)]
+    pub listen_addr: Option<String>,
+    /// 计划级编排：ramp / hold / step，按权重拆分每阶段并发
+    #[serde(default)]
+    pub orchestration: Option<Orchestration>,
 }
 
 /// 校验并归一化配对码有效期：缺省 300 秒，允许 1 分钟到 1 小时
@@ -143,6 +155,16 @@ struct NodeState {
     preflight_ok: Option<bool>,
     samples: Vec<SamplePayload>,
     done: Option<DonePayload>,
+    protocol_version: u32,
+    device_id: Option<String>,
+    token: Option<String>,
+    capacity_concurrent: Option<u32>,
+    capacity_qps: Option<f64>,
+    cores: Option<u32>,
+    os: Option<String>,
+    suggested_weight: Option<f64>,
+    disconnected_at: Option<i64>,
+    gap_seconds: u64,
 }
 
 impl NodeState {
@@ -172,6 +194,35 @@ impl NodeState {
             preflight_ok: None,
             samples: Vec::new(),
             done: None,
+            protocol_version: PROTOCOL_VERSION,
+            device_id: None,
+            token: None,
+            capacity_concurrent: None,
+            capacity_qps: None,
+            cores: None,
+            os: None,
+            suggested_weight: None,
+            disconnected_at: None,
+            gap_seconds: 0,
+        }
+    }
+
+    fn apply_capability(&mut self, capability: &DeviceCapability) {
+        if capability.capacity_concurrent > 0 {
+            self.capacity_concurrent = Some(capability.capacity_concurrent);
+        }
+        if capability.capacity_qps > 0.0 {
+            self.capacity_qps = Some(capability.capacity_qps);
+        }
+        if capability.cores > 0 {
+            self.cores = Some(capability.cores);
+        }
+        if capability
+            .os
+            .as_deref()
+            .is_some_and(|os| !os.trim().is_empty())
+        {
+            self.os = capability.os.clone();
         }
     }
 
@@ -193,11 +244,23 @@ impl NodeState {
             joined_at: self.joined_at,
             last_seen_at: self.last_seen_at,
             error: self.error.clone(),
+            protocol_version: self.protocol_version,
+            device_id: self.device_id.clone(),
+            capacity_concurrent: self.capacity_concurrent,
+            capacity_qps: self.capacity_qps,
+            cores: self.cores,
+            os: self.os.clone(),
+            suggested_weight: self.suggested_weight,
+            disconnected_at: self.disconnected_at,
+            gap_seconds: self.gap_seconds,
         }
     }
 
     fn is_active(&self) -> bool {
-        !matches!(self.status.as_str(), "lost" | "left" | "rejected" | "done")
+        !matches!(
+            self.status.as_str(),
+            "lost" | "left" | "rejected" | "done" | "disconnected"
+        )
     }
 }
 
@@ -210,6 +273,7 @@ struct SessionState {
     pair_code: Option<PairCode>,
     nodes: Vec<NodeState>,
     next_node: u32,
+    current_phase: Option<u32>,
 }
 
 /// 主节点本地引擎的逐请求明细：集群报告只收主节点的明细，需在报告里标注
@@ -254,6 +318,7 @@ struct MasterSession {
     aborting: AtomicBool,
     /// 合并落库只允许执行一次
     finalizing: AtomicBool,
+    orchestration: Option<Orchestration>,
 }
 
 struct RunningMaster {
@@ -291,7 +356,13 @@ impl ClusterMaster {
             ));
         }
         let (config, required_vars) = shared_config(&payload.config)?;
-        let total_concurrent = payload.config.concurrent;
+        if let Some(orchestration) = &payload.orchestration {
+            orchestration.expand_totals()?;
+        }
+        let total_concurrent = match &payload.orchestration {
+            Some(orchestration) => orchestration.peak()?,
+            None => payload.config.concurrent,
+        };
         let plan_name = payload
             .plan_name
             .as_deref()
@@ -309,8 +380,19 @@ impl ClusterMaster {
             })
             .unwrap_or_else(|| payload.config.url.trim().to_string());
         let port = payload.port.unwrap_or(DEFAULT_PORT);
+        let listen_ip: std::net::IpAddr = payload
+            .listen_addr
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .unwrap_or("0.0.0.0")
+            .parse()
+            .map_err(|_| "监听地址需填写本机内网 IP，例如 192.168.1.10".to_string())?;
+        if !listen_ip.is_unspecified() && !super::is_private(listen_ip) {
+            return Err("集群端口只允许绑定内网 / 回环地址".to_string());
+        }
         let pair_code_ttl = resolve_pair_code_ttl(payload.pair_code_ttl_sec)?;
-        let listener = TcpListener::bind(("0.0.0.0", port))
+        let listener = TcpListener::bind((listen_ip, port))
             .await
             .map_err(|error| format!("集群端口 {port} 监听失败：{error}"))?;
         let port = listener.local_addr().map_err(err)?.port();
@@ -328,11 +410,18 @@ impl ClusterMaster {
             .map(str::to_string)
             .unwrap_or_else(|| local_node_name("master"));
         let master_addr = local_addresses.first().cloned().unwrap_or_default();
+        let orchestration_json = payload
+            .orchestration
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(err)?;
         let job_config = serde_json::json!({
             "config": config.clone(),
             "envName": payload.env_name.clone(),
             "requiredVars": required_vars.clone(),
             "weights": {},
+            "orchestration": payload.orchestration,
         });
         let job_id = insert_job(
             &pool,
@@ -344,8 +433,21 @@ impl ClusterMaster {
             &job_config.to_string(),
             pair_code.expires_at,
             total_concurrent,
+            orchestration_json.as_deref(),
         )?;
-        let master_node = NodeState::master(master_name, master_addr, created_at);
+        let mut master_node = NodeState::master(master_name, master_addr, created_at);
+        if let Some(capacity) = local_capacity(&pool) {
+            master_node.apply_capability(&DeviceCapability {
+                device_id: None,
+                node_name: master_node.name.clone(),
+                os: Some(capacity.os.clone()),
+                cores: capacity.cores,
+                capacity_concurrent: capacity.saturation_concurrent,
+                capacity_qps: capacity.max_qps,
+                probed_at: Some(capacity.probed_at),
+            });
+            master_node.suggested_weight = Some(1.0);
+        }
         upsert_worker(&pool, job_id, &master_node)?;
         let session = Arc::new(MasterSession {
             job_id,
@@ -374,6 +476,7 @@ impl ClusterMaster {
                 pair_code: Some(pair_code),
                 nodes: vec![master_node],
                 next_node: 1,
+                current_phase: None,
             }),
             local_prepared: Mutex::new(None),
             local_job: Mutex::new(None),
@@ -381,7 +484,18 @@ impl ClusterMaster {
             local_details: Mutex::new(None),
             aborting: AtomicBool::new(false),
             finalizing: AtomicBool::new(false),
+            orchestration: payload.orchestration,
         });
+        let mdns_name = session
+            .state
+            .lock()
+            .nodes
+            .first()
+            .map(|node| node.name.clone())
+            .unwrap_or_else(|| "master".to_string());
+        if let Err(error) = discovery::advertise_master(job_id, &mdns_name, port) {
+            log::warn!("mDNS 注册跳过：{error}");
+        }
         let accept = tauri::async_runtime::spawn(accept_loop(session.clone(), listener));
         tauri::async_runtime::spawn(watchdog_loop(session.clone()));
         let snapshot = session.snapshot();
@@ -454,6 +568,7 @@ impl ClusterMaster {
             .ok_or_else(|| format!("分布式压测任务 {job_id} 不存在或已关闭"))?;
         running.session.shutdown.store(true, Ordering::SeqCst);
         running.accept.abort();
+        discovery::unadvertise_master(job_id);
         if matches!(
             running.session.state.lock().status.as_str(),
             "pairing" | "preparing" | "ready" | "running"
@@ -496,6 +611,8 @@ impl MasterSession {
             message: state.message.clone(),
             nodes: state.nodes.iter().map(NodeState::info).collect(),
             created_at: self.created_at,
+            orchestration: self.orchestration.clone(),
+            current_phase: state.current_phase,
         }
     }
 
@@ -578,17 +695,26 @@ impl MasterSession {
         tx: mpsc::UnboundedSender<ClusterMessage>,
     ) -> Result<String, String> {
         let now = now_ms();
+        if !(MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&hello.version) {
+            return Err(format!(
+                "协议版本不兼容：主节点支持 v{}–v{}，从节点 v{}，请升级后重试",
+                MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, hello.version
+            ));
+        }
+        let negotiated = hello.version.min(PROTOCOL_VERSION);
+        if let Some(token) = hello
+            .session_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        {
+            return self.resume_node(peer, &hello, token, negotiated, tx);
+        }
         let ttl_sec = self.pair_code_ttl_sec;
-        let (node_id, token, probes, pair_expires) = {
+        let (node_id, token, probes, pair_expires, device_id) = {
             let mut state = self.state.lock();
             if state.status != "pairing" {
                 return Err("任务已开始或已结束，不能再加入节点".to_string());
-            }
-            if hello.version != PROTOCOL_VERSION {
-                return Err(format!(
-                    "协议版本不一致：主节点 v{}，从节点 v{}，请升级后重试",
-                    PROTOCOL_VERSION, hello.version
-                ));
             }
             let code = state
                 .pair_code
@@ -619,7 +745,7 @@ impl MasterSession {
                 .filter(|node| node.role == "slave" && node.is_active())
                 .count();
             if live >= MAX_NODES {
-                return Err(format!("一期单任务最多 {MAX_NODES} 个从节点"));
+                return Err(format!("单任务最多 {MAX_NODES} 个从节点"));
             }
             let id = format!("node-{}", state.next_node);
             state.next_node += 1;
@@ -643,7 +769,14 @@ impl MasterSession {
                 clock_probes.insert(seq, at);
                 probes.push(TimeProbePayload { seq, t0: at });
             }
-            state.nodes.push(NodeState {
+            let device_id = hello
+                .device_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("device-{}", Uuid::new_v4().simple()));
+            let mut node = NodeState {
                 id: id.clone(),
                 name: name.to_string(),
                 role: "slave".to_string(),
@@ -668,20 +801,55 @@ impl MasterSession {
                 preflight_ok: None,
                 samples: Vec::new(),
                 done: None,
+                protocol_version: negotiated,
+                device_id: Some(device_id.clone()),
+                token: Some(Uuid::new_v4().simple().to_string()),
+                capacity_concurrent: hello.capacity_concurrent.filter(|value| *value > 0),
+                capacity_qps: None,
+                cores: None,
+                os: None,
+                suggested_weight: None,
+                disconnected_at: None,
+                gap_seconds: 0,
+            };
+            node.apply_capability(&DeviceCapability {
+                device_id: Some(device_id.clone()),
+                node_name: node.name.clone(),
+                os: None,
+                cores: 0,
+                capacity_concurrent: hello.capacity_concurrent.unwrap_or(0),
+                capacity_qps: 0.0,
+                probed_at: None,
             });
+            state.nodes.push(node);
+            refresh_suggestions(&mut state.nodes);
             (
                 id,
-                Uuid::new_v4().simple().to_string(),
+                state
+                    .nodes
+                    .last()
+                    .and_then(|node| node.token.clone())
+                    .unwrap_or_default(),
                 probes,
                 pair_expires,
+                device_id,
             )
         };
 
+        if let Err(error) = devices::touch_device(
+            &self.db,
+            &device_id,
+            hello.node_name.trim(),
+            &peer.to_string(),
+        ) {
+            log::warn!("缓存集群设备失败：{error}");
+        }
         let ack = ClusterMessage::HelloAck(HelloAckPayload {
-            version: PROTOCOL_VERSION,
+            version: negotiated,
             token,
             node_id: node_id.clone(),
             job_id: self.job_id,
+            resumed: false,
         });
         if tx.send(ack).is_err() {
             return Err("连接已断开".to_string());
@@ -691,12 +859,121 @@ impl MasterSession {
                 return Err("连接已断开".to_string());
             }
         }
+        if negotiated >= 2 {
+            let _ = tx.send(ClusterMessage::DeviceList(DeviceListPayload {
+                devices: self.device_list(),
+            }));
+        }
         if let Err(error) = update_pair_expiry(&self.db, self.job_id, pair_expires) {
             log::warn!("更新配对码有效期失败：{error}");
         }
         self.persist_node(&node_id);
         self.emit_snapshot();
         Ok(node_id)
+    }
+
+    /// 断线重连：令牌恢复原节点，不重新走配对码与时钟探测
+    fn resume_node(
+        &self,
+        peer: SocketAddr,
+        hello: &HelloPayload,
+        token: &str,
+        negotiated: u32,
+        tx: mpsc::UnboundedSender<ClusterMessage>,
+    ) -> Result<String, String> {
+        let now = now_ms();
+        let (node_id, ack_token, node_version, resumed_status, device_id) = {
+            let mut state = self.state.lock();
+            if matches!(state.status.as_str(), "finished" | "failed") {
+                return Err("任务已结束，无法恢复会话；请重新创建任务并配对".to_string());
+            }
+            let session_status = match state.status.as_str() {
+                "running" => "running",
+                "ready" => "ready",
+                "preparing" => "preparing",
+                _ => "pairReady",
+            };
+            let Some(node) = state
+                .nodes
+                .iter_mut()
+                .find(|node| node.role == "slave" && node.token.as_deref() == Some(token))
+            else {
+                return Err("会话令牌已失效，请用新配对码重新加入".to_string());
+            };
+            if matches!(node.status.as_str(), "left" | "rejected" | "done" | "lost") {
+                return Err(format!("节点「{}」已结束会话，不能恢复", node.name));
+            }
+            if let Some(existing) = node.device_id.as_deref() {
+                if let Some(incoming) = hello.device_id.as_deref().map(str::trim) {
+                    if !incoming.is_empty() && incoming != existing {
+                        return Err("重连令牌与设备标识不匹配".to_string());
+                    }
+                }
+            }
+            if node.disconnected_at.is_some() {
+                let gap = (now - node.disconnected_at.unwrap_or(now)).max(0) as u64 / 1000;
+                node.gap_seconds = node.gap_seconds.saturating_add(gap);
+            }
+            node.tx = Some(tx.clone());
+            node.last_seen_at = Some(now);
+            node.disconnected_at = None;
+            node.error = None;
+            node.protocol_version = node.protocol_version.min(negotiated);
+            node.status = session_status.to_string();
+            (
+                node.id.clone(),
+                node.token.clone().unwrap_or_default(),
+                node.protocol_version,
+                true,
+                node.device_id.clone(),
+            )
+        };
+        if let Err(error) = devices::touch_device(
+            &self.db,
+            device_id.as_deref().unwrap_or(""),
+            hello.node_name.trim(),
+            &peer.to_string(),
+        ) {
+            log::warn!("刷新集群设备失败：{error}");
+        }
+        let ack = ClusterMessage::HelloAck(HelloAckPayload {
+            version: node_version,
+            token: ack_token,
+            node_id: node_id.clone(),
+            job_id: self.job_id,
+            resumed: resumed_status,
+        });
+        if tx.send(ack).is_err() {
+            return Err("连接已断开".to_string());
+        }
+        if node_version >= 2 {
+            let _ = tx.send(ClusterMessage::DeviceList(DeviceListPayload {
+                devices: self.device_list(),
+            }));
+        }
+        self.persist_node(&node_id);
+        self.emit_snapshot();
+        Ok(node_id)
+    }
+
+    fn device_list(&self) -> Vec<ClusterDevice> {
+        let mut items = devices::list_devices(&self.db, 100).unwrap_or_default();
+        let online: HashMap<String, bool> = {
+            let state = self.state.lock();
+            state
+                .nodes
+                .iter()
+                .filter_map(|node| {
+                    node.device_id
+                        .clone()
+                        .map(|id| (id, node.is_active() && node.status != "disconnected"))
+                })
+                .collect()
+        };
+        for item in &mut items {
+            item.online = online.get(&item.node_id).copied().unwrap_or(false);
+        }
+        items
     }
 
     fn touch(&self, node_id: &str) {
@@ -706,9 +983,57 @@ impl MasterSession {
         }
     }
 
+    fn on_capability(&self, node_id: &str, payload: DeviceCapability) {
+        let device_id = {
+            let mut state = self.state.lock();
+            let device_id = {
+                let Some(node) = state.nodes.iter_mut().find(|node| node.id == node_id) else {
+                    return;
+                };
+                if node.protocol_version < 2 {
+                    return;
+                }
+                node.apply_capability(&payload);
+                if let Some(id) = payload
+                    .device_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                {
+                    node.device_id = Some(id.to_string());
+                }
+                node.device_id.clone()
+            };
+            // 配对阶段才用能力建议覆盖默认权重，准备后尊重用户显式设置
+            if state.status == "pairing" {
+                refresh_suggestions(&mut state.nodes);
+            }
+            device_id
+        };
+        if let Some(device_id) = device_id {
+            let addr = {
+                let state = self.state.lock();
+                state
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == node_id)
+                    .map(|node| node.addr.clone())
+                    .unwrap_or_default()
+            };
+            if let Err(error) = devices::upsert_device(&self.db, &device_id, &addr, &payload) {
+                log::warn!("缓存节点能力失败：{error}");
+            }
+        }
+        self.persist_node(node_id);
+        self.emit_snapshot();
+    }
+
     fn handle_message(&self, node_id: &str, message: ClusterMessage) {
         self.touch(node_id);
         match message {
+            ClusterMessage::CapabilityReport(payload) => self.on_capability(node_id, payload),
+            ClusterMessage::DeviceList(_) => {}
+            ClusterMessage::PhaseStart(_) => {}
             ClusterMessage::TimeAck(payload) => self.on_time_ack(node_id, payload),
             ClusterMessage::PrepareAck(payload) => self.on_prepare_ack(node_id, payload),
             ClusterMessage::Preflight(payload) => self.on_preflight(node_id, payload),
@@ -953,17 +1278,25 @@ impl MasterSession {
             if matches!(state.status.as_str(), "finished" | "failed") {
                 return;
             }
+            let running = state.status == "running";
             let Some(node) = state.nodes.iter_mut().find(|node| node.id == node_id) else {
                 return;
             };
-            if !node.is_active() {
+            if !node.is_active() && node.status != "disconnected" {
                 return;
             }
-            node.status = "lost".to_string();
             node.tx = None;
-            node.error = Some("连接断开".to_string());
-            if state.status == "running" {
+            if running {
+                // 运行期断线保留 5 分钟重连窗口；期间引擎继续跑，采样形成缺口
+                if node.status != "disconnected" {
+                    node.disconnected_at = Some(now_ms());
+                }
+                node.status = "disconnected".to_string();
+                node.error = Some("连接断开，等待从节点重连".to_string());
                 state.incomplete = true;
+            } else {
+                node.status = "lost".to_string();
+                node.error = Some("连接断开".to_string());
             }
         }
         self.persist_node(node_id);
@@ -1034,7 +1367,34 @@ impl MasterSession {
             .find(|(id, _)| id == "master")
             .map(|(_, concurrent)| *concurrent)
             .unwrap_or(1);
-        if let Err(message) = self.prepare_local_engine(master_concurrent) {
+        // 编排任务把每秒集群总并发按权重拆到各节点，再合并成阶梯阶段交给引擎
+        let stage_map = match &self.orchestration {
+            Some(orchestration) => {
+                let state = self.state.lock();
+                let participants: Vec<(String, f64)> = state
+                    .nodes
+                    .iter()
+                    .map(|node| (node.id.clone(), node.weight))
+                    .collect();
+                let weights = participants.clone();
+                Some(orchestration_stages(
+                    orchestration,
+                    &participants,
+                    &weights,
+                )?)
+            }
+            None => None,
+        };
+        let master_stages = stage_map
+            .as_ref()
+            .and_then(|map| map.get("master").cloned())
+            .unwrap_or_default();
+        let master_concurrent = master_stages
+            .iter()
+            .map(|stage| stage.concurrent)
+            .max()
+            .unwrap_or(master_concurrent);
+        if let Err(message) = self.prepare_local_engine(master_concurrent, master_stages) {
             self.fail(message.clone());
             return Err(message);
         }
@@ -1061,14 +1421,32 @@ impl MasterSession {
                 if node.role == "master" {
                     continue;
                 }
+                let stages = stage_map
+                    .as_ref()
+                    .and_then(|map| map.get(node_id).cloned())
+                    .unwrap_or_default();
+                let mut config = self.config.clone();
+                if !stages.is_empty() {
+                    if let Some(object) = config.as_object_mut() {
+                        object.insert(
+                            "stages".to_string(),
+                            serde_json::to_value(&stages).unwrap_or_default(),
+                        );
+                    }
+                }
                 PreparePayload {
                     job_id: self.job_id,
                     plan_name: self.plan_name.clone(),
-                    config: self.config.clone(),
+                    config,
                     env_name: self.env_name.clone(),
                     required_vars: self.required_vars.clone(),
-                    concurrent: *concurrent,
+                    concurrent: stages
+                        .iter()
+                        .map(|stage| stage.concurrent)
+                        .max()
+                        .unwrap_or(*concurrent),
                     total_concurrent: self.total_concurrent,
+                    orchestration: self.orchestration.clone(),
                 }
             };
             if !self.send(node_id, ClusterMessage::Prepare(payload)) {
@@ -1154,6 +1532,7 @@ impl MasterSession {
         if let Err(error) = update_job_start(&self.db, self.job_id, at_ms) {
             log::warn!("记录集群任务起跑时间失败：{error}");
         }
+        self.spawn_phase_scheduler(at_ms);
         // 主节点自己也施压：与从节点同一 atMs 起跑，采样通过 sink 进入合并
         if let Some(prepared) = self.local_prepared.lock().take() {
             let watch = self.local_watch.lock().clone();
@@ -1164,6 +1543,98 @@ impl MasterSession {
         }
         self.emit_snapshot();
         Ok(())
+    }
+
+    /// 编排阶段切换：按原始阶段边界通知各节点并刷新当前阶段
+    ///
+    /// 引擎已按每秒拆分后的阶梯表执行，这份通知只用于协议与界面同步。
+    fn spawn_phase_scheduler(self: &Arc<Self>, at_ms: i64) {
+        let Some(orchestration) = self.orchestration.clone() else {
+            return;
+        };
+        let session = Arc::clone(self);
+        tauri::async_runtime::spawn(async move {
+            let mut offset_ms: i64 = 0;
+            for (index, phase) in orchestration.phases.iter().enumerate() {
+                let due = at_ms + offset_ms;
+                offset_ms += phase.duration_sec as i64 * 1000;
+                let wait = due - now_ms();
+                if wait > 0 {
+                    tokio::time::sleep(Duration::from_millis(wait as u64)).await;
+                }
+                if session.shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                if session.state.lock().status != "running" {
+                    break;
+                }
+                let target = match phase.kind.as_str() {
+                    "ramp" => phase.to_concurrent.unwrap_or(0),
+                    _ => phase.concurrent.unwrap_or(0),
+                };
+                let (participants, node_ids) = {
+                    let state = session.state.lock();
+                    (
+                        state
+                            .nodes
+                            .iter()
+                            .map(|node| (node.id.clone(), node.weight))
+                            .collect::<Vec<(String, f64)>>(),
+                        state
+                            .nodes
+                            .iter()
+                            .filter(|node| node.status == "running")
+                            .map(|node| node.id.clone())
+                            .collect::<Vec<String>>(),
+                    )
+                };
+                if participants.is_empty() {
+                    break;
+                }
+                let total = target.max(participants.len() as u32);
+                let allocation = allocate_concurrency(total, &participants, &participants)
+                    .unwrap_or_else(|_| {
+                        participants.iter().map(|(id, _)| (id.clone(), 1)).collect()
+                    });
+                {
+                    let mut state = session.state.lock();
+                    state.current_phase = Some(index as u32);
+                    for node in &mut state.nodes {
+                        if let Some((_, concurrent)) =
+                            allocation.iter().find(|(id, _)| id == &node.id)
+                        {
+                            node.concurrent = *concurrent;
+                        }
+                    }
+                }
+                for node_id in &node_ids {
+                    let weight = participants
+                        .iter()
+                        .find(|(id, _)| id == node_id)
+                        .map(|(_, weight)| *weight)
+                        .unwrap_or(1.0);
+                    let node_concurrent = allocation
+                        .iter()
+                        .find(|(id, _)| id == node_id)
+                        .map(|(_, concurrent)| *concurrent)
+                        .unwrap_or(0);
+                    let _ = session.send(
+                        node_id,
+                        ClusterMessage::PhaseStart(PhaseStartPayload {
+                            index: index as u32,
+                            at_ms: now_ms(),
+                            concurrent: total,
+                            weight,
+                            node_concurrent,
+                            kind: phase.kind.clone(),
+                            duration_sec: phase.duration_sec,
+                        }),
+                    );
+                }
+                session.persist_node("master");
+                session.emit_snapshot();
+            }
+        });
     }
 
     /// 主节点本地引擎：每秒采样并入主节点节点状态，结束后结算报告
@@ -1185,6 +1656,7 @@ impl MasterSession {
             EngineOptions {
                 start_at_ms: Some(at_ms),
                 sink: Some(sink),
+                persist: None,
             },
         )
         .await;
@@ -1192,7 +1664,11 @@ impl MasterSession {
     }
 
     /// 准备主节点本地引擎：与从节点一样受本机任务注册表约束
-    fn prepare_local_engine(&self, concurrent: u32) -> Result<(), String> {
+    fn prepare_local_engine(
+        &self,
+        concurrent: u32,
+        stages: Vec<StressStage>,
+    ) -> Result<(), String> {
         let app_state = self
             .app
             .try_state()
@@ -1205,6 +1681,9 @@ impl MasterSession {
         }
         let mut config = self.local_config.clone();
         config.concurrent = concurrent.max(1);
+        if !stages.is_empty() {
+            config.stages = stages;
+        }
         if config
             .name
             .as_deref()
@@ -1324,7 +1803,12 @@ impl MasterSession {
             let unavailable: Vec<String> = state
                 .nodes
                 .iter()
-                .filter(|node| matches!(node.status.as_str(), "lost" | "left" | "rejected"))
+                .filter(|node| {
+                    matches!(
+                        node.status.as_str(),
+                        "lost" | "left" | "rejected" | "disconnected"
+                    )
+                })
                 .map(|node| node.name.clone())
                 .collect();
             let incomplete = state.incomplete || !unavailable.is_empty();
@@ -1375,6 +1859,7 @@ impl MasterSession {
                 finished_at,
                 incomplete,
                 note: Some(notes.join("；")),
+                orchestration: self.orchestration.clone(),
                 config_snapshot: local
                     .as_ref()
                     .map(|(_, _, snapshot)| snapshot.clone())
@@ -1396,7 +1881,9 @@ impl MasterSession {
             &self.db,
             ReportPayload {
                 report: &merged.report,
+                job_id: None,
                 samples: &merged.samples,
+                worker_states: &[],
                 errors: &errors,
                 requests: &requests,
                 stages: &empty_stages,
@@ -1520,26 +2007,57 @@ impl MasterSession {
         let now = now_ms();
         let threshold = (HEARTBEAT_SEC * HEARTBEAT_MISSES as u64 * 1000) as i64;
         let mut lost: Vec<String> = Vec::new();
+        let mut changed_ids: Vec<String> = Vec::new();
         let mut setup_failure: Option<String> = None;
         {
             let mut state = self.state.lock();
             if matches!(state.status.as_str(), "finished" | "failed") {
                 return;
             }
+            let running = state.status == "running";
             for node in state.nodes.iter_mut() {
-                if node.role != "slave" || !node.is_active() {
+                if node.role != "slave" {
+                    continue;
+                }
+                if node.status == "disconnected" {
+                    let since = node.disconnected_at.unwrap_or(now);
+                    if now - since >= RECONNECT_GRACE_SEC as i64 * 1000 {
+                        node.gap_seconds = node
+                            .gap_seconds
+                            .saturating_add(((now - since).max(0) as u64) / 1000);
+                        node.status = "lost".to_string();
+                        node.error = Some(format!(
+                            "重连超过 {} 分钟，节点已定格",
+                            RECONNECT_GRACE_SEC / 60
+                        ));
+                        changed_ids.push(node.id.clone());
+                        lost.push(node.name.clone());
+                    }
+                    continue;
+                }
+                if !node.is_active() {
                     continue;
                 }
                 let last_seen = node.last_seen_at.unwrap_or(node.joined_at);
                 if now - last_seen <= threshold {
                     continue;
                 }
-                node.status = "lost".to_string();
                 node.tx = None;
-                node.error = Some(format!("心跳超时（{}s 未收到消息）", threshold / 1000));
-                lost.push(node.name.clone());
+                if running {
+                    node.status = "disconnected".to_string();
+                    node.disconnected_at = Some(now);
+                    node.error = Some(format!(
+                        "心跳超时（{}s 未收到消息），等待重连",
+                        threshold / 1000
+                    ));
+                } else {
+                    node.status = "lost".to_string();
+                    node.error = Some(format!("心跳超时（{}s 未收到消息）", threshold / 1000));
+                    lost.push(node.name.clone());
+                }
+                changed_ids.push(node.id.clone());
             }
-            if lost.is_empty() {
+            if changed_ids.is_empty() {
                 return;
             }
             let running = state.status == "running";
@@ -1548,6 +2066,9 @@ impl MasterSession {
             } else if matches!(state.status.as_str(), "preparing" | "ready") {
                 setup_failure = Some(format!("节点失联，启动已取消：{}", lost.join("、")));
             }
+        }
+        for node_id in &changed_ids {
+            self.persist_node(node_id);
         }
         self.emit_snapshot();
         if let Some(message) = setup_failure {
@@ -1931,6 +2452,66 @@ pub(crate) fn allocate_concurrency(
         .collect())
 }
 
+/// 把编排展开成逐节点阶梯表：每秒集群总并发按权重拆分，连续相同并发合并
+///
+/// 集群总并发低于节点数时抬升到节点数，保证每节点至少有 1 并发。
+pub(crate) fn orchestration_stages(
+    orchestration: &Orchestration,
+    participants: &[(String, f64)],
+    weights: &[(String, f64)],
+) -> Result<HashMap<String, Vec<StressStage>>, String> {
+    let totals = orchestration.expand_totals()?;
+    let minimum = participants.len() as u32;
+    let mut stages: HashMap<String, Vec<StressStage>> = participants
+        .iter()
+        .map(|(id, _)| (id.clone(), Vec::new()))
+        .collect();
+    for total in totals {
+        let allocation = allocate_concurrency(total.max(minimum), participants, weights)?;
+        for (id, concurrent) in allocation {
+            let Some(list) = stages.get_mut(&id) else {
+                continue;
+            };
+            match list.last_mut() {
+                Some(last) if last.concurrent == concurrent => {
+                    last.duration_sec = last.duration_sec.saturating_add(1);
+                }
+                _ => list.push(StressStage {
+                    concurrent,
+                    duration_sec: 1,
+                }),
+            }
+        }
+    }
+    Ok(stages)
+}
+
+/// 按能力归一化刷新建议权重；没有能力数据的节点保持 None
+fn refresh_suggestions(nodes: &mut [NodeState]) {
+    let inputs: Vec<(String, Option<u32>)> = nodes
+        .iter()
+        .map(|node| (node.id.clone(), node.capacity_concurrent))
+        .collect();
+    let weights = devices::suggest_weights(&inputs);
+    for node in nodes {
+        if let Some((_, weight)) = weights.iter().find(|(id, _)| id == &node.id) {
+            node.suggested_weight = *weight;
+            // 配对阶段默认权重跟随能力；用户显式改动会在 prepare 时覆盖
+            if let Some(weight) = weight.filter(|value| *value > 0.0) {
+                node.weight = weight;
+            }
+        }
+    }
+}
+
+/// 读取最近一次本机能力检测：主节点自身也参与权重建议
+fn local_capacity(pool: &DbPool) -> Option<CapacityResult> {
+    let conn = pool.get().ok()?;
+    crate::commands::capacity::latest_result(&conn)
+        .ok()
+        .flatten()
+}
+
 /// NTP 单样本：偏移 = t1 - (t0 + t2) / 2，误差取单程 RTT / 2
 pub(crate) fn clock_metrics(t0: i64, t1: i64, t2: i64) -> (f64, f64) {
     let rtt = (t2 - t0).max(0) as f64;
@@ -1947,13 +2528,18 @@ fn setup_ready(state: &SessionState) -> bool {
     !slaves.is_empty() && slaves.iter().all(|node| node.status == "ready")
 }
 
-/// 所有节点都已结算：done / lost / left / rejected；主节点本地引擎也在内
+/// 所有节点都已结算：done / lost / left / rejected / disconnected
+///
+/// 主节点本地引擎结束时不再等 5 分钟宽限：断线节点按缺口定格，
+/// 报告里保留缺口与不完整标记；若主节点仍在跑，重连窗口内仍可恢复。
 fn nodes_settled(state: &SessionState) -> bool {
     !state.nodes.is_empty()
-        && state
-            .nodes
-            .iter()
-            .all(|node| matches!(node.status.as_str(), "done" | "lost" | "left" | "rejected"))
+        && state.nodes.iter().all(|node| {
+            matches!(
+                node.status.as_str(),
+                "done" | "lost" | "left" | "rejected" | "disconnected"
+            )
+        })
 }
 
 fn new_pair_code() -> String {
@@ -2002,12 +2588,13 @@ fn insert_job(
     config_json: &str,
     pair_expires_at: i64,
     total_concurrent: u32,
+    orchestration_json: Option<&str>,
 ) -> Result<i64, String> {
     let conn = pool.get().map_err(err)?;
     conn.execute(
         "INSERT INTO cluster_jobs (created_at, status, master_node, plan_id, plan_name, port,
-            config_json, pair_code_expires_at, total_concurrent)
-         VALUES (?1, 'pairing', ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            config_json, pair_code_expires_at, total_concurrent, orchestration_json)
+         VALUES (?1, 'pairing', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             created_at,
             master_node,
@@ -2016,7 +2603,8 @@ fn insert_job(
             port,
             config_json,
             pair_expires_at,
-            total_concurrent
+            total_concurrent,
+            orchestration_json
         ],
     )
     .map_err(err)?;
@@ -2202,6 +2790,7 @@ pub fn recover_stale_jobs(pool: &DbPool) -> Result<usize, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::cluster::protocol::OrchestrationPhase;
 
     #[test]
     fn pair_code_is_fixed_width_digits() {
@@ -2338,6 +2927,7 @@ mod tests {
             "{}",
             2_000,
             16,
+            None,
         )
         .unwrap();
         update_job_finished(&pool, job_id, "合并报告 #9 已生成", true, Some(9)).unwrap();
@@ -2384,6 +2974,7 @@ mod tests {
             pair_code: None,
             nodes: vec![NodeState::master("m".to_string(), String::new(), 1)],
             next_node: 1,
+            current_phase: None,
         };
         assert!(!nodes_settled(&state));
         state.nodes[0].status = "done".to_string();
@@ -2393,6 +2984,40 @@ mod tests {
             .push(NodeState::master("s".to_string(), String::new(), 1));
         state.nodes[1].status = "lost".to_string();
         assert!(nodes_settled(&state));
+    }
+
+    #[test]
+    fn orchestration_expands_to_weighted_per_node_stages() {
+        let orchestration = Orchestration {
+            version: 1,
+            assignment: "weighted".to_string(),
+            phases: vec![
+                OrchestrationPhase {
+                    kind: "hold".to_string(),
+                    duration_sec: 2,
+                    from_concurrent: None,
+                    to_concurrent: None,
+                    concurrent: Some(10),
+                },
+                OrchestrationPhase {
+                    kind: "ramp".to_string(),
+                    duration_sec: 3,
+                    from_concurrent: Some(10),
+                    to_concurrent: Some(30),
+                    concurrent: None,
+                },
+            ],
+        };
+        let participants = vec![("master".to_string(), 1.0), ("a".to_string(), 1.0)];
+        let stages = orchestration_stages(&orchestration, &participants, &participants).unwrap();
+        let master = &stages["master"];
+        assert_eq!(
+            master.iter().map(|stage| stage.duration_sec).sum::<u32>(),
+            5
+        );
+        assert_eq!(master.iter().map(|stage| stage.concurrent).max(), Some(15));
+        // 10 并发持续 2 秒 + ramp 首秒仍为 10，前三秒合并成一个 3 秒阶段
+        assert_eq!(master.first().map(|stage| stage.duration_sec), Some(3));
     }
 
     #[test]

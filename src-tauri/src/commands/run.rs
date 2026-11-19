@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::docs::masking::SecretSet;
 use crate::models::{HttpResult, KeyValueItem, RequestRun, RequestRunSummary, SendRequestPayload};
 use crate::state::{AppState, DbPool};
 use crate::util::{err, now_ms};
@@ -26,6 +27,7 @@ pub fn record_run(
     body: &str,
     result: &HttpResult,
     origin: &str,
+    secrets: &SecretSet,
 ) -> Result<(), String> {
     let conn = pool.get().map_err(err)?;
 
@@ -34,30 +36,44 @@ pub fn record_run(
             .iter()
             .map(|(key, value)| KeyValueItem {
                 key: key.clone(),
-                value: value.clone(),
+                value: secrets.mask_text(value),
                 enabled: true,
             })
             .collect::<Vec<_>>(),
     )
     .map_err(err)?;
-    let params_json = serde_json::to_string(&payload.params).map_err(err)?;
-    let response_headers_json = serde_json::to_string(&result.headers).map_err(err)?;
+    let params_json = secrets.mask_json(&serde_json::to_string(&payload.params).map_err(err)?);
+    let response_headers_json = serde_json::to_string(
+        &result
+            .headers
+            .iter()
+            .map(|(key, value)| (key.clone(), secrets.mask_text(value)))
+            .collect::<HashMap<_, _>>(),
+    )
+    .map_err(err)?;
+    // 历史快照里的 URL / 正文同样不能出现 secret 变量真实值
+    let url = secrets.mask_text(url);
+    let error = result.error.as_deref().map(|text| secrets.mask_text(text));
 
-    let request_bytes = body.as_bytes();
-    let request_truncated = request_bytes.len() > MAX_STORED_BODY;
-    let stored_request_body = if request_truncated {
-        String::from_utf8_lossy(&request_bytes[..MAX_STORED_BODY]).to_string()
-    } else {
-        body.to_string()
+    // 先脱敏再按上限截断，避免 secret 恰好跨在截断点上只留下半截明文
+    let truncate = |text: &str| -> String {
+        if text.len() <= MAX_STORED_BODY {
+            text.to_string()
+        } else {
+            String::from_utf8_lossy(&text.as_bytes()[..MAX_STORED_BODY]).to_string()
+        }
     };
+    let request_bytes = body.as_bytes();
+    let masked_request = secrets.mask_text(body);
+    let request_truncated =
+        request_bytes.len() > MAX_STORED_BODY || masked_request.len() > MAX_STORED_BODY;
+    let stored_request_body = truncate(&masked_request);
 
     let response_bytes = result.body.as_bytes();
-    let response_truncated = response_bytes.len() > MAX_STORED_BODY;
-    let response_body = if response_truncated {
-        String::from_utf8_lossy(&response_bytes[..MAX_STORED_BODY]).to_string()
-    } else {
-        result.body.clone()
-    };
+    let masked_response = secrets.mask_text(&result.body);
+    let response_truncated =
+        response_bytes.len() > MAX_STORED_BODY || masked_response.len() > MAX_STORED_BODY;
+    let response_body = truncate(&masked_response);
 
     conn.execute(
         "INSERT INTO request_runs
@@ -82,7 +98,7 @@ pub fn record_run(
             response_body,
             result.duration_ms as i64,
             result.size_bytes as i64,
-            result.error,
+            error,
             now_ms(),
             origin,
             request_bytes.len() as i64,

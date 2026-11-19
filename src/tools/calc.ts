@@ -257,8 +257,6 @@ export function colorInfo(text: string): ColorInfo {
   const delta = max - min
   const v = max
   const sv = max === 0 ? 0 : delta / max
-  const k = 1 - max
-  const c = (1 - Math.abs(2 * (1 - k) - 1)) * (max === 0 ? 0 : delta / max)
   const cmykK = v === 0 ? 0 : 1 - v
   const cmykC = v === 0 ? 0 : (1 - r / 255 - cmykK) / (1 - cmykK)
   const cmykM = v === 0 ? 0 : (1 - g / 255 - cmykK) / (1 - cmykK)

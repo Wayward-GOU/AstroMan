@@ -309,16 +309,12 @@ mod unix {
                             }
                         }
                         #[cfg(target_os = "macos")]
-                        libc::AF_LINK => {
-                            if item.mac.is_empty() {
-                                item.mac = link_mac(entry.ifa_addr);
-                            }
+                        libc::AF_LINK if item.mac.is_empty() => {
+                            item.mac = link_mac(entry.ifa_addr);
                         }
                         #[cfg(target_os = "linux")]
-                        libc::AF_PACKET => {
-                            if item.mac.is_empty() {
-                                item.mac = packet_mac(entry.ifa_addr);
-                            }
+                        libc::AF_PACKET if item.mac.is_empty() => {
+                            item.mac = packet_mac(entry.ifa_addr);
                         }
                         _ => {}
                     }
@@ -387,7 +383,8 @@ mod unix {
         use std::sync::{Mutex, OnceLock};
         use std::time::{Duration, Instant};
 
-        static CACHE: OnceLock<Mutex<Option<(Instant, HashMap<String, String>)>>> = OnceLock::new();
+        type GatewayCache = Mutex<Option<(Instant, HashMap<String, String>)>>;
+        static CACHE: OnceLock<GatewayCache> = OnceLock::new();
         let cache = CACHE.get_or_init(|| Mutex::new(None));
         let mut guard = cache.lock().unwrap_or_else(|error| error.into_inner());
         if let Some((at, gateways)) = guard.as_ref() {

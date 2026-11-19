@@ -22,8 +22,10 @@ use rusqlite::{params, Connection};
 use tauri::State;
 
 use crate::commands::cookie;
+use crate::docs::masking::SecretSet;
 use crate::models::{
-    FormField, HttpResult, RedirectHop, RequestTimings, RetryAttempt, SendRequestPayload,
+    FormField, HttpResult, RedirectHop, RequestAuth, RequestTimings, RetryAttempt,
+    SendRequestPayload,
 };
 use crate::secret::{self, AAD_ENV};
 use crate::state::AppState;
@@ -136,12 +138,14 @@ pub(crate) async fn execute_with(
     record: RecordOptions,
     cookie_jar: Option<&cookie::CookieJar>,
 ) -> Result<HttpResult, String> {
-    let vars = match payload.env_id {
+    let (vars, mut secret_set) = match payload.env_id {
         Some(env_id) => {
             let conn = state.pool.get().map_err(err)?;
-            load_vars(&conn, env_id)?
+            let (vars, names) = load_vars_with_secrets(&conn, env_id)?;
+            let set = secret_set_from_vars(&vars, &names);
+            (vars, set)
         }
-        None => HashMap::new(),
+        None => (HashMap::new(), SecretSet::default()),
     };
 
     let mut url = render(payload.url.trim(), &vars).trim().to_string();
@@ -177,6 +181,7 @@ pub(crate) async fn execute_with(
 
     // API Key 认证可以放在查询参数上
     let auth = payload.auth.clone().unwrap_or_default();
+    apply_auth_secrets(&mut secret_set, &auth, &vars);
     if auth.kind == "apikey" && auth.add_to == "query" && !auth.key.trim().is_empty() {
         let mut pairs = parsed.query_pairs_mut();
         pairs.append_pair(&render(auth.key.trim(), &vars), &render(&auth.value, &vars));
@@ -371,7 +376,15 @@ pub(crate) async fn execute_with(
             Err(error) => {
                 if error.cancelled {
                     let result = cancelled_result(started.elapsed());
-                    finish_record(state, &payload, &url_for_history, &plan, &result, &record);
+                    finish_record(
+                        state,
+                        &payload,
+                        &url_for_history,
+                        &plan,
+                        &result,
+                        &record,
+                        &secret_set,
+                    );
                     release_cancel(state, &cancel_flag);
                     return Ok(result);
                 }
@@ -436,7 +449,15 @@ pub(crate) async fn execute_with(
     }
 
     // Cookie 回写（最终响应已在 send_chain 内处理，这里处理错误分支的兜底）
-    finish_record(state, &payload, &url_for_history, &plan, &result, &record);
+    finish_record(
+        state,
+        &payload,
+        &url_for_history,
+        &plan,
+        &result,
+        &record,
+        &secret_set,
+    );
     Ok(result)
 }
 
@@ -453,9 +474,10 @@ fn finish_record(
     plan: &RequestPlan,
     result: &HttpResult,
     record: &RecordOptions,
+    secrets: &SecretSet,
 ) {
     if record.history {
-        record_history(state, payload, url, result);
+        record_history(state, payload, url, result, secrets);
     }
     if record.run_snapshot {
         let body_text = match &plan.body {
@@ -478,6 +500,7 @@ fn finish_record(
             &body_text,
             result,
             &record.origin,
+            secrets,
         );
 
         // 实体自动同步：只处理手工发送，best-effort，不影响请求结果
@@ -999,7 +1022,7 @@ fn charset_from_meta(head: &[u8]) -> Option<&'static Encoding> {
     for (index, _) in text.match_indices("charset=") {
         let rest = &text[index + "charset=".len()..];
         let label = rest
-            .trim_start_matches(|c: char| c == '"' || c == '\'')
+            .trim_start_matches(['"', '\''])
             .split(|c: char| c == '"' || c == '\'' || c == ';' || c == '>' || c.is_whitespace())
             .next()
             .unwrap_or("");
@@ -1260,6 +1283,7 @@ fn decode_text(buffer: &[u8], charset: Option<&'static Encoding>) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn collect_text(
     response: &mut reqwest::Response,
     head: Vec<u8>,
@@ -1344,6 +1368,7 @@ async fn collect_text(
 /* ---------- 基础工具 ---------- */
 
 /// 写入单接口的运行快照，失败不影响本次请求结果
+#[allow(clippy::too_many_arguments)]
 fn record_run_snapshot(
     state: &AppState,
     payload: &SendRequestPayload,
@@ -1352,6 +1377,7 @@ fn record_run_snapshot(
     body: &str,
     result: &HttpResult,
     origin: &str,
+    secrets: &SecretSet,
 ) {
     let Some(request_id) = payload.request_id else {
         return;
@@ -1365,6 +1391,7 @@ fn record_run_snapshot(
         body,
         result,
         origin,
+        secrets,
     );
 }
 
@@ -1395,6 +1422,39 @@ pub(crate) fn base64_encode(input: &[u8]) -> String {
 
 pub(crate) fn load_vars(conn: &Connection, env_id: i64) -> Result<HashMap<String, String>, String> {
     Ok(load_vars_with_secrets(conn, env_id)?.0)
+}
+
+/// 从已解密的变量表里挑出 `is_secret` 项，生成历史 / 运行快照的脱敏清单
+fn secret_set_from_vars(
+    vars: &HashMap<String, String>,
+    names: &std::collections::HashSet<String>,
+) -> SecretSet {
+    let mut set = SecretSet::default();
+    for name in names {
+        if let Some(value) = vars.get(name) {
+            set.add(value);
+        }
+    }
+    set
+}
+
+/// 认证配置里的凭据也纳入脱敏清单：即使没写 `{{secret}}`，Token 也不该明文入库
+fn apply_auth_secrets(set: &mut SecretSet, auth: &RequestAuth, vars: &HashMap<String, String>) {
+    let rendered = |value: &str| render(value.trim(), vars);
+    match auth.kind.as_str() {
+        "bearer" | "oauth2" => {
+            set.add(&rendered(&auth.token));
+            set.add(&rendered(&auth.client_secret));
+        }
+        "basic" => {
+            let raw = format!("{}:{}", rendered(&auth.username), rendered(&auth.password));
+            set.add(&raw);
+            // Authorization 头里是 base64(user:pass)，一并登记
+            set.add(&base64_encode(raw.as_bytes()));
+        }
+        "apikey" => set.add(&rendered(&auth.value)),
+        _ => {}
+    }
 }
 
 /// 同时返回变量与需要脱敏的密钥名（`is_secret = 1`）
@@ -1441,7 +1501,13 @@ pub(crate) fn load_vars_with_secrets(
     Ok((vars, secrets))
 }
 
-fn record_history(state: &AppState, payload: &SendRequestPayload, url: &str, result: &HttpResult) {
+fn record_history(
+    state: &AppState,
+    payload: &SendRequestPayload,
+    url: &str,
+    result: &HttpResult,
+    secrets: &SecretSet,
+) {
     let Ok(conn) = state.pool.get() else {
         return;
     };
@@ -1451,6 +1517,9 @@ fn record_history(state: &AppState, payload: &SendRequestPayload, url: &str, res
         .clone()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| url.to_string());
+    // 入库前脱敏：URL 查询参数与请求名里可能带 secret 变量的真实值
+    let name = secrets.mask_text(&name);
+    let url = secrets.mask_text(url);
 
     let timings_json = result
         .timings
@@ -1624,6 +1693,73 @@ mod tests {
         let client = reqwest::Client::new();
         let result = send_with_cancel(client.get("http://127.0.0.1:9"), Some(&flag)).await;
         assert!(matches!(result, Err(error) if error.cancelled));
-        assert_eq!(flag.load(Ordering::SeqCst), true);
+        assert!(flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn history_masks_secret_variable_values() {
+        let root = crate::util::test_dir("history-mask");
+        let state = AppState::headless(root.join("data"), root.join("config")).unwrap();
+
+        let secret = "s3cr3t-token-value";
+        let mut secrets = SecretSet::default();
+        secrets.add(secret);
+
+        let payload = SendRequestPayload {
+            request_id: None,
+            name: Some(format!("查询 {secret}")),
+            method: "GET".to_string(),
+            url: format!("https://api.example.com/items?token={secret}"),
+            headers: Vec::new(),
+            params: Vec::new(),
+            body_type: "none".to_string(),
+            body: None,
+            env_id: None,
+            insecure: false,
+            timeout_ms: 30_000,
+            auth: None,
+            cookie_enabled: None,
+            origin: None,
+            request_key: None,
+            protocol: None,
+            follow_redirects: None,
+            connect_timeout_ms: None,
+            retry: None,
+        };
+        let result = HttpResult {
+            status: 200,
+            status_text: "OK".to_string(),
+            duration_ms: 12,
+            size_bytes: 2,
+            headers: HashMap::new(),
+            body: "{}".to_string(),
+            truncated: false,
+            error: None,
+            body_kind: "text".to_string(),
+            body_file: None,
+            body_bytes: 2,
+            raw_bytes: 2,
+            preview_base64: None,
+            timings: None,
+            http_version: "HTTP/1.1".to_string(),
+            redirects: Vec::new(),
+            retries: Vec::new(),
+            ignored_headers: Vec::new(),
+            cancelled: false,
+        };
+        record_history(&state, &payload, &payload.url, &result, &secrets);
+
+        let conn = state.pool.get().unwrap();
+        let (name, url): (String, String) = conn
+            .query_row(
+                "SELECT request_name, url FROM request_history LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(!name.contains(secret), "请求名仍含明文：{name}");
+        assert!(!url.contains(secret), "URL 仍含明文：{url}");
+        assert!(url.contains(crate::secret::MASK));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -1,4 +1,4 @@
-import type { ReportDetail } from '@/types/models'
+import type { ExternalMetricPoint, ReportDetail } from '@/types/models'
 import { detectKnee, median, qpsP10, sampleSummary, scoreReport } from './reportAnalytics'
 
 /**
@@ -62,6 +62,137 @@ export function latencyDrift(detail: ReportDetail): number {
   return head > 0 ? (tail - head) / head : 0
 }
 
+/** 单位展示：percent → %，其余原样（count 不后缀） */
+export function unitLabel(unit: string): string {
+  const value = unit.trim().toLowerCase()
+  if (value === 'percent') return '%'
+  if (value === 'count') return ''
+  return value
+}
+
+/**
+ * 把外部指标对齐到报告采样点：取「不晚于该秒的最近一个采样点」，
+ * 不做插值；早于首个数据点时沿用首值，保证曲线从压测开始就有形状。
+ */
+export function alignMetric(points: ExternalMetricPoint[], seconds: number[]): number[] {
+  if (!points.length) return seconds.map(() => 0)
+  const sorted = [...points].sort((a, b) => a.t - b.t)
+  let cursor = 0
+  let value = sorted[0].v
+  return seconds.map((sec) => {
+    while (cursor + 1 < sorted.length && sorted[cursor + 1].t <= sec) cursor += 1
+    if (sorted[cursor].t <= sec) value = sorted[cursor].v
+    return value
+  })
+}
+
+/** 时间窗口内的最大值（含边界），不做插值 */
+function peakInWindow(
+  points: ExternalMetricPoint[],
+  center: number,
+  radius: number,
+): ExternalMetricPoint | null {
+  let best: ExternalMetricPoint | null = null
+  for (const point of points) {
+    if (Math.abs(point.t - center) > radius) continue
+    if (!best || point.v > best.v) best = point
+  }
+  return best
+}
+
+/**
+ * 外部指标映射（3.6.2）：只对已知 metric 给结论，未映射指标只画曲线。
+ * 时间对齐统一取窗口内最大值，不做插值；措辞保持「疑似」。
+ */
+export function externalMetricFindings(detail: ReportDetail): Finding[] {
+  const series = detail.report.externalMetrics ?? []
+  const samples = [...(detail.samples ?? [])]
+  if (!series.length || samples.length < 3) return []
+  const findings: Finding[] = []
+  const find = (metric: string) =>
+    series.find((item) => item.metric.trim().toLowerCase() === metric) ?? null
+
+  const cpu = find('cpu.usage')
+  if (cpu?.points.length) {
+    let run: typeof samples = []
+    let best: typeof samples = []
+    let cpuPeak = 0
+    for (const sample of samples) {
+      const hit = peakInWindow(cpu.points, sample.elapsedSec, 2)
+      if (hit && hit.v >= 85) {
+        run.push(sample)
+        cpuPeak = Math.max(cpuPeak, hit.v)
+        if (run.length > best.length) best = [...run]
+      } else {
+        run = []
+      }
+    }
+    if (best.length >= 3) {
+      const qpsValues = best.map((item) => item.qps)
+      const minQps = Math.min(...qpsValues)
+      const maxQps = Math.max(...qpsValues)
+      const meanQps = qpsValues.reduce((sum, value) => sum + value, 0) / qpsValues.length
+      const swing = meanQps > 0 ? (maxQps - minQps) / meanQps : 1
+      if (swing <= 0.1) {
+        findings.push({
+          level: 'warn',
+          title: `疑似 CPU 饱和：第 ${best[0].elapsedSec}–${best[best.length - 1].elapsedSec} 秒 CPU 持续 ≥ 85%`,
+          detail: `外部指标 ${cpu.metric} 在该窗口峰值 ${cpuPeak.toFixed(1)}%，同期 QPS 仅 ${int(minQps)}–${int(maxQps)} req/s（波动 ${pct(swing * 100, 1)}）。CPU 已接近打满而吞吐不再增长，瓶颈很可能在目标机 CPU；需结合服务端监控确认。`,
+        })
+      }
+    }
+  }
+
+  const gc = find('gc.pause')
+  if (gc?.points.length) {
+    const peak = samples.reduce((best, item) => (item.p99Rt > best.p99Rt ? item : best))
+    const hit = peakInWindow(gc.points, peak.elapsedSec, 3)
+    if (hit && hit.v > 0 && peak.p99Rt > detail.report.avgRt * 1.5) {
+      findings.push({
+        level: 'warn',
+        title: `疑似 GC 导致长尾：P99 峰值与 GC 停顿重叠`,
+        detail: `第 ${peak.elapsedSec} 秒 P99 达到 ${ms(peak.p99Rt)}（平均 ${ms(detail.report.avgRt)}），窗口内 ${gc.metric} 最大 ${hit.v.toFixed(1)} ms。停顿时间与长尾时间对齐，建议查看该时段的 GC 日志。`,
+      })
+    }
+  }
+
+  const db = find('db.pool.wait')
+  if (db?.points.length) {
+    const peak = samples.reduce((best, item) => (item.avgRt > best.avgRt ? item : best))
+    const base = median(samples.map((item) => item.avgRt))
+    const hit = peakInWindow(db.points, peak.elapsedSec, 3)
+    if (hit && hit.v > 0 && base > 0 && peak.avgRt >= base * 1.2) {
+      findings.push({
+        level: 'warn',
+        title: '疑似连接池等待：DB 等待与响应时间上升重叠',
+        detail: `第 ${peak.elapsedSec} 秒平均响应时间 ${ms(peak.avgRt)}，是全程中位数的 ${(peak.avgRt / base).toFixed(1)} 倍；窗口内 ${db.metric} 最大 ${hit.v.toFixed(1)} ms。建议核查连接池大小与慢查询。`,
+      })
+    }
+  }
+
+  const pool = find('thread.pool.active')
+  if (pool?.points.length) {
+    const top = pool.points.reduce((best, item) => (item.v > best.v ? item : best))
+    const sample = samples.reduce((best, item) =>
+      Math.abs(item.elapsedSec - top.t) < Math.abs(best.elapsedSec - top.t) ? item : best,
+    )
+    const index = samples.indexOf(sample)
+    const before = samples[Math.max(0, index - 3)]
+    const after = samples[Math.min(samples.length - 1, index + 3)]
+    const growth = before.qps > 0 ? (after.qps - before.qps) / before.qps : 0
+    const hit = peakInWindow(pool.points, sample.elapsedSec, 2)
+    if (top.v > 0 && hit && hit.v >= top.v * 0.95 && growth < 0.05 && after.qps > 0) {
+      findings.push({
+        level: 'warn',
+        title: '疑似线程池饱和：活跃线程已达观测峰值而 QPS 不再增长',
+        detail: `第 ${sample.elapsedSec} 秒 ${pool.metric} 升至 ${hit.v.toFixed(0)}（CSV 未提供配置上限，这里按观测最大值判断），QPS 前后仅变化 ${pct(growth * 100, 1)}。建议核对线程池配置与队列积压。`,
+      })
+    }
+  }
+
+  return findings
+}
+
 /** 错误发生的时间窗口；无错误时返回 null */
 export function errorWindow(detail: ReportDetail): { from: number; to: number; count: number } | null {
   const hits = (detail.samples ?? []).filter((item) => item.errorCount > 0)
@@ -99,6 +230,17 @@ export function gradeReport(detail: ReportDetail): GradeResult {
   const report = detail.report
   const sla = detail.config?.sla
   const score = scoreReport(detail)
+
+  // 崩溃恢复出的报告没有跑完：不按 SLA 判定，直接 fail，避免被当成有效结论
+  if (detail.config?.partial) {
+    const cutoff = clock(detail.config.dataCutoffSec ?? 0)
+    return {
+      grade: 'fail',
+      label: '不完整',
+      statement: `压测运行中断，报告只覆盖到第 ${cutoff}（数据来自已落盘采样，未续跑）。`,
+      reason: '报告不完整，不能作为容量或 SLA 结论',
+    }
+  }
 
   const failed: string[] = []
   if (sla?.p95Ms && report.p95Rt > sla.p95Ms) failed.push('P95 延迟')
@@ -168,6 +310,14 @@ export function buildFindings(detail: ReportDetail): Finding[] {
   const ninety = qpsP10(samples, { rampUpSec: config?.rampUpSec ?? 0 })
   const drift = latencyDrift(detail)
   const window = errorWindow(detail)
+
+  if (config?.partial) {
+    findings.push({
+      level: 'bad',
+      title: `运行中断，数据截至第 ${clock(config.dataCutoffSec ?? 0)}`,
+      detail: `${config.partialReason || '压测未正常结束，已从运行期落盘的采样恢复'}。曲线完整到中断点，但没有后续数据，不能作为容量、稳定性或 SLA 结论；请按原参数重新跑完一次。`,
+    })
+  }
 
   if (knee.saturated) {
     findings.push({

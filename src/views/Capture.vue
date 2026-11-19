@@ -16,6 +16,7 @@ import {
   FileZipOutlined,
   FolderOutlined,
   GlobalOutlined,
+  HistoryOutlined,
   PlayCircleOutlined,
   PlusOutlined,
   ReloadOutlined,
@@ -26,15 +27,21 @@ import {
   SendOutlined,
   SettingOutlined,
   StopOutlined,
+  SwapOutlined,
 } from '@ant-design/icons-vue'
 import * as api from '@/api/capture'
 import type {
+  CaptureArchiveMode,
+  CaptureArchivedFlow,
   CaptureBody,
   CaptureCaInfo,
   CaptureFlow,
   CaptureFlowDetail,
   CaptureHeader,
   CaptureRepeatResult,
+  CaptureSessionCompare,
+  CaptureSessionFlows,
+  CaptureSessionSummary,
   CaptureStatus,
   InterceptView,
   PendingBreakpoint,
@@ -68,6 +75,12 @@ interface GroupMenu {
   ids: number[]
 }
 
+interface FlowMenu {
+  x: number
+  y: number
+  flow: CaptureFlow
+}
+
 interface RepeatForm {
   method: string
   url: string
@@ -95,6 +108,32 @@ const minDuration = ref<number | null>(null)
 const autoScroll = ref(true)
 const port = ref(8888)
 const bindAddr = ref('127.0.0.1')
+/** 上游代理，形如 http://user:pass@host:port；开始录制时生效 */
+const upstreamProxy = ref('')
+/** SSL 直通白名单，一行一条：*.example.com / host:port / 10.0.0.0/8 */
+const passthroughHosts = ref('')
+/** 会话归档：按会话生效，开始录制后不可改 */
+const archiveMode = ref<CaptureArchiveMode>('memory')
+const archiveName = ref('')
+const archiveExclude = ref('')
+const detailArchived = ref(false)
+const historyOpen = ref(false)
+const historyLoading = ref(false)
+const sessions = shallowRef<CaptureSessionSummary[]>([])
+const historyFilter = ref('')
+const currentSession = ref<CaptureSessionSummary | null>(null)
+const archivedFlows = shallowRef<CaptureArchivedFlow[]>([])
+const archivedTotal = ref(0)
+const archiveKeyword = ref('')
+const archiveMethod = ref<string | undefined>(undefined)
+const archiveStatus = ref<string | undefined>(undefined)
+const archiveOffset = ref(0)
+const archiveLimit = 200
+const archiveLoading = ref(false)
+const compareIds = ref<number[]>([])
+const compareLoading = ref(false)
+const compareOpen = ref(false)
+const compareResult = shallowRef<CaptureSessionCompare | null>(null)
 const starting = ref(false)
 const stopping = ref(false)
 const loadingCa = ref(false)
@@ -131,8 +170,11 @@ const exporting = ref(false)
 /** 折叠的域名 / 目录节点键（h:域名、d:域名:/路径） */
 const collapsedNodes = ref<Set<string>>(new Set())
 const groupMenu = ref<GroupMenu | null>(null)
+const flowMenu = ref<FlowMenu | null>(null)
 const requestPretty = ref(true)
 const responsePretty = ref(true)
+/** HTML 响应默认按渲染结果预览，取消勾选回到源码 */
+const responseHtmlPreview = ref(true)
 const flowList = ref<HTMLElement | null>(null)
 /** 虚拟滚动的输入：列表滚动位置与可视高度（行高固定，窗口按像素算） */
 const listScrollTop = ref(0)
@@ -160,6 +202,8 @@ function emptyStatus(): CaptureStatus {
     caInstalled: false,
     sysproxyOn: false,
     upstreamProxy: null,
+    upstreamActive: false,
+    passthroughCount: 0,
     lastError: null,
   }
 }
@@ -230,19 +274,6 @@ const stateText = computed(() => {
       return '异常'
     default:
       return '未开始'
-  }
-})
-const stateColor = computed(() => {
-  switch (status.value.state) {
-    case 'running':
-      return 'success'
-    case 'starting':
-    case 'stopping':
-      return 'processing'
-    case 'error':
-      return 'error'
-    default:
-      return undefined
   }
 })
 const proxyAddress = computed(() => {
@@ -321,6 +352,43 @@ const methodOptions = computed(() =>
 const mimeOptions = computed(() =>
   mimeKinds.filter((kind) => flows.value.some((flow) => mimeKind(flow.contentType) === kind.value)),
 )
+
+const archiveMethods = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'].map(
+  (method) => ({ value: method, label: method }),
+)
+const filteredSessions = computed(() => {
+  const keyword = historyFilter.value.trim().toLowerCase()
+  if (!keyword) return sessions.value
+  return sessions.value.filter((session) =>
+    [session.name, session.mode, session.bindAddr, session.appVersion ?? '']
+      .join(' ')
+      .toLowerCase()
+      .includes(keyword),
+  )
+})
+const compareReady = computed(() => compareIds.value.length === 2)
+const compareItems = computed(() => compareResult.value?.items.slice(0, 200) ?? [])
+const historyStatusOptions = statusOptions.filter((item) => item.value !== 'all')
+
+function archiveModeLabel(mode: CaptureArchiveMode) {
+  return mode === 'archive-full' ? '元信息+正文' : mode === 'archive-meta' ? '仅元信息' : '不落库'
+}
+
+function formatPercent(value: number) {
+  return `${(value * 100).toFixed(1)}%`
+}
+
+function formatDelta(value: number | null) {
+  if (value === null || Number.isNaN(value)) return '—'
+  return `${value > 0 ? '+' : ''}${value.toFixed(1)}%`
+}
+
+function deltaClass(value: number | null) {
+  if (value === null) return ''
+  if (value > 10) return 'delta-up'
+  if (value < -10) return 'delta-down'
+  return ''
+}
 
 const filterActive = computed(
   () =>
@@ -467,7 +535,7 @@ function flowIdsOf(group: CaptureHostTree): number[] {
 }
 
 function openGroupMenu(event: MouseEvent, group: CaptureHostTree) {
-  closeGroupMenu()
+  closeMenus()
   // 菜单宽约 230、高约 190，贴边时向内收，避免被窗口裁掉
   const x = Math.max(8, Math.min(event.clientX, window.innerWidth - 238))
   const y = Math.max(8, Math.min(event.clientY, window.innerHeight - 198))
@@ -481,8 +549,16 @@ function openGroupMenu(event: MouseEvent, group: CaptureHostTree) {
   }
 }
 
-function closeGroupMenu() {
+function openFlowMenu(event: MouseEvent, flow: CaptureFlow) {
+  closeMenus()
+  const x = Math.max(8, Math.min(event.clientX, window.innerWidth - 238))
+  const y = Math.max(8, Math.min(event.clientY, window.innerHeight - 140))
+  flowMenu.value = { x, y, flow }
+}
+
+function closeMenus() {
   groupMenu.value = null
+  flowMenu.value = null
 }
 
 function expandAll() {
@@ -506,7 +582,7 @@ function statusTone(code: number | null) {
   return 'st-error'
 }
 
-function statusClass(flow: CaptureFlow) {
+function statusClass(flow: Pick<CaptureFlow, 'status' | 'error'>) {
   return flow.error ? 'st-error' : statusTone(flow.status)
 }
 
@@ -616,6 +692,23 @@ function isJsonBody(body: CaptureBody) {
   return /^\s*[{\[]/.test(body.text)
 }
 
+function isHtmlBody(body: CaptureBody) {
+  return !!body.text && !body.binary && /html/i.test(body.contentType)
+}
+
+/**
+ * 沙箱预览：禁脚本、禁表单、禁同源，并用 CSP 掐断外部请求，
+ * 只保留内联样式与 data: 资源，避免被动把抓包内容发到第三方。
+ */
+function htmlPreviewDoc(html: string) {
+  const meta =
+    '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; img-src data:; style-src \'unsafe-inline\' data:; font-src data:; media-src data:">'
+  if (/<head[^>]*>/i.test(html)) {
+    return html.replace(/<head([^>]*)>/i, `<head$1>${meta}`)
+  }
+  return `<!doctype html><html><head>${meta}</head><body>${html}</body></html>`
+}
+
 /** 超过这个体积不再做 JSON 美化：大 body 的 parse/stringify 会明显阻塞渲染 */
 const BODY_PRETTY_LIMIT = 512 * 1024
 
@@ -655,6 +748,10 @@ const requestBodyDisplay = computed(() =>
 const responseBodyDisplay = computed(() =>
   detail.value ? bodyText(detail.value.responseBody, responsePretty.value) : '',
 )
+const responseHtmlSrcdoc = computed(() => {
+  const body = detail.value?.responseBody
+  return body?.text && isHtmlBody(body) ? htmlPreviewDoc(body.text) : ''
+})
 const rawRequestText = computed(() => rawRequest())
 const rawResponseText = computed(() => rawResponse())
 
@@ -687,6 +784,8 @@ function sameStatus(a: CaptureStatus, b: CaptureStatus) {
     a.caInstalled === b.caInstalled &&
     a.sysproxyOn === b.sysproxyOn &&
     a.upstreamProxy === b.upstreamProxy &&
+    a.upstreamActive === b.upstreamActive &&
+    a.passthroughCount === b.passthroughCount &&
     a.lastError === b.lastError
   )
 }
@@ -802,7 +901,7 @@ async function tick() {
 }
 
 function onListScroll() {
-  closeGroupMenu()
+  closeMenus()
   const element = flowList.value
   if (!element) return
   listScrollTop.value = element.scrollTop
@@ -820,15 +919,17 @@ function askHangzai() {
     title: `${flow.method} ${flow.host}${flow.path}${flow.status ? ` · ${flow.status}` : ''}`,
     prompt: captureFlowPrompt(flow),
   })
-  router.push('/ai')
+  void router.push('/ai')
 }
 
 async function selectFlow(flow: CaptureFlow) {
   selectedId.value = flow.id
   requestPretty.value = true
   responsePretty.value = true
+  responseHtmlPreview.value = true
   try {
     detail.value = await api.captureFlowDetail(flow.id)
+    detailArchived.value = false
   } catch (error) {
     detail.value = null
     message.error(String(error))
@@ -842,9 +943,143 @@ async function clearFlows() {
     lastFlowCount = 0
     selectedId.value = null
     detail.value = null
+    detailArchived.value = false
   } catch (error) {
     message.error(String(error))
   }
+}
+
+function parsePassthroughHosts() {
+  return passthroughHosts.value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith('#'))
+}
+
+function parseArchiveExclude() {
+  return archiveExclude.value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith('#'))
+}
+
+async function refreshSessions() {
+  historyLoading.value = true
+  try {
+    sessions.value = await api.captureSessionsList(50)
+  } catch (error) {
+    message.error(String(error))
+  } finally {
+    historyLoading.value = false
+  }
+}
+
+function openHistory() {
+  historyOpen.value = true
+}
+
+function openSession(session: CaptureSessionSummary) {
+  currentSession.value = session
+  archiveOffset.value = 0
+  void loadArchivedFlows()
+}
+
+async function loadArchivedFlows() {
+  const session = currentSession.value
+  if (!session) return
+  archiveLoading.value = true
+  try {
+    const result: CaptureSessionFlows = await api.captureSessionFlows(session.id, {
+      keyword: archiveKeyword.value.trim() || undefined,
+      method: archiveMethod.value || undefined,
+      status: archiveStatus.value || undefined,
+      offset: archiveOffset.value,
+      limit: archiveLimit,
+    })
+    archivedFlows.value = result.items
+    archivedTotal.value = result.total
+  } catch (error) {
+    archivedFlows.value = []
+    archivedTotal.value = 0
+    message.error(String(error))
+  } finally {
+    archiveLoading.value = false
+  }
+}
+
+function searchArchived() {
+  archiveOffset.value = 0
+  void loadArchivedFlows()
+}
+
+function pageArchived(delta: number) {
+  const next = archiveOffset.value + delta * archiveLimit
+  if (next < 0 || next >= archivedTotal.value) return
+  archiveOffset.value = next
+  void loadArchivedFlows()
+}
+
+async function openArchivedDetail(flow: CaptureArchivedFlow) {
+  const session = currentSession.value
+  if (!session) return
+  detailArchived.value = true
+  responseHtmlPreview.value = true
+  try {
+    detail.value = await api.captureSessionFlowDetail(session.id, flow.id)
+    historyOpen.value = false
+  } catch (error) {
+    detail.value = null
+    message.error(String(error))
+  }
+}
+
+function toggleCompare(id: number) {
+  if (compareIds.value.includes(id)) {
+    compareIds.value = compareIds.value.filter((item) => item !== id)
+    return
+  }
+  compareIds.value = [...compareIds.value, id].slice(-2)
+}
+
+async function runCompare() {
+  if (!compareReady.value) return
+  compareLoading.value = true
+  try {
+    compareResult.value = await api.captureSessionCompare(
+      compareIds.value[0],
+      compareIds.value[1],
+    )
+    compareOpen.value = true
+  } catch (error) {
+    message.error(String(error))
+  } finally {
+    compareLoading.value = false
+  }
+}
+
+function deleteSession(session: CaptureSessionSummary) {
+  Modal.confirm({
+    title: `删除会话「${session.name}」？`,
+    content: `将删除 ${session.flowCount} 条流量及其归档正文，不可恢复。`,
+    okText: '删除',
+    okType: 'danger',
+    cancelText: '取消',
+    async onOk() {
+      try {
+        await api.captureSessionDelete(session.id)
+        if (currentSession.value?.id === session.id) {
+          currentSession.value = null
+          archivedFlows.value = []
+          archivedTotal.value = 0
+        }
+        compareIds.value = compareIds.value.filter((id) => id !== session.id)
+        await refreshSessions()
+        message.success('会话已删除')
+      } catch (error) {
+        message.error(String(error))
+      }
+    },
+  })
 }
 
 async function start() {
@@ -860,12 +1095,17 @@ async function start() {
     lastFlowCount = 0
     selectedId.value = null
     detail.value = null
+    detailArchived.value = false
     status.value = await api.captureStart({
       port: targetPort,
       bindAddr: bindAddr.value,
-      sslHosts: [],
+      sslHosts: parsePassthroughHosts(),
       ignorePatterns: [],
       captureStatic: true,
+      upstreamProxy: upstreamProxy.value.trim() || null,
+      archiveMode: archiveMode.value,
+      archiveName: archiveName.value.trim() || null,
+      archiveExclude: parseArchiveExclude(),
     })
     port.value = status.value.port || targetPort
     autoScroll.value = true
@@ -914,7 +1154,7 @@ function installCa() {
   Modal.confirm({
     title: '安装当前根证书？',
     content:
-      '将把当前根证书安装到「当前用户 → 受信任的根证书颁发机构」。安装后 HTTPS 流量才能被解密；如果之前装过旧证书，这一步会用当前证书覆盖安装。',
+      '将把当前根证书安装到当前用户的系统信任库（Windows：受信任的根证书颁发机构；macOS：登录钥匙串）。安装后 HTTPS 流量才能被解密；如果之前装过旧证书，这一步会用当前证书覆盖信任设置。macOS 可能弹出钥匙串授权窗口，需要允许一次。',
     okText: '安装',
     cancelText: '取消',
     async onOk() {
@@ -935,7 +1175,23 @@ function installCa() {
   })
 }
 
-async function toggleSysproxy() {
+function toggleSysproxy() {
+  if (!status.value.sysproxyOn && !ca.value.installed) {
+    Modal.confirm({
+      title: '根证书尚未信任',
+      content:
+        '接管后所有 HTTPS 请求都要经过解密，根证书未信任时这些请求会失败。建议先安装并信任根证书，再接管系统代理。仍然继续？',
+      okText: '仍然接管',
+      okType: 'danger',
+      cancelText: '先去安装',
+      onOk: () => applySysproxy(),
+    })
+    return
+  }
+  void applySysproxy()
+}
+
+async function applySysproxy() {
   sysproxyBusy.value = true
   try {
     status.value = status.value.sysproxyOn
@@ -975,6 +1231,31 @@ async function copyText(text: string, label: string) {
     message.success(`${label}已复制`)
   } catch {
     message.warning('当前环境不支持剪贴板')
+  }
+}
+
+function flowUrl(flow: CaptureFlow) {
+  return `${flow.scheme}://${flow.host}${flow.path}`
+}
+
+function copyFlowUrl(flow: CaptureFlow) {
+  closeMenus()
+  void copyText(flowUrl(flow), 'URL')
+}
+
+/** cURL 需要请求头与 body，列表行只有摘要，按需取一次详情 */
+async function copyFlowCurl(flow: CaptureFlow) {
+  closeMenus()
+  if (flow.passthrough || flow.method === 'CONNECT') {
+    message.warning('直通流量没有明文，无法生成 cURL')
+    return
+  }
+  try {
+    const full =
+      detail.value?.id === flow.id ? detail.value : await api.captureFlowDetail(flow.id)
+    await copyText(curlText(full), 'cURL')
+  } catch (error) {
+    message.error(String(error))
   }
 }
 
@@ -1067,19 +1348,21 @@ async function submitRepeat() {
       return
     }
     message.success('已重发，新流量已记录')
-    window.setTimeout(async () => {
-      await refreshFlows(true)
-      try {
-        const target = new URL(result.url)
-        const path = `${target.pathname}${target.search}`
-        const candidates = flows.value.filter(
-          (item) => item.id > flow.id && item.method === method && item.path === path,
-        )
-        const latest = candidates[candidates.length - 1]
-        if (latest) await selectFlow(latest)
-      } catch {
-        // URL 解析失败时只保留列表刷新
-      }
+    window.setTimeout(() => {
+      void (async () => {
+        await refreshFlows(true)
+        try {
+          const target = new URL(result.url)
+          const path = `${target.pathname}${target.search}`
+          const candidates = flows.value.filter(
+            (item) => item.id > flow.id && item.method === method && item.path === path,
+          )
+          const latest = candidates[candidates.length - 1]
+          if (latest) await selectFlow(latest)
+        } catch {
+          // URL 解析失败时只保留列表刷新
+        }
+      })()
     }, 450)
   } catch (error) {
     message.error(String(error))
@@ -1160,14 +1443,14 @@ function exportZip() {
 /** 右键域名分组：只导出该分组下的请求 */
 function exportGroupHar() {
   const menu = groupMenu.value
-  closeGroupMenu()
+  closeMenus()
   if (!menu || !menu.ids.length) return
   void exportCapture('har', menu.ids, menu.host)
 }
 
 function exportGroupZip() {
   const menu = groupMenu.value
-  closeGroupMenu()
+  closeMenus()
   if (!menu || !menu.ids.length) return
   void exportCapture('zip', menu.ids, menu.host)
 }
@@ -1195,7 +1478,7 @@ async function saveBody(part: 'request' | 'response') {
 function beginResize(event: PointerEvent) {
   if (window.innerWidth < 1120) return
   event.preventDefault()
-  closeGroupMenu()
+  closeMenus()
   resizing.value = true
   window.addEventListener('pointermove', onResizeMove)
   window.addEventListener('pointerup', endResize, { once: true })
@@ -1215,7 +1498,7 @@ function endResize() {
 }
 
 function onGlobalKeydown(event: KeyboardEvent) {
-  if (event.key === 'Escape') closeGroupMenu()
+  if (event.key === 'Escape') closeMenus()
 }
 
 onMounted(async () => {
@@ -1223,9 +1506,9 @@ onMounted(async () => {
   if (Number.isFinite(stored) && stored >= 280) {
     splitWidth.value = Math.min(stored, Math.max(window.innerWidth - 780, 280))
   }
-  window.addEventListener('click', closeGroupMenu)
+  window.addEventListener('click', closeMenus)
   window.addEventListener('keydown', onGlobalKeydown)
-  window.addEventListener('blur', closeGroupMenu)
+  window.addEventListener('blur', closeMenus)
   await Promise.all([
     refreshStatus(),
     refreshCa(),
@@ -1249,13 +1532,17 @@ onBeforeUnmount(() => {
   if (caTimer) window.clearInterval(caTimer)
   listObserver?.disconnect()
   window.removeEventListener('pointermove', onResizeMove)
-  window.removeEventListener('click', closeGroupMenu)
+  window.removeEventListener('click', closeMenus)
   window.removeEventListener('keydown', onGlobalKeydown)
-  window.removeEventListener('blur', closeGroupMenu)
+  window.removeEventListener('blur', closeMenus)
 })
 
 watch(settingsOpen, (open) => {
   if (open) void refreshLanIps()
+})
+
+watch(historyOpen, (open) => {
+  if (open) void refreshSessions()
 })
 </script>
 
@@ -1282,15 +1569,22 @@ watch(settingsOpen, (open) => {
           清空
         </a-button>
         <a-divider type="vertical" class="toolbar-divider" />
-        <a-tag :color="stateColor" class="state-pill">
+        <a-tag class="state-pill" :class="`state-${status.state}`">
           <span class="state-dot" :class="status.state" />
           {{ stateText }}
         </a-tag>
         <span class="toolbar-meta mono">{{ proxyAddress }}</span>
+        <a-tag v-if="running && status.sessionId" color="geekblue" class="state-pill">
+          归档中 #{{ status.sessionId }}
+        </a-tag>
         <span v-if="status.dropped" class="toolbar-warn">丢弃 {{ status.dropped }}</span>
       </div>
 
       <div class="toolbar-group toolbar-right">
+        <a-button size="small" title="历史抓包会话" @click="openHistory">
+          <HistoryOutlined />
+          历史会话
+        </a-button>
         <a-button
           size="small"
           :disabled="!flows.length"
@@ -1547,9 +1841,10 @@ watch(settingsOpen, (open) => {
                   v-else
                   type="button"
                   class="flow-row"
-                  :class="{ active: selectedId === item.row.flow.id, failed: !!item.row.flow.error }"
+                  :class="{ active: selectedId === item.row.flow.id, failed: !!item.row.flow.error && !item.row.flow.passthrough }"
                   :style="{ paddingLeft: `${24 + item.row.depth * 16}px` }"
                   @click="selectFlow(item.row.flow)"
+                  @contextmenu.prevent="openFlowMenu($event, item.row.flow)"
                 >
                   <span class="method-tag flow-method" :class="methodClass(item.row.flow.method)">
                     {{ item.row.flow.method }}
@@ -1579,6 +1874,11 @@ watch(settingsOpen, (open) => {
                       class="flow-flag modified"
                       title="断点修改过请求或响应"
                     >已改</span>
+                    <span
+                      v-if="item.row.flow.passthrough"
+                      class="flow-flag passthrough"
+                      title="命中 SSL 直通白名单：只有 CONNECT 隧道，没有明文"
+                    >直通</span>
                   </span>
                   <span class="flow-time">{{ formatDuration(item.row.flow.durationMs) }}</span>
                   <span class="flow-size">{{ formatBytes(item.row.flow.responseSize) }}</span>
@@ -1610,6 +1910,8 @@ watch(settingsOpen, (open) => {
               </span>
               <span class="detail-duration">{{ formatDuration(detail.durationMs) }}</span>
               <span class="detail-clock">{{ formatClock(detail.startedAt) }}</span>
+              <a-tag v-if="detail.passthrough" color="default" class="detail-flag">直通未解密</a-tag>
+              <a-tag v-if="detailArchived" color="geekblue" class="detail-flag">历史会话</a-tag>
               <a-tag v-if="detail.mapped" color="purple" class="detail-flag">本地映射</a-tag>
               <a-tag v-if="detail.remote" color="cyan" class="detail-flag">远程映射</a-tag>
               <a-tag v-if="detail.modified" color="orange" class="detail-flag">断点改包</a-tag>
@@ -1618,7 +1920,7 @@ watch(settingsOpen, (open) => {
                   <RobotOutlined />
                   问航仔
                 </a-button>
-                <a-button size="small" :loading="repeatBusy" @click="openRepeat">
+                <a-button v-if="!detailArchived" size="small" :loading="repeatBusy" @click="openRepeat">
                   <SendOutlined />
                   重发
                 </a-button>
@@ -1636,7 +1938,14 @@ watch(settingsOpen, (open) => {
           </div>
 
           <a-alert
-            v-if="detail.error"
+            v-if="detail.passthrough"
+            type="info"
+            show-icon
+            message="该域名命中 SSL 直通白名单：只记录 CONNECT 隧道，没有明文；断点、本地/远程映射与弱网对它不生效。"
+            class="detail-error"
+          />
+          <a-alert
+            v-else-if="detail.error"
             type="error"
             show-icon
             :message="detail.error"
@@ -1755,7 +2064,7 @@ watch(settingsOpen, (open) => {
                     >
                       <CopyOutlined />
                     </a-button>
-                    <a-button size="small" type="text" title="保存请求体" @click="saveBody('request')">
+                    <a-button v-if="!detailArchived" size="small" type="text" title="保存请求体" @click="saveBody('request')">
                       <DownloadOutlined />
                     </a-button>
                   </div>
@@ -1810,6 +2119,14 @@ watch(settingsOpen, (open) => {
                     </a-tag>
                     <span class="spacer" />
                     <a-checkbox
+                      v-if="isHtmlBody(detail.responseBody)"
+                      v-model:checked="responseHtmlPreview"
+                      class="pretty-check"
+                      title="沙箱渲染：脚本、表单与外部资源不会执行"
+                    >
+                      预览
+                    </a-checkbox>
+                    <a-checkbox
                       v-if="isJsonBody(detail.responseBody)"
                       v-model:checked="responsePretty"
                       class="pretty-check"
@@ -1824,7 +2141,7 @@ watch(settingsOpen, (open) => {
                     >
                       <CopyOutlined />
                     </a-button>
-                    <a-button size="small" type="text" title="保存响应体" @click="saveBody('response')">
+                    <a-button v-if="!detailArchived" size="small" type="text" title="保存响应体" @click="saveBody('response')">
                       <DownloadOutlined />
                     </a-button>
                   </div>
@@ -1834,6 +2151,13 @@ watch(settingsOpen, (open) => {
                     class="body-image"
                     :src="bodyDataUrl(detail.responseBody)"
                     alt="响应图片预览"
+                  />
+                  <iframe
+                    v-else-if="isHtmlBody(detail.responseBody) && responseHtmlPreview"
+                    class="body-frame"
+                    :srcdoc="responseHtmlSrcdoc"
+                    sandbox=""
+                    title="HTML 响应预览"
                   />
                   <pre
                     v-else-if="detail.responseBody.text !== null"
@@ -1893,6 +2217,12 @@ watch(settingsOpen, (open) => {
       <span v-if="interceptView.mapActive" class="status-info">本地映射</span>
       <span v-if="interceptView.remoteActive" class="status-info">远程映射</span>
       <span v-if="interceptView.weak.enabled" class="status-warn">弱网模拟</span>
+      <span v-if="status.upstreamActive" class="status-info">
+        上游 {{ status.upstreamProxy }}
+      </span>
+      <span v-if="status.passthroughCount" class="status-warn">
+        直通 {{ status.passthroughCount }}
+      </span>
       <span>系统代理 {{ status.sysproxyOn ? '已接管' : '未接管' }}</span>
       <span :class="{ 'status-ok': ca.installed, 'status-bad': !ca.installed }">
         CA {{ ca.installed ? '已信任' : '未信任' }}
@@ -1977,21 +2307,107 @@ watch(settingsOpen, (open) => {
             </a-button>
           </div>
           <p class="settings-hint">
-            接管后会修改 Windows 系统代理，停止录制或退出应用时自动恢复原值。手机抓包把监听地址切到
+            接管后会修改当前系统的 HTTP / HTTPS 代理（macOS 首次可能要求管理员授权），停止录制或退出应用时自动恢复原值。手机抓包把监听地址切到
             0.0.0.0，手机和电脑连同一 Wi-Fi，Wi-Fi 代理填上面的「手机代理」地址；HTTPS 还需在手机上安装根证书。
+          </p>
+        </section>
+
+        <section class="settings-section">
+          <h4>上游代理与 SSL 直通</h4>
+          <div class="settings-row">
+            <span>上游代理</span>
+            <a-input
+              v-model:value="upstreamProxy"
+              :disabled="running"
+              size="small"
+              placeholder="http://user:pass@127.0.0.1:7890"
+              class="settings-wide"
+              allow-clear
+            />
+          </div>
+          <p class="settings-hint">
+            只支持 http:// 代理。所有转发（含 CONNECT 隧道）都经上游发出，密码不会回显到界面和状态接口。
+          </p>
+          <div class="settings-col">
+            <span>SSL 直通域名</span>
+            <a-textarea
+              v-model:value="passthroughHosts"
+              :disabled="running"
+              :rows="4"
+              size="small"
+              placeholder="*.apple.com&#10;10.0.0.0/8&#10;host.example.com:8443"
+            />
+          </div>
+          <p class="settings-hint">
+            一行一条，支持通配（*.example.com）、host:port 和 IPv4 CIDR。命中的连接只记录 CONNECT 隧道、不解密，
+            断点、本地/远程映射与弱网对它都不生效；直通流量不会再走上游代理。
+          </p>
+          <p v-if="running && status.upstreamActive" class="card-hint hint-ok">
+            本次录制已启用上游代理 <span class="mono">{{ status.upstreamProxy }}</span>，直通
+            {{ status.passthroughCount }} 条连接。修改配置需先停止再重新开始。
+          </p>
+        </section>
+
+        <section class="settings-section">
+          <h4>会话归档</h4>
+          <div class="settings-row">
+            <span>归档模式</span>
+            <a-select
+              v-model:value="archiveMode"
+              :disabled="running"
+              size="small"
+              class="settings-select"
+            >
+              <a-select-option value="memory">不落库（默认）</a-select-option>
+              <a-select-option value="archive-meta">仅元信息</a-select-option>
+              <a-select-option value="archive-full">元信息 + 正文</a-select-option>
+            </a-select>
+          </div>
+          <p class="settings-hint">
+            按会话生效，开始录制后不可修改。归档默认保留最近 20 个会话 / 1GB，超出后最旧的会话先降级为仅元信息再删除。
+          </p>
+          <div v-if="archiveMode !== 'memory'" class="settings-row">
+            <span>会话名称</span>
+            <a-input
+              v-model:value="archiveName"
+              :disabled="running"
+              size="small"
+              placeholder="留空按开始时间自动命名"
+              class="settings-wide"
+              allow-clear
+            />
+          </div>
+          <div v-if="archiveMode !== 'memory'" class="settings-col">
+            <span>排除域名</span>
+            <a-textarea
+              v-model:value="archiveExclude"
+              :disabled="running"
+              :rows="3"
+              size="small"
+              placeholder="*.example.com&#10;login.prod.com"
+            />
+          </div>
+          <p v-if="archiveMode !== 'memory'" class="settings-hint">
+            一行一条，命中的域名不写入归档；请求头与正文落库前会按敏感字段名和已识别的密钥值脱敏。
+          </p>
+          <p v-if="running && status.sessionId" class="card-hint hint-ok">
+            本次已开启归档（会话 #{{ status.sessionId }}），停止录制后可在顶部「历史会话」中检索与对比。
+          </p>
+          <p v-else-if="running" class="settings-hint">
+            本次录制为不落库模式；历史会话只保留此前开启归档的记录。
           </p>
         </section>
 
         <section class="settings-section">
           <h4>
             根证书
-            <a-tag :color="ca.installed ? 'success' : 'error'" class="settings-tag">
+            <a-tag class="settings-tag" :class="ca.installed ? 'is-ok' : 'is-bad'">
               {{ ca.installed ? '已安装并信任' : '未安装' }}
             </a-tag>
           </h4>
           <a-spin :spinning="loadingCa">
             <dl class="cert-meta">
-              <dt>SHA-1（证书管理器里的「指纹」）</dt>
+              <dt>SHA-1（Windows 证书管理器 / macOS 钥匙串里的「指纹」）</dt>
               <dd class="mono fingerprint">
                 {{ ca.thumbprint || '生成后显示' }}
                 <a-button
@@ -2046,7 +2462,7 @@ watch(settingsOpen, (open) => {
               <CheckCircleOutlined /> 当前证书已被系统信任，HTTPS 可以解密。
             </template>
             <template v-else>
-              检测不到当前证书。若确定装过，多半装成了旧证书（重新生成后旧证书会失效），点「一键安装」覆盖即可。
+              检测不到当前证书的信任记录。若确定装过，请确认装的是当前这张（重新生成后旧证书会失效），或点「一键安装」重建信任；macOS 还需把证书的「信任」设为「始终信任」。
             </template>
           </p>
           <a-button type="text" size="small" danger class="regen-btn" @click="regenerateCa">
@@ -2085,11 +2501,227 @@ watch(settingsOpen, (open) => {
             <li>HTTP/3（QUIC）不经过代理，必要时关闭浏览器 QUIC。</li>
             <li>部分 App 做了证书固定（pinning），这类流量无法解密。</li>
             <li v-if="isLan">当前监听 0.0.0.0，手机代理填电脑局域网 IP + 端口，不是 127.0.0.1。</li>
-            <li>流量仅存内存（5000 条 / 128 MB body），重启应用后清空。</li>
+            <li>流量默认仅存内存（5000 条 / 128 MB body），重启应用后清空；开启「会话归档」后才会落库。</li>
           </ul>
         </section>
       </div>
     </a-drawer>
+
+    <a-drawer
+      v-model:open="historyOpen"
+      title="历史会话"
+      :width="980"
+      placement="right"
+      class="history-drawer"
+    >
+      <div class="history-toolbar">
+        <a-input
+          v-model:value="historyFilter"
+          allow-clear
+          size="small"
+          placeholder="搜索会话名 / 域名 / 版本"
+          class="history-filter"
+        >
+          <template #prefix><SearchOutlined /></template>
+        </a-input>
+        <a-button size="small" :loading="historyLoading" @click="refreshSessions">
+          <ReloadOutlined />
+          刷新
+        </a-button>
+        <a-button
+          size="small"
+          :disabled="!compareReady"
+          :loading="compareLoading"
+          @click="runCompare"
+        >
+          <SwapOutlined />
+          对比所选
+        </a-button>
+        <span class="history-hint">勾选两个会话对比；默认保留最近 20 个 / 1GB</span>
+      </div>
+
+      <a-spin :spinning="historyLoading">
+        <div v-if="!filteredSessions.length" class="history-empty">
+          还没有归档会话。在抓包设置里开启「会话归档」，录制并停止后即可在这里检索。
+        </div>
+        <div v-else class="history-list">
+          <div
+            v-for="session in filteredSessions"
+            :key="session.id"
+            class="history-row"
+            :class="{
+              active: currentSession?.id === session.id,
+              checked: compareIds.includes(session.id),
+            }"
+          >
+            <a-checkbox
+              :checked="compareIds.includes(session.id)"
+              @change="toggleCompare(session.id)"
+            />
+            <button type="button" class="history-main" @click="openSession(session)">
+              <div class="history-title">
+                <b>{{ session.name }}</b>
+                <a-tag
+                  :color="session.mode === 'archive-full' ? 'blue' : 'default'"
+                  class="history-mode"
+                >
+                  {{ archiveModeLabel(session.mode) }}
+                </a-tag>
+                <span v-if="!session.endedAt" class="history-warn">未正常结束</span>
+              </div>
+              <div class="history-meta mono">
+                {{ formatDateTime(session.startedAt) }} · {{ session.flowCount }} 条 ·
+                {{ formatBytes(session.bytes) }}
+                <span v-if="session.dropped"> · 归档丢弃 {{ session.dropped }}</span>
+                · {{ session.bindAddr }}:{{ session.port }}
+                <span v-if="session.appVersion"> · v{{ session.appVersion }}</span>
+              </div>
+            </button>
+            <a-button size="small" type="text" danger title="删除会话" @click.stop="deleteSession(session)">
+              <DeleteOutlined />
+            </a-button>
+          </div>
+        </div>
+      </a-spin>
+
+      <div v-if="currentSession" class="history-flows">
+        <div class="history-flows-head">
+          <div class="history-flows-title">
+            <b>{{ currentSession.name }}</b>
+            <span>{{ archivedTotal }} 条</span>
+          </div>
+          <div class="history-filters">
+            <a-input
+              v-model:value="archiveKeyword"
+              allow-clear
+              size="small"
+              placeholder="过滤 host / path"
+              class="history-keyword"
+              @press-enter="searchArchived"
+            >
+              <template #prefix><SearchOutlined /></template>
+            </a-input>
+            <a-select
+              v-model:value="archiveMethod"
+              allow-clear
+              size="small"
+              placeholder="方法"
+              :options="archiveMethods"
+              class="history-select"
+            />
+            <a-select
+              v-model:value="archiveStatus"
+              allow-clear
+              size="small"
+              placeholder="状态"
+              :options="historyStatusOptions"
+              class="history-select"
+            />
+            <a-button size="small" :loading="archiveLoading" @click="searchArchived">查询</a-button>
+          </div>
+        </div>
+
+        <a-spin :spinning="archiveLoading">
+          <div v-if="!archivedFlows.length" class="history-empty">
+            当前会话没有匹配的流量。
+          </div>
+          <div v-else class="history-flow-list">
+            <button
+              v-for="flow in archivedFlows"
+              :key="flow.id"
+              type="button"
+              class="history-flow"
+              @click="openArchivedDetail(flow)"
+            >
+              <span class="method-tag" :class="methodClass(flow.method)">{{ flow.method }}</span>
+              <span class="flow-status" :class="statusClass(flow)">{{ flow.status ?? 'ERR' }}</span>
+              <span class="history-flow-url mono" :title="`${flow.scheme}://${flow.host}${flow.path}`">
+                {{ flow.host }}{{ flow.path }}
+              </span>
+              <span v-if="flow.passthrough" class="flow-flag passthrough">直通</span>
+              <span class="history-flow-time">{{ formatDuration(flow.durationMs) }}</span>
+              <span class="history-flow-size">{{ formatBytes(flow.responseSize) }}</span>
+            </button>
+          </div>
+        </a-spin>
+
+        <div class="history-pager">
+          <span>
+            第 {{ Math.floor(archiveOffset / archiveLimit) + 1 }} 页 · 共
+            {{ archivedTotal }} 条
+          </span>
+          <div>
+            <a-button
+              size="small"
+              :disabled="archiveOffset <= 0"
+              @click="pageArchived(-1)"
+            >
+              上一页
+            </a-button>
+            <a-button
+              size="small"
+              :disabled="archiveOffset + archiveLimit >= archivedTotal"
+              @click="pageArchived(1)"
+            >
+              下一页
+            </a-button>
+          </div>
+        </div>
+      </div>
+    </a-drawer>
+
+    <a-modal v-model:open="compareOpen" title="会话对比" :width="980" :footer="null">
+      <template v-if="compareResult">
+        <div class="compare-head">
+          <span><b>A</b> {{ compareResult.a.name }} <em>{{ compareResult.a.flowCount }} 条</em></span>
+          <SwapOutlined />
+          <span><b>B</b> {{ compareResult.b.name }} <em>{{ compareResult.b.flowCount }} 条</em></span>
+          <span class="history-hint">按 method + host + path 归一化，变化为 B 相对 A</span>
+        </div>
+        <div class="compare-table">
+          <div class="compare-row compare-row-head">
+            <span>请求</span>
+            <span>A 次数</span>
+            <span>B 次数</span>
+            <span>A 平均</span>
+            <span>B 平均</span>
+            <span>变化</span>
+            <span>错误率 A→B</span>
+          </div>
+          <div v-for="(item, index) in compareItems" :key="index" class="compare-row">
+            <span class="compare-req mono" :title="`${item.host}${item.path}`">
+              {{ item.method }} {{ item.host }}{{ item.path }}
+            </span>
+            <span>{{ item.aCount }}</span>
+            <span>{{ item.bCount }}</span>
+            <span>{{ formatDuration(item.aAvgMs) }}</span>
+            <span>{{ formatDuration(item.bAvgMs) }}</span>
+            <span :class="deltaClass(item.deltaPct)">
+              {{ formatDelta(item.deltaPct) }}
+            </span>
+            <span>{{ formatPercent(item.aErrorRate) }} → {{ formatPercent(item.bErrorRate) }}</span>
+          </div>
+          <div v-if="!compareItems.length" class="history-empty">
+            两个会话没有相同的请求。
+          </div>
+        </div>
+        <p v-if="compareResult.items.length > compareItems.length" class="history-hint">
+          仅展示变化最大的前 {{ compareItems.length }} 条，共 {{ compareResult.items.length }} 条。
+        </p>
+        <div v-if="compareResult.onlyA.length" class="compare-only">
+          <b>仅 A 有（{{ compareResult.onlyA.length }}）：</b>
+          <span v-for="(item, index) in compareResult.onlyA.slice(0, 12)" :key="`a-${index}`" class="mono">
+            {{ item.method }} {{ item.host }}{{ item.path }} ×{{ item.count }}
+          </span>
+        </div>
+        <div v-if="compareResult.onlyB.length" class="compare-only">
+          <b>仅 B 有（{{ compareResult.onlyB.length }}）：</b>
+          <span v-for="(item, index) in compareResult.onlyB.slice(0, 12)" :key="`b-${index}`" class="mono">
+            {{ item.method }} {{ item.host }}{{ item.path }} ×{{ item.count }}
+          </span>
+        </div>
+      </template>
+    </a-modal>
 
     <Teleport to="body">
       <div
@@ -2120,6 +2752,38 @@ watch(settingsOpen, (open) => {
           <RightOutlined v-if="isCollapsed(groupMenu.key)" />
           <DownOutlined v-else />
           {{ isCollapsed(groupMenu.key) ? '展开该分组' : '折叠该分组' }}
+        </button>
+      </div>
+    </Teleport>
+
+    <Teleport to="body">
+      <div
+        v-if="flowMenu"
+        class="capture-context-menu flow-menu"
+        :style="{ left: `${flowMenu.x}px`, top: `${flowMenu.y}px` }"
+        @click.stop
+        @contextmenu.prevent
+      >
+        <div class="context-head" :title="flowUrl(flowMenu.flow)">
+          <span
+            class="method-tag flow-method"
+            :class="methodClass(flowMenu.flow.method)"
+          >{{ flowMenu.flow.method }}</span>
+          <span class="context-host mono">{{ flowMenu.flow.path }}</span>
+          <span class="context-count">{{ flowMenu.flow.status ?? 'ERR' }}</span>
+        </div>
+        <button
+          type="button"
+          :disabled="flowMenu.flow.passthrough || flowMenu.flow.method === 'CONNECT'"
+          :title="flowMenu.flow.passthrough ? '直通流量没有明文，无法生成 cURL' : ''"
+          @click="copyFlowCurl(flowMenu.flow)"
+        >
+          <CodeOutlined />
+          复制为 cURL
+        </button>
+        <button type="button" @click="copyFlowUrl(flowMenu.flow)">
+          <CopyOutlined />
+          复制 URL
         </button>
       </div>
     </Teleport>
@@ -2363,6 +3027,25 @@ watch(settingsOpen, (open) => {
   align-items: center;
   gap: 6px;
   margin: 0;
+}
+
+.state-pill.state-running {
+  color: var(--fm-success);
+  background: var(--fm-success-soft);
+  border-color: color-mix(in srgb, var(--fm-success) 30%, var(--fm-border));
+}
+
+.state-pill.state-starting,
+.state-pill.state-stopping {
+  color: var(--fm-warning);
+  background: var(--fm-warning-soft);
+  border-color: color-mix(in srgb, var(--fm-warning) 30%, var(--fm-border));
+}
+
+.state-pill.state-error {
+  color: var(--fm-danger);
+  background: var(--fm-danger-soft);
+  border-color: color-mix(in srgb, var(--fm-danger) 30%, var(--fm-border));
 }
 
 .state-dot {
@@ -2708,6 +3391,30 @@ watch(settingsOpen, (open) => {
   color: var(--fm-muted);
 }
 
+.flow-menu {
+  width: 240px;
+}
+
+.flow-menu .context-head {
+  gap: 6px;
+}
+
+.flow-menu .context-host {
+  font-family: var(--fm-font-mono);
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--fm-text-2);
+}
+
+.flow-menu .context-count {
+  font-family: var(--fm-font-mono);
+}
+
+.capture-context-menu button:disabled:hover {
+  background: transparent;
+  color: var(--fm-text-2);
+}
+
 .capture-context-menu button {
   display: flex;
   align-items: center;
@@ -2867,6 +3574,11 @@ watch(settingsOpen, (open) => {
 .flow-flag.remote {
   color: var(--fm-primary);
   background: color-mix(in srgb, var(--fm-primary) 14%, transparent);
+}
+
+.flow-flag.passthrough {
+  color: var(--fm-muted);
+  background: color-mix(in srgb, var(--fm-muted) 16%, transparent);
 }
 
 .flow-time,
@@ -3169,6 +3881,27 @@ watch(settingsOpen, (open) => {
   flex: none;
 }
 
+/* 直通提示改为中性底 + 主色引导线，避免 info 型整块浅绿底 */
+.detail-error.ant-alert-info {
+  padding: 8px 12px;
+  border: 1px solid var(--fm-border);
+  border-left: 2px solid var(--fm-primary);
+  border-radius: var(--fm-radius-sm);
+  background: var(--fm-surface-alt);
+  color: var(--fm-text-2);
+  font-size: 12px;
+}
+
+.detail-error.ant-alert-info :deep(.ant-alert-icon) {
+  color: var(--fm-primary);
+  font-size: 13px;
+}
+
+.detail-error.ant-alert-info :deep(.ant-alert-message) {
+  color: var(--fm-text-2);
+  font-size: 12px;
+}
+
 .detail-tabs {
   flex: 1;
   min-height: 0;
@@ -3366,6 +4099,14 @@ watch(settingsOpen, (open) => {
   background: var(--fm-surface-alt);
 }
 
+.body-frame {
+  display: block;
+  width: 100%;
+  height: 430px;
+  border: 0;
+  background: #fff;
+}
+
 .raw-block {
   margin-bottom: 10px;
   overflow: hidden;
@@ -3457,6 +4198,18 @@ watch(settingsOpen, (open) => {
   font-size: 10px;
 }
 
+.settings-tag.is-ok {
+  color: var(--fm-success);
+  background: var(--fm-success-soft);
+  border-color: color-mix(in srgb, var(--fm-success) 30%, var(--fm-border));
+}
+
+.settings-tag.is-bad {
+  color: var(--fm-danger);
+  background: var(--fm-danger-soft);
+  border-color: color-mix(in srgb, var(--fm-danger) 30%, var(--fm-border));
+}
+
 .settings-row {
   display: flex;
   align-items: center;
@@ -3473,6 +4226,19 @@ watch(settingsOpen, (open) => {
 
 .settings-select {
   width: 190px;
+}
+
+.settings-wide {
+  width: 240px;
+}
+
+.settings-col {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 7px;
+  font-size: 11.5px;
+  color: var(--fm-text-2);
 }
 
 .settings-line {
@@ -3810,5 +4576,279 @@ watch(settingsOpen, (open) => {
 
 .repeat-result .body-pre {
   max-height: 52vh;
+}
+
+.history-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+.history-filter {
+  width: 260px;
+}
+
+.history-hint {
+  font-size: 10.5px;
+  color: var(--fm-muted);
+}
+
+.history-empty {
+  padding: 18px 12px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--fm-muted);
+  border: 1px dashed var(--fm-border);
+  border-radius: 8px;
+}
+
+.history-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 42vh;
+  overflow: auto;
+}
+
+.history-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--fm-border);
+  border-radius: 8px;
+}
+
+.history-row.active {
+  border-color: var(--fm-primary);
+  background: color-mix(in srgb, var(--fm-primary) 8%, transparent);
+}
+
+.history-row.checked {
+  background: color-mix(in srgb, var(--fm-primary) 5%, transparent);
+}
+
+.history-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  text-align: left;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  color: inherit;
+}
+
+.history-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  overflow: hidden;
+}
+
+.history-title b {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-mode {
+  margin: 0;
+  flex-shrink: 0;
+}
+
+.history-warn {
+  color: var(--fm-warning);
+  font-size: 10.5px;
+  flex-shrink: 0;
+}
+
+.history-meta {
+  font-size: 10.5px;
+  color: var(--fm-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.history-flows {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--fm-border);
+}
+
+.history-flows-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.history-flows-title {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12.5px;
+}
+
+.history-flows-title span {
+  font-size: 10.5px;
+  color: var(--fm-muted);
+}
+
+.history-filters {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.history-keyword {
+  width: 200px;
+}
+
+.history-select {
+  width: 96px;
+}
+
+.history-flow-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 40vh;
+  overflow: auto;
+}
+
+.history-flow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 6px;
+  border: none;
+  border-bottom: 1px solid var(--fm-border);
+  background: none;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  font-size: 11.5px;
+}
+
+.history-flow:hover {
+  background: var(--fm-hover);
+}
+
+.history-flow-url {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-flow-time,
+.history-flow-size {
+  flex-shrink: 0;
+  color: var(--fm-muted);
+  font-size: 10.5px;
+}
+
+.history-flow-size {
+  width: 62px;
+  text-align: right;
+}
+
+.history-pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 8px;
+  font-size: 10.5px;
+  color: var(--fm-muted);
+}
+
+.history-pager > div {
+  display: flex;
+  gap: 6px;
+}
+
+.compare-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+  font-size: 12px;
+}
+
+.compare-head em {
+  font-style: normal;
+  color: var(--fm-muted);
+  font-size: 10.5px;
+}
+
+.compare-table {
+  border: 1px solid var(--fm-border);
+  border-radius: 8px;
+  overflow: auto;
+  max-height: 52vh;
+}
+
+.compare-row {
+  display: grid;
+  grid-template-columns: minmax(220px, 2fr) 60px 60px 76px 76px 76px 130px;
+  gap: 6px;
+  align-items: center;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--fm-border);
+  font-size: 11px;
+}
+
+.compare-row:last-child {
+  border-bottom: none;
+}
+
+.compare-row-head {
+  position: sticky;
+  top: 0;
+  background: var(--fm-surface);
+  color: var(--fm-muted);
+  font-size: 10.5px;
+  z-index: 1;
+}
+
+.compare-req {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.delta-up {
+  color: var(--fm-danger);
+}
+
+.delta-down {
+  color: var(--fm-success);
+}
+
+.compare-only {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+  font-size: 10.5px;
+  color: var(--fm-muted);
+}
+
+.compare-only b {
+  color: var(--fm-text);
 }
 </style>

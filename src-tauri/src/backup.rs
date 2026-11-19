@@ -89,6 +89,12 @@ pub struct BackupItem {
     /// 备份文件内的 schema 版本（读取失败时为 0）
     pub schema_version: i64,
     pub tables: i64,
+    /// 备份创建时的密钥指纹（`app_meta.key_fingerprint`）；1.1.1 之前的老备份为 None
+    pub key_id: Option<String>,
+    /// 与本机当前主密钥是否一致；无法判断（老备份 / 密钥未解锁）时按 true 放行
+    pub key_matches: bool,
+    /// `match` / `mismatch` / `unknown`
+    pub key_state: String,
 }
 
 /// 建一个快照
@@ -145,6 +151,10 @@ fn item_for(path: &Path) -> Result<BackupItem, String> {
         .unwrap_or_default();
     let kind = BackupKind::parse(&name);
     let (schema_version, tables) = inspect(path).unwrap_or((0, 0));
+    let key = inspect_key(path);
+    let local_fingerprint = crate::secret::current_key_fingerprint();
+    let (key_state, key_matches) =
+        key_state_for(key.key_id.as_deref(), local_fingerprint.as_deref());
     let created_at = meta
         .modified()
         .ok()
@@ -160,6 +170,9 @@ fn item_for(path: &Path) -> Result<BackupItem, String> {
         kind_label: kind.label().to_string(),
         schema_version,
         tables,
+        key_id: key.key_id,
+        key_matches,
+        key_state: key_state.to_string(),
     })
 }
 
@@ -177,6 +190,62 @@ fn inspect(path: &Path) -> Option<(i64, i64)> {
         )
         .ok()?;
     Some((version, tables))
+}
+
+/// 备份里的密钥相关元信息（S10）
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupKeyInfo {
+    /// 备份创建时的密钥指纹；老备份为 None
+    pub key_id: Option<String>,
+    /// 备份里是否存在 `enc:v1:` 密文
+    pub has_encrypted_fields: bool,
+    /// 受影响（恢复后可能解不开）的加密字段条数
+    pub affected_secrets: i64,
+}
+
+/// 读备份文件里的密钥指纹与加密字段条数
+///
+/// 备份是 `VACUUM INTO` 的一致性快照，`app_meta` 天然在里面，
+/// 所以不需要旁挂 meta 文件——备份文件自描述，复制到任何地方都不丢信息。
+fn inspect_key(path: &Path) -> BackupKeyInfo {
+    let empty = BackupKeyInfo {
+        key_id: None,
+        has_encrypted_fields: false,
+        affected_secrets: 0,
+    };
+    let Ok(conn) = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        return empty;
+    };
+    let key_id =
+        crate::db::meta_get(&conn, "key_fingerprint").filter(|value| !value.trim().is_empty());
+
+    // 老库 / 精简备份可能没有其中一张表：逐条查询，失败就跳过，不影响恢复校验
+    let mut affected = 0i64;
+    for sql in [
+        "SELECT COUNT(*) FROM env_variables WHERE value LIKE 'enc:v1:%'",
+        "SELECT COUNT(*) FROM ai_providers WHERE api_key_enc LIKE 'enc:v1:%'",
+    ] {
+        if let Ok(count) = conn.query_row(sql, [], |row| row.get::<_, i64>(0)) {
+            affected += count;
+        }
+    }
+
+    BackupKeyInfo {
+        key_id,
+        has_encrypted_fields: affected > 0,
+        affected_secrets: affected,
+    }
+}
+
+/// 密钥状态判定：只有「两边都有指纹且不同」才算 mismatch；
+/// 缺任一侧都按 unknown 放行——老备份和口令未解锁时不能凭空阻断恢复。
+fn key_state_for(backup_id: Option<&str>, local_id: Option<&str>) -> (&'static str, bool) {
+    match (backup_id, local_id) {
+        (Some(backup), Some(local)) if backup == local => ("match", true),
+        (Some(_), Some(_)) => ("mismatch", false),
+        _ => ("unknown", true),
+    }
 }
 
 /// 列出全部备份（新的在前）
@@ -280,6 +349,82 @@ pub fn has_pending_restore(config_file: &Path) -> bool {
     restore_marker(config_file).exists()
 }
 
+/// 恢复预览：恢复前告诉前端「这份备份的钥匙和本机是否一致、
+/// 恢复后有多少条密钥需要重填」，让用户带着影响面做决定
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestorePlan {
+    pub item: BackupItem,
+    pub key_id: Option<String>,
+    pub key_state: String,
+    pub key_matches: bool,
+    pub affected_secrets: i64,
+}
+
+/// 只校验并生成预览，不写恢复标记
+pub fn restore_preview(path: &Path) -> Result<RestorePlan, String> {
+    let item = validate(path)?;
+    let key = inspect_key(path);
+    let local_fingerprint = crate::secret::current_key_fingerprint();
+    let (key_state, key_matches) =
+        key_state_for(key.key_id.as_deref(), local_fingerprint.as_deref());
+    Ok(RestorePlan {
+        item,
+        key_id: key.key_id,
+        key_state: key_state.to_string(),
+        key_matches,
+        affected_secrets: key.affected_secrets,
+    })
+}
+
+/// 恢复前置校验 + 写「待恢复」标记。两个恢复入口（本地备份 / 异地备份）共用，
+/// 避免只拦一个入口就能绕过密钥校验。
+///
+/// `accept` 为 false 且密钥不一致时返回 `E_KEY_MISMATCH`，且**不写**标记。
+pub fn prepare_restore(
+    config_file: &Path,
+    path: &Path,
+    accept: bool,
+) -> Result<RestorePlan, String> {
+    let plan = restore_preview(path)?;
+    prepare_restore_with_plan(config_file, path, plan, accept)
+}
+
+fn prepare_restore_with_plan(
+    config_file: &Path,
+    path: &Path,
+    plan: RestorePlan,
+    accept: bool,
+) -> Result<RestorePlan, String> {
+    if plan.key_state == "mismatch" && !accept {
+        return Err(format!(
+            "E_KEY_MISMATCH: 该备份由另一台机器/另一把主密钥创建，恢复后约 {} 条密钥需要重新填写。\
+如确认继续，请传 acceptKeyMismatch=true（密文会保留，但当前主密钥解不开）",
+            plan.affected_secrets
+        ));
+    }
+    mark_restore(config_file, path)?;
+    Ok(plan)
+}
+
+/// 测试 / 预检用：指定「本机指纹」再判定，避免依赖全局密钥单例
+#[cfg(test)]
+fn restore_preview_with_local(
+    path: &Path,
+    local_fingerprint: Option<&str>,
+) -> Result<RestorePlan, String> {
+    let item = validate(path)?;
+    let key = inspect_key(path);
+    let (key_state, key_matches) = key_state_for(key.key_id.as_deref(), local_fingerprint);
+    Ok(RestorePlan {
+        item,
+        key_id: key.key_id,
+        key_state: key_state.to_string(),
+        key_matches,
+        affected_secrets: key.affected_secrets,
+    })
+}
+
 /// 启动时执行待恢复：备份当前库 → 删旧文件（含 -wal/-shm）→ 复制备份 → 删标记
 ///
 /// 必须在 `open_pool` 之前调用，否则池里已有连接，替换文件会写坏库。
@@ -333,6 +478,19 @@ pub fn apply_pending_restore(
         }
     }
     std::fs::copy(&source, &db_file).map_err(|e| format!("复制备份失败：{e}"))?;
+
+    // 记录恢复来源：此时连接池尚未建立（state.rs 在 open_pool 之前调用本函数），
+    // 自开一次连接写 app_meta，写完立即关闭，赶在建池之前完成。
+    // 写失败不阻断恢复——来源只是给设置页解释「密钥为什么不匹配」用的。
+    if let Ok(conn) = Connection::open(&db_file) {
+        let source_name = source
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| source.to_string_lossy().to_string());
+        let _ = db::meta_set(&conn, "restore.source", &source_name);
+        let _ = db::meta_set(&conn, "restore.at", &crate::util::now_ms().to_string());
+    }
+
     let _ = std::fs::remove_file(&marker);
     log::info!("已从备份恢复：{}", source.display());
     Ok(Some(source.to_string_lossy().to_string()))
@@ -467,6 +625,9 @@ mod tests {
         let conn = pool.get().unwrap();
         conn.execute_batch(
             "CREATE TABLE demo (id INTEGER PRIMARY KEY, name TEXT);
+             CREATE TABLE app_meta (key TEXT PRIMARY KEY, value TEXT);
+             CREATE TABLE env_variables (id INTEGER PRIMARY KEY, is_secret INTEGER, value TEXT);
+             CREATE TABLE ai_providers (id INTEGER PRIMARY KEY, api_key_enc TEXT);
              INSERT INTO demo (name) VALUES ('a'), ('b');
              PRAGMA user_version = 2;",
         )
@@ -517,6 +678,128 @@ mod tests {
         }
         let error = validate(Path::new(&item.path)).unwrap_err();
         assert!(error.contains("更高版本"), "实际：{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn key_state_covers_match_mismatch_and_unknown() {
+        assert_eq!(key_state_for(Some("aaaa"), Some("aaaa")), ("match", true));
+        assert_eq!(
+            key_state_for(Some("aaaa"), Some("bbbb")),
+            ("mismatch", false)
+        );
+        assert_eq!(key_state_for(None, Some("bbbb")), ("unknown", true));
+        assert_eq!(key_state_for(Some("aaaa"), None), ("unknown", true));
+        assert_eq!(key_state_for(None, None), ("unknown", true));
+    }
+
+    #[test]
+    fn backup_records_key_id_and_affected_secrets() {
+        let (dir, pool) = temp_state("key-id");
+        {
+            let conn = pool.get().unwrap();
+            conn.execute(
+                "INSERT INTO app_meta (key, value) VALUES ('key_fingerprint', 'deadbeefdeadbeef')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO env_variables (is_secret, value) VALUES (1, 'enc:v1:abc')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO ai_providers (api_key_enc) VALUES ('enc:v1:def')",
+                [],
+            )
+            .unwrap();
+        }
+        let item = create(&pool, &dir, BackupKind::Manual).unwrap();
+        assert_eq!(item.key_id.as_deref(), Some("deadbeefdeadbeef"));
+
+        let key = inspect_key(Path::new(&item.path));
+        assert_eq!(key.key_id.as_deref(), Some("deadbeefdeadbeef"));
+        assert!(key.has_encrypted_fields);
+        assert_eq!(key.affected_secrets, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_rejects_wrong_key_by_default() {
+        let (dir, pool) = temp_state("restore-wrong");
+        {
+            let conn = pool.get().unwrap();
+            conn.execute(
+                "INSERT INTO app_meta (key, value) VALUES ('key_fingerprint', 'aaaa')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO env_variables (is_secret, value) VALUES (1, 'enc:v1:abc')",
+                [],
+            )
+            .unwrap();
+        }
+        let item = create(&pool, &dir, BackupKind::Manual).unwrap();
+        let plan = restore_preview_with_local(Path::new(&item.path), Some("bbbb")).unwrap();
+        assert_eq!(plan.key_state, "mismatch");
+        assert!(!plan.key_matches);
+        assert_eq!(plan.affected_secrets, 1);
+
+        let config = dir.join("config").join("storage.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let marker = config.parent().unwrap().join("restore.pending");
+
+        let error =
+            prepare_restore_with_plan(&config, Path::new(&item.path), plan, false).unwrap_err();
+        assert!(error.starts_with("E_KEY_MISMATCH"), "实际：{error}");
+        assert!(!marker.exists(), "默认必须不写恢复标记");
+
+        let plan = restore_preview_with_local(Path::new(&item.path), Some("bbbb")).unwrap();
+        let accepted =
+            prepare_restore_with_plan(&config, Path::new(&item.path), plan, true).unwrap();
+        assert!(!accepted.key_matches);
+        assert!(marker.exists(), "确认后必须写恢复标记");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_tolerates_backup_without_fingerprint() {
+        let (dir, pool) = temp_state("restore-unknown");
+        let item = create(&pool, &dir, BackupKind::Manual).unwrap();
+        // 老备份（1.1.1 之前）没有 key_fingerprint
+        {
+            let conn = Connection::open(&item.path).unwrap();
+            conn.execute("DELETE FROM app_meta WHERE key = 'key_fingerprint'", [])
+                .unwrap();
+        }
+        let plan = restore_preview_with_local(Path::new(&item.path), Some("bbbb")).unwrap();
+        assert_eq!(plan.key_state, "unknown");
+        assert!(plan.key_matches);
+
+        let config = dir.join("config").join("storage.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let marker = config.parent().unwrap().join("restore.pending");
+        prepare_restore_with_plan(&config, Path::new(&item.path), plan, false).unwrap();
+        assert!(marker.exists(), "老备份应默认放行");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_writes_source_meta_after_apply() {
+        let (dir, pool) = temp_state("restore-meta");
+        let item = create(&pool, &dir, BackupKind::Manual).unwrap();
+        let config = dir.join("config").join("storage.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        mark_restore(&config, Path::new(&item.path)).unwrap();
+
+        let restored = apply_pending_restore(&config, &dir).unwrap();
+        assert!(restored.is_some());
+
+        let conn = Connection::open(dir.join(crate::state::DB_FILE)).unwrap();
+        let source = crate::db::meta_get(&conn, "restore.source").unwrap();
+        assert_eq!(source, item.name);
+        assert!(crate::db::meta_get(&conn, "restore.at").is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

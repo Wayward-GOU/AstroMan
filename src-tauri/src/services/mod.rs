@@ -12,6 +12,7 @@ pub mod contract;
 pub mod diagnostics;
 pub mod docs;
 pub mod docs_site;
+pub mod external_metrics;
 pub mod faker;
 pub mod graphql;
 pub mod mock;

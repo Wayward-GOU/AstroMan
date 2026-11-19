@@ -21,7 +21,11 @@ mod seed;
 /// 15 = 压测 v1.1.1（plan 的 request_id 可空且 SET NULL、机器容量表、
 ///      报告分组 / 响应体耗时直方图 / TopN 慢请求、采样响应体耗时）
 /// 16 = 分布式压测一期（cluster_jobs / cluster_workers，报告仍复用 test_reports）
-pub const DB_VERSION: i64 = 16;
+/// 17 = 压测增量落库与外部指标（stress_job_samples / stress_job_meta、
+///      test_reports.external_metrics_json）
+/// 18 = 抓包会话归档（capture_sessions / capture_flows / capture_bodies）
+/// 19 = 分布式压测二期三期（cluster_devices、cluster_jobs.orchestration_json）
+pub const DB_VERSION: i64 = 19;
 
 /// 每条连接都要应用的 SQLite 参数（P-06）。
 ///
@@ -113,6 +117,7 @@ pub fn init(pool: &DbPool) -> Result<(), String> {
     migrate(pool)?;
     verify_core_tables(pool)?;
     recover_interrupted_runs(pool)?;
+    recover_interrupted_stress_jobs(pool)?;
     seed_database(pool)
 }
 
@@ -155,6 +160,272 @@ fn recover_interrupted_runs(pool: &DbPool) -> Result<(), String> {
     Ok(())
 }
 
+/// v17 / R3：崩溃恢复。运行期每秒把采样追加进 `stress_job_samples`，
+/// 正常结束由 `save_report` 在同一事务里标记 `saved` 并删除临时样本；
+/// 启动时看到 `running` / `failed` 的任务头，就用已落盘的样本生成「不完整」报告。
+///
+/// 不自动续跑：续跑会产生时间轴断裂的报告，误导性大于价值。
+fn recover_interrupted_stress_jobs(pool: &DbPool) -> Result<(), String> {
+    let conn = pool.get().map_err(err)?;
+
+    // 报告已提交、只差清理任务头：直接收尾，不重复生成报告
+    conn.execute(
+        "DELETE FROM stress_job_samples
+         WHERE job_id IN (SELECT job_id FROM stress_job_meta WHERE status = 'saved')",
+        [],
+    )
+    .map_err(err)?;
+    conn.execute("DELETE FROM stress_job_meta WHERE status = 'saved'", [])
+        .map_err(err)?;
+
+    type PendingStressJob = (i64, Option<i64>, Option<String>, String, i64);
+    let jobs: Vec<PendingStressJob> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT job_id, plan_id, plan_name, config_json, started_at
+                 FROM stress_job_meta WHERE status IN ('running', 'failed')",
+            )
+            .map_err(err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .map_err(err)?;
+        rows.filter_map(Result::ok).collect()
+    };
+
+    for (job_id, plan_id, plan_name, config_json, started_at) in jobs {
+        let samples = match load_job_samples(&conn, job_id) {
+            Ok(samples) => samples,
+            Err(error) => {
+                log::warn!("读取中断压测 #{} 的采样失败：{error}", job_id);
+                continue;
+            }
+        };
+        if samples.is_empty() {
+            // 启动后立刻被强杀：没有任何可用数据，清掉任务头即可
+            let _ = conn.execute(
+                "DELETE FROM stress_job_meta WHERE job_id = ?1",
+                rusqlite::params![job_id],
+            );
+            continue;
+        }
+        if let Err(error) = build_partial_report(
+            &conn,
+            plan_id,
+            plan_name.as_deref(),
+            &config_json,
+            started_at,
+            &samples,
+        ) {
+            // 保留现场，下次启动再试；宁可不生成，也不要写出半条坏报告
+            log::warn!("恢复中断压测 #{} 失败：{error}", job_id);
+            continue;
+        }
+        let _ = conn.execute(
+            "DELETE FROM stress_job_samples WHERE job_id = ?1",
+            rusqlite::params![job_id],
+        );
+        let _ = conn.execute(
+            "DELETE FROM stress_job_meta WHERE job_id = ?1",
+            rusqlite::params![job_id],
+        );
+        log::info!(
+            "已把中断压测 #{} 恢复为不完整报告（{} 个采样点）",
+            job_id,
+            samples.len()
+        );
+    }
+    Ok(())
+}
+
+fn load_job_samples(
+    conn: &rusqlite::Connection,
+    job_id: i64,
+) -> Result<Vec<crate::models::ReportSample>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT elapsed_sec, concurrent, qps, avg_rt, p50_rt, p95_rt, p99_rt,
+                    ttfb_avg, body_avg, body_p95, bytes, success_count, error_count
+             FROM stress_job_samples WHERE job_id = ?1 ORDER BY elapsed_sec ASC",
+        )
+        .map_err(err)?;
+    let samples = stmt
+        .query_map(rusqlite::params![job_id], |row| {
+            Ok(crate::models::ReportSample {
+                elapsed_sec: row.get::<_, i64>(0)?.max(0) as u64,
+                concurrent: row.get::<_, i64>(1)?.max(0) as u32,
+                qps: row.get(2)?,
+                avg_rt: row.get(3)?,
+                p50_rt: row.get(4)?,
+                p95_rt: row.get(5)?,
+                p99_rt: row.get(6)?,
+                ttfb_avg: row.get(7)?,
+                body_avg: row.get(8)?,
+                body_p95: row.get(9)?,
+                bytes: row.get::<_, i64>(10)?.max(0) as u64,
+                success_count: row.get::<_, i64>(11)?.max(0) as u64,
+                error_count: row.get::<_, i64>(12)?.max(0) as u64,
+            })
+        })
+        .map_err(err)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(err)?;
+    Ok(samples)
+}
+
+/// 用已落盘采样拼一份「不完整」报告：状态 `interrupted`，配置快照标记 `partial`。
+/// 分位与均值只能按每秒样本加权回算，因此不参与基线对比，健康结论由前端强制 fail。
+fn build_partial_report(
+    conn: &rusqlite::Connection,
+    plan_id: Option<i64>,
+    plan_name: Option<&str>,
+    config_json: &str,
+    started_at: i64,
+    samples: &[crate::models::ReportSample],
+) -> Result<(), String> {
+    use crate::models::ReportSample;
+
+    let requests: i64 = samples
+        .iter()
+        .map(|s| (s.success_count + s.error_count) as i64)
+        .sum();
+    let success: i64 = samples.iter().map(|s| s.success_count as i64).sum();
+    let errors: i64 = samples.iter().map(|s| s.error_count as i64).sum();
+    let bytes: i64 = samples.iter().map(|s| s.bytes as i64).sum();
+    let last_sec = samples.iter().map(|s| s.elapsed_sec).max().unwrap_or(0);
+    let max_qps = samples.iter().map(|s| s.qps).fold(0.0, f64::max);
+    let avg_qps = if last_sec > 0 {
+        requests as f64 / last_sec as f64
+    } else {
+        0.0
+    };
+    let weighted = |get: fn(&ReportSample) -> f64| -> f64 {
+        if requests > 0 {
+            samples
+                .iter()
+                .map(|s| get(s) * (s.success_count + s.error_count) as f64)
+                .sum::<f64>()
+                / requests as f64
+        } else {
+            0.0
+        }
+    };
+    let min_rt = samples
+        .iter()
+        .map(|s| s.avg_rt)
+        .reduce(f64::min)
+        .unwrap_or(0.0);
+    let max_rt = samples
+        .iter()
+        .map(|s| s.avg_rt)
+        .reduce(f64::max)
+        .unwrap_or(0.0);
+    let concurrency = samples.last().map(|s| s.concurrent as i64).unwrap_or(0);
+
+    let mut config: serde_json::Value =
+        serde_json::from_str(config_json).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(map) = config.as_object_mut() {
+        map.insert("partial".to_string(), serde_json::json!(true));
+        map.insert(
+            "partialReason".to_string(),
+            serde_json::json!("运行中断，已恢复已落盘采样（未续跑）"),
+        );
+        map.insert(
+            "restoredAt".to_string(),
+            serde_json::json!(crate::util::now_ms()),
+        );
+        map.insert("dataCutoffSec".to_string(), serde_json::json!(last_sec));
+        map.insert(
+            "restoredSamples".to_string(),
+            serde_json::json!(samples.len()),
+        );
+    }
+
+    let end_time = started_at + (last_sec as i64) * 1000;
+    conn.execute(
+        "INSERT INTO test_reports
+            (plan_id, plan_name, total_requests, success_count, error_count,
+             avg_rt, min_rt, max_rt, p50_rt, p75_rt, p90_rt, p95_rt, p99_rt, p999_rt,
+             stddev_rt, ttfb_avg, ttfb_p95, apdex, bytes_total, max_qps, avg_qps,
+             target_rps, error_rate, concurrency, status, config_json, start_time, end_time, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                 ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, 'interrupted',
+                 ?25, ?26, ?27, ?28)",
+        rusqlite::params![
+            plan_id,
+            plan_name.unwrap_or("压测（运行中断）"),
+            requests,
+            success,
+            errors,
+            weighted(|s| s.avg_rt),
+            min_rt,
+            max_rt,
+            weighted(|s| s.p50_rt),
+            weighted(|s| s.p95_rt),
+            weighted(|s| s.p95_rt),
+            weighted(|s| s.p95_rt),
+            weighted(|s| s.p99_rt),
+            weighted(|s| s.p99_rt),
+            0.0,
+            weighted(|s| s.ttfb_avg),
+            weighted(|s| s.ttfb_avg),
+            0.0,
+            bytes,
+            max_qps,
+            avg_qps,
+            0.0,
+            if requests > 0 {
+                errors as f64 / requests as f64 * 100.0
+            } else {
+                0.0
+            },
+            concurrency,
+            config.to_string(),
+            started_at,
+            end_time,
+            crate::util::now_ms(),
+        ],
+    )
+    .map_err(err)?;
+    let report_id = conn.last_insert_rowid();
+
+    let mut stmt = conn
+        .prepare(
+            "INSERT INTO report_samples
+                (report_id, elapsed_sec, concurrent, qps, avg_rt, p50_rt, p95_rt, p99_rt,
+                 ttfb_avg, body_avg, body_p95, bytes, success_count, error_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        )
+        .map_err(err)?;
+    for sample in samples {
+        stmt.execute(rusqlite::params![
+            report_id,
+            sample.elapsed_sec as i64,
+            sample.concurrent as i64,
+            sample.qps,
+            sample.avg_rt,
+            sample.p50_rt,
+            sample.p95_rt,
+            sample.p99_rt,
+            sample.ttfb_avg,
+            sample.body_avg,
+            sample.body_p95,
+            sample.bytes as i64,
+            sample.success_count as i64,
+            sample.error_count as i64,
+        ])
+        .map_err(err)?;
+    }
+    Ok(())
+}
+
 /// 存量表补列清单：(表, 列, 列定义)
 ///
 /// 改成结构化清单而不是整条 SQL，是为了在执行前先 `PRAGMA table_info` 判存：
@@ -178,6 +449,10 @@ const COLUMN_MIGRATIONS: &[(&str, &str, &str)] = &[
     // v1.0.8 压测报告：可编辑的场景描述与总结
     ("test_reports", "scenario_text", "TEXT"),
     ("test_reports", "summary_text", "TEXT"),
+    // v17：外部监控指标序列（R5），列表查询不带该列，详情读取
+    ("test_reports", "external_metrics_json", "TEXT"),
+    // v17：并发透视的每秒 worker 状态分布（R8），仅详情读取
+    ("test_reports", "worker_states_json", "TEXT"),
     ("report_samples", "p50_rt", "REAL DEFAULT 0"),
     ("report_samples", "ttfb_avg", "REAL DEFAULT 0"),
     ("report_samples", "bytes", "INTEGER DEFAULT 0"),
@@ -231,6 +506,8 @@ const COLUMN_MIGRATIONS: &[(&str, &str, &str)] = &[
         "response_body_truncated",
         "INTEGER NOT NULL DEFAULT 0",
     ),
+    // v19：计划级编排定义（cluster_jobs 在 v16 建表，老库需补列）
+    ("cluster_jobs", "orchestration_json", "TEXT"),
     // v1.0.8：耗时分解、响应体类型、按请求网络配置
     ("request_history", "timings_json", "TEXT"),
     ("request_history", "body_kind", "TEXT"),
@@ -507,6 +784,111 @@ mod tests {
             .with_init(|conn| conn.execute_batch(&connection_pragmas()));
         let pool = r2d2::Pool::builder().max_size(2).build(manager).unwrap();
         (dir, pool)
+    }
+
+    #[test]
+    fn crash_recovery_builds_partial_report() {
+        let (dir, pool) = temp_pool("recover-stress");
+        init(&pool).unwrap();
+        {
+            let conn = pool.get().unwrap();
+            conn.execute(
+                "INSERT INTO stress_job_meta
+                    (job_id, plan_id, plan_name, config_json, started_at, status)
+                 VALUES (42, NULL, 'crash', '{\"mode\":\"fixed\"}', 1000, 'running')",
+                [],
+            )
+            .unwrap();
+            for sec in 1..=5 {
+                conn.execute(
+                    "INSERT INTO stress_job_samples
+                        (job_id, elapsed_sec, concurrent, qps, avg_rt, p50_rt, p95_rt, p99_rt,
+                         ttfb_avg, body_avg, body_p95, bytes, success_count, error_count, created_at)
+                     VALUES (42, ?1, 10, 100, 20, 18, 40, 60, 8, 5, 9, 1000, 9, 1, 1000)",
+                    params![sec],
+                )
+                .unwrap();
+            }
+        }
+        recover_interrupted_stress_jobs(&pool).unwrap();
+
+        let conn = pool.get().unwrap();
+        let (status, total, config_text): (String, i64, String) = conn
+            .query_row(
+                "SELECT status, total_requests, config_json FROM test_reports
+                 WHERE plan_name = 'crash'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "interrupted");
+        assert_eq!(total, 50);
+        let config: serde_json::Value = serde_json::from_str(&config_text).unwrap();
+        assert_eq!(config["partial"], true);
+        assert_eq!(config["dataCutoffSec"], 5);
+
+        let samples: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM report_samples
+                 WHERE report_id = (SELECT id FROM test_reports WHERE plan_name = 'crash')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(samples, 5);
+
+        let leftovers: i64 = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM stress_job_meta WHERE job_id = 42)
+                        + (SELECT COUNT(*) FROM stress_job_samples WHERE job_id = 42)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(leftovers, 0, "恢复后必须删除临时行");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saved_job_is_cleaned_without_duplicate_report() {
+        let (dir, pool) = temp_pool("recover-saved");
+        init(&pool).unwrap();
+        {
+            let conn = pool.get().unwrap();
+            conn.execute(
+                "INSERT INTO stress_job_meta
+                    (job_id, plan_id, plan_name, config_json, started_at, status)
+                 VALUES (7, NULL, 'saved', '{}', 1000, 'saved')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO stress_job_samples
+                    (job_id, elapsed_sec, concurrent, qps, created_at)
+                 VALUES (7, 1, 1, 1, 1000)",
+                [],
+            )
+            .unwrap();
+        }
+        recover_interrupted_stress_jobs(&pool).unwrap();
+        let conn = pool.get().unwrap();
+        let reports: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM test_reports WHERE plan_name = 'saved'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reports, 0, "已保存的任务不应再生成报告");
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM stress_job_samples", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 0);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

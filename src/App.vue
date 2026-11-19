@@ -61,7 +61,7 @@ const backKeyText = isMac ? '⌥ ←' : 'Alt + ←'
 
 function goBackPage() {
   const target = stepBack()
-  if (target) router.push(target)
+  if (target) void router.push(target)
 }
 
 const ZOOM_KEY = 'fm-zoom'
@@ -100,15 +100,15 @@ async function applyZoom(value: number, persist = true) {
 }
 
 function zoomIn() {
-  applyZoom(zoom.value + ZOOM_STEP)
+  void applyZoom(zoom.value + ZOOM_STEP)
 }
 
 function zoomOut() {
-  applyZoom(zoom.value - ZOOM_STEP)
+  void applyZoom(zoom.value - ZOOM_STEP)
 }
 
 function resetZoom() {
-  applyZoom(1)
+  void applyZoom(1)
 }
 
 function onZoomHotkey(event: KeyboardEvent) {
@@ -257,7 +257,7 @@ const paletteIndex = ref(0)
 const paletteInput = ref<{ focus: () => void } | null>(null)
 
 function go(path: string) {
-  router.push(path)
+  void router.push(path)
 }
 
 function cycleTheme() {
@@ -301,7 +301,7 @@ const paletteCommands = computed<PaletteItem[]>(() => [
     hint: '从 GitHub 获取最新版本',
     group: '应用',
     run: () => {
-      checkForUpdates({ silent: false })
+      void checkForUpdates({ silent: false })
     },
   },
 ])
@@ -322,7 +322,7 @@ function openPalette() {
   paletteQuery.value = ''
   paletteIndex.value = 0
   paletteOpen.value = true
-  nextTick(() => paletteInput.value?.focus())
+  void nextTick(() => paletteInput.value?.focus())
 }
 
 function runPalette(index: number) {
@@ -396,7 +396,7 @@ onMounted(() => {
   applyMotionPreference()
   if (isBare.value) return
   const stored = Number(localStorage.getItem(ZOOM_KEY) ?? '1')
-  applyZoom(Number.isFinite(stored) && stored > 0 ? stored : 1, false)
+  void applyZoom(Number.isFinite(stored) && stored > 0 ? stored : 1, false)
   syncSidebarWidth()
   window.addEventListener('resize', syncSidebarWidth)
   window.addEventListener('keydown', onZoomHotkey)
@@ -431,7 +431,7 @@ onMounted(() => {
   // 启动后静默检查一次 GitHub 最新版本，有更新才提示
   if (isAutoUpdateEnabled()) {
     window.setTimeout(() => {
-      checkForUpdates({ silent: true })
+      void checkForUpdates({ silent: true })
     }, 5000)
   }
 })

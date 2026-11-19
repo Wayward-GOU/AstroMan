@@ -1,6 +1,16 @@
 use std::collections::HashMap;
 
 use crate::state::AppState;
+
+type EnvSnapshotCache = HashMap<i64, (String, Vec<String>, HashMap<String, String>)>;
+type PlanExportRow = (
+    String,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 use crate::util::{err, now_ms, render};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -381,10 +391,7 @@ fn enrich_plan_config(
             .optional()
             .map_err(err)?
             .ok_or_else(|| "计划绑定的环境不存在或已删除".to_string())?,
-        None => match project_active_env(conn, project_id)? {
-            Some(env) => env,
-            None => (0, String::new()),
-        },
+        None => project_active_env(conn, project_id)?.unwrap_or_default(),
     };
     if env.0 > 0 {
         map.insert("envId".to_string(), json!(env.0));
@@ -640,17 +647,9 @@ pub fn plan_export(
     let include_sensitive = include_sensitive.unwrap_or(false);
     let conn = state.pool.get().map_err(err)?;
     let mut plans = Vec::new();
-    let mut env_cache: HashMap<i64, (String, Vec<String>, HashMap<String, String>)> =
-        HashMap::new();
+    let mut env_cache: EnvSnapshotCache = HashMap::new();
     for id in plan_ids {
-        let row: Option<(
-            String,
-            Option<String>,
-            Option<i64>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        )> = conn
+        let row: Option<PlanExportRow> = conn
             .query_row(
                 "SELECT p.name, pr.name, p.request_id, r.method, r.url, p.config_json
                  FROM test_plans p
@@ -706,7 +705,7 @@ pub fn plan_export(
 
         let env = match env_id {
             Some(env_id) => {
-                if !env_cache.contains_key(&env_id) {
+                if let std::collections::hash_map::Entry::Vacant(entry) = env_cache.entry(env_id) {
                     let name: Option<String> = conn
                         .query_row(
                             "SELECT name FROM environments WHERE id = ?1",
@@ -719,7 +718,7 @@ pub fn plan_export(
                         crate::commands::http::load_vars(&conn, env_id).unwrap_or_default();
                     let mut keys: Vec<String> = vars_map.keys().cloned().collect();
                     keys.sort();
-                    env_cache.insert(env_id, (name.unwrap_or_default(), keys, vars_map));
+                    entry.insert((name.unwrap_or_default(), keys, vars_map));
                 }
                 env_cache
                     .get(&env_id)

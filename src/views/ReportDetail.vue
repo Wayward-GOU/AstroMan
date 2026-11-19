@@ -2,7 +2,7 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
-import { save } from '@tauri-apps/plugin-dialog'
+import { open as openDialog, save } from '@tauri-apps/plugin-dialog'
 import {
   ArrowLeftOutlined,
   DeleteOutlined,
@@ -12,6 +12,7 @@ import {
   DownOutlined,
   EyeOutlined,
   CopyOutlined,
+  ImportOutlined,
 } from '@ant-design/icons-vue'
 import AiSparkIcon from '@/components/AiSparkIcon.vue'
 import PageHeader from '@/components/PageHeader.vue'
@@ -20,11 +21,30 @@ import { useAiAssistStore } from '@/stores/aiAssist'
 import { reportReviewPrompt } from '@/utils/aiScenarios'
 import { formatDateTime } from '@/utils/datetime'
 import * as api from '@/api'
-import type { ReportDetail, ReportRequestRecord, ReportRequestsPage } from '@/types/models'
+import type {
+  ReportDetail,
+  ReportRequestRecord,
+  ReportRequestsPage,
+  WorkerStateSample,
+} from '@/types/models'
 import type { ClusterReportMeta } from '@/types/cluster'
 import { buildReportHtml, buildReportSheets } from '@/utils/reportExport'
-import { detectKnee, qpsOverview, scoreReport, selfCheck } from '@/utils/reportAnalytics'
-import { buildFindings, gradeReport, latencyDrift, type Finding } from '@/utils/reportNarrative'
+import {
+  detectKnee,
+  diagnoseWorkerStates,
+  qpsOverview,
+  scoreReport,
+  selfCheck,
+} from '@/utils/reportAnalytics'
+import {
+  alignMetric,
+  buildFindings,
+  externalMetricFindings,
+  gradeReport,
+  latencyDrift,
+  unitLabel,
+  type Finding,
+} from '@/utils/reportNarrative'
 import { buildXlsx } from '@/utils/xlsx'
 import { copyToClipboard } from '@/utils/clipboard'
 
@@ -139,14 +159,14 @@ async function loadRequests() {
 
 function onRequestFilterChange() {
   requestPage.value = 1
-  loadRequests()
+  void loadRequests()
 }
 
 function onRequestPageChange(page: number, pageSize: number) {
   const size = Number(pageSize)
   requestPage.value = size === requestPageSize.value ? page : 1
   requestPageSize.value = size
-  loadRequests()
+  void loadRequests()
 }
 
 onMounted(async () => {
@@ -161,6 +181,13 @@ onMounted(async () => {
 })
 
 const report = computed(() => detail.value?.report ?? null)
+
+const statusLabel = computed(() => {
+  const status = report.value?.status
+  if (status === 'interrupted') return '运行中断'
+  if (status === 'stopped') return '已停止'
+  return '已完成'
+})
 
 const aiAssist = useAiAssistStore()
 
@@ -262,10 +289,16 @@ const stageRows = computed(() => {
 })
 const score = computed(() => (detail.value ? scoreReport(detail.value) : null))
 const checks = computed(() => (detail.value ? selfCheck(detail.value) : []))
-const checksPassed = computed(() => checks.value.every((item) => item.pass))
 
 /* ---------- 关键发现与结论（3.4.1） ---------- */
-const findings = computed<Finding[]>(() => (detail.value ? buildFindings(detail.value) : []))
+const findings = computed<Finding[]>(() => {
+  if (!detail.value) return []
+  return [
+    ...workerFindings.value,
+    ...externalFindings.value,
+    ...buildFindings(detail.value),
+  ]
+})
 const gradeInfo = computed(() => (detail.value ? gradeReport(detail.value) : null))
 
 const FINDING_TAG: Record<Finding['level'], string> = {
@@ -330,7 +363,9 @@ async function loadBaseline() {
   }
   baselineLoading.value = true
   try {
-    baseline.value = await api.reportGet(id)
+    const detail = await api.reportGet(id)
+    // 中断报告不完整，不能作为基线参与对比（R3）
+    baseline.value = detail.report.status === 'interrupted' ? null : detail
   } catch {
     baseline.value = null
   } finally {
@@ -492,10 +527,77 @@ function clearDetails() {
 
 const chartLabels = computed(() => samples.value.map((s) => `${s.elapsedSec}s`))
 
+/* ---------- 并发透视（R8） ---------- */
+const workerStates = computed(() => detail.value?.workerStates ?? [])
+
+const WORKER_SERIES: Array<{ key: keyof WorkerStateSample; name: string; color: string }> = [
+  { key: 'readBody', name: '读取响应体', color: '#5b8def' },
+  { key: 'awaitHeader', name: '等待首字节', color: 'var(--fm-primary)' },
+  { key: 'rateWait', name: '限速等待', color: 'var(--fm-warning)' },
+  { key: 'idle', name: '空闲', color: '#94a3b8' },
+  { key: 'rampWait', name: '升压等待', color: '#8b5cf6' },
+  { key: 'stageWait', name: '阶段等待', color: '#64748b' },
+  { key: 'think', name: '思考时间', color: '#14b8a6' },
+  { key: 'done', name: '已完成', color: 'var(--fm-success)' },
+]
+
+const workerSeries = computed(() =>
+  WORKER_SERIES.map((item) => ({
+    name: item.name,
+    color: item.color,
+    values: workerStates.value.map((sample) => Number(sample[item.key]) || 0),
+  })),
+)
+const workerLabels = computed(() => workerStates.value.map((item) => `${item.elapsedSec}s`))
+
+/** 客户端视角的自动诊断：统一标 P1，措辞「疑似」，供报告 findings 使用 */
+const workerFindings = computed<Finding[]>(() =>
+  diagnoseWorkerStates(workerStates.value, { errorTypes: errorTypes.value }).map((item) => ({
+    level: 'warn',
+    title: item.label,
+    detail: item.detail,
+  })),
+)
+
 const qpsSeries = computed(() => [
   { name: 'QPS', color: 'var(--fm-primary)', values: samples.value.map((s) => s.qps) },
   { name: '并发', color: 'var(--fm-muted)', values: samples.value.map((s) => s.concurrent) },
 ])
+
+/* ---------- 外部指标（R11） ---------- */
+const externalMetrics = computed(() => detail.value?.report.externalMetrics ?? [])
+
+const externalFindings = computed<Finding[]>(() =>
+  detail.value ? externalMetricFindings(detail.value) : [],
+)
+
+const EXTERNAL_COLORS = [
+  '#8b5cf6',
+  '#14b8a6',
+  '#f59e0b',
+  '#ef4444',
+  '#3b82f6',
+  '#ec4899',
+  '#22c55e',
+  '#0ea5e9',
+  '#a855f7',
+  '#64748b',
+]
+
+const externalChartSeries = computed(() => {
+  if (!externalMetrics.value.length) return []
+  const seconds = samples.value.map((item) => item.elapsedSec)
+  return [
+    { name: 'QPS', color: 'var(--fm-primary)', values: samples.value.map((item) => item.qps) },
+    ...externalMetrics.value.map((item, index) => ({
+      name: `${item.source} · ${item.metric} (${item.unit})`,
+      color: EXTERNAL_COLORS[index % EXTERNAL_COLORS.length],
+      values: alignMetric(item.points, seconds),
+      axis: 'right' as const,
+      unit: unitLabel(item.unit),
+    })),
+  ]
+})
 
 const latencySeries = computed(() => [
   { name: '平均', color: 'var(--fm-primary)', values: samples.value.map((s) => s.avgRt) },
@@ -780,7 +882,7 @@ function onExportMenu(info: { key: string | number }) {
     clearDetails()
     return
   }
-  exportReport(info.key as ExportFormat)
+  void exportReport(info.key as ExportFormat)
 }
 
 function remove() {
@@ -795,9 +897,61 @@ function remove() {
       const result = await api.reportDelete(report.value!.id)
       const freed = result.freedBytes > 0 ? `，释放 ${fmtBytes(result.freedBytes)}` : ''
       message.success(`已删除${freed}`)
-      router.push('/stress')
+      void router.push('/stress')
     },
   })
+}
+
+/* ---------- 外部指标导入（R11） ---------- */
+const metricOpen = ref(false)
+const metricPath = ref('')
+const metricName = ref('')
+const metricUnit = ref('percent')
+const metricImporting = ref(false)
+const METRIC_UNITS = [
+  { value: 'percent', label: 'percent（百分比）' },
+  { value: 'ms', label: 'ms（毫秒）' },
+  { value: 'count', label: 'count（计数）' },
+  { value: 'bytes', label: 'bytes（字节）' },
+]
+const METRIC_PRESETS = ['cpu.usage', 'gc.pause', 'db.pool.wait', 'thread.pool.active']
+
+async function pickMetricFile() {
+  const picked = await openDialog({
+    multiple: false,
+    filters: [{ name: '监控 CSV', extensions: ['csv', 'txt'] }],
+  })
+  const path = Array.isArray(picked) ? picked[0] : picked
+  if (path) metricPath.value = path
+}
+
+async function submitMetricImport() {
+  if (!metricPath.value) {
+    message.warning('请先选择 CSV 文件')
+    return
+  }
+  const name = metricName.value.trim()
+  if (!name) {
+    message.warning('请填写指标名，例如 cpu.usage')
+    return
+  }
+  metricImporting.value = true
+  try {
+    const list = await api.reportExternalMetricsImport(
+      reportId.value,
+      metricPath.value,
+      name,
+      metricUnit.value,
+    )
+    if (detail.value) detail.value.report.externalMetrics = list
+    const saved = list.find((item) => item.metric === name)
+    metricOpen.value = false
+    message.success(`已导入 ${name}，共 ${saved?.points.length ?? 0} 个采样点`)
+  } catch (error) {
+    message.error(String(error))
+  } finally {
+    metricImporting.value = false
+  }
 }
 </script>
 
@@ -808,6 +962,10 @@ function remove() {
       title="压测报告详情"
       subtitle="吞吐、延迟分位、状态码与错误分布的完整记录"
     >
+      <a-button :disabled="!detail" @click="metricOpen = true">
+        <template #icon><ImportOutlined /></template>
+        导入外部指标
+      </a-button>
       <a-button :disabled="!detail" @click="aiReview">
         <template #icon><AiSparkIcon /></template>
         AI 解读
@@ -848,10 +1006,22 @@ function remove() {
         <div class="fm-card overview">
           <div class="overview-main">
             <div class="title-row">
-              <span class="status-dot" :class="{ stopped: report.status === 'stopped' }" />
+              <span
+                class="status-dot"
+                :class="{
+                  stopped: report.status === 'stopped',
+                  interrupted: report.status === 'interrupted',
+                }"
+              />
               <h2 class="report-name">{{ report.planName }}</h2>
-              <span class="status-pill" :class="{ stopped: report.status === 'stopped' }">
-                {{ report.status === 'stopped' ? '已停止' : '已完成' }}
+              <span
+                class="status-pill"
+                :class="{
+                  stopped: report.status === 'stopped',
+                  interrupted: report.status === 'interrupted',
+                }"
+              >
+                {{ statusLabel }}
               </span>
               <span class="mode-pill">{{ modeLabel }}</span>
             </div>
@@ -865,6 +1035,12 @@ function remove() {
               <span v-if="qps?.target">目标 {{ fmtNum(qps.target, 0) }} QPS</span>
               <span v-if="qps?.attainment != null" class="dot-sep">·</span>
               <span v-if="qps?.attainment != null">达成 {{ fmtNum(qps.attainment, 0) }}%</span>
+            </div>
+            <div v-if="config?.partial" class="partial-banner">
+              <span class="partial-title">运行中断，报告不完整</span>
+              数据截至压测第 {{ fmtDuration((config.dataCutoffSec ?? 0) * 1000) }}，
+              由运行期落盘的 {{ config.restoredSamples ?? samples.length }} 个采样点恢复（未续跑）。
+              曲线只到中断点，不能作为容量、稳定性或 SLA 结论，也不能选作基线。
             </div>
             <div v-if="targetUrlInfo.url || targetUrlInfo.note" class="target-line">
               <span class="method-chip">{{ config?.method || 'GET' }}</span>
@@ -1296,6 +1472,15 @@ function remove() {
             </div>
             <LineChart :series="errorSeries" :labels="chartLabels" unit="%" :area="false" />
           </div>
+          <div v-if="externalMetrics.length" class="fm-card chart-card">
+            <div class="chart-head">
+              <span class="chart-title">外部指标</span>
+              <span class="chart-sub">
+                QPS（左轴）与导入曲线（右轴），按压测秒数对齐；未映射指标只画曲线不给结论
+              </span>
+            </div>
+            <LineChart :series="externalChartSeries" :labels="chartLabels" :area="false" />
+          </div>
           <div class="fm-card chart-card">
             <div class="chart-head">
               <span class="chart-title">延迟直方图</span>
@@ -1333,6 +1518,13 @@ function remove() {
               </div>
             </div>
             <div v-else class="inline-empty">历史报告未记录响应体耗时直方图</div>
+          </div>
+          <div v-if="workerStates.length" class="fm-card chart-card">
+            <div class="chart-head">
+              <span class="chart-title">并发状态分布</span>
+              <span class="chart-sub">每秒各状态 worker 数，查看并发究竟耗在哪里</span>
+            </div>
+            <LineChart :series="workerSeries" :labels="workerLabels" unit="" stacked />
           </div>
         </div>
 
@@ -1914,6 +2106,42 @@ function remove() {
 
       <div v-else-if="!loading" class="fm-card empty-hint">报告不存在或已被删除</div>
     </a-spin>
+
+    <a-modal
+      v-model:open="metricOpen"
+      title="导入外部指标"
+      :confirm-loading="metricImporting"
+      ok-text="导入"
+      cancel-text="取消"
+      @ok="submitMetricImport"
+    >
+      <div class="metric-form">
+        <div class="metric-row">
+          <span>CSV 文件</span>
+          <div class="metric-file">
+            <span class="mono metric-path" :title="metricPath">{{ metricPath || '尚未选择' }}</span>
+            <a-button size="small" @click="pickMetricFile">选择文件</a-button>
+          </div>
+        </div>
+        <div class="metric-row">
+          <span>指标名</span>
+          <a-auto-complete
+            v-model:value="metricName"
+            :options="METRIC_PRESETS.map((value) => ({ value }))"
+            placeholder="cpu.usage"
+          />
+        </div>
+        <div class="metric-row">
+          <span>单位</span>
+          <a-select v-model:value="metricUnit" :options="METRIC_UNITS" />
+        </div>
+        <p class="metric-hint">
+          CSV 两列 t,v：t 为相对压测开始的秒数，也接受绝对时间戳；同 source + metric 覆盖旧曲线。
+          单份报告最多 10 条、每条最多 3600 点。映射规则：cpu.usage / gc.pause / db.pool.wait /
+          thread.pool.active，其余指标只画曲线不给结论。
+        </p>
+      </div>
+    </a-modal>
   </div>
 </template>
 
@@ -1944,6 +2172,10 @@ function remove() {
   background: var(--fm-warning);
 }
 
+.status-dot.interrupted {
+  background: var(--fm-danger);
+}
+
 .report-name {
   font-size: 18px;
   font-weight: 700;
@@ -1962,6 +2194,28 @@ function remove() {
 .status-pill.stopped {
   background: var(--fm-warning-soft);
   color: var(--fm-warning);
+}
+
+.status-pill.interrupted {
+  background: var(--fm-danger-soft);
+  color: var(--fm-danger);
+}
+
+.partial-banner {
+  margin-top: 12px;
+  padding: 9px 12px;
+  border-radius: var(--fm-radius);
+  border: 1px solid var(--fm-danger);
+  background: var(--fm-danger-soft);
+  color: var(--fm-text-2);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.partial-title {
+  margin-right: 8px;
+  font-weight: 700;
+  color: var(--fm-danger);
 }
 
 .mode-pill {
@@ -3444,6 +3698,45 @@ function remove() {
 .target-url.missing,
 .c-value-url.missing {
   color: var(--fm-warning);
+}
+
+.metric-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-top: 4px;
+}
+.metric-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 12px;
+  color: var(--fm-text-2);
+}
+.metric-row > span:first-child {
+  flex: none;
+  width: 56px;
+}
+.metric-file {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.metric-path {
+  flex: 1;
+  overflow: hidden;
+  font-size: 11px;
+  color: var(--fm-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.metric-hint {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.65;
+  color: var(--fm-muted);
 }
 
 @media (max-width: 1180px) {

@@ -41,6 +41,7 @@ import type {
   AppInfo,
   AppSettings,
   BackupItem,
+  BackupRestorePreview,
   CapacityProgress,
   CapacityResult,
   CheckResult,
@@ -513,6 +514,8 @@ const backupLoading = ref(false)
 const backupBusy = ref(false)
 const backupDir = ref('')
 const restoreTarget = ref<BackupItem | null>(null)
+const restorePreview = ref<BackupRestorePreview | null>(null)
+const restorePreviewLoading = ref(false)
 const checkResult = ref<CheckResult | null>(null)
 const checking = ref(false)
 
@@ -528,7 +531,8 @@ function fmtBackupSize(bytes: number): string {
 
 function fmtBackupTime(ts: number): string {
   if (!ts) return '-'
-  const d = new Date(ts * 1000)
+  // 后端 BackupItem.createdAt 是毫秒时间戳（metadata.modified().as_millis()）
+  const d = new Date(ts)
   const pad = (n: number) => String(n).padStart(2, '0')
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
@@ -559,8 +563,26 @@ async function createBackup() {
   }
 }
 
-function askRestore(item: BackupItem) {
+function backupKeyLabel(state: string): string {
+  if (state === 'mismatch') return '密钥：不一致'
+  if (state === 'unknown') return '密钥：未知'
+  return '密钥：一致'
+}
+
+async function askRestore(item: BackupItem) {
   restoreTarget.value = item
+  restorePreview.value = null
+  // 列表里的密钥状态可能已过期；恢复前始终重新取一次预览，
+  // 拿到当前密钥判定与受影响条数再做决定
+  restorePreviewLoading.value = true
+  try {
+    restorePreview.value = await api.backupRestorePreview(item.name)
+  } catch (e) {
+    message.error(String(e))
+    restoreTarget.value = null
+  } finally {
+    restorePreviewLoading.value = false
+  }
 }
 
 async function confirmRestore() {
@@ -568,8 +590,10 @@ async function confirmRestore() {
   if (!item) return
   backupBusy.value = true
   try {
-    await api.backupRestore(item.name)
+    const accept = restorePreview.value?.keyState === 'mismatch'
+    await api.backupRestore(item.name, accept)
     restoreTarget.value = null
+    restorePreview.value = null
     Modal.confirm({
       title: '恢复已排队',
       content: '已把备份标记为待恢复。重启应用后会在打开数据库之前完成替换，期间你的当前数据会先自动备份一份。',
@@ -1152,6 +1176,7 @@ async function openReleasePage() {
                     <div class="backup-name mono">{{ item.name }}</div>
                     <div class="backup-meta">
                       <span class="backup-kind" :class="`kind-${item.kind}`">{{ item.kindLabel }}</span>
+                      <span class="backup-key" :class="`key-${item.keyState}`">{{ backupKeyLabel(item.keyState) }}</span>
                       <span>{{ fmtBackupTime(item.createdAt) }}</span>
                       <span>{{ fmtBackupSize(item.size) }}</span>
                       <span>schema v{{ item.schemaVersion }} · {{ item.tables }} 张表</span>
@@ -2093,6 +2118,7 @@ async function openReleasePage() {
       ok-text="排队恢复"
       cancel-text="取消"
       :confirm-loading="backupBusy"
+      :ok-button-props="{ disabled: restorePreviewLoading }"
       @ok="confirmRestore"
       @cancel="restoreTarget = null"
     >
@@ -2100,6 +2126,15 @@ async function openReleasePage() {
         <p>
           即将用 <span class="mono">{{ restoreTarget?.name }}</span>
           （{{ fmtBackupTime(restoreTarget?.createdAt || 0) }} 的快照）替换当前数据库。
+        </p>
+        <p v-if="restorePreview?.keyState === 'mismatch'" class="modal-note warn-note">
+          该备份由另一台机器或另一把主密钥创建。恢复后约
+          <b>{{ restorePreview.affectedSecrets }} 条</b>密钥（环境变量与 AI Key）将无法解密，
+          需要重新填写，或导入原机器的密钥包。密文会原样保留，不会被删除。
+        </p>
+        <p v-else-if="restorePreview?.keyState === 'unknown'" class="modal-note">
+          无法判断该备份的密钥是否与本机一致（备份来自旧版本，或当前主密钥尚未解锁）。
+          恢复后请检查环境变量与 AI Key 是否可用。
         </p>
         <p class="modal-note">
           恢复会在重启应用时、打开数据库之前完成；替换前会先把当前数据备份成一份 pre-restore 快照，
@@ -2791,6 +2826,34 @@ kbd {
 .backup-kind.kind-pre-migrate {
   background: var(--fm-warning-soft);
   color: var(--fm-warning);
+}
+
+.backup-key {
+  padding: 0 6px;
+  border-radius: var(--fm-radius-sm);
+  font-size: 10px;
+  line-height: 16px;
+  background: var(--fm-surface-alt);
+  color: var(--fm-text-2);
+}
+
+.backup-key.key-match {
+  background: var(--fm-success-soft);
+  color: var(--fm-success);
+}
+
+.backup-key.key-mismatch {
+  background: var(--fm-danger-soft);
+  color: var(--fm-danger);
+}
+
+.backup-key.key-unknown {
+  background: var(--fm-warning-soft);
+  color: var(--fm-warning);
+}
+
+.warn-note {
+  color: var(--fm-danger);
 }
 
 .backup-actions {

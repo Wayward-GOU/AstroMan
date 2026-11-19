@@ -167,7 +167,9 @@ async function tick() {
 
 function startTimer() {
   stopTimer()
-  timer = window.setInterval(tick, intervalSec.value * 1000)
+  timer = window.setInterval(() => {
+    void tick()
+  }, intervalSec.value * 1000)
 }
 
 function stopTimer() {
@@ -181,7 +183,7 @@ function togglePause() {
   paused.value = !paused.value
   if (paused.value) stopTimer()
   else {
-    tick()
+    void tick()
     startTimer()
   }
 }

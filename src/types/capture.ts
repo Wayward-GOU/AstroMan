@@ -10,7 +10,12 @@ export interface CaptureStatus {
   dropped: number
   caInstalled: boolean
   sysproxyOn: boolean
+  /** 已脱敏的上游代理地址 */
   upstreamProxy: string | null
+  /** 本次录制是否真的走上游代理 */
+  upstreamActive: boolean
+  /** 命中 SSL 直通白名单的连接数 */
+  passthroughCount: number
   lastError: string | null
 }
 
@@ -64,6 +69,8 @@ export interface CaptureFlow {
   modified: boolean
   /** 远程映射真正发往的上游地址；未命中时为 null */
   remote: string | null
+  /** 命中 SSL 直通白名单：只看得到 CONNECT，没有明文 */
+  passthrough: boolean
 }
 
 export interface CaptureFlowDetail extends CaptureFlow {
@@ -80,6 +87,89 @@ export interface CaptureStartOptions {
   ignorePatterns?: string[]
   captureStatic?: boolean
   upstreamProxy?: string | null
+  /** memory 不落库；archive-meta 只存元信息；archive-full 另存 body */
+  archiveMode?: CaptureArchiveMode
+  archiveName?: string | null
+  /** 归档排除的域名，支持 *.example.com */
+  archiveExclude?: string[]
+}
+
+export type CaptureArchiveMode = 'memory' | 'archive-meta' | 'archive-full'
+
+/** 历史会话（R7） */
+export interface CaptureSessionSummary {
+  id: number
+  name: string
+  mode: CaptureArchiveMode
+  bindAddr: string
+  port: number
+  startedAt: number
+  endedAt: number | null
+  flowCount: number
+  dropped: number
+  bytes: number
+  appVersion: string | null
+}
+
+/** 归档流量：不含 remote（远程映射目标未落库） */
+export interface CaptureArchivedFlow {
+  id: number
+  startedAt: number
+  method: string
+  scheme: string
+  host: string
+  path: string
+  httpVersion: string
+  status: number | null
+  durationMs: number
+  requestSize: number
+  responseSize: number
+  contentType: string
+  clientAddr: string
+  error: string | null
+  mapped: boolean
+  modified: boolean
+  passthrough: boolean
+}
+
+export interface CaptureSessionFlows {
+  total: number
+  items: CaptureArchivedFlow[]
+}
+
+export interface CaptureCompareSide {
+  id: number
+  name: string
+  startedAt: number
+  flowCount: number
+}
+
+export interface CaptureCompareItem {
+  method: string
+  host: string
+  path: string
+  aCount: number
+  bCount: number
+  aAvgMs: number
+  bAvgMs: number
+  deltaPct: number | null
+  aErrorRate: number
+  bErrorRate: number
+}
+
+export interface CaptureCompareOnly {
+  method: string
+  host: string
+  path: string
+  count: number
+}
+
+export interface CaptureSessionCompare {
+  a: CaptureCompareSide
+  b: CaptureCompareSide
+  items: CaptureCompareItem[]
+  onlyA: CaptureCompareOnly[]
+  onlyB: CaptureCompareOnly[]
 }
 
 /** 重发时可覆盖的参数；不传的字段沿用原请求 */

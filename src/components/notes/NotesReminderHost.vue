@@ -60,7 +60,7 @@ async function snoozeAll(ids: number[]) {
 
 function openNotes() {
   close()
-  router.push('/notes')
+  void router.push('/notes')
 }
 
 function show(event: NotesReminderEvent) {

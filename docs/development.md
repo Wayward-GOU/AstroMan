@@ -74,14 +74,17 @@ npm.cmd run dev
 
 ## 测试与质量门禁
 
-`.github/workflows/ci.yml` 在每次 push / PR 上跑四道门禁，本地提交前跑同一组命令可以少一轮往返。
+`.github/workflows/ci.yml` 在每次 push / PR 上跑五道门禁，本地提交前跑同一组命令可以少一轮往返。
 
 ### 前端
 
 ```powershell
+npm.cmd run lint        # ESLint：未使用变量、浮动 Promise、v-for 缺 key 等正确性问题
 npm.cmd run test        # vitest run：14 个 spec / 160 条
 npm.cmd run build       # vue-tsc --noEmit + vite build（类型错误在这里拦）
 ```
+
+> lint 只做正确性规则，不做格式统一（不引入 Prettier）。类型错误归 `vue-tsc`，两者分工不重叠；CI 在 `npm ci` 之后先跑 lint，失败即停，省掉后续构建时间。
 
 > 受限环境（临时目录不可写）下 vitest 可能报 `EPERM ... \Temp\...`，文件数与用例数会抖动，那不是用例失败；加 `--pool=forks --poolOptions.forks.singleFork` 串行执行即可稳定。
 

@@ -11,7 +11,6 @@ import {
   FileTextOutlined,
   InfoCircleOutlined,
   PlusOutlined,
-  FolderOpenOutlined,
   SaveOutlined,
   DeleteOutlined,
   DesktopOutlined,
@@ -36,10 +35,11 @@ import type {
   ReportSample,
   RequestSearchHit,
   StressDone,
-  StressJobSummary,
   StressProgress,
   StressReport,
   StressStage,
+  WorkerSnapshot,
+  WorkerStateSample,
 } from '@/types/models'
 
 const route = useRoute()
@@ -52,7 +52,6 @@ const projectId = computed(() => Number(route.query.projectId || 0))
 const routePlanId = computed(() => Number(route.query.planId || 0))
 const routeJobId = computed(() => Number(route.query.jobId || 0))
 const routeEnvId = computed(() => Number(route.query.envId || 0))
-const newWindow = computed(() => route.query.newWindow === '1' || route.query.newWindow === 'true')
 
 /** 本窗口绑定的压测任务；事件与停止都按它过滤（1.1.2） */
 const jobId = ref<number | null>(null)
@@ -185,8 +184,8 @@ function aiPlan() {
 
 /** 压测页头部 Tab：压测 / 计划 / 报告（2.1.3） */
 function switchStressTab(key: string | number) {
-  if (key === 'plans') router.push('/plans')
-  else if (key === 'reports') router.push('/reports')
+  if (key === 'plans') void router.push('/plans')
+  else if (key === 'reports') void router.push('/reports')
 }
 
 /** 把当前任务放到独立窗口查看；未绑定时按当前计划开新窗口（1.2.1） */
@@ -427,7 +426,9 @@ const baselineReports = ref<StressReport[]>([])
 
 async function loadBaselineReports() {
   try {
-    baselineReports.value = await api.reportList(200)
+    const list = await api.reportList(200)
+    // 崩溃恢复出的不完整报告不能选作基线（R3）
+    baselineReports.value = list.filter((item) => item.status !== 'interrupted')
   } catch {
     baselineReports.value = []
   }
@@ -519,6 +520,12 @@ onMounted(async () => {
         if (event.payload.samples?.length) {
           liveSamples.value.push(...event.payload.samples)
         }
+        if (event.payload.workerStates) {
+          const last = workerSamples.value[workerSamples.value.length - 1]
+          if (!last || last.elapsedSec !== event.payload.workerStates.elapsedSec) {
+            workerSamples.value.push(event.payload.workerStates)
+          }
+        }
         if (event.payload.notice) message.info(event.payload.notice)
       }),
     )
@@ -538,7 +545,7 @@ onMounted(async () => {
           })
         }
         void reportList.value?.reload()
-        nextTick(() => resultCard.value?.scrollIntoView({ behavior: 'smooth', block: 'center' }))
+        void nextTick(() => resultCard.value?.scrollIntoView({ behavior: 'smooth', block: 'center' }))
       }),
     )
   } catch (e) {
@@ -675,6 +682,7 @@ async function openPlan(planIdValue: number) {
 
 onBeforeUnmount(() => {
   for (const off of unlisteners) off()
+  closeWorkers()
   // 关闭窗口不中断任务：任务归注册表，窗口只是视图（1.2.5）
 })
 
@@ -696,6 +704,77 @@ const latencySeries = computed(() => [
 ])
 
 const chartLabels = computed(() => samples.value.map((s) => `${s.elapsedSec}s`))
+
+/* ---------- 并发透视（R8） ---------- */
+const workerSamples = ref<WorkerStateSample[]>([])
+const hasWorkerStates = computed(() => workerSamples.value.length > 0)
+
+const WORKER_SERIES: Array<{ key: keyof WorkerStateSample; name: string; color: string }> = [
+  { key: 'readBody', name: '读取响应体', color: '#5b8def' },
+  { key: 'awaitHeader', name: '等待首字节', color: 'var(--fm-primary)' },
+  { key: 'rateWait', name: '限速等待', color: 'var(--fm-warning)' },
+  { key: 'idle', name: '空闲', color: '#94a3b8' },
+  { key: 'rampWait', name: '升压等待', color: '#8b5cf6' },
+  { key: 'stageWait', name: '阶段等待', color: '#64748b' },
+  { key: 'think', name: '思考时间', color: '#14b8a6' },
+  { key: 'done', name: '已完成', color: 'var(--fm-success)' },
+]
+
+const workerSeries = computed(() =>
+  WORKER_SERIES.map((item) => ({
+    name: item.name,
+    color: item.color,
+    values: workerSamples.value.map((sample) => Number(sample[item.key]) || 0),
+  })),
+)
+const workerLabels = computed(() => workerSamples.value.map((item) => `${item.elapsedSec}s`))
+
+const workersOpen = ref(false)
+const workersLoading = ref(false)
+const workerRows = ref<WorkerSnapshot[]>([])
+let workerTimer: number | undefined
+
+const WORKER_STATE_TEXT: Record<string, string> = {
+  idle: '空闲',
+  ramp_wait: '升压等待',
+  stage_wait: '阶段等待',
+  rate_wait: '限速等待',
+  await_header: '等待首字节',
+  read_body: '读取响应体',
+  think: '思考时间',
+  done: '已完成',
+}
+
+async function loadWorkers() {
+  if (!jobId.value) return
+  workersLoading.value = true
+  try {
+    workerRows.value = await api.stressWorkers(jobId.value)
+  } catch (e) {
+    message.warning(String(e))
+    closeWorkers()
+  } finally {
+    workersLoading.value = false
+  }
+}
+
+function openWorkers() {
+  if (!jobId.value) {
+    message.warning('任务尚未开始')
+    return
+  }
+  workersOpen.value = true
+  void loadWorkers()
+  workerTimer = window.setInterval(() => void loadWorkers(), 2000)
+}
+
+function closeWorkers() {
+  workersOpen.value = false
+  if (workerTimer !== undefined) {
+    window.clearInterval(workerTimer)
+    workerTimer = undefined
+  }
+}
 
 const elapsed = computed(() => progress.value?.elapsedSec ?? done.value?.elapsedSec ?? 0)
 
@@ -862,6 +941,7 @@ async function start() {
   stopping.value = false
   running.value = true
   liveSamples.value = []
+  workerSamples.value = []
 
   try {
     const id = await api.stressStart({
@@ -954,10 +1034,10 @@ async function stop() {
 
 function backToRequest() {
   if (!request.value?.id) {
-    router.push('/')
+    void router.push('/')
     return
   }
-  router.push({
+  void router.push({
     name: 'request',
     params: { id: request.value.id },
     query: { projectId: activeProjectId.value || undefined },
@@ -1401,6 +1481,32 @@ function backToRequest() {
             <LineChart :series="latencySeries" :labels="chartLabels" unit="ms" :area="false" />
           </div>
 
+          <div class="fm-card chart-card">
+            <div class="chart-head">
+              <span class="chart-title">并发状态分布</span>
+              <span class="chart-sub">
+                每秒各状态 worker 数
+                <a-button
+                  v-if="running"
+                  type="link"
+                  size="small"
+                  class="worker-link"
+                  @click="openWorkers"
+                >
+                  查看在途请求
+                </a-button>
+              </span>
+            </div>
+            <LineChart
+              v-if="hasWorkerStates"
+              :series="workerSeries"
+              :labels="workerLabels"
+              unit=""
+              stacked
+            />
+            <div v-else class="worker-empty">开始压测后按秒采集，500 并发到底在干什么一目了然</div>
+          </div>
+
           <div v-if="done" ref="resultCard" class="fm-card result-card">
             <div class="result-icon"><FileTextOutlined /></div>
             <div class="result-main">
@@ -1445,6 +1551,45 @@ function backToRequest() {
       </div>
       <StressReportList ref="reportList" />
     </div>
+
+    <a-drawer
+      v-model:open="workersOpen"
+      title="在途请求快照"
+      placement="right"
+      :width="760"
+      @close="closeWorkers"
+    >
+      <div class="workers-meta">每 2 秒刷新，最多 200 条，按已耗时倒序；只读快照，不影响压测。</div>
+      <a-spin :spinning="workersLoading">
+        <table v-if="workerRows.length" class="workers-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>状态</th>
+              <th>方法</th>
+              <th>阶段</th>
+              <th>已耗时</th>
+              <th>地址</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="row in workerRows" :key="row.index">
+              <td class="mono">{{ row.index }}</td>
+              <td>
+                <span class="worker-state" :class="`ws-${row.state}`">
+                  {{ WORKER_STATE_TEXT[row.state] ?? row.state }}
+                </span>
+              </td>
+              <td class="mono">{{ row.method }}</td>
+              <td class="mono">{{ row.stageIndex + 1 }}</td>
+              <td class="mono">{{ (row.elapsedMs / 1000).toFixed(1) }}s</td>
+              <td class="worker-url" :title="row.url">{{ row.url }}</td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-else class="worker-empty">暂无在途请求，或任务已结束</div>
+      </a-spin>
+    </a-drawer>
 
     <a-modal
       v-model:open="configOpen"
@@ -2805,5 +2950,76 @@ function backToRequest() {
 .plan-row .plan-template {
   flex: 0 0 160px;
   min-width: 140px;
+}
+
+.worker-link {
+  margin-left: 8px;
+  padding: 0;
+  height: auto;
+  font-size: 12px;
+}
+
+.worker-empty {
+  padding: 32px 0;
+  text-align: center;
+  color: var(--fm-muted);
+  font-size: 12px;
+  background: var(--fm-surface-alt);
+  border-radius: 10px;
+}
+
+.workers-meta {
+  margin-bottom: 12px;
+  font-size: 12px;
+  color: var(--fm-muted);
+}
+
+.workers-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.workers-table th,
+.workers-table td {
+  padding: 7px 8px;
+  text-align: left;
+  border-bottom: 1px solid var(--fm-border);
+}
+
+.workers-table th {
+  color: var(--fm-muted);
+  font-weight: 500;
+}
+
+.worker-url {
+  max-width: 300px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fm-text-2);
+}
+
+.worker-state {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 10px;
+  background: var(--fm-surface-alt);
+  color: var(--fm-text-2);
+}
+
+.ws-await_header {
+  background: color-mix(in srgb, var(--fm-primary) 14%, transparent);
+  color: var(--fm-primary);
+}
+
+.ws-read_body {
+  background: color-mix(in srgb, var(--fm-success) 14%, transparent);
+  color: var(--fm-success);
+}
+
+.ws-rate_wait {
+  background: color-mix(in srgb, var(--fm-warning) 16%, transparent);
+  color: var(--fm-warning);
 }
 </style>

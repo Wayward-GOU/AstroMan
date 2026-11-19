@@ -2,7 +2,7 @@
 //! W2 G-04：项目本地 Mock Server 面板
 //!
 //! 路由表与运行状态分离：未启动也能编辑 / 生成路由；启动后轮询状态与请求日志。
-import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { message, Modal } from 'ant-design-vue'
 import {
   CaretRightOutlined,
@@ -38,6 +38,43 @@ const loading = ref(false)
 const busy = ref(false)
 const port = ref<number>(0)
 const host = ref('127.0.0.1')
+/** 跨域白名单：留空时不返回 CORS 头，第三方页面无法读取 Mock 数据 */
+const corsOrigins = ref('')
+const corsCredentials = ref(false)
+
+function corsStorageKey() {
+  return `astroman.mock.cors.${props.projectId}`
+}
+
+function loadCorsPrefs() {
+  try {
+    const raw = localStorage.getItem(corsStorageKey())
+    if (!raw) return
+    const parsed = JSON.parse(raw) as { origins?: string[]; credentials?: boolean }
+    corsOrigins.value = (parsed.origins ?? []).join(', ')
+    corsCredentials.value = !!parsed.credentials
+  } catch {
+    // 配置损坏时按默认（不放行任何来源）处理
+  }
+}
+
+function corsOriginList(): string[] {
+  return corsOrigins.value
+    .split(/[,，\n]/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+}
+
+function saveCorsPrefs() {
+  try {
+    localStorage.setItem(
+      corsStorageKey(),
+      JSON.stringify({ origins: corsOriginList(), credentials: corsCredentials.value }),
+    )
+  } catch {
+    // 存不下不影响本次启动
+  }
+}
 
 const editorOpen = ref(false)
 const form = reactive({
@@ -91,10 +128,13 @@ async function loadAll() {
 async function start() {
   busy.value = true
   try {
+    saveCorsPrefs()
     status.value = await api.mockStart({
       projectId: props.projectId,
       port: port.value || 0,
       host: host.value,
+      corsOrigins: corsOriginList(),
+      corsCredentials: corsCredentials.value,
     })
     message.success(`Mock Server 已启动：${status.value.url}`)
     await refresh()
@@ -252,11 +292,17 @@ function fmtTime(ts: number) {
 }
 
 onMounted(() => {
+  loadCorsPrefs()
   void loadAll()
   timer = window.setInterval(() => {
     if (visible.value) void refresh()
   }, 2500)
 })
+
+watch(
+  () => props.projectId,
+  () => loadCorsPrefs(),
+)
 
 onUnmounted(() => {
   if (timer) window.clearInterval(timer)
@@ -319,6 +365,18 @@ onUnmounted(() => {
             <template #icon><ReloadOutlined /></template>
           </a-button>
         </div>
+      </div>
+
+      <div class="cors-row">
+        <span class="muted">跨域白名单</span>
+        <a-input
+          v-model:value="corsOrigins"
+          size="small"
+          :disabled="running"
+          placeholder="http://localhost:5173, https://*.example.com；留空则不返回 CORS 头"
+          style="flex: 1"
+        />
+        <a-checkbox v-model:checked="corsCredentials" :disabled="running">允许凭据</a-checkbox>
       </div>
 
       <div class="grid">
@@ -457,6 +515,12 @@ onUnmounted(() => {
   display: flex;
   gap: 6px;
   flex-wrap: wrap;
+}
+.cors-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
 }
 .muted {
   font-size: 12px;

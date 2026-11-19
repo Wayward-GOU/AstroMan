@@ -451,8 +451,11 @@ impl AppState {
             log::warn!("清理上次遗留的集群任务失败：{error}");
         }
 
-        let capture =
-            crate::capture::CaptureManager::new_with_limits(data_dir.clone(), profile.limits);
+        let capture = crate::capture::CaptureManager::new_with_pool(
+            data_dir.clone(),
+            profile.limits,
+            pool.clone(),
+        );
         Ok(Self {
             pool,
             data_dir,
@@ -512,8 +515,11 @@ impl AppState {
         if let Err(error) = crate::services::cluster::server::recover_stale_jobs(&pool) {
             log::warn!("清理上次遗留的集群任务失败：{error}");
         }
-        let capture =
-            crate::capture::CaptureManager::new_with_limits(data_dir.clone(), profile.limits);
+        let capture = crate::capture::CaptureManager::new_with_pool(
+            data_dir.clone(),
+            profile.limits,
+            pool.clone(),
+        );
         Ok(Self {
             pool,
             db_path,

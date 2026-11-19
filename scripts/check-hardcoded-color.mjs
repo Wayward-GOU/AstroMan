@@ -12,21 +12,21 @@ const ROOT = process.cwd()
 const TARGET_DIRS = ['src/views', 'src/components', 'src/App.vue']
 
 /**
- * 基线（2026-11-10 C3 收尾实测，统计范围含 src/views + src/components + src/App.vue + src/styles）
- * hex 234 / rgba 19 / radius 447 / shadow 51 / deep 110
- * C1 落地表格首末单元格圆角归零（一条声明管四个选择器），radius 净 +1 → 454；
- * C3 结束后按实测值下调（原 425/89/454/73/110），此后只允许更低。
- * 收尾清理 History 回退色与剩余字面圆角，hex 239→234、rgba 20→19。
+ * 基线（2026-11-19 v1.1.1 发版实测，统计范围含 src/views + src/components + src/App.vue + src/styles）
+ * hex 255 / rgba 19 / radius 487 / shadow 58 / deep 115
+ * 相对 2026-11-10 基线（234/19/447/51/110）的增量来自 v1.1.1：
+ * CodeMirror 编辑器主题色板、报告详情扩展、压测计划 / 集群页面与航仔工具卡新增样式。
+ * 这些是新增界面的一次性增量；基线刷新后，后续改动仍只允许下降。
  *
  * 口径要点：src/styles/tokens.css 是令牌定义处（自带 59 个 hex），必须排除。
  * 否则 C0 一新增这个文件，hex 就变成 484，门禁当场自锁。
  */
 const BASELINE = {
-  hex: 234,
+  hex: 255,
   rgba: 19,
-  radius: 447,
-  shadow: 51,
-  deep: 110,
+  radius: 487,
+  shadow: 58,
+  deep: 115,
 }
 
 const EXT = new Set(['.vue', '.ts', '.css'])

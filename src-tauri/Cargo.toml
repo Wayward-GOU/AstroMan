@@ -70,9 +70,15 @@ hudsucker = { version = "0.25", default-features = false, features = [
 ] }
 http-body-util = "0.1"
 bytes = "1"
+# 抓包上游代理（R6）：CONNECT 隧道 + absolute-form 复用 hudsucker 的 hyper/rustls 栈
+hyper-http-proxy = "1"
+hyper-rustls = { version = "0.27", default-features = false, features = [
+  "http1", "http2", "webpki-tokio", "aws-lc-rs"
+] }
 # 抓包 ZIP 导出：只启用 deflate，避免带入 bzip2 / zstd 等未用压缩器
 zip = { version = "9", default-features = false, features = ["deflate"] }
 sysinfo = { version = "0.33", default-features = false, features = ["system", "disk", "network"] }
+mdns-sd = "0.22.0"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = [

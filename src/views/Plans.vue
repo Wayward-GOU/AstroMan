@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
 import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog'
@@ -129,12 +129,12 @@ async function loadAll() {
 }
 
 function switchTab(key: string | number) {
-  if (key === 'stress') router.push('/stress')
-  else if (key === 'reports') router.push('/reports')
+  if (key === 'stress') void router.push('/stress')
+  else if (key === 'reports') void router.push('/reports')
 }
 
 function runPlan(plan: { id: number }) {
-  router.push({ path: '/stress', query: { planId: String(plan.id) } })
+  void router.push({ path: '/stress', query: { planId: String(plan.id) } })
 }
 
 async function runInWindow(plan: { id: number }) {

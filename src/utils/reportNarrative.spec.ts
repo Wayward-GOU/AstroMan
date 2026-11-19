@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest'
-import type { ReportDetail, ReportSample } from '@/types/models'
-import { buildAdvice, buildFindings, cdfPoints, gradeReport, latencyDrift } from './reportNarrative'
+import type { ExternalMetricSeries, ReportDetail, ReportSample } from '@/types/models'
+import {
+  alignMetric,
+  buildAdvice,
+  buildFindings,
+  cdfPoints,
+  externalMetricFindings,
+  gradeReport,
+  latencyDrift,
+} from './reportNarrative'
 
 function samples(count: number, patch: (index: number) => Partial<ReportSample> = () => ({})): ReportSample[] {
   return Array.from({ length: count }, (_, index) => ({
@@ -188,5 +196,89 @@ describe('cdfPoints', () => {
     const detail = makeDetail()
     detail.histogram = []
     expect(cdfPoints(detail)).toEqual([])
+  })
+})
+
+describe('外部指标（R11）', () => {
+  function metric(
+    name: string,
+    unit: string,
+    points: Array<[number, number]>,
+  ): ExternalMetricSeries {
+    return {
+      source: 'csv:target',
+      metric: name,
+      unit,
+      points: points.map(([t, v]) => ({ t, v })),
+    }
+  }
+
+  function withMetrics(
+    series: ExternalMetricSeries[],
+    samplePatch?: (index: number) => Partial<ReportSample>,
+  ): ReportDetail {
+    const detail = makeDetail({}, samplePatch)
+    detail.report.externalMetrics = series
+    return detail
+  }
+
+  it('对齐时取不晚于当前秒的最近点，不做插值', () => {
+    const values = alignMetric(
+      [
+        { t: 0, v: 10 },
+        { t: 5, v: 20 },
+      ],
+      [0, 1, 4, 5, 9],
+    )
+    expect(values).toEqual([10, 10, 10, 20, 20])
+  })
+
+  it('CPU 高且 QPS 平台期时给出「疑似 CPU 饱和」', () => {
+    const cpu = metric(
+      'cpu.usage',
+      'percent',
+      Array.from({ length: 21 }, (_, index) => [10 + index, 90] as [number, number]),
+    )
+    const findings = externalMetricFindings(withMetrics([cpu]))
+    expect(findings.some((item) => item.title.includes('疑似 CPU 饱和'))).toBe(true)
+  })
+
+  it('CPU 高但 QPS 仍在增长时不下饱和结论', () => {
+    const cpu = metric('cpu.usage', 'percent', [[20, 95]])
+    const detail = withMetrics([cpu], (index) => ({ qps: 1000 + index * 200 }))
+    expect(externalMetricFindings(detail)).toEqual([])
+  })
+
+  it('GC 停顿与 P99 峰值对齐时提示长尾', () => {
+    const gc = metric('gc.pause', 'ms', [
+      [28, 5],
+      [30, 60],
+      [32, 8],
+    ])
+    const detail = withMetrics([gc], (index) => (index === 29 ? { p99Rt: 300 } : {}))
+    const findings = externalMetricFindings(detail)
+    expect(findings.some((item) => item.title.includes('疑似 GC 导致长尾'))).toBe(true)
+  })
+
+  it('DB 等待与 RT 上升对齐时提示连接池', () => {
+    const db = metric('db.pool.wait', 'ms', [[30, 40]])
+    const detail = withMetrics([db], (index) => (index === 29 ? { avgRt: 60 } : {}))
+    const findings = externalMetricFindings(detail)
+    expect(findings.some((item) => item.title.includes('疑似连接池等待'))).toBe(true)
+  })
+
+  it('线程池达到观测峰值且 QPS 不涨时提示饱和', () => {
+    const pool = metric('thread.pool.active', 'count', [[30, 100]])
+    const detail = withMetrics([pool])
+    const findings = externalMetricFindings(detail)
+    expect(findings.some((item) => item.title.includes('疑似线程池饱和'))).toBe(true)
+  })
+
+  it('未映射指标只画曲线，不产出结论', () => {
+    const custom = metric('custom.latency', 'ms', [
+      [10, 100],
+      [20, 200],
+    ])
+    expect(externalMetricFindings(withMetrics([custom]))).toEqual([])
   })
 })

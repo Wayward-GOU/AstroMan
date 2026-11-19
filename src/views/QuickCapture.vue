@@ -2,7 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { notesCreate } from '@/api/notes'
-import { formatDueLabel, parseQuickNote } from '@/utils/notesQuickParse'
+import { parseQuickNote } from '@/utils/notesQuickParse'
 
 const DRAFT_KEY = 'astroman:notes:quick-draft'
 const HINT_KEY = 'astroman:notes:quick-hint'
@@ -15,7 +15,6 @@ const inputRef = ref<HTMLTextAreaElement | null>(null)
 let composing = false
 
 const parsed = computed(() => parseQuickNote(input.value, new Date()))
-const canSave = computed(() => Boolean(input.value.trim()) && Boolean(parsed.value.title.trim()))
 
 function loadDraft() {
   try {

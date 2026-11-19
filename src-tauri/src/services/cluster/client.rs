@@ -6,6 +6,7 @@
 //! 与主节点一致，传输是内网明文 WebSocket + JSON；变量值只在本机解析，
 //! 主节点下发的配置里只有变量名与引用。断线重连、跨网段不在本期。
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -18,13 +19,15 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Notify};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
+use uuid::Uuid;
 
 use super::host::ClusterApp;
 use super::protocol::{
-    AbortPayload, ClusterMessage, ClusterSlaveSnapshot, DonePayload, ErrorPayload, HelloAckPayload,
-    HelloPayload, PingPayload, PongPayload, PreflightPayload, PrepareAckPayload, PreparePayload,
-    StartPayload, TimeAckPayload, TimeProbePayload, DEFAULT_PORT, HEARTBEAT_MISSES, HEARTBEAT_SEC,
-    MAX_MESSAGE_BYTES, PROTOCOL_VERSION,
+    AbortPayload, ClusterMessage, ClusterSlaveSnapshot, DeviceCapability, DonePayload,
+    ErrorPayload, HelloAckPayload, HelloPayload, PhaseStartPayload, PingPayload, PongPayload,
+    PreflightPayload, PrepareAckPayload, PreparePayload, StartPayload, TimeAckPayload,
+    TimeProbePayload, DEFAULT_PORT, HEARTBEAT_MISSES, HEARTBEAT_SEC, MAX_MESSAGE_BYTES,
+    MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, RECONNECT_BACKOFF_MAX_SEC, RECONNECT_GRACE_SEC,
 };
 use super::server::local_node_name;
 use crate::commands::stress::{
@@ -43,6 +46,13 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// 目标预检的总预算：必须小于主节点的失联阈值，避免误判
 const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
+/// 断线期间缓存的消息上限：逐秒采样约 1 条/秒，保留最近 8 分钟足够覆盖重连
+const MAX_PENDING_MESSAGES: usize = 512;
+
+type WsStream = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
+
+/// 稳定设备标识：跨任务复用，存在 app_meta 里
+const DEVICE_ID_KEY: &str = "cluster_device_id";
 
 /// 从节点连接参数
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -158,6 +168,12 @@ struct SlaveState {
     error: Option<String>,
     missing_vars: Vec<String>,
     joined_at: Option<i64>,
+    device_id: Option<String>,
+    protocol_version: u32,
+    reconnecting: bool,
+    phase_index: Option<u32>,
+    phase_concurrent: u32,
+    reconnect_attempts: u32,
 }
 
 impl SlaveState {
@@ -178,6 +194,12 @@ impl SlaveState {
             error: None,
             missing_vars: Vec::new(),
             joined_at: None,
+            device_id: None,
+            protocol_version: PROTOCOL_VERSION,
+            reconnecting: false,
+            phase_index: None,
+            phase_concurrent: 0,
+            reconnect_attempts: 0,
         }
     }
 
@@ -210,6 +232,12 @@ impl SlaveState {
             error: self.error.clone(),
             missing_vars: self.missing_vars.clone(),
             joined_at: self.joined_at,
+            device_id: self.device_id.clone(),
+            protocol_version: self.protocol_version,
+            reconnecting: self.reconnecting,
+            phase_index: self.phase_index,
+            phase_concurrent: self.phase_concurrent,
+            reconnect_attempts: self.reconnect_attempts,
         }
     }
 }
@@ -344,12 +372,6 @@ impl ClusterSlave {
 
 /* ---------- 后台会话 ---------- */
 
-enum RunEnd {
-    Done,
-    Aborted(String),
-    Lost(String),
-}
-
 struct LocalPrepare {
     prepared: PreparedStress,
     job_id: u64,
@@ -371,50 +393,123 @@ fn prepare_failure(error: impl Into<String>) -> PrepareFailure {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_slave(
-    app: Arc<dyn ClusterApp>,
-    pool: DbPool,
-    master: MasterAddr,
-    node_name: String,
-    pair_code: String,
-    abort: Arc<AtomicBool>,
-    notify: Arc<Notify>,
-    state: Arc<Mutex<SlaveState>>,
-) {
+/* ---------- 连接与重连 ---------- */
+
+/// 断线期间缓存出站消息：逐秒采样最多保留最近 8 分钟
+#[derive(Default)]
+struct Link {
+    tx: Mutex<Option<mpsc::UnboundedSender<ClusterMessage>>>,
+    pending: Mutex<VecDeque<ClusterMessage>>,
+}
+
+impl Link {
+    fn attach(&self, tx: &mpsc::UnboundedSender<ClusterMessage>) {
+        {
+            let mut pending = self.pending.lock();
+            for message in pending.drain(..) {
+                let _ = tx.send(message);
+            }
+        }
+        *self.tx.lock() = Some(tx.clone());
+    }
+
+    fn detach(&self) {
+        *self.tx.lock() = None;
+    }
+
+    /// 已连接就直接发送；断线期间入队等待重连后补发
+    fn send(&self, message: ClusterMessage) -> bool {
+        let tx = self.tx.lock().clone();
+        if let Some(tx) = tx {
+            if tx.send(message.clone()).is_ok() {
+                return true;
+            }
+        }
+        let mut pending = self.pending.lock();
+        if pending.len() >= MAX_PENDING_MESSAGES {
+            pending.pop_front();
+        }
+        pending.push_back(message);
+        false
+    }
+}
+
+/// 跨连接保留的执行上下文：断线只换链路，引擎与已准备的配置不重建
+struct SlaveRuntime {
+    prepared: Option<PreparedStress>,
+    local_job: Option<u64>,
+    watch: Option<Arc<AtomicBool>>,
+    running_job: Option<u64>,
+    engine_job: Option<tauri::async_runtime::JoinHandle<()>>,
+    outcome: Option<EngineOutcome>,
+    started: bool,
+    token: Option<String>,
+    protocol_version: u32,
+}
+
+impl SlaveRuntime {
+    fn new() -> Self {
+        Self {
+            prepared: None,
+            local_job: None,
+            watch: None,
+            running_job: None,
+            engine_job: None,
+            outcome: None,
+            started: false,
+            token: None,
+            protocol_version: PROTOCOL_VERSION,
+        }
+    }
+}
+
+enum ConnEnd {
+    /// 连接中断，按令牌重连
+    Reconnect,
+    Terminate {
+        status: &'static str,
+        error: Option<String>,
+    },
+}
+
+enum HelloFailure {
+    /// 主节点明确拒绝（配对码 / 版本 / 令牌问题），重试无意义
+    Rejected(String),
+    /// 网络层断开或超时，可重连
+    Closed(String),
+}
+
+async fn connect_ws(master: &MasterAddr) -> Result<WsStream, String> {
     let mut config = WebSocketConfig::default();
     config.max_message_size = Some(MAX_MESSAGE_BYTES);
     config.max_frame_size = Some(MAX_MESSAGE_BYTES);
-    let ws = match tokio::time::timeout(
+    match tokio::time::timeout(
         CONNECT_TIMEOUT,
         tokio_tungstenite::connect_async_with_config(master.ws_url.as_str(), Some(config), false),
     )
     .await
     {
-        Ok(Ok(pair)) => pair.0,
-        Ok(Err(error)) => {
-            finish_with_error(
-                app.as_ref(),
-                &state,
-                "lost",
-                format!("连接主节点失败：{error}"),
-            );
-            return;
-        }
-        Err(_) => {
-            finish_with_error(
-                app.as_ref(),
-                &state,
-                "lost",
-                format!("连接主节点超时（{} 秒）", CONNECT_TIMEOUT.as_secs()),
-            );
-            return;
-        }
-    };
+        Ok(Ok(pair)) => Ok(pair.0),
+        Ok(Err(error)) => Err(format!("连接主节点失败：{error}")),
+        Err(_) => Err(format!(
+            "连接主节点超时（{} 秒）",
+            CONNECT_TIMEOUT.as_secs()
+        )),
+    }
+}
 
-    let (mut sink, mut read) = ws.split();
+type WsRead = futures_util::stream::SplitStream<WsStream>;
+
+fn spawn_connection(
+    ws: WsStream,
+) -> (
+    mpsc::UnboundedSender<ClusterMessage>,
+    WsRead,
+    tauri::async_runtime::JoinHandle<()>,
+) {
+    let (mut sink, read) = ws.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<ClusterMessage>();
-    let mut writer = tauri::async_runtime::spawn(async move {
+    let writer = tauri::async_runtime::spawn(async move {
         while let Some(message) = rx.recv().await {
             let text = match serde_json::to_string(&message) {
                 Ok(text) => text,
@@ -433,288 +528,716 @@ async fn run_slave(
         }
         let _ = sink.close().await;
     });
+    (tx, read, writer)
+}
 
-    let capacity = pool
-        .get()
-        .ok()
-        .and_then(|conn| {
-            crate::commands::capacity::latest_result(&conn)
-                .ok()
-                .flatten()
-        })
-        .map(|item| item.saturation_concurrent)
-        .filter(|value| *value > 0);
-    let _ = tx.send(ClusterMessage::Hello(HelloPayload {
-        version: PROTOCOL_VERSION,
-        pair_code,
-        node_name,
-        capacity_concurrent: capacity,
-    }));
-
-    let mut prepared: Option<PreparedStress> = None;
-    let mut local_job: Option<u64> = None;
-    let mut watch: Option<Arc<AtomicBool>> = None;
-    let mut greeted = false;
-    let mut last_rx = Instant::now();
-    let hello_deadline = Instant::now() + HELLO_TIMEOUT;
-
-    let mut ticker = tokio::time::interval(Duration::from_secs(1));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    ticker.tick().await;
-
+/// 等待 hello 回执：期间主节点可能先发版本拒绝
+async fn read_hello_ack(read: &mut WsRead) -> Result<HelloAckPayload, HelloFailure> {
+    let deadline = tokio::time::sleep(HELLO_TIMEOUT);
+    tokio::pin!(deadline);
     loop {
         tokio::select! {
-            _ = notify.notified() => {
-                abort.store(true, Ordering::SeqCst);
-                let _ = tx.send(ClusterMessage::Abort(AbortPayload {
-                    reason: Some("从节点主动断开".to_string()),
-                }));
-                set_status(&state, "left", Some("已断开与主节点的会话".to_string()));
-                break;
-            }
-            _ = ticker.tick() => {
-                if last_rx.elapsed() >= MASTER_SILENCE {
-                    abort.store(true, Ordering::SeqCst);
-                    set_status(&state, "lost", Some("与主节点失联超过 6 秒".to_string()));
-                    break;
-                }
-                if !greeted && Instant::now() >= hello_deadline {
-                    abort.store(true, Ordering::SeqCst);
-                    set_status(&state, "rejected", Some("主节点未回执 hello（超时 10 秒）".to_string()));
-                    break;
-                }
+            _ = &mut deadline => {
+                return Err(HelloFailure::Closed(format!(
+                    "主节点未回执 hello（超时 {} 秒）",
+                    HELLO_TIMEOUT.as_secs()
+                )));
             }
             frame = read.next() => {
                 let Some(frame) = frame else {
-                    if !matches!(state.lock().status.as_str(), "done" | "left" | "rejected") {
-                        abort.store(true, Ordering::SeqCst);
-                        set_status(&state, "lost", Some("主节点关闭了连接".to_string()));
-                    }
-                    break;
+                    return Err(HelloFailure::Closed("主节点关闭了连接".to_string()));
                 };
-                last_rx = Instant::now();
-                let text = match frame {
-                    Ok(Message::Text(text)) => text,
+                match frame {
+                    Ok(Message::Text(text)) => {
+                        let message: ClusterMessage = match serde_json::from_str(&text) {
+                            Ok(message) => message,
+                            Err(error) => {
+                                return Err(HelloFailure::Rejected(format!(
+                                    "主节点回执无法解析：{error}"
+                                )));
+                            }
+                        };
+                        match message {
+                            ClusterMessage::HelloAck(ack) => return Ok(ack),
+                            ClusterMessage::Error(ErrorPayload { message }) => {
+                                return Err(HelloFailure::Rejected(message));
+                            }
+                            _ => {}
+                        }
+                    }
                     Ok(Message::Close(_)) => {
-                        abort.store(true, Ordering::SeqCst);
-                        set_status(&state, "lost", Some("主节点关闭了连接".to_string()));
-                        break;
+                        return Err(HelloFailure::Closed("主节点关闭了连接".to_string()));
                     }
                     Ok(Message::Binary(_)) => {
-                        let _ = tx.send(ClusterMessage::Error(ErrorPayload {
-                            message: "集群协议只接受 JSON 文本消息".to_string(),
-                        }));
-                        continue;
+                        return Err(HelloFailure::Rejected(
+                            "集群协议只接受 JSON 文本消息".to_string(),
+                        ));
                     }
-                    Ok(Message::Ping(_)) | Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => continue,
+                    Ok(Message::Ping(_)) | Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => {}
                     Err(error) => {
-                        abort.store(true, Ordering::SeqCst);
-                        set_status(&state, "lost", Some(format!("读取主节点消息失败：{error}")));
-                        break;
+                        return Err(HelloFailure::Closed(format!(
+                            "读取主节点消息失败：{error}"
+                        )));
                     }
-                };
-                let message: ClusterMessage = match serde_json::from_str(&text) {
-                    Ok(message) => message,
-                    Err(error) => {
-                        log::warn!("集群从节点收到无法解析的消息：{error}");
-                        continue;
-                    }
-                };
-                match message {
-                    ClusterMessage::HelloAck(HelloAckPayload { version, node_id, .. }) => {
-                        if version != PROTOCOL_VERSION {
-                            abort.store(true, Ordering::SeqCst);
-                            set_status(
-                                &state,
-                                "rejected",
-                                Some(format!(
-                                    "协议版本不一致：主节点 v{version}，本机 v{PROTOCOL_VERSION}，请升级后重试"
-                                )),
-                            );
-                            break;
-                        }
-                        greeted = true;
-                        {
-                            let mut guard = state.lock();
-                            guard.node_id = Some(node_id);
-                            guard.joined_at = Some(now_ms());
-                        }
-                        emit_state(app.as_ref(), &state);
-                    }
-                    ClusterMessage::TimeProbe(TimeProbePayload { seq, t0 }) => {
-                        let _ = tx.send(ClusterMessage::TimeAck(TimeAckPayload {
-                            seq,
-                            t0,
-                            t1: now_ms(),
-                        }));
-                    }
-                    ClusterMessage::Prepare(payload) => {
-                        {
-                            let mut guard = state.lock();
-                            guard.status = "preparing".to_string();
-                            guard.plan_name = Some(payload.plan_name.clone());
-                            guard.concurrent = payload.concurrent;
-                            guard.error = None;
-                            guard.missing_vars.clear();
-                        }
-                        emit_state(app.as_ref(), &state);
-                        let result = match app.try_state() {
-                            Some(app_state) => {
-                                prepare_local(app_state.inner(), &pool, payload, &abort)
-                            }
-                            None => Err(prepare_failure("应用状态不可用")),
-                        };
-                        match result {
-                            Ok(local) => {
-                                {
-                                    let mut guard = state.lock();
-                                    guard.target = Some(local.target.clone());
-                                    guard.method = Some(local.method.clone());
-                                    guard.concurrent = local.accepted;
-                                }
-                                prepared = Some(local.prepared);
-                                local_job = Some(local.job_id);
-                                watch = Some(local.watch);
-                                let _ = tx.send(ClusterMessage::PrepareAck(PrepareAckPayload {
-                                    ok: true,
-                                    error: None,
-                                    missing_vars: Vec::new(),
-                                    accepted_concurrent: local.accepted,
-                                }));
-                                // 预检用渲染后的真实目标：变量缺失在前一步已拦截
-                                let target = prepared
-                                    .as_ref()
-                                    .map(|item| item.url_text.clone())
-                                    .unwrap_or_default();
-                                let preflight = preflight_target(&target).await;
-                                // 预检期间没有读连接，缓冲的 Ping 尚未消费；
-                                // 以预检结束时刻为准，避免紧接着的 tick 误判失联
-                                last_rx = Instant::now();
-                                if abort.load(Ordering::SeqCst) {
-                                    // 预检期间被断开：主动告诉主节点，避免它等到超时
-                                    let _ = tx.send(ClusterMessage::Abort(AbortPayload {
-                                        reason: Some("从节点在准备阶段中止".to_string()),
-                                    }));
-                                    break;
-                                }
-                                if preflight.ok {
-                                    set_status(&state, "ready", None);
-                                    let _ = tx.send(ClusterMessage::Preflight(PreflightPayload {
-                                        ok: true,
-                                        error: None,
-                                    }));
-                                } else {
-                                    if let Some(job) = local_job.take() {
-                                        finish_local(app.as_ref(), job);
-                                    }
-                                    set_status(
-                                        &state,
-                                        "rejected",
-                                        preflight.error.clone(),
-                                    );
-                                    let _ = tx.send(ClusterMessage::Preflight(PreflightPayload {
-                                        ok: false,
-                                        error: preflight.error,
-                                    }));
-                                    break;
-                                }
-                            }
-                            Err(failure) => {
-                                {
-                                    let mut guard = state.lock();
-                                    guard.missing_vars = failure.missing.clone();
-                                }
-                                set_status(&state, "rejected", Some(failure.error.clone()));
-                                let _ = tx.send(ClusterMessage::PrepareAck(PrepareAckPayload {
-                                    ok: false,
-                                    error: Some(failure.error),
-                                    missing_vars: failure.missing,
-                                    accepted_concurrent: 0,
-                                }));
-                                break;
-                            }
-                        }
-                    }
-                    ClusterMessage::Start(StartPayload { at_ms, offset_ms }) => {
-                        let (Some(item), Some(job), Some(run_watch)) =
-                            (prepared.take(), local_job.take(), watch.take())
-                        else {
-                            let _ = tx.send(ClusterMessage::Error(ErrorPayload {
-                                message: "尚未收到可执行的配置".to_string(),
-                            }));
-                            break;
-                        };
-                        // 主节点时钟 → 本机时钟：偏移由时钟探测得到，正值表示本机更快
-                        let local_at_ms = at_ms.saturating_add(offset_ms.round() as i64);
-                        {
-                            let mut guard = state.lock();
-                            guard.status = "running".to_string();
-                            guard.start_at_ms = Some(local_at_ms);
-                            guard.elapsed_sec = 0;
-                            guard.qps = 0.0;
-                            guard.clock_offset_ms = offset_ms;
-                        }
-                        emit_state(app.as_ref(), &state);
-                        let end = run_session(
-                            app.as_ref(),
-                            &tx,
-                            &state,
-                            &abort,
-                            &notify,
-                            &mut read,
-                            item,
-                            job,
-                            run_watch,
-                            local_at_ms,
-                        )
-                        .await;
-                        match end {
-                            RunEnd::Done => set_status(&state, "done", None),
-                            RunEnd::Aborted(reason) => set_status(&state, "left", Some(reason)),
-                            RunEnd::Lost(reason) => set_status(&state, "lost", Some(reason)),
-                        }
-                        emit_state(app.as_ref(), &state);
-                        break;
-                    }
-                    ClusterMessage::Abort(AbortPayload { reason }) => {
-                        abort.store(true, Ordering::SeqCst);
-                        set_status(
-                            &state,
-                            "left",
-                            Some(
-                                reason
-                                    .filter(|text| !text.trim().is_empty())
-                                    .unwrap_or_else(|| "主节点中止了任务".to_string()),
-                            ),
-                        );
-                        break;
-                    }
-                    ClusterMessage::Ping(PingPayload { at_ms }) => {
-                        let _ = tx.send(ClusterMessage::Pong(PongPayload { at_ms }));
-                    }
-                    ClusterMessage::Pong(_) => {}
-                    ClusterMessage::Error(ErrorPayload { message }) => {
-                        abort.store(true, Ordering::SeqCst);
-                        set_status(&state, "rejected", Some(message));
-                        break;
-                    }
-                    _ => {}
                 }
             }
         }
     }
+}
 
-    if let Some(job) = local_job {
-        finish_local(app.as_ref(), job);
+fn local_device_id(pool: &DbPool) -> String {
+    if let Ok(conn) = pool.get() {
+        if let Ok(Some(value)) = conn
+            .query_row(
+                "SELECT value FROM app_meta WHERE key = ?1",
+                params![DEVICE_ID_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+        {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+        let id = format!("device-{}", Uuid::new_v4().simple());
+        let _ = conn.execute(
+            "INSERT INTO app_meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![DEVICE_ID_KEY, id],
+        );
+        return id;
     }
-    // 拒绝 / 失联前的最后一条消息不能被随后的 close 抢掉：留出发送窗口
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    drop(tx);
-    if tokio::time::timeout(Duration::from_secs(2), &mut writer)
-        .await
-        .is_err()
+    format!("device-{}", Uuid::new_v4().simple())
+}
+
+fn local_capability(pool: &DbPool, node_name: &str, device_id: &str) -> Option<DeviceCapability> {
+    let conn = pool.get().ok()?;
+    let result = crate::commands::capacity::latest_result(&conn)
+        .ok()
+        .flatten()?;
+    Some(DeviceCapability {
+        device_id: Some(device_id.to_string()),
+        node_name: node_name.to_string(),
+        os: Some(result.os.clone()),
+        cores: result.cores,
+        capacity_concurrent: result.saturation_concurrent,
+        capacity_qps: result.max_qps,
+        probed_at: Some(result.probed_at),
+    })
+}
+
+fn drain_outcome(
+    runtime: &mut SlaveRuntime,
+    engine_rx: &mut Option<mpsc::UnboundedReceiver<EngineOutcome>>,
+) {
+    let Some(receiver) = engine_rx.as_mut() else {
+        return;
+    };
+    match receiver.try_recv() {
+        Ok(outcome) => {
+            *engine_rx = None;
+            runtime.outcome = Some(outcome);
+        }
+        Err(mpsc::error::TryRecvError::Disconnected) => *engine_rx = None,
+        Err(mpsc::error::TryRecvError::Empty) => {}
+    }
+}
+
+fn deliver_done(runtime: &mut SlaveRuntime, state: &Arc<Mutex<SlaveState>>, link: &Link) -> bool {
+    let Some(outcome) = runtime.outcome.as_ref() else {
+        return true;
+    };
+    let offset_ms = state.lock().clock_offset_ms;
+    let payload = done_payload(outcome, offset_ms);
+    let elapsed_sec = outcome
+        .report
+        .end_time
+        .unwrap_or(0)
+        .saturating_sub(outcome.report.start_time.unwrap_or(0)) as u64
+        / 1000;
     {
-        writer.abort();
+        let mut guard = state.lock();
+        guard.elapsed_sec = elapsed_sec;
+        guard.qps = 0.0;
+        guard.phase_index = None;
+    }
+    if link.send(ClusterMessage::Done(payload)) {
+        runtime.outcome = None;
+        true
+    } else {
+        false
+    }
+}
+
+fn start_engine(
+    app: Arc<dyn ClusterApp>,
+    runtime: &mut SlaveRuntime,
+    engine_rx: &mut Option<mpsc::UnboundedReceiver<EngineOutcome>>,
+    state: &Arc<Mutex<SlaveState>>,
+    link: &Arc<Link>,
+    at_ms: i64,
+) -> Result<(), String> {
+    let (Some(prepared), Some(job), Some(watch)) = (
+        runtime.prepared.take(),
+        runtime.local_job.take(),
+        runtime.watch.take(),
+    ) else {
+        return Err("尚未收到可执行的配置".to_string());
+    };
+    let state_for_sink = state.clone();
+    let link_for_sink = link.clone();
+    let sink: EngineSampleSink = Arc::new(move |sample| {
+        state_for_sink.lock().qps = sample.qps;
+        link_for_sink.send(ClusterMessage::Sample(sample));
+    });
+    let (outcome_tx, outcome_rx) = mpsc::unbounded_channel();
+    let app_for_task = Arc::clone(&app);
+    let handle = tauri::async_runtime::spawn(async move {
+        let outcome = run_engine(
+            prepared,
+            job,
+            None,
+            Some(&watch),
+            EngineOptions {
+                start_at_ms: Some(at_ms),
+                sink: Some(sink),
+                persist: None,
+            },
+        )
+        .await;
+        let _ = outcome_tx.send(outcome);
+        finish_local(app_for_task.as_ref(), job);
+    });
+    *engine_rx = Some(outcome_rx);
+    runtime.running_job = Some(job);
+    runtime.engine_job = Some(handle);
+    runtime.started = true;
+    Ok(())
+}
+
+fn stop_engine(
+    app: &dyn ClusterApp,
+    runtime: &mut SlaveRuntime,
+    engine_rx: &mut Option<mpsc::UnboundedReceiver<EngineOutcome>>,
+) {
+    if let Some(watch) = runtime.watch.as_ref() {
+        watch.store(true, Ordering::SeqCst);
+    }
+    if let Some(job) = runtime.running_job.take() {
+        finish_local(app, job);
+    }
+    if let Some(handle) = runtime.engine_job.take() {
+        handle.abort();
+    }
+    *engine_rx = None;
+}
+
+fn mark_reconnecting(state: &Arc<Mutex<SlaveState>>, attempts: u32, elapsed: Duration) {
+    let mut guard = state.lock();
+    guard.reconnecting = true;
+    guard.reconnect_attempts = attempts;
+    guard.error = Some(format!(
+        "与主节点连接中断，正在重连（第 {attempts} 次，已等待 {}s）",
+        elapsed.as_secs()
+    ));
+}
+
+async fn wait_backoff(
+    runtime: &mut SlaveRuntime,
+    engine_rx: &mut Option<mpsc::UnboundedReceiver<EngineOutcome>>,
+    attempts: u32,
+) {
+    let seconds = (1u64 << attempts.saturating_sub(1).min(5)).min(RECONNECT_BACKOFF_MAX_SEC);
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    while Instant::now() < deadline {
+        let left = deadline.saturating_duration_since(Instant::now());
+        tokio::time::sleep(left.min(Duration::from_millis(250))).await;
+        drain_outcome(runtime, engine_rx);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_slave(
+    app: Arc<dyn ClusterApp>,
+    pool: DbPool,
+    master: MasterAddr,
+    node_name: String,
+    pair_code: String,
+    abort: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+    state: Arc<Mutex<SlaveState>>,
+) {
+    let device_id = local_device_id(&pool);
+    let capability = local_capability(&pool, &node_name, &device_id);
+    let legacy_capacity = capability
+        .as_ref()
+        .map(|item| item.capacity_concurrent)
+        .filter(|value| *value > 0);
+    let mut pair_code = Some(pair_code);
+    let link = Arc::new(Link::default());
+    let mut runtime = SlaveRuntime::new();
+    let mut engine_rx: Option<mpsc::UnboundedReceiver<EngineOutcome>> = None;
+    let mut reconnect_since: Option<Instant> = None;
+    let mut attempts = 0u32;
+    {
+        let mut guard = state.lock();
+        guard.device_id = Some(device_id.clone());
+        guard.protocol_version = PROTOCOL_VERSION;
+    }
+
+    loop {
+        if abort.load(Ordering::SeqCst) {
+            set_status(&state, "left", Some("已断开与主节点的会话".to_string()));
+            emit_state(app.as_ref(), &state);
+            return;
+        }
+        if let Some(since) = reconnect_since {
+            if since.elapsed() >= Duration::from_secs(RECONNECT_GRACE_SEC) {
+                stop_engine(app.as_ref(), &mut runtime, &mut engine_rx);
+                set_status(
+                    &state,
+                    "lost",
+                    Some(format!(
+                        "与主节点重连超过 {} 分钟，已停止本机压测",
+                        RECONNECT_GRACE_SEC / 60
+                    )),
+                );
+                emit_state(app.as_ref(), &state);
+                return;
+            }
+        }
+
+        let ws = match connect_ws(&master).await {
+            Ok(ws) => ws,
+            Err(error) => {
+                if !runtime.started {
+                    finish_with_error(app.as_ref(), &state, "lost", error);
+                    return;
+                }
+                let since = *reconnect_since.get_or_insert_with(Instant::now);
+                attempts += 1;
+                mark_reconnecting(&state, attempts, since.elapsed());
+                emit_state(app.as_ref(), &state);
+                wait_backoff(&mut runtime, &mut engine_rx, attempts).await;
+                continue;
+            }
+        };
+        let (tx, mut read, mut writer) = spawn_connection(ws);
+        let hello = HelloPayload {
+            version: PROTOCOL_VERSION,
+            pair_code: pair_code.take().unwrap_or_default(),
+            node_name: node_name.clone(),
+            capacity_concurrent: legacy_capacity,
+            device_id: Some(device_id.clone()),
+            session_token: runtime.started.then(|| runtime.token.clone()).flatten(),
+        };
+        let _ = tx.send(ClusterMessage::Hello(hello));
+        let ack = match read_hello_ack(&mut read).await {
+            Ok(ack) => ack,
+            Err(HelloFailure::Rejected(message)) => {
+                drop(tx);
+                let _ = tokio::time::timeout(Duration::from_secs(2), &mut writer).await;
+                stop_engine(app.as_ref(), &mut runtime, &mut engine_rx);
+                finish_with_error(app.as_ref(), &state, "rejected", message);
+                return;
+            }
+            Err(HelloFailure::Closed(message)) => {
+                drop(tx);
+                let _ = tokio::time::timeout(Duration::from_secs(2), &mut writer).await;
+                if !runtime.started {
+                    finish_with_error(app.as_ref(), &state, "lost", message);
+                    return;
+                }
+                let since = *reconnect_since.get_or_insert_with(Instant::now);
+                attempts += 1;
+                mark_reconnecting(&state, attempts, since.elapsed());
+                emit_state(app.as_ref(), &state);
+                wait_backoff(&mut runtime, &mut engine_rx, attempts).await;
+                continue;
+            }
+        };
+        if !(MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&ack.version) {
+            drop(tx);
+            let _ = tokio::time::timeout(Duration::from_secs(2), &mut writer).await;
+            finish_with_error(
+                app.as_ref(),
+                &state,
+                "rejected",
+                format!(
+                    "协议版本不兼容：主节点 v{}，本机支持 v{}–v{}",
+                    ack.version, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION
+                ),
+            );
+            return;
+        }
+        runtime.token = Some(ack.token.clone());
+        runtime.protocol_version = ack.version;
+        {
+            let mut guard = state.lock();
+            guard.node_id = Some(ack.node_id.clone());
+            guard.protocol_version = ack.version;
+            if guard.joined_at.is_none() {
+                guard.joined_at = Some(now_ms());
+            }
+            guard.reconnecting = false;
+            guard.reconnect_attempts = 0;
+            guard.error = None;
+        }
+        if ack.version >= 2 {
+            if let Some(capability) = capability.clone() {
+                let _ = tx.send(ClusterMessage::CapabilityReport(capability));
+            }
+        }
+        link.attach(&tx);
+        reconnect_since = None;
+        attempts = 0;
+        emit_state(app.as_ref(), &state);
+
+        let end = run_link_loop(
+            &app,
+            &pool,
+            &state,
+            &abort,
+            &notify,
+            &link,
+            &mut read,
+            &mut runtime,
+            &mut engine_rx,
+        )
+        .await;
+        link.detach();
+        drop(tx);
+        if tokio::time::timeout(Duration::from_secs(2), &mut writer)
+            .await
+            .is_err()
+        {
+            writer.abort();
+        }
+
+        match end {
+            ConnEnd::Terminate { status, error } => {
+                if status != "done" {
+                    if let Some(watch) = runtime.watch.as_ref() {
+                        watch.store(true, Ordering::SeqCst);
+                    }
+                }
+                if let Some(job) = runtime.running_job.take() {
+                    finish_local(app.as_ref(), job);
+                }
+                set_status(&state, status, error);
+                emit_state(app.as_ref(), &state);
+                return;
+            }
+            ConnEnd::Reconnect => {
+                let since = *reconnect_since.get_or_insert_with(Instant::now);
+                attempts += 1;
+                mark_reconnecting(&state, attempts, since.elapsed());
+                emit_state(app.as_ref(), &state);
+                wait_backoff(&mut runtime, &mut engine_rx, attempts).await;
+            }
+        }
+    }
+}
+
+/// 单条连接的收发循环：准备 → 起跑 → 断线时保留引擎并返回重连
+#[allow(clippy::too_many_arguments)]
+async fn run_link_loop(
+    app: &Arc<dyn ClusterApp>,
+    pool: &DbPool,
+    state: &Arc<Mutex<SlaveState>>,
+    abort: &Arc<AtomicBool>,
+    notify: &Notify,
+    link: &Arc<Link>,
+    read: &mut WsRead,
+    runtime: &mut SlaveRuntime,
+    engine_rx: &mut Option<mpsc::UnboundedReceiver<EngineOutcome>>,
+) -> ConnEnd {
+    let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await;
+    let mut last_rx = Instant::now();
+
+    loop {
+        drain_outcome(runtime, engine_rx);
+        if runtime.outcome.is_some() {
+            if deliver_done(runtime, state, link) {
+                return ConnEnd::Terminate {
+                    status: "done",
+                    error: None,
+                };
+            }
+            return ConnEnd::Reconnect;
+        }
+        if abort.load(Ordering::SeqCst) {
+            return ConnEnd::Terminate {
+                status: "left",
+                error: Some("已断开与主节点的会话".to_string()),
+            };
+        }
+
+        let frame = tokio::select! {
+            _ = notify.notified() => {
+                abort.store(true, Ordering::SeqCst);
+                if let Some(watch) = runtime.watch.as_ref() {
+                    watch.store(true, Ordering::SeqCst);
+                }
+                let _ = link.send(ClusterMessage::Abort(AbortPayload {
+                    reason: Some("从节点主动断开".to_string()),
+                }));
+                return ConnEnd::Terminate {
+                    status: "left",
+                    error: Some("已断开与主节点的会话".to_string()),
+                };
+            }
+            _ = ticker.tick() => {
+                if last_rx.elapsed() >= MASTER_SILENCE {
+                    return if runtime.started {
+                        ConnEnd::Reconnect
+                    } else {
+                        ConnEnd::Terminate {
+                            status: "lost",
+                            error: Some("与主节点失联超过 6 秒".to_string()),
+                        }
+                    };
+                }
+                continue;
+            }
+            frame = read.next() => frame,
+        };
+        let Some(frame) = frame else {
+            return if runtime.started {
+                ConnEnd::Reconnect
+            } else {
+                ConnEnd::Terminate {
+                    status: "lost",
+                    error: Some("主节点关闭了连接".to_string()),
+                }
+            };
+        };
+        last_rx = Instant::now();
+        let text = match frame {
+            Ok(Message::Text(text)) => text,
+            Ok(Message::Close(_)) => {
+                return if runtime.started {
+                    ConnEnd::Reconnect
+                } else {
+                    ConnEnd::Terminate {
+                        status: "lost",
+                        error: Some("主节点关闭了连接".to_string()),
+                    }
+                };
+            }
+            Ok(Message::Binary(_)) => {
+                let _ = link.send(ClusterMessage::Error(ErrorPayload {
+                    message: "集群协议只接受 JSON 文本消息".to_string(),
+                }));
+                continue;
+            }
+            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => continue,
+            Err(error) => {
+                return if runtime.started {
+                    ConnEnd::Reconnect
+                } else {
+                    ConnEnd::Terminate {
+                        status: "lost",
+                        error: Some(format!("读取主节点消息失败：{error}")),
+                    }
+                };
+            }
+        };
+        let message: ClusterMessage = match serde_json::from_str(&text) {
+            Ok(message) => message,
+            Err(error) => {
+                log::warn!("集群从节点收到无法解析的消息：{error}");
+                continue;
+            }
+        };
+
+        match message {
+            ClusterMessage::Ping(PingPayload { at_ms }) => {
+                let _ = link.send(ClusterMessage::Pong(PongPayload { at_ms }));
+            }
+            ClusterMessage::Pong(_) => {}
+            ClusterMessage::TimeProbe(TimeProbePayload { seq, t0 }) => {
+                let _ = link.send(ClusterMessage::TimeAck(TimeAckPayload {
+                    seq,
+                    t0,
+                    t1: now_ms(),
+                }));
+            }
+            ClusterMessage::PhaseStart(PhaseStartPayload {
+                index,
+                node_concurrent,
+                ..
+            }) => {
+                {
+                    let mut guard = state.lock();
+                    guard.phase_index = Some(index);
+                    guard.phase_concurrent = node_concurrent;
+                    guard.concurrent = node_concurrent;
+                }
+                emit_state(app.as_ref(), state);
+            }
+            ClusterMessage::Prepare(payload) => {
+                if runtime.started {
+                    continue;
+                }
+                let plan_name = payload.plan_name.clone();
+                let requested = payload.concurrent;
+                {
+                    let mut guard = state.lock();
+                    guard.status = "preparing".to_string();
+                    guard.plan_name = Some(plan_name);
+                    guard.concurrent = requested;
+                    guard.error = None;
+                    guard.missing_vars.clear();
+                }
+                emit_state(app.as_ref(), state);
+                let result = match app.try_state() {
+                    Some(app_state) => prepare_local(app_state.inner(), pool, payload, abort),
+                    None => Err(prepare_failure("应用状态不可用")),
+                };
+                match result {
+                    Ok(local) => {
+                        {
+                            let mut guard = state.lock();
+                            guard.target = Some(local.target.clone());
+                            guard.method = Some(local.method.clone());
+                            guard.concurrent = local.accepted;
+                        }
+                        runtime.prepared = Some(local.prepared);
+                        runtime.local_job = Some(local.job_id);
+                        runtime.watch = Some(local.watch);
+                        let _ = link.send(ClusterMessage::PrepareAck(PrepareAckPayload {
+                            ok: true,
+                            error: None,
+                            missing_vars: Vec::new(),
+                            accepted_concurrent: local.accepted,
+                        }));
+                        // 预检用渲染后的真实目标：变量缺失在前一步已拦截
+                        let target = runtime
+                            .prepared
+                            .as_ref()
+                            .map(|item| item.url_text.clone())
+                            .unwrap_or_default();
+                        let preflight = preflight_target(&target).await;
+                        // 预检期间没有读连接，缓冲的 Ping 尚未消费；
+                        // 以预检结束时刻为准，避免紧接着的 tick 误判失联
+                        last_rx = Instant::now();
+                        if abort.load(Ordering::SeqCst) {
+                            let _ = link.send(ClusterMessage::Abort(AbortPayload {
+                                reason: Some("从节点在准备阶段中止".to_string()),
+                            }));
+                            return ConnEnd::Terminate {
+                                status: "left",
+                                error: Some("从节点在准备阶段中止".to_string()),
+                            };
+                        }
+                        if preflight.ok {
+                            set_status(state, "ready", None);
+                            let _ = link.send(ClusterMessage::Preflight(PreflightPayload {
+                                ok: true,
+                                error: None,
+                            }));
+                            emit_state(app.as_ref(), state);
+                        } else {
+                            if let Some(job) = runtime.local_job.take() {
+                                finish_local(app.as_ref(), job);
+                            }
+                            let detail = preflight
+                                .error
+                                .clone()
+                                .unwrap_or_else(|| "目标不可达".to_string());
+                            set_status(state, "rejected", Some(detail.clone()));
+                            let _ = link.send(ClusterMessage::Preflight(PreflightPayload {
+                                ok: false,
+                                error: preflight.error,
+                            }));
+                            return ConnEnd::Terminate {
+                                status: "rejected",
+                                error: Some(detail),
+                            };
+                        }
+                    }
+                    Err(failure) => {
+                        {
+                            let mut guard = state.lock();
+                            guard.missing_vars = failure.missing.clone();
+                        }
+                        set_status(state, "rejected", Some(failure.error.clone()));
+                        let _ = link.send(ClusterMessage::PrepareAck(PrepareAckPayload {
+                            ok: false,
+                            error: Some(failure.error.clone()),
+                            missing_vars: failure.missing,
+                            accepted_concurrent: 0,
+                        }));
+                        return ConnEnd::Terminate {
+                            status: "rejected",
+                            error: Some(failure.error),
+                        };
+                    }
+                }
+            }
+            ClusterMessage::Start(StartPayload { at_ms, offset_ms }) => {
+                // 主节点时钟 → 本机时钟：偏移由时钟探测得到，正值表示本机更快
+                let local_at_ms = at_ms.saturating_add(offset_ms.round() as i64);
+                {
+                    let mut guard = state.lock();
+                    guard.status = "running".to_string();
+                    guard.start_at_ms = Some(local_at_ms);
+                    guard.elapsed_sec = 0;
+                    guard.qps = 0.0;
+                    guard.clock_offset_ms = offset_ms;
+                    guard.phase_index = None;
+                    guard.phase_concurrent = 0;
+                    guard.reconnecting = false;
+                    guard.error = None;
+                }
+                emit_state(app.as_ref(), state);
+                if let Err(error) = start_engine(
+                    Arc::clone(app),
+                    runtime,
+                    engine_rx,
+                    state,
+                    link,
+                    local_at_ms,
+                ) {
+                    let _ = link.send(ClusterMessage::Error(ErrorPayload {
+                        message: error.clone(),
+                    }));
+                    return ConnEnd::Terminate {
+                        status: "rejected",
+                        error: Some(error),
+                    };
+                }
+            }
+            ClusterMessage::Abort(AbortPayload { reason }) => {
+                abort.store(true, Ordering::SeqCst);
+                if let Some(watch) = runtime.watch.as_ref() {
+                    watch.store(true, Ordering::SeqCst);
+                }
+                let detail = reason
+                    .filter(|text| !text.trim().is_empty())
+                    .unwrap_or_else(|| "主节点中止了任务".to_string());
+                return ConnEnd::Terminate {
+                    status: "left",
+                    error: Some(detail),
+                };
+            }
+            ClusterMessage::Error(ErrorPayload { message }) => {
+                if runtime.started {
+                    // 运行期可能是主节点临时异常：保留引擎，按令牌重连
+                    log::warn!("主节点运行期报错：{message}");
+                    return ConnEnd::Reconnect;
+                }
+                return ConnEnd::Terminate {
+                    status: "rejected",
+                    error: Some(message),
+                };
+            }
+            _ => {}
+        }
     }
 }
 
@@ -846,137 +1369,6 @@ fn query_env_id(conn: &rusqlite::Connection, name: &str) -> Result<i64, PrepareF
             "本机未找到环境「{name}」，请在各节点创建同名环境并补全变量"
         ))
     })
-}
-
-/// 执行引擎并同时处理主节点消息：只在中止 / 失联时提前返回
-#[allow(clippy::too_many_arguments)]
-async fn run_session<S>(
-    app: &dyn ClusterApp,
-    tx: &mpsc::UnboundedSender<ClusterMessage>,
-    state: &Arc<Mutex<SlaveState>>,
-    abort: &Arc<AtomicBool>,
-    notify: &Notify,
-    read: &mut S,
-    prepared: PreparedStress,
-    job_id: u64,
-    watch: Arc<AtomicBool>,
-    at_ms: i64,
-) -> RunEnd
-where
-    S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
-{
-    let state_for_sink = state.clone();
-    let tx_for_sink = tx.clone();
-    let sink: EngineSampleSink = Arc::new(move |sample| {
-        state_for_sink.lock().qps = sample.qps;
-        let _ = tx_for_sink.send(ClusterMessage::Sample(sample));
-    });
-    let engine = run_engine(
-        prepared,
-        job_id,
-        None,
-        Some(&watch),
-        EngineOptions {
-            start_at_ms: Some(at_ms),
-            sink: Some(sink),
-        },
-    );
-    tokio::pin!(engine);
-
-    let mut ticker = tokio::time::interval(Duration::from_secs(1));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    ticker.tick().await;
-    let mut last_rx = Instant::now();
-
-    let (end, outcome) = loop {
-        tokio::select! {
-            outcome = &mut engine => break (RunEnd::Done, Some(outcome)),
-            _ = notify.notified() => {
-                abort.store(true, Ordering::SeqCst);
-                watch.store(true, Ordering::SeqCst);
-                let _ = tx.send(ClusterMessage::Abort(AbortPayload {
-                    reason: Some("从节点主动断开".to_string()),
-                }));
-                break (RunEnd::Aborted("已断开与主节点的会话".to_string()), None);
-            }
-            _ = ticker.tick() => {
-                if last_rx.elapsed() >= MASTER_SILENCE {
-                    abort.store(true, Ordering::SeqCst);
-                    watch.store(true, Ordering::SeqCst);
-                    break (RunEnd::Lost("与主节点失联超过 6 秒".to_string()), None);
-                }
-            }
-            frame = read.next() => {
-                let Some(frame) = frame else {
-                    abort.store(true, Ordering::SeqCst);
-                    watch.store(true, Ordering::SeqCst);
-                    break (RunEnd::Lost("主节点关闭了连接".to_string()), None);
-                };
-                last_rx = Instant::now();
-                match frame {
-                    Ok(Message::Text(text)) => {
-                        let message: ClusterMessage = match serde_json::from_str(&text) {
-                            Ok(message) => message,
-                            Err(_) => continue,
-                        };
-                        match message {
-                            ClusterMessage::Ping(PingPayload { at_ms }) => {
-                                let _ = tx.send(ClusterMessage::Pong(PongPayload { at_ms }));
-                            }
-                            ClusterMessage::Abort(AbortPayload { reason }) => {
-                                abort.store(true, Ordering::SeqCst);
-                                watch.store(true, Ordering::SeqCst);
-                                let detail = reason
-                                    .filter(|text| !text.trim().is_empty())
-                                    .unwrap_or_else(|| "主节点中止了任务".to_string());
-                                break (RunEnd::Aborted(detail), None);
-                            }
-                            ClusterMessage::Error(ErrorPayload { message }) => {
-                                abort.store(true, Ordering::SeqCst);
-                                watch.store(true, Ordering::SeqCst);
-                                break (RunEnd::Lost(format!("主节点报错：{message}")), None);
-                            }
-                            _ => {}
-                        }
-                    }
-                    Ok(Message::Close(_)) => {
-                        abort.store(true, Ordering::SeqCst);
-                        watch.store(true, Ordering::SeqCst);
-                        break (RunEnd::Lost("主节点关闭了连接".to_string()), None);
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        abort.store(true, Ordering::SeqCst);
-                        watch.store(true, Ordering::SeqCst);
-                        break (RunEnd::Lost(format!("读取主节点消息失败：{error}")), None);
-                    }
-                }
-            }
-        }
-    };
-
-    finish_local(app, job_id);
-
-    if let Some(outcome) = outcome {
-        let elapsed_sec = outcome
-            .report
-            .end_time
-            .unwrap_or(0)
-            .saturating_sub(outcome.report.start_time.unwrap_or(0))
-            as u64
-            / 1000;
-        let offset_ms = state.lock().clock_offset_ms;
-        {
-            let mut guard = state.lock();
-            guard.elapsed_sec = elapsed_sec;
-            guard.qps = 0.0;
-        }
-        let payload = done_payload(&outcome, offset_ms);
-        let _ = tx.send(ClusterMessage::Done(payload));
-    } else {
-        state.lock().qps = 0.0;
-    }
-    end
 }
 
 /// 从引擎结果生成 `done`：合并只认原始计数与毫秒桶

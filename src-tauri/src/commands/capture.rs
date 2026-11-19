@@ -6,6 +6,7 @@ use crate::capture::intercept::{
     BreakpointRule, Decision, InterceptView, MapLocalRule, MapRemoteRule, RequestEdit,
     ResponseEdit, WeakNetwork,
 };
+use crate::capture::persist::{self, ArchiveMode, SessionCompare, SessionFlows, SessionSummary};
 use crate::capture::store::{BodyPayload, FlowBrief, FlowDetail, HeaderEntry};
 use crate::capture::{CaptureConfig, CaptureState, CaptureStatus};
 use crate::state::AppState;
@@ -13,6 +14,7 @@ use base64::Engine as _;
 use bytes::Bytes;
 use std::time::{Duration, Instant};
 
+#[allow(clippy::too_many_arguments)]
 fn default_config(
     port: Option<u16>,
     bind_addr: Option<String>,
@@ -20,7 +22,10 @@ fn default_config(
     ignore_patterns: Option<Vec<String>>,
     capture_static: Option<bool>,
     upstream_proxy: Option<String>,
-) -> CaptureConfig {
+    archive_mode: Option<String>,
+    archive_name: Option<String>,
+    archive_exclude: Option<Vec<String>>,
+) -> Result<CaptureConfig, String> {
     let mut config = CaptureConfig::default();
     if let Some(port) = port {
         config.port = port;
@@ -38,10 +43,16 @@ fn default_config(
         config.capture_static = capture_static;
     }
     config.upstream_proxy = upstream_proxy;
-    config
+    if let Some(mode) = archive_mode {
+        config.archive_mode = ArchiveMode::parse(&mode)?;
+    }
+    config.archive_name = archive_name.filter(|name| !name.trim().is_empty());
+    config.archive_exclude = archive_exclude.unwrap_or_default();
+    Ok(config)
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub fn capture_start(
     state: tauri::State<'_, AppState>,
     port: Option<u16>,
@@ -50,6 +61,9 @@ pub fn capture_start(
     ignore_patterns: Option<Vec<String>>,
     capture_static: Option<bool>,
     upstream_proxy: Option<String>,
+    archive_mode: Option<String>,
+    archive_name: Option<String>,
+    archive_exclude: Option<Vec<String>>,
 ) -> Result<CaptureStatus, String> {
     let config = default_config(
         port,
@@ -58,7 +72,10 @@ pub fn capture_start(
         ignore_patterns,
         capture_static,
         upstream_proxy,
-    );
+        archive_mode,
+        archive_name,
+        archive_exclude,
+    )?;
     state.capture.start(Some(config))
 }
 
@@ -503,4 +520,67 @@ pub fn capture_breakpoint_resolve(
 pub fn capture_breakpoint_release_all(state: tauri::State<'_, AppState>) -> InterceptView {
     state.capture.release_pauses();
     state.capture.intercept_view()
+}
+
+/// 历史会话列表（R7）。
+#[tauri::command(async)]
+pub fn capture_sessions_list(
+    state: tauri::State<'_, AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<SessionSummary>, String> {
+    persist::list_sessions(&state.pool, limit.unwrap_or(50))
+}
+
+/// 会话内流量检索：关键字命中 host/path，可叠加方法/状态过滤。
+#[tauri::command(async)]
+pub fn capture_session_flows(
+    state: tauri::State<'_, AppState>,
+    session_id: i64,
+    keyword: Option<String>,
+    method: Option<String>,
+    status: Option<String>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<SessionFlows, String> {
+    persist::session_flows(
+        &state.pool,
+        session_id,
+        keyword.as_deref(),
+        method.as_deref(),
+        status.as_deref(),
+        offset.unwrap_or(0),
+        limit.unwrap_or(200),
+    )
+}
+
+/// 归档流量详情：头与 body 从 capture_bodies 还原。
+#[tauri::command(async)]
+pub fn capture_session_flow_detail(
+    state: tauri::State<'_, AppState>,
+    session_id: i64,
+    flow_id: u64,
+) -> Result<FlowDetail, String> {
+    persist::session_flow_detail(&state.pool, state.capture.data_dir(), session_id, flow_id)
+}
+
+/// 删除一个归档会话；录制中的会话不允许删。
+#[tauri::command(async)]
+pub fn capture_session_delete(
+    state: tauri::State<'_, AppState>,
+    session_id: i64,
+) -> Result<(), String> {
+    if state.capture.status().session_id == Some(session_id) {
+        return Err("E_ARCHIVE: 录制中的会话不能删除".into());
+    }
+    persist::delete_session(&state.pool, state.capture.data_dir(), session_id)
+}
+
+/// 两个会话按 method + host + path 归一化后对比。
+#[tauri::command(async)]
+pub fn capture_session_compare(
+    state: tauri::State<'_, AppState>,
+    a: i64,
+    b: i64,
+) -> Result<SessionCompare, String> {
+    persist::compare_sessions(&state.pool, a, b)
 }

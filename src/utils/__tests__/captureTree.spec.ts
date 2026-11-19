@@ -41,6 +41,7 @@ function flow(
     mapped: false,
     modified: false,
     remote: null,
+    passthrough: false,
     ...extra,
   }
 }

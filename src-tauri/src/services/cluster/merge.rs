@@ -17,8 +17,8 @@ use std::collections::BTreeMap;
 use serde_json::json;
 
 use super::protocol::{
-    ClusterReportMeta, ClusterReportNode, DonePayload, SamplePayload, CLOCK_DROP_UNCERTAINTY_MS,
-    PROTOCOL_VERSION,
+    ClusterReportMeta, ClusterReportNode, DonePayload, Orchestration, SamplePayload,
+    CLOCK_DROP_UNCERTAINTY_MS, PROTOCOL_VERSION,
 };
 use crate::commands::stress::EngineOutcome;
 use crate::models::{ErrorTypeCount, HistogramBucket, ReportSample, StatusCount, StressReport};
@@ -54,6 +54,8 @@ pub(crate) struct MergeRequest {
     pub finished_at: i64,
     pub incomplete: bool,
     pub note: Option<String>,
+    /// 计划级编排：写入报告元数据，便于还原阶段边界
+    pub orchestration: Option<Orchestration>,
     /// 主节点本地引擎的配置快照；合并后把集群元数据插进 `cluster` 字段
     pub config_snapshot: String,
     pub nodes: Vec<MergeNode>,
@@ -314,6 +316,7 @@ pub(crate) fn merge(request: MergeRequest) -> MergedReport {
         start_time: Some(start_ms),
         end_time: Some(end_ms),
         created_at: end_ms,
+        external_metrics: None,
     };
 
     let status_codes = sorted_codes(&codes);
@@ -339,6 +342,7 @@ pub(crate) fn merge(request: MergeRequest) -> MergedReport {
         dropped_samples,
         nodes: node_meta,
         note: request.note.clone(),
+        orchestration: request.orchestration.clone(),
     };
 
     let mut config: serde_json::Value =
@@ -589,6 +593,7 @@ mod tests {
             finished_at: 11_000,
             incomplete: false,
             note: None,
+            orchestration: None,
             config_snapshot: "{}".to_string(),
             nodes,
         }
@@ -701,7 +706,9 @@ mod tests {
             &pool,
             ReportPayload {
                 report: &merged.report,
+                job_id: None,
                 samples: &merged.samples,
+                worker_states: &[],
                 errors: &errors,
                 requests: &requests,
                 stages: &stages,
@@ -774,6 +781,7 @@ mod tests {
                 start_time: Some(5_000),
                 end_time: Some(9_000),
                 created_at: 9_000,
+                external_metrics: None,
             },
             samples: vec![],
             errors: vec![],
@@ -784,6 +792,7 @@ mod tests {
             histogram: vec![],
             body_histogram: vec![],
             error_types: vec![],
+            worker_states: vec![],
             config_snapshot: r#"{"metrics":{"cpuPeakCores":1.5,"memPeakMb":256}}"#.to_string(),
             sparse: crate::commands::stress::EngineSparseMetrics {
                 total: 10,

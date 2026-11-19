@@ -80,6 +80,9 @@ pub struct FlowBrief {
     /// 远程映射真正发往的上游地址；未命中远程映射时为 None
     #[serde(default)]
     pub remote: Option<String>,
+    /// 命中 SSL 直通白名单：只看得到 CONNECT，没有明文（R6）
+    #[serde(default)]
+    pub passthrough: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,9 +119,11 @@ struct Inner {
 
 pub struct CaptureStore {
     inner: Mutex<Inner>,
+    archive: Mutex<Option<super::persist::ArchiveSender>>,
     next_id: AtomicU64,
     total: AtomicU64,
     dropped: AtomicU64,
+    passthrough: AtomicU64,
 }
 
 impl CaptureStore {
@@ -133,9 +138,11 @@ impl CaptureStore {
                 body_bytes: 0,
                 limits,
             }),
+            archive: Mutex::new(None),
             next_id: AtomicU64::new(1),
             total: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
+            passthrough: AtomicU64::new(0),
         }
     }
 
@@ -164,6 +171,11 @@ impl CaptureStore {
     }
 
     pub fn record(&self, record: FlowRecord) {
+        // 归档只在会话开启时才有 sender；try_send 满队列即丢，不阻塞转发
+        let archive = self.archive.lock().clone();
+        if let Some(archive) = archive {
+            archive.send(&record);
+        }
         let added = record.body_bytes();
         let mut inner = self.inner.lock();
         if inner.flows.len() >= inner.limits.max_flows {
@@ -172,9 +184,13 @@ impl CaptureStore {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
+        let passthrough = record.brief.passthrough;
         inner.flows.push_back(record);
         inner.body_bytes = inner.body_bytes.saturating_add(added);
         self.total.fetch_add(1, Ordering::Relaxed);
+        if passthrough {
+            self.passthrough.fetch_add(1, Ordering::Relaxed);
+        }
 
         // body 总预算超限：从最旧一条开始淘汰，直到回到预算内
         while inner.body_bytes > inner.limits.max_body_bytes && inner.flows.len() > 1 {
@@ -285,6 +301,10 @@ impl CaptureStore {
             .collect()
     }
 
+    pub fn set_archive(&self, sender: Option<super::persist::ArchiveSender>) {
+        *self.archive.lock() = sender;
+    }
+
     pub fn clear(&self) {
         let mut inner = self.inner.lock();
         inner.flows.clear();
@@ -292,6 +312,7 @@ impl CaptureStore {
         self.next_id.store(1, Ordering::Relaxed);
         self.total.store(0, Ordering::Relaxed);
         self.dropped.store(0, Ordering::Relaxed);
+        self.passthrough.store(0, Ordering::Relaxed);
     }
 
     pub fn total(&self) -> u64 {
@@ -300,6 +321,10 @@ impl CaptureStore {
 
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
+    }
+
+    pub fn passthrough_count(&self) -> u64 {
+        self.passthrough.load(Ordering::Relaxed)
     }
 }
 

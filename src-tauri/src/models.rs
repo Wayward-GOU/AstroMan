@@ -892,6 +892,28 @@ pub struct CapacityResult {
     pub samples: Vec<CapacitySample>,
 }
 
+/// 外部监控指标的一个采样点（R5 / 3.6.1）
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalMetricPoint {
+    /// 相对压测开始的秒数，与 report_samples.elapsed_sec 同一时间轴
+    pub t: i64,
+    pub v: f64,
+}
+
+/// 外部监控指标序列（CSV / Prometheus 导入后落到 test_reports.external_metrics_json）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalMetricSeries {
+    /// 数据来源标识：csv:<文件名> / prometheus:<expr 摘要>
+    pub source: String,
+    /// 指标名，如 cpu.usage / gc.pause / db.pool.wait
+    pub metric: String,
+    /// 单位：percent / ms / count / bytes
+    pub unit: String,
+    pub points: Vec<ExternalMetricPoint>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StressReport {
@@ -927,6 +949,9 @@ pub struct StressReport {
     pub start_time: Option<i64>,
     pub end_time: Option<i64>,
     pub created_at: i64,
+    /// 外部监控指标（R5）：独立列读取；老报告 / 未导入时为 None
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_metrics: Option<Vec<ExternalMetricSeries>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -950,6 +975,37 @@ pub struct ReportDetail {
     pub scenario_text: Option<String>,
     /// 用户可编辑的报告总结
     pub summary_text: Option<String>,
+    /// 并发透视：每秒 worker 状态分布（R8）
+    #[serde(default)]
+    pub worker_states: Vec<WorkerStateSample>,
+}
+
+/// 单个采样点的 worker 状态分布（R8）
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerStateSample {
+    pub elapsed_sec: u64,
+    pub idle: u32,
+    pub ramp_wait: u32,
+    pub stage_wait: u32,
+    pub rate_wait: u32,
+    pub await_header: u32,
+    pub read_body: u32,
+    pub think: u32,
+    pub done: u32,
+}
+
+/// 按需 worker 快照（R8）：回答「当前并发各自卡在哪」
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerSnapshot {
+    pub index: u32,
+    pub state: String,
+    pub method: String,
+    pub url: String,
+    pub stage_index: u32,
+    pub elapsed_ms: u64,
+    pub started_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -977,6 +1033,9 @@ pub struct StressProgress {
     pub record_mode: String,
     /// 一次性提示（如自动降档），前端 toast 后即丢弃
     pub notice: Option<String>,
+    /// 当前 tick 的 worker 状态分布（R8）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_states: Option<WorkerStateSample>,
 }
 
 #[derive(Debug, Clone, Serialize)]

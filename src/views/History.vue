@@ -230,7 +230,7 @@ async function openItem(item: HistoryItem) {
     return
   }
   tabs.ensureProject(item.projectId ?? 0)
-  router.push({
+  void router.push({
     name: 'request',
     params: { id: item.requestId },
     query: item.projectId ? { projectId: item.projectId } : {},

@@ -1186,6 +1186,8 @@ fn cmd_mock_start(args: &Args) -> CliResult<i32> {
         project_id,
         port,
         host,
+        cors_origins: Vec::new(),
+        cors_credentials: false,
     };
     state
         .policy()

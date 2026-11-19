@@ -190,6 +190,8 @@ async fn pair_cluster(
         port: Some(0),
         pair_code_ttl_sec: None,
         master_name: Some("主-验收".to_string()),
+        listen_addr: None,
+        orchestration: None,
     };
     let snapshot = master
         .state()
@@ -270,6 +272,7 @@ async fn baseline_qps(node: &MockNode, config: StressConfig) -> f64 {
         EngineOptions {
             start_at_ms: None,
             sink: None,
+            persist: None,
         },
     )
     .await;
@@ -498,7 +501,8 @@ async fn lost_slave_marks_report_incomplete() {
     // 模拟从节点进程被杀：直接掐断会话任务，不发送 abort
     assert!(slave.state().cluster_slave.kill(), "应能杀掉从节点会话");
     let killed_at = Instant::now();
-    let lost = wait_until(Duration::from_secs(7), || {
+    // R10：运行期断线先进入 disconnected，保留 5 分钟重连窗口
+    let disconnected = wait_until(Duration::from_secs(7), || {
         master
             .state()
             .cluster
@@ -507,18 +511,18 @@ async fn lost_slave_marks_report_incomplete() {
                 snapshot
                     .nodes
                     .iter()
-                    .any(|node| node.role == "slave" && node.status == "lost")
+                    .any(|node| node.role == "slave" && node.status == "disconnected")
             })
             .unwrap_or(false)
     })
     .await;
     assert!(
-        lost,
-        "从节点被杀后 7 秒内未标记失联（实际等待 {:?}）",
+        disconnected,
+        "从节点被杀后 7 秒内未标记断线（实际等待 {:?}）",
         killed_at.elapsed()
     );
     eprintln!(
-        "[W6] 从节点被杀后 {:.1}s 标记 lost（阈值 6s）",
+        "[W6] 从节点被杀后 {:.1}s 标记 disconnected（阈值 6s）",
         killed_at.elapsed().as_secs_f64()
     );
 
@@ -559,7 +563,8 @@ async fn lost_slave_marks_report_incomplete() {
         .as_array()
         .and_then(|nodes| nodes.iter().find(|node| node["role"] == "slave"))
         .expect("从节点元数据");
-    assert_eq!(lost_node["status"], "lost");
+    // 5 分钟宽限内主节点本地引擎结束：节点按 disconnected 定格并标记缺口
+    assert_eq!(lost_node["status"], "disconnected");
 
     master
         .state()

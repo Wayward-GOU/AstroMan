@@ -49,7 +49,7 @@ const router = useRouter()
 
 function openStressReport(reportId?: number) {
   if (!reportId) return
-  router.push(`/reports/${reportId}`)
+  void router.push(`/reports/${reportId}`)
 }
 
 const envName = computed(() => {
@@ -558,7 +558,9 @@ async function refreshRun() {
 
 function startPolling() {
   stopPolling()
-  pollTimer = window.setInterval(refreshRun, 800)
+  pollTimer = window.setInterval(() => {
+    void refreshRun()
+  }, 800)
 }
 function stopPolling() {
   if (pollTimer !== null) {
@@ -582,7 +584,7 @@ function openRun(runId: number) {
   runDrawer.open = true
   runDrawer.runId = runId
   activeCase.value = null
-  refreshRun().then(() => {
+  void refreshRun().then(() => {
     if (running.value) startPolling()
   })
 }
@@ -922,7 +924,7 @@ onBeforeUnmount(stopPolling)
                   <label>解释器路径 <a-input v-model:value="settingsForm.pythonPath" placeholder="留空自动探测" /></label>
                   <label class="wide">
                     套件配置（JSON）
-                    <a-textarea v-model:value="settingsForm.configJson" :rows="4" placeholder='{"failFast":true,"maxWorkers":1,"cookieMode":"shared"}' />
+                    <a-textarea v-model:value="settingsForm.configJson" :rows="4" placeholder='{"failFast":true,"cookieMode":"shared","vars":{}}' />
                   </label>
                   <label class="wide">
                     setupScript（Python）

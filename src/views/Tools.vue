@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, defineAsyncComponent, markRaw, onMounted, ref, shallowRef, watch, type Component } from 'vue'
+import { computed, markRaw, onMounted, ref, shallowRef, watch, type Component } from 'vue'
 import { useRoute } from 'vue-router'
 import {
   ArrowLeftOutlined,

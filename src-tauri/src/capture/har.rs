@@ -211,6 +211,7 @@ mod tests {
                 mapped: false,
                 modified: false,
                 remote: None,
+                passthrough: false,
             },
             request_headers: vec![HeaderEntry {
                 name: "Content-Type".into(),

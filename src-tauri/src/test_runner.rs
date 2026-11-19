@@ -84,7 +84,6 @@ impl SuiteConfig {
             None => Ok(Self::default()),
         }
     }
-
     fn cookie_isolated(&self) -> bool {
         matches!(
             crate::commands::cookie::CookieMode::parse(self.cookie_mode.as_deref().unwrap_or("")),
@@ -108,6 +107,26 @@ impl SuiteConfig {
             .map(|value| Duration::from_millis(value.clamp(500, 600_000) as u64))
             .unwrap_or(Duration::from_millis(python_exec::DEFAULT_TIMEOUT_MS))
     }
+}
+
+/// 并行配置目前尚未实现：明确拒绝，避免「配置了 20 并发却串行执行」的静默错误。
+///
+/// 执行循环依赖运行时变量、依赖关系与 fail-fast 的先后顺序，真正的并行调度
+/// 需要单独重构，已在路线图中。这里只做配置闸门。
+fn validate_parallel_config(config: &SuiteConfig) -> Result<(), String> {
+    if config.max_workers != 1 {
+        return Err(format!(
+            "套件配置 maxWorkers = {}，当前版本串行执行，该字段不生效；请改为 1 或删除该字段（并行执行在路线图中）",
+            config.max_workers
+        ));
+    }
+    if config.parallel_rows {
+        return Err(
+            "套件配置 parallelRows = true，当前版本不支持按数据行并行；请关闭该字段（并行执行在路线图中）"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// 引擎事件：命令层负责 `app.emit(name, payload)`
@@ -720,6 +739,7 @@ pub async fn run_suite(
         let conn = state.pool.get().map_err(err)?;
         let suite = find_suite(&conn, suite_id)?;
         let config = SuiteConfig::parse(suite.config_json.as_deref())?;
+        validate_parallel_config(&config)?;
         (suite, config)
     };
 
@@ -2710,6 +2730,21 @@ mod tests {
     use std::net::TcpListener;
     use std::path::PathBuf;
 
+    #[test]
+    fn rejects_parallel_options_that_do_nothing() {
+        let mut config = SuiteConfig::default();
+        assert!(validate_parallel_config(&config).is_ok());
+
+        config.max_workers = 4;
+        let error = validate_parallel_config(&config).unwrap_err();
+        assert!(error.contains("maxWorkers"));
+
+        config.max_workers = 1;
+        config.parallel_rows = true;
+        let error = validate_parallel_config(&config).unwrap_err();
+        assert!(error.contains("parallelRows"));
+    }
+
     /// 起一个只回固定响应的本地服务，避免测试依赖外网
     fn spawn_server(body: &'static str) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3588,6 +3623,7 @@ mod tests {
             start_time: Some(0),
             end_time: Some(1000),
             created_at: 1000,
+            external_metrics: None,
         }
     }
 

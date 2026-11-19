@@ -21,6 +21,7 @@ function detail(overrides: Partial<CaptureFlowDetail> = {}): CaptureFlowDetail {
     mapped: false,
     modified: false,
     remote: null,
+    passthrough: false,
     requestHeaders: [
       { name: 'Authorization', value: 'Bearer abcdefghijklmn' },
       { name: 'X-Trace-Id', value: 'trace-123' },

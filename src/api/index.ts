@@ -13,6 +13,7 @@ import type {
   AppSettings,
   AuditLog,
   BackupItem,
+  BackupRestorePreview,
   BackupTarget,
   BackupTargetInput,
   BackupTargetTestReport,
@@ -26,6 +27,7 @@ import type {
   DashboardMetrics,
   Environment,
   EnvVariable,
+  ExternalMetricSeries,
   EntityTarget,
   GraphqlIntrospectPayload,
   GraphqlSchemaEntry,
@@ -82,6 +84,7 @@ import type {
   StressConfig,
   StressJobSummary,
   StressReport,
+  WorkerSnapshot,
   TestPlan,
   UpdateInfo,
   WorkspaceStats,
@@ -105,12 +108,14 @@ import type {
   DocsSiteStatus,
 } from '@/types/docs'
 import type {
+  ClusterDevice,
   ClusterMasterSnapshot,
   ClusterMasterStartPayload,
   ClusterNodeWeight,
   ClusterProtocolInfo,
   ClusterSlaveConnectPayload,
   ClusterSlaveSnapshot,
+  DiscoveredMaster,
 } from '@/types/cluster'
 
 export { appInfo, projectList, projectCreate, projectUpdate, projectDelete } from './project'
@@ -415,6 +420,10 @@ export const stressStopAll = () => invoke<number>('stress_stop_all')
 /** 运行中任务快照（主窗口面板与窗口恢复） */
 export const stressJobs = () => invoke<StressJobSummary[]>('stress_jobs')
 
+/** 运行中任务的在途请求快照（R8，最多 200 条） */
+export const stressWorkers = (jobId: number) =>
+  invoke<WorkerSnapshot[]>('stress_workers', { jobId })
+
 /** 新窗口打开压测页；重复打开同一任务会聚焦已有窗口 */export const stressOpenWindow = (
   planId?: number | null,
   jobId?: number | null,
@@ -468,6 +477,12 @@ export const clusterSlaveSnapshot = () => invoke<ClusterSlaveSnapshot>('cluster_
 
 export const clusterSlaveDisconnect = () => invoke<void>('cluster_slave_disconnect')
 
+export const clusterDevicesList = (limit = 50) =>
+  invoke<ClusterDevice[]>('cluster_devices_list', { limit })
+
+export const clusterMdnsBrowse = (timeoutMs?: number) =>
+  invoke<DiscoveredMaster[]>('cluster_mdns_browse', { timeoutMs: timeoutMs ?? null })
+
 // 压测报告
 export const reportList = (limit = 100) => invoke<StressReport[]>('report_list', { limit })
 
@@ -495,6 +510,15 @@ export const reportClearDetails = (id: number) =>
 /** 明细 / 错误 CSV 流式导出，返回写入行数 */
 export const reportExportDetailCsv = (id: number, kind: 'requests' | 'errors', path: string) =>
   invoke<number>('report_export_detail_csv', { id, kind, path })
+
+/** 导入一份外部监控 CSV（R11）；同 source + metric 覆盖旧序列 */
+export const reportExternalMetricsImport = (
+  id: number,
+  path: string,
+  metric: string,
+  unit: string,
+) =>
+  invoke<ExternalMetricSeries[]>('report_external_metrics_import', { id, path, metric, unit })
 
 // cURL 导入
 export const curlParse = (text: string) => invoke<CurlParsed>('curl_parse', { text })
@@ -836,7 +860,11 @@ export const backupList = () => invoke<BackupItem[]>('backup_list')
 export const backupCreate = () => invoke<BackupItem>('backup_create')
 
 /** 恢复备份：写入 restore.pending 标记，需重启应用生效 */
-export const backupRestore = (name: string) => invoke<BackupItem>('backup_restore', { name })
+export const backupRestorePreview = (name: string) =>
+  invoke<BackupRestorePreview>('backup_restore_preview', { name })
+
+export const backupRestore = (name: string, acceptKeyMismatch = false) =>
+  invoke<BackupRestorePreview>('backup_restore', { name, acceptKeyMismatch })
 
 export const backupCancelRestore = () => invoke<void>('backup_cancel_restore')
 
@@ -872,8 +900,18 @@ export const backupUpload = (id: number, passphrase: string) =>
   invoke<BackupUploadResult>('backup_upload', { id, passphrase })
 
 /** 从异地备份恢复：写入待恢复标记，需重启应用生效 */
-export const backupRestoreFromTarget = (id: number, name: string, passphrase: string) =>
-  invoke<BackupItem>('backup_restore_from_target', { id, name, passphrase })
+export const backupRestoreFromTarget = (
+  id: number,
+  name: string,
+  passphrase: string,
+  acceptKeyMismatch = false,
+) =>
+  invoke<BackupRestorePreview>('backup_restore_from_target', {
+    id,
+    name,
+    passphrase,
+    acceptKeyMismatch,
+  })
 
 /* ---------- W2：Mock Server（G-04） ---------- */
 

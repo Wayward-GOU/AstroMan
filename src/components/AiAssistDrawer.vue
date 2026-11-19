@@ -28,7 +28,7 @@ const providerOptions = computed(() =>
 )
 
 function scrollBottom() {
-  nextTick(() => {
+  void nextTick(() => {
     const el = bodyRef.value
     if (el) el.scrollTop = el.scrollHeight
   })
@@ -88,7 +88,7 @@ function goChat() {
     setHandoff({ source: store.source, title: store.title, prompt })
   }
   store.close()
-  router.push('/ai')
+  void router.push('/ai')
 }
 </script>
 

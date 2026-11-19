@@ -6,6 +6,9 @@ import type {
   CaptureFlowDetail,
   CaptureRepeatPayload,
   CaptureRepeatResult,
+  CaptureSessionCompare,
+  CaptureSessionFlows,
+  CaptureSessionSummary,
   CaptureStartOptions,
   CaptureStatus,
   InterceptView,
@@ -107,3 +110,31 @@ export const captureBreakpointResolve = (payload: {
 /** 放行全部挂起的断点（停止录制时也会自动释放） */
 export const captureBreakpointReleaseAll = () =>
   invoke<InterceptView>('capture_breakpoint_release_all')
+
+/** 历史会话列表（R7） */
+export const captureSessionsList = (limit = 50) =>
+  invoke<CaptureSessionSummary[]>('capture_sessions_list', { limit })
+
+export const captureSessionFlows = (
+  sessionId: number,
+  options: {
+    keyword?: string
+    method?: string
+    status?: string
+    offset?: number
+    limit?: number
+  } = {},
+) =>
+  invoke<CaptureSessionFlows>('capture_session_flows', {
+    sessionId,
+    ...options,
+  })
+
+export const captureSessionFlowDetail = (sessionId: number, flowId: number) =>
+  invoke<CaptureFlowDetail>('capture_session_flow_detail', { sessionId, flowId })
+
+export const captureSessionDelete = (sessionId: number) =>
+  invoke<void>('capture_session_delete', { sessionId })
+
+export const captureSessionCompare = (a: number, b: number) =>
+  invoke<CaptureSessionCompare>('capture_session_compare', { a, b })

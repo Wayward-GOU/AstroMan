@@ -1,4 +1,10 @@
-import type { ReportDetail, ReportSample, StageSummary } from '@/types/models'
+import type {
+  ErrorTypeCount,
+  ReportDetail,
+  ReportSample,
+  StageSummary,
+  WorkerStateSample,
+} from '@/types/models'
 
 /**
  * 压测报告分析算法集合
@@ -350,6 +356,98 @@ export function scoreReport(detail: ReportDetail): ScoreResult {
     ruleNote:
       '容量 = 阶段稳态 QPS 峰值（固定并发取平均）/ 目标 × 100（无目标不评分）；稳定性 = 100 − 变异系数 × 150；错误 = 100 − 错误率 × 20；尾部延迟 = 100 − (P99/平均 − 1) × 25',
   }
+}
+
+export interface WorkerFinding {
+  key: 'rate_wait' | 'await_header' | 'read_body' | 'client_idle' | 'timeout'
+  label: string
+  detail: string
+}
+
+const WORKER_SUFFIX = '（基于客户端观测，服务端监控数据缺失）'
+
+const stateTotal = (item: WorkerStateSample) =>
+  item.idle + item.rampWait + item.stageWait + item.rateWait + item.awaitHeader + item.readBody + item.think + item.done
+
+/** 连续 seconds 秒满足条件才判定，避免单 tick 噪声误报 */
+function sustained(
+  samples: WorkerStateSample[],
+  predicate: (item: WorkerStateSample) => boolean,
+  seconds = 3,
+): boolean {
+  let streak = 0
+  for (const item of samples) {
+    streak = predicate(item) ? streak + 1 : 0
+    if (streak >= seconds) return true
+  }
+  return false
+}
+
+function ratio(item: WorkerStateSample, key: keyof WorkerStateSample): number {
+  const total = stateTotal(item)
+  return total > 0 ? (item[key] as number) / total : 0
+}
+
+/**
+ * worker 状态自动诊断（R8 / 1.5.5）
+ *
+ * 规则全部按「持续 N 秒」判定并统一使用「疑似」措辞：这里只能看到客户端视角，
+ * 根因需要结合服务端监控；输出直接作为报告 findings（P1）。
+ */
+export function diagnoseWorkerStates(
+  samples: WorkerStateSample[],
+  options: { errorTypes?: ErrorTypeCount[]; seconds?: number } = {},
+): WorkerFinding[] {
+  const usable = (samples ?? []).filter((item) => stateTotal(item) > 0)
+  if (!usable.length) return []
+  const seconds = Math.max(1, options.seconds ?? 3)
+  const findings: WorkerFinding[] = []
+
+  if (sustained(usable, (item) => ratio(item, 'rateWait') > 0.5, seconds)) {
+    findings.push({
+      key: 'rate_wait',
+      label: '限速等待占比偏高',
+      detail: `超过半数的 worker 处于限速等待，疑似限速未生效或目标 RPS 设得过低${WORKER_SUFFIX}`,
+    })
+  }
+
+  if (sustained(usable, (item) => ratio(item, 'awaitHeader') > 0.9, seconds)) {
+    findings.push({
+      key: 'await_header',
+      label: '等待首字节占比偏高',
+      detail: `绝大多数 worker 都在等待响应头，疑似目标侧饱和或处理排队${WORKER_SUFFIX}`,
+    })
+  }
+
+  if (sustained(usable, (item) => ratio(item, 'readBody') > 0.5, seconds)) {
+    findings.push({
+      key: 'read_body',
+      label: '响应体读取占比偏高',
+      detail: `超过半数的 worker 在读取响应体，疑似带宽受限或响应体过大${WORKER_SUFFIX}`,
+    })
+  }
+
+  // 仅统计未进入 Done 的 worker，Done 属于正常收尾不算客户端瓶颈
+  if (sustained(usable, (item) => item.done === 0 && ratio(item, 'idle') > 0.3, seconds)) {
+    findings.push({
+      key: 'client_idle',
+      label: 'worker 空转占比偏高',
+      detail: `并发已满但大量 worker 处于空闲，疑似客户端 CPU 或事件循环瓶颈${WORKER_SUFFIX}`,
+    })
+  }
+
+  const errorTypes = options.errorTypes ?? []
+  const totalErrors = errorTypes.reduce((sum, item) => sum + item.count, 0)
+  const timeouts = errorTypes.find((item) => item.errorType === 'timeout')?.count ?? 0
+  if (totalErrors > 0 && timeouts / totalErrors >= 0.5) {
+    findings.push({
+      key: 'timeout',
+      label: '超时错误集中',
+      detail: `错误中 ${((timeouts / totalErrors) * 100).toFixed(0)}% 为 timeout，疑似连接池耗尽或目标限流${WORKER_SUFFIX}`,
+    })
+  }
+
+  return findings
 }
 
 export interface SelfCheckItem {

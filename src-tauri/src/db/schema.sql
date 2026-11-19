@@ -136,6 +136,10 @@ CREATE TABLE IF NOT EXISTS test_reports (
     body_histogram_json TEXT,
     -- TopN 慢请求快照，JSON 数组（v15）
     slow_requests_json  TEXT,
+    -- 外部监控指标序列，JSON 数组（v17 / R5）
+    external_metrics_json TEXT,
+    -- 并发透视：每秒 worker 状态分布，JSON 数组（v17 / R8）
+    worker_states_json TEXT,
     start_time     INTEGER,
     end_time       INTEGER,
     created_at     INTEGER NOT NULL
@@ -197,6 +201,39 @@ CREATE TABLE IF NOT EXISTS report_requests (
 
 CREATE INDEX IF NOT EXISTS idx_report_requests_report ON report_requests(report_id, id);
 
+-- 运行期增量采样（v17 / R3）：压测结束前先落这里，崩溃后可恢复出「不完整」报告。
+-- 不复用 report_samples：那张表的 report_id 是 NOT NULL 且外键指向 test_reports，
+-- 运行期还没有 report 行。
+CREATE TABLE IF NOT EXISTS stress_job_samples (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id        INTEGER NOT NULL,
+    elapsed_sec   INTEGER NOT NULL,
+    concurrent    INTEGER NOT NULL DEFAULT 0,
+    qps           REAL    NOT NULL DEFAULT 0,
+    avg_rt        REAL    NOT NULL DEFAULT 0,
+    p50_rt        REAL    NOT NULL DEFAULT 0,
+    p95_rt        REAL    NOT NULL DEFAULT 0,
+    p99_rt        REAL    NOT NULL DEFAULT 0,
+    ttfb_avg      REAL    NOT NULL DEFAULT 0,
+    body_avg      REAL    NOT NULL DEFAULT 0,
+    body_p95      REAL    NOT NULL DEFAULT 0,
+    bytes         INTEGER NOT NULL DEFAULT 0,
+    success_count INTEGER NOT NULL DEFAULT 0,
+    error_count   INTEGER NOT NULL DEFAULT 0,
+    created_at    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_job_samples_job ON stress_job_samples(job_id, elapsed_sec);
+
+-- 运行期任务快照（v17 / R3）：每个 job 一行，崩溃恢复时用来还原报告头
+CREATE TABLE IF NOT EXISTS stress_job_meta (
+    job_id        INTEGER PRIMARY KEY,
+    plan_id       INTEGER,
+    plan_name     TEXT,
+    config_json   TEXT NOT NULL,
+    started_at    INTEGER NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'running'
+);
+
 -- 本机容量探测结果（v15）：分级加压测出的吞吐上限，保留最近 10 次
 CREATE TABLE IF NOT EXISTS machine_capacity (
     id                    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -228,9 +265,24 @@ CREATE TABLE IF NOT EXISTS cluster_jobs (
     report_id            INTEGER,
     incomplete           INTEGER NOT NULL DEFAULT 0,
     message              TEXT,
-    finished_at          INTEGER
+    finished_at          INTEGER,
+    orchestration_json   TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_cluster_jobs_created ON cluster_jobs(created_at DESC);
+
+-- 集群设备（v19）：按稳定 device_id 缓存能力检测结果，跨任务复用
+CREATE TABLE IF NOT EXISTS cluster_devices (
+    node_id              TEXT PRIMARY KEY,
+    node_name            TEXT NOT NULL,
+    last_addr            TEXT NOT NULL,
+    last_seen_at         INTEGER NOT NULL,
+    os                   TEXT,
+    cores                INTEGER NOT NULL DEFAULT 0,
+    capacity_concurrent  INTEGER NOT NULL DEFAULT 0,
+    capacity_qps         REAL NOT NULL DEFAULT 0,
+    probed_at            INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_cluster_devices_seen ON cluster_devices(last_seen_at DESC);
 
 -- 集群节点（v16）：每个任务下每个从节点一条，主节点自身也记一条 role=master
 CREATE TABLE IF NOT EXISTS cluster_workers (
@@ -695,3 +747,59 @@ CREATE TABLE IF NOT EXISTS graphql_schemas (
     UNIQUE(project_id, endpoint)
 );
 CREATE INDEX IF NOT EXISTS idx_graphql_schemas_project ON graphql_schemas(project_id, fetched_at DESC);
+
+-- 抓包会话归档（R7）：默认 memory 模式不写这三张表
+CREATE TABLE IF NOT EXISTS capture_sessions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL,
+    mode        TEXT NOT NULL,
+    bind_addr   TEXT NOT NULL DEFAULT '',
+    port        INTEGER NOT NULL DEFAULT 0,
+    started_at  INTEGER NOT NULL,
+    ended_at    INTEGER,
+    flow_count  INTEGER NOT NULL DEFAULT 0,
+    dropped     INTEGER NOT NULL DEFAULT 0,
+    filter_json TEXT,
+    app_version TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_capture_sessions_started ON capture_sessions(started_at DESC);
+
+CREATE TABLE IF NOT EXISTS capture_flows (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id     INTEGER NOT NULL REFERENCES capture_sessions(id) ON DELETE CASCADE,
+    flow_id        INTEGER NOT NULL,
+    started_at     INTEGER NOT NULL,
+    method         TEXT NOT NULL,
+    scheme         TEXT NOT NULL,
+    host           TEXT NOT NULL,
+    path           TEXT NOT NULL,
+    http_version   TEXT NOT NULL DEFAULT '',
+    status         INTEGER,
+    duration_ms    INTEGER NOT NULL DEFAULT 0,
+    request_size   INTEGER NOT NULL DEFAULT 0,
+    response_size  INTEGER NOT NULL DEFAULT 0,
+    content_type   TEXT NOT NULL DEFAULT '',
+    client_addr    TEXT NOT NULL DEFAULT '',
+    error          TEXT,
+    mapped         INTEGER NOT NULL DEFAULT 0,
+    modified       INTEGER NOT NULL DEFAULT 0,
+    passthrough    INTEGER NOT NULL DEFAULT 0,
+    request_headers_json  TEXT,
+    response_headers_json TEXT,
+    request_body_sha  TEXT,
+    response_body_sha TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_capture_flows_session ON capture_flows(session_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_capture_flows_host ON capture_flows(host, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_capture_flows_status ON capture_flows(status);
+
+CREATE TABLE IF NOT EXISTS capture_bodies (
+    sha256      TEXT PRIMARY KEY,
+    size        INTEGER NOT NULL,
+    truncated   INTEGER NOT NULL DEFAULT 0,
+    binary      INTEGER NOT NULL DEFAULT 0,
+    content_type TEXT NOT NULL DEFAULT '',
+    storage     TEXT NOT NULL,
+    inline_text TEXT,
+    file_path   TEXT
+);

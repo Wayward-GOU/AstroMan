@@ -3,9 +3,11 @@
 //! 不依赖浏览器或外网，`cargo test capture::tests` 即可复现。
 
 use super::{CaptureConfig, CaptureManager, CaptureState};
+use crate::capture::persist::{self, ArchiveMode};
 use crate::capture::store::{BodyPayload, FlowBrief, FlowDetail, HeaderEntry};
 use crate::commands::capture::{repeat_request, RepeatOverride};
 use base64::Engine;
+use r2d2_sqlite::SqliteConnectionManager;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
@@ -238,6 +240,7 @@ fn zip_export_contains_readable_text_and_binary_bodies() {
             mapped: false,
             modified: false,
             remote: None,
+            passthrough: false,
         },
         request_headers: vec![HeaderEntry {
             name: "content-type".into(),
@@ -284,6 +287,7 @@ fn zip_export_contains_readable_text_and_binary_bodies() {
             mapped: false,
             modified: false,
             remote: None,
+            passthrough: false,
         },
         request_headers: Vec::new(),
         response_headers: vec![HeaderEntry {
@@ -401,6 +405,7 @@ fn repeat_detail(port: u16) -> FlowDetail {
             mapped: false,
             modified: false,
             remote: None,
+            passthrough: false,
         },
         request_headers: vec![HeaderEntry {
             name: "host".into(),
@@ -978,4 +983,350 @@ fn request_breakpoint_applies_edit_before_upstream() {
     assert_eq!(flows[0].path, "/edited?from=bp");
     assert!(flows[0].modified, "断点改包应标记 modified");
     manager.stop().expect("stop capture");
+}
+
+/// 最小「上游代理」：只收一次请求并回 200，同时把请求行回传给测试。
+fn spawn_capture_proxy() -> (
+    u16,
+    std::sync::mpsc::Receiver<String>,
+    std::thread::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    let port = listener.local_addr().expect("proxy addr").port();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut buffer = [0u8; 8192];
+            let read = stream.read(&mut buffer).unwrap_or(0);
+            let text = String::from_utf8_lossy(&buffer[..read]).to_string();
+            let first_line = text.lines().next().unwrap_or_default().to_string();
+            let _ = tx.send(first_line);
+            let body = "hello-from-proxy";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    (port, rx, handle)
+}
+
+#[test]
+fn upstream_proxy_forwards_http() {
+    let data_dir = temp_dir();
+    let manager = CaptureManager::new(data_dir);
+    let (proxy_port, seen, proxy) = spawn_capture_proxy();
+    let status = manager
+        .start(Some(CaptureConfig {
+            port: 0,
+            bind_addr: "127.0.0.1".into(),
+            upstream_proxy: Some(format!("http://127.0.0.1:{proxy_port}")),
+            ..CaptureConfig::default()
+        }))
+        .expect("start capture with upstream");
+    assert!(status.upstream_active, "状态应标记上游代理已生效");
+    assert_eq!(
+        status.upstream_proxy.as_deref(),
+        Some(format!("http://127.0.0.1:{proxy_port}").as_str())
+    );
+
+    // 目标域名不可解析：只有真的走了上游代理才能拿到 200
+    let mut client = TcpStream::connect(("127.0.0.1", status.port)).expect("connect capture");
+    let _ = client.set_read_timeout(Some(Duration::from_secs(10)));
+    let request = "POST http://no-such-host.invalid/hello HTTP/1.1\r\nHost: no-such-host.invalid\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    client.write_all(request.as_bytes()).expect("write request");
+    let mut response = Vec::new();
+    let _ = client.read_to_end(&mut response);
+    let text = String::from_utf8_lossy(&response);
+    assert!(text.starts_with("HTTP/1.1 200"), "unexpected: {text}");
+    assert!(text.contains("hello-from-proxy"));
+
+    // http 目标走 absolute-form，代理收到的请求行带完整 URL
+    let first_line = seen
+        .recv_timeout(Duration::from_secs(5))
+        .expect("proxy should receive request");
+    assert!(
+        first_line.contains("http://no-such-host.invalid/hello"),
+        "代理收到: {first_line}"
+    );
+    proxy.join().expect("proxy thread");
+    manager.stop().expect("stop capture");
+}
+
+#[test]
+fn passthrough_host_skips_mitm_and_is_listed() {
+    let data_dir = temp_dir();
+    let manager = CaptureManager::new(data_dir);
+    let (upstream_port, upstream) = spawn_upstream();
+    let status = manager
+        .start(Some(CaptureConfig {
+            port: 0,
+            bind_addr: "127.0.0.1".into(),
+            ssl_hosts: vec!["127.0.0.1".into()],
+            ..CaptureConfig::default()
+        }))
+        .expect("start capture");
+    assert!(!status.upstream_active);
+
+    let mut client = TcpStream::connect(("127.0.0.1", status.port)).expect("connect capture");
+    let _ = client.set_read_timeout(Some(Duration::from_secs(10)));
+    let connect = format!(
+        "CONNECT 127.0.0.1:{upstream_port} HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\n\r\n"
+    );
+    client.write_all(connect.as_bytes()).expect("write connect");
+    // CONNECT 之后不建 TLS，直接写明文；直通模式应原样隧道到上游
+    client
+        .write_all(b"GET /raw HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .expect("write tunneled request");
+    let mut response = Vec::new();
+    let _ = client.read_to_end(&mut response);
+    let text = String::from_utf8_lossy(&response);
+    assert!(
+        text.contains("hello-from-upstream"),
+        "直通流量应到达真实上游: {text}"
+    );
+    upstream.join().expect("upstream thread");
+
+    let mut flows = manager.flows(10);
+    for _ in 0..50 {
+        if !flows.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        flows = manager.flows(10);
+    }
+    assert_eq!(flows.len(), 1, "直通也应留一条提示: {flows:?}");
+    assert!(flows[0].passthrough, "应标记 passthrough");
+    assert_eq!(flows[0].host, format!("127.0.0.1:{upstream_port}"));
+    assert_eq!(manager.status().passthrough_count, 1);
+    manager.stop().expect("stop capture");
+}
+
+/// 模拟证书固定客户端（不信任代理 CA）：连续多次握手被拒后，
+/// 代理应把该域名自动改为直通，后续 ClientHello 原样到达上游。
+#[test]
+fn pinned_client_rejections_switch_host_to_auto_passthrough() {
+    use hudsucker::rustls::pki_types::ServerName;
+    use hudsucker::rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
+    use std::sync::{mpsc, Arc};
+
+    fn read_header(stream: &mut TcpStream) -> String {
+        let mut header = Vec::new();
+        let mut byte = [0u8; 1];
+        while !header.ends_with(b"\r\n\r\n") {
+            match stream.read(&mut byte) {
+                Ok(1) => header.push(byte[0]),
+                _ => break,
+            }
+        }
+        String::from_utf8_lossy(&header).to_string()
+    }
+
+    fn connect_tunnel(proxy_port: u16, target_port: u16) -> TcpStream {
+        let mut stream = TcpStream::connect(("127.0.0.1", proxy_port)).expect("connect proxy");
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+        let connect = format!(
+            "CONNECT 127.0.0.1:{target_port} HTTP/1.1\r\nHost: 127.0.0.1:{target_port}\r\n\r\n"
+        );
+        stream.write_all(connect.as_bytes()).expect("write connect");
+        let header = read_header(&mut stream);
+        assert!(header.starts_with("HTTP/1.1 200"), "CONNECT 失败: {header}");
+        stream
+    }
+
+    fn tls_attempt(proxy_port: u16, target_port: u16) -> std::io::Result<()> {
+        let stream = connect_tunnel(proxy_port, target_port);
+        // 空信任库 = 模拟只信任固定证书的客户端，不认代理的 MITM CA
+        let config = ClientConfig::builder_with_provider(Arc::new(
+            hudsucker::rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("tls versions")
+        .with_root_certificates(RootCertStore::empty())
+        .with_no_client_auth();
+        let server = ServerName::try_from("localhost").expect("server name");
+        let connection = ClientConnection::new(Arc::new(config), server).expect("tls client");
+        let mut tls = StreamOwned::new(connection, stream);
+        tls.write_all(b"GET /pinned HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")?;
+        let mut chunk = [0u8; 256];
+        let _ = tls.read(&mut chunk);
+        Ok(())
+    }
+
+    // 明文 TCP 上游：把收到的第一段字节回传给测试，用于判断是否真的直通
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind upstream");
+    let target_port = listener.local_addr().expect("upstream addr").port();
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    let upstream = std::thread::spawn(move || {
+        let _ = listener.set_nonblocking(true);
+        while !stop_thread.load(std::sync::atomic::Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let tx = tx.clone();
+                    // 每次连接独立线程：被拒绝的握手可能卡在 read，不能阻塞后续直通
+                    std::thread::spawn(move || {
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+                        let mut buffer = [0u8; 4096];
+                        if let Ok(read) = stream.read(&mut buffer) {
+                            if read > 0 {
+                                let _ = tx.send(buffer[..read].to_vec());
+                            }
+                        }
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        );
+                        let _ = stream.flush();
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let manager = CaptureManager::new(temp_dir());
+    let status = manager
+        .start(Some(CaptureConfig {
+            port: 0,
+            bind_addr: "127.0.0.1".into(),
+            ..CaptureConfig::default()
+        }))
+        .expect("start capture");
+
+    let first = tls_attempt(status.port, target_port);
+    assert!(first.is_err(), "客户端应拒绝 MITM 证书: {first:?}");
+    std::thread::sleep(Duration::from_millis(300));
+    let second = tls_attempt(status.port, target_port);
+    assert!(second.is_err(), "第二次握手仍应被拒绝: {second:?}");
+    // 拉长跨度，满足「至少 3 次握手、跨度 ≥ 2 秒、期间无成功」的判定
+    std::thread::sleep(Duration::from_millis(2100));
+    while rx.try_recv().is_ok() {}
+
+    // 第三次触发自动直通：ClientHello 原样隧道到上游，而不是再被 MITM
+    let _ = tls_attempt(status.port, target_port);
+    let seen = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("自动直通后上游应收到客户端发来的字节");
+    assert_eq!(
+        seen.first(),
+        Some(&0x16),
+        "直通流量应是原样转发的 TLS 握手记录: {seen:?}"
+    );
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    upstream.join().expect("upstream thread");
+
+    let mut flows = manager.flows(10);
+    for _ in 0..50 {
+        if !flows.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        flows = manager.flows(10);
+    }
+    let flow = flows
+        .iter()
+        .find(|flow| flow.host.starts_with("localhost"))
+        .unwrap_or_else(|| panic!("应记录直通流量: {flows:?}"));
+    assert!(flow.passthrough, "应标记 passthrough: {flows:?}");
+    assert_eq!(manager.status().passthrough_count, 1);
+    manager.stop().expect("stop capture");
+}
+
+#[test]
+fn upstream_proxy_scheme_is_validated_on_start() {
+    let manager = CaptureManager::new(temp_dir());
+    let error = manager
+        .start(Some(CaptureConfig {
+            upstream_proxy: Some("socks5://127.0.0.1:1080".into()),
+            ..CaptureConfig::default()
+        }))
+        .unwrap_err();
+    assert!(error.contains("E_UPSTREAM_SCHEME"), "{error}");
+    assert_eq!(manager.status().state, CaptureState::Idle);
+}
+
+/// R7 会话生命周期：开始建会话、停止收尾，归档详情可回读。
+#[test]
+fn archive_session_is_created_and_finalized_on_stop() {
+    let data_dir = temp_dir();
+    let manager = SqliteConnectionManager::file(data_dir.join("astroman.db"))
+        .with_init(|conn| conn.execute_batch(&crate::db::connection_pragmas()));
+    let pool = r2d2::Pool::builder()
+        .max_size(2)
+        .build(manager)
+        .expect("build pool");
+    crate::db::init(&pool).expect("init db");
+    let manager = CaptureManager::new_with_pool(
+        data_dir.clone(),
+        crate::services::profile::CaptureLimits::default(),
+        pool.clone(),
+    );
+    let (upstream_port, upstream) = spawn_upstream();
+    let status = manager
+        .start(Some(CaptureConfig {
+            port: 0,
+            bind_addr: "127.0.0.1".into(),
+            archive_mode: ArchiveMode::ArchiveFull,
+            archive_name: Some("R7 验收".into()),
+            ..CaptureConfig::default()
+        }))
+        .expect("start capture");
+    assert!(status.session_id.is_some());
+
+    let mut client = TcpStream::connect(("127.0.0.1", status.port)).expect("connect proxy");
+    let _ = client.set_read_timeout(Some(Duration::from_secs(10)));
+    let request = format!(
+        "GET http://127.0.0.1:{upstream_port}/archived HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nAuthorization: Bearer top-secret\r\nConnection: close\r\n\r\n"
+    );
+    client.write_all(request.as_bytes()).expect("write request");
+    let mut response = Vec::new();
+    let _ = client.read_to_end(&mut response);
+
+    let mut flows = manager.flows(10);
+    for _ in 0..50 {
+        if !flows.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        flows = manager.flows(10);
+    }
+    manager.stop().expect("stop capture");
+    upstream.join().expect("upstream thread");
+
+    let sessions = persist::list_sessions(&pool, 10).expect("list sessions");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].name, "R7 验收");
+    assert_eq!(sessions[0].mode, "archive-full");
+    assert_eq!(sessions[0].flow_count, 1);
+    assert!(sessions[0].ended_at.is_some());
+    let session_id = sessions[0].id;
+    let archived = persist::session_flows(&pool, session_id, None, Some("GET"), None, 0, 10)
+        .expect("session flows");
+    assert_eq!(archived.total, 1);
+    let detail = persist::session_flow_detail(&pool, &data_dir, session_id, archived.items[0].id)
+        .expect("archived detail");
+    assert_eq!(
+        detail.response_body.text.as_deref(),
+        Some("hello-from-upstream")
+    );
+    let auth = detail
+        .request_headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case("authorization"))
+        .expect("authorization header");
+    assert_eq!(
+        auth.value,
+        crate::secret::MASK,
+        "Authorization 落库前应脱敏"
+    );
+    drop(manager);
+    let _ = std::fs::remove_dir_all(&data_dir);
 }

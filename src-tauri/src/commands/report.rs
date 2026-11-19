@@ -1,6 +1,7 @@
 use crate::models::{
-    ErrorTypeCount, HistogramBucket, ReclaimResult, ReportDetail, ReportError, ReportRequestRecord,
-    ReportRequestsPage, ReportSample, StageSummary, StatusCount, StressReport,
+    ErrorTypeCount, ExternalMetricSeries, HistogramBucket, ReclaimResult, ReportDetail,
+    ReportError, ReportRequestRecord, ReportRequestsPage, ReportSample, StageSummary, StatusCount,
+    StressReport,
 };
 use crate::state::AppState;
 use crate::util::{err, now_ms};
@@ -18,7 +19,7 @@ const REPORT_COLUMNS: &str =
 
 /// 详情查询在基础列之后追加的 JSON 列
 const JSON_COLUMNS: &str =
-    "config_json, stages_json, codes_json, histogram_json, error_types_json, scenario_text, summary_text, slow_requests_json, body_histogram_json";
+    "config_json, stages_json, codes_json, histogram_json, error_types_json, scenario_text, summary_text, slow_requests_json, body_histogram_json, external_metrics_json, worker_states_json";
 
 fn map_report(row: &Row<'_>) -> rusqlite::Result<StressReport> {
     Ok(StressReport {
@@ -53,6 +54,7 @@ fn map_report(row: &Row<'_>) -> rusqlite::Result<StressReport> {
         created_at: row.get(28)?,
         plan_id: row.get(29)?,
         run_group_id: row.get(30)?,
+        external_metrics: None,
     })
 }
 
@@ -64,6 +66,73 @@ fn parse_list<T: serde::de::DeserializeOwned>(raw: Option<String>) -> Vec<T> {
 fn parse_value(raw: Option<String>) -> Option<Value> {
     raw.and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .filter(|value| !value.is_null())
+}
+
+/// 外部指标：优先读独立列；为空时回退 `config_json.externalMetrics`
+/// （兼容按 V1.1.1 原方案写进配置快照的数据）
+fn parse_external_metrics(
+    raw: Option<String>,
+    config: Option<&Value>,
+) -> Option<Vec<ExternalMetricSeries>> {
+    let from_column = raw
+        .and_then(|text| serde_json::from_str::<Vec<ExternalMetricSeries>>(&text).ok())
+        .filter(|list| !list.is_empty());
+    if from_column.is_some() {
+        return from_column;
+    }
+    config
+        .and_then(|value| value.get("externalMetrics"))
+        .and_then(|value| serde_json::from_value::<Vec<ExternalMetricSeries>>(value.clone()).ok())
+        .filter(|list| !list.is_empty())
+}
+
+/// 导入一份 CSV 指标：同 source + metric 覆盖旧序列，结果立刻落库。
+fn import_external_metrics(
+    db: &crate::state::DbPool,
+    id: i64,
+    path: &str,
+    metric: &str,
+    unit: &str,
+) -> Result<Vec<ExternalMetricSeries>, String> {
+    let incoming =
+        crate::services::external_metrics::parse_csv(std::path::Path::new(path), metric, unit)?;
+    let conn = db.get().map_err(err)?;
+    let (external_text, config_text) = conn
+        .query_row(
+            "SELECT external_metrics_json, config_json FROM test_reports WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => "报告不存在".to_string(),
+            other => err(other),
+        })?;
+    let existing = parse_external_metrics(external_text, parse_value(config_text).as_ref())
+        .unwrap_or_default();
+    let merged = crate::services::external_metrics::merge_series(existing, incoming)?;
+    let text = serde_json::to_string(&merged).map_err(err)?;
+    conn.execute(
+        "UPDATE test_reports SET external_metrics_json = ?2 WHERE id = ?1",
+        params![id, text],
+    )
+    .map_err(err)?;
+    Ok(merged)
+}
+
+#[tauri::command]
+pub fn report_external_metrics_import(
+    state: State<'_, AppState>,
+    id: i64,
+    path: String,
+    metric: String,
+    unit: String,
+) -> Result<Vec<ExternalMetricSeries>, String> {
+    import_external_metrics(&state.pool, id, &path, &metric, &unit)
 }
 
 fn load_detail(conn: &rusqlite::Connection, id: i64) -> Result<ReportDetail, String> {
@@ -79,6 +148,8 @@ fn load_detail(conn: &rusqlite::Connection, id: i64) -> Result<ReportDetail, Str
         summary_text,
         slow_requests_text,
         body_histogram_text,
+        external_metrics_text,
+        worker_states_text,
     ) = conn
         .query_row(&sql, params![id], |row| {
             Ok((
@@ -92,6 +163,8 @@ fn load_detail(conn: &rusqlite::Connection, id: i64) -> Result<ReportDetail, Str
                 row.get::<_, Option<String>>(37)?,
                 row.get::<_, Option<String>>(38)?,
                 row.get::<_, Option<String>>(39)?,
+                row.get::<_, Option<String>>(40)?,
+                row.get::<_, Option<String>>(41)?,
             ))
         })
         .map_err(|e| match e {
@@ -151,6 +224,11 @@ fn load_detail(conn: &rusqlite::Connection, id: i64) -> Result<ReportDetail, Str
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(err)?;
 
+    let config = parse_value(config_text);
+    let external_metrics = parse_external_metrics(external_metrics_text, config.as_ref());
+    let mut report = report;
+    report.external_metrics = external_metrics;
+
     Ok(ReportDetail {
         report,
         samples,
@@ -161,9 +239,10 @@ fn load_detail(conn: &rusqlite::Connection, id: i64) -> Result<ReportDetail, Str
         body_histogram: parse_list::<HistogramBucket>(body_histogram_text),
         stages: parse_list::<StageSummary>(stages_text),
         slow_requests: parse_list::<crate::models::SlowRequest>(slow_requests_text),
-        config: parse_value(config_text),
+        config,
         scenario_text: scenario_text.filter(|text| !text.trim().is_empty()),
         summary_text: summary_text.filter(|text| !text.trim().is_empty()),
+        worker_states: parse_list::<crate::models::WorkerStateSample>(worker_states_text),
     })
 }
 
@@ -605,4 +684,231 @@ pub fn report_export_detail_csv(
         format!("保存文件失败：{e}")
     })?;
     Ok(done)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::stress::{save_report, ReportPayload};
+    use crate::models::{ExternalMetricPoint, ExternalMetricSeries};
+
+    fn fixture() -> StressReport {
+        StressReport {
+            id: 0,
+            plan_id: None,
+            run_group_id: None,
+            plan_name: "external".to_string(),
+            request_id: None,
+            total_requests: 10,
+            success_count: 10,
+            error_count: 0,
+            avg_rt: 10.0,
+            min_rt: 1.0,
+            max_rt: 20.0,
+            p50_rt: 9.0,
+            p75_rt: 10.0,
+            p90_rt: 12.0,
+            p95_rt: 15.0,
+            p99_rt: 19.0,
+            p999_rt: 20.0,
+            stddev_rt: 1.0,
+            ttfb_avg: 5.0,
+            ttfb_p95: 6.0,
+            apdex: 1.0,
+            bytes_total: 100,
+            max_qps: 1.0,
+            avg_qps: 1.0,
+            target_rps: 0.0,
+            error_rate: 0.0,
+            concurrency: 1,
+            status: "completed".to_string(),
+            start_time: Some(0),
+            end_time: Some(1000),
+            created_at: 1000,
+            external_metrics: None,
+        }
+    }
+
+    fn payload<'a>(report: &'a StressReport, config: &'a str) -> ReportPayload<'a> {
+        ReportPayload {
+            report,
+            job_id: None,
+            samples: &[],
+            worker_states: &[],
+            errors: &[],
+            requests: &[],
+            stages: &[],
+            status_codes: &[],
+            histogram: &[],
+            body_histogram: &[],
+            slow_requests: &[],
+            error_types: &[],
+            config,
+        }
+    }
+
+    fn test_state(tag: &str) -> AppState {
+        let root = crate::util::test_dir(&format!("report-external-{tag}"));
+        let _ = std::fs::remove_dir_all(&root);
+        AppState::headless(root.join("data"), root.join("config")).unwrap()
+    }
+
+    fn series() -> ExternalMetricSeries {
+        ExternalMetricSeries {
+            source: "csv:cpu.csv".to_string(),
+            metric: "cpu.usage".to_string(),
+            unit: "percent".to_string(),
+            points: vec![
+                ExternalMetricPoint { t: 0, v: 10.0 },
+                ExternalMetricPoint { t: 1, v: 20.0 },
+                ExternalMetricPoint { t: 2, v: 30.0 },
+            ],
+        }
+    }
+
+    #[test]
+    fn report_round_trips_external_metrics() {
+        let state = test_state("roundtrip");
+        let mut report = fixture();
+        report.external_metrics = Some(vec![series()]);
+        let id = save_report(&state.pool, payload(&report, "{}")).unwrap();
+        let conn = state.pool.get().unwrap();
+        let detail = load_detail(&conn, id).unwrap();
+        let read = detail.report.external_metrics.expect("应读回外部指标");
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].metric, "cpu.usage");
+        assert_eq!(read[0].points.len(), 3);
+        assert_eq!(read[0].points[2].v, 30.0);
+        let _ = std::fs::remove_dir_all(&state.data_dir);
+    }
+
+    #[test]
+    fn report_without_external_metrics_reads_none() {
+        let state = test_state("none");
+        let report = fixture();
+        let id = save_report(&state.pool, payload(&report, "{}")).unwrap();
+        let conn = state.pool.get().unwrap();
+        let detail = load_detail(&conn, id).unwrap();
+        assert!(detail.report.external_metrics.is_none());
+        let _ = std::fs::remove_dir_all(&state.data_dir);
+    }
+
+    #[test]
+    fn legacy_config_external_metrics_falls_back() {
+        let state = test_state("fallback");
+        let report = fixture();
+        let config = serde_json::json!({
+            "externalMetrics": [{
+                "source": "csv:old.csv",
+                "metric": "gc.pause",
+                "unit": "ms",
+                "points": [{ "t": 0, "v": 5.0 }]
+            }]
+        })
+        .to_string();
+        let id = save_report(&state.pool, payload(&report, &config)).unwrap();
+        let conn = state.pool.get().unwrap();
+        let detail = load_detail(&conn, id).unwrap();
+        let read = detail
+            .report
+            .external_metrics
+            .expect("应回退读 config_json");
+        assert_eq!(read[0].metric, "gc.pause");
+        let _ = std::fs::remove_dir_all(&state.data_dir);
+    }
+
+    /// v16 老库升级到 v17：补列后老报告该字段为 NULL，读取行为不变
+    #[test]
+    fn old_report_without_column_is_readable() {
+        let state = test_state("old-column");
+        let report = fixture();
+        let id = save_report(&state.pool, payload(&report, "{}")).unwrap();
+        {
+            let conn = state.pool.get().unwrap();
+            conn.execute(
+                "ALTER TABLE test_reports DROP COLUMN external_metrics_json",
+                [],
+            )
+            .unwrap();
+            conn.execute("PRAGMA user_version = 16", []).unwrap();
+        }
+
+        crate::db::init(&state.pool).unwrap();
+
+        let conn = state.pool.get().unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::db::DB_VERSION);
+        let detail = load_detail(&conn, id).unwrap();
+        assert_eq!(detail.report.plan_name, "external");
+        assert!(detail.report.external_metrics.is_none());
+        let _ = std::fs::remove_dir_all(&state.data_dir);
+    }
+
+    #[test]
+    fn broken_external_metrics_json_does_not_break_report() {
+        let state = test_state("broken");
+        let mut report = fixture();
+        report.external_metrics = Some(vec![series()]);
+        let id = save_report(&state.pool, payload(&report, "{}")).unwrap();
+        {
+            let conn = state.pool.get().unwrap();
+            conn.execute(
+                "UPDATE test_reports SET external_metrics_json = '{not json' WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+        }
+        let conn = state.pool.get().unwrap();
+        let detail = load_detail(&conn, id).unwrap();
+        assert!(detail.report.external_metrics.is_none());
+        let _ = std::fs::remove_dir_all(&state.data_dir);
+    }
+
+    fn write_metric_csv(tag: &str, body: &str) -> std::path::PathBuf {
+        let dir = crate::util::test_dir(&format!("report-external-csv-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cpu.csv");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn import_adds_then_replaces_same_series() {
+        let state = test_state("import");
+        let report = fixture();
+        let id = save_report(&state.pool, payload(&report, "{}")).unwrap();
+        let path = write_metric_csv("import", "t,v\n0,10\n1,20\n");
+        let path_text = path.to_string_lossy().to_string();
+
+        let first =
+            import_external_metrics(&state.pool, id, &path_text, "cpu.usage", "percent").unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].source, "csv:cpu");
+        assert_eq!(first[0].points.len(), 2);
+
+        let second =
+            import_external_metrics(&state.pool, id, &path_text, "cpu.usage", "percent").unwrap();
+        assert_eq!(second.len(), 1, "同 source + metric 应覆盖而不是重复追加");
+
+        let conn = state.pool.get().unwrap();
+        let detail = load_detail(&conn, id).unwrap();
+        let read = detail.report.external_metrics.expect("导入后应能读回");
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].metric, "cpu.usage");
+        assert_eq!(read[0].unit, "percent");
+        drop(conn);
+
+        assert_eq!(
+            import_external_metrics(&state.pool, 9999, &path_text, "cpu.usage", "percent")
+                .unwrap_err(),
+            "报告不存在"
+        );
+        let _ = std::fs::remove_dir_all(&state.data_dir);
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
 }

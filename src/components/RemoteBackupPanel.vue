@@ -179,6 +179,23 @@ function openRestore(item: BackupTarget, name: string) {
   passOpen.value = true
 }
 
+function showRemoteQueued() {
+  Modal.confirm({
+    title: '恢复已排队',
+    content:
+      '已从异地备份解密并校验通过。重启应用后会在打开数据库之前完成替换，期间当前数据会先自动备份一份。',
+    okText: '立即重启',
+    cancelText: '稍后手动重启',
+    onOk: async () => {
+      try {
+        await api.appRestart()
+      } catch (e) {
+        message.error(String(e))
+      }
+    },
+  })
+}
+
 async function submitPassphrase() {
   const target = passTarget.value
   if (!target) return
@@ -199,22 +216,35 @@ async function submitPassphrase() {
       passOpen.value = false
       await loadTargets()
     } else {
-      await api.backupRestoreFromTarget(target.id, passRemoteName.value, secret)
-      passOpen.value = false
-      Modal.confirm({
-        title: '恢复已排队',
-        content:
-          '已从异地备份解密并校验通过。重启应用后会在打开数据库之前完成替换，期间当前数据会先自动备份一份。',
-        okText: '立即重启',
-        cancelText: '稍后手动重启',
-        onOk: async () => {
-          try {
-            await api.appRestart()
-          } catch (e) {
-            message.error(String(e))
-          }
-        },
-      })
+      try {
+        await api.backupRestoreFromTarget(target.id, passRemoteName.value, secret)
+        passOpen.value = false
+        showRemoteQueued()
+      } catch (e) {
+        const text = String(e)
+        if (!text.includes('E_KEY_MISMATCH')) throw e
+        // 备份由另一把主密钥加密：先说明影响条数，确认后再用 acceptKeyMismatch 重试
+        const count = text.match(/(\d+)\s*条/)?.[1] || '若干'
+        Modal.confirm({
+          title: '备份密钥与本机不一致',
+          content: `该异地备份由另一台机器或另一把主密钥创建，恢复后约 ${count} 条密钥（环境变量与 AI Key）将无法解密，需要重新填写，或导入原机器的密钥包。确认继续恢复？`,
+          okText: '继续恢复',
+          okType: 'danger',
+          cancelText: '取消',
+          onOk: async () => {
+            busy.value = true
+            try {
+              await api.backupRestoreFromTarget(target.id, passRemoteName.value, secret, true)
+              passOpen.value = false
+              showRemoteQueued()
+            } catch (err) {
+              message.error(String(err))
+            } finally {
+              busy.value = false
+            }
+          },
+        })
+      }
     }
   } catch (e) {
     message.error(String(e))

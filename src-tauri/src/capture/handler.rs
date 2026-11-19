@@ -21,6 +21,7 @@ use crate::capture::intercept::{
     MAX_MAP_FILE,
 };
 use crate::capture::store::{BodyPayload, CaptureStore, FlowBrief, FlowRecord, HeaderEntry};
+use crate::capture::upstream::PassthroughRules;
 use crate::capture::CaptureConfig;
 use crate::services::profile::CaptureLimits;
 use http_body_util::BodyExt;
@@ -33,6 +34,7 @@ use hudsucker::hyper::{Method, Request, Response, StatusCode, Uri, Version};
 use hudsucker::hyper_util::client::legacy::Error as ClientError;
 use hudsucker::{decode_response, Body, HttpContext, HttpHandler, RequestOrResponse};
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::future::Future;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -44,6 +46,63 @@ use std::time::{Duration, Instant};
 const MAX_COLLECT_BODY: u64 = 8 * 1024 * 1024;
 /// 图片只预览 1 MB 以内的，超过就当普通二进制跳过。
 const MAX_IMAGE_BODY: u64 = 1024 * 1024;
+/// 自动直通判定：同一域名至少失败这么多次、持续这么久、且没有成功解出任何请求。
+/// hudsucker 不回调 TLS 握手失败（客户端拒绝证书时只在内部日志里返回），
+/// 只能按「反复握手但一条请求都没进来」识别证书固定类 App。
+const TLS_FALLBACK_ATTEMPTS: u32 = 3;
+const TLS_FALLBACK_MIN_SPAN: Duration = Duration::from_secs(2);
+
+#[derive(Default)]
+struct TlsProbe {
+    attempts: u32,
+    successes: u64,
+    first: Option<Instant>,
+    auto_passthrough: bool,
+}
+
+/// 每个录制会话独立；命中后本次录制内保持直通，停止录制后重置。
+#[derive(Default)]
+struct TlsFallback {
+    hosts: Mutex<HashMap<String, TlsProbe>>,
+}
+
+enum TlsVerdict {
+    Intercept,
+    /// 刚判定为证书固定，需要记录一条直通说明
+    AutoPassthrough,
+    /// 之前已判定，后续连接直接直通
+    Passthrough,
+}
+
+impl TlsFallback {
+    fn observe_handshake(&self, host: &str) -> TlsVerdict {
+        let mut hosts = self.hosts.lock();
+        let probe = hosts.entry(host.to_ascii_lowercase()).or_default();
+        if probe.auto_passthrough {
+            return TlsVerdict::Passthrough;
+        }
+        let now = Instant::now();
+        let first = *probe.first.get_or_insert(now);
+        probe.attempts += 1;
+        if probe.successes == 0
+            && probe.attempts >= TLS_FALLBACK_ATTEMPTS
+            && now.duration_since(first) >= TLS_FALLBACK_MIN_SPAN
+        {
+            probe.auto_passthrough = true;
+            return TlsVerdict::AutoPassthrough;
+        }
+        TlsVerdict::Intercept
+    }
+
+    /// 只要有一条请求成功解出，就说明客户端信任当前根证书，不再自动直通
+    fn observe_success(&self, host: &str) {
+        let mut hosts = self.hosts.lock();
+        hosts
+            .entry(host.to_ascii_lowercase())
+            .or_default()
+            .successes += 1;
+    }
+}
 
 /// 低内存档收紧采集上限，避免把大响应整段读进内存再截断
 fn collect_cap(limits: &CaptureLimits) -> u64 {
@@ -91,6 +150,10 @@ pub struct CaptureHandler {
     store: Arc<CaptureStore>,
     config: CaptureConfig,
     intercept: Arc<InterceptState>,
+    /// ssl_hosts 直通白名单：命中后 CONNECT / TLS 都不解密
+    passthrough: Arc<PassthroughRules>,
+    /// 证书固定类 App 的自动降级：反复握手失败且没有成功请求的域名改为直通
+    tls_fallback: Arc<TlsFallback>,
     /// 当前请求的上下文；请求体异步读取，因此需要内部可变。
     pending: Arc<Mutex<Option<Pending>>>,
 }
@@ -102,6 +165,8 @@ impl Clone for CaptureHandler {
             store: self.store.clone(),
             config: self.config.clone(),
             intercept: self.intercept.clone(),
+            passthrough: self.passthrough.clone(),
+            tls_fallback: self.tls_fallback.clone(),
             pending: Arc::new(Mutex::new(None)),
         }
     }
@@ -113,12 +178,56 @@ impl CaptureHandler {
         config: CaptureConfig,
         intercept: Arc<InterceptState>,
     ) -> Self {
+        let passthrough = Arc::new(PassthroughRules::new(&config.ssl_hosts));
         Self {
             store,
             config,
             intercept,
+            passthrough,
+            tls_fallback: Arc::new(TlsFallback::default()),
             pending: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// 直通流量在列表里留一条提示，否则用户会以为抓包漏了
+    fn record_passthrough(&self, ctx: &HttpContext, host: &str, version: Version, detail: &str) {
+        let host = host.trim();
+        if host.is_empty() {
+            return;
+        }
+        let port = host
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.parse::<u16>().ok());
+        let authority = match port {
+            Some(_) => host.to_string(),
+            None => format!("{host}:443"),
+        };
+        self.store.record(FlowRecord {
+            brief: FlowBrief {
+                id: self.store.next_id(),
+                started_at: crate::util::now_ms(),
+                method: "CONNECT".into(),
+                scheme: "https".into(),
+                host: authority,
+                path: "/".into(),
+                http_version: version_text(version),
+                status: None,
+                duration_ms: 0,
+                request_size: 0,
+                response_size: 0,
+                content_type: String::new(),
+                client_addr: ctx.client_addr.to_string(),
+                error: Some(format!("已直通（未解密）：{detail}")),
+                mapped: false,
+                modified: false,
+                remote: None,
+                passthrough: true,
+            },
+            request_headers: Vec::new(),
+            response_headers: Vec::new(),
+            request_body: BodyPayload::default(),
+            response_body: BodyPayload::default(),
+        });
     }
 
     fn should_capture(&self, method: &Method, uri: &Uri) -> bool {
@@ -145,6 +254,12 @@ impl HttpHandler for CaptureHandler {
         ctx: &HttpContext,
         req: Request<Body>,
     ) -> impl Future<Output = RequestOrResponse> + Send {
+        // 能走进来说明 TLS 已解密成功，用于阻止自动直通误判
+        if *req.method() != Method::CONNECT {
+            if let Some(host) = req.uri().host() {
+                self.tls_fallback.observe_success(host);
+            }
+        }
         let matched = self.should_capture(req.method(), req.uri());
         let eligible = *req.method() != Method::CONNECT;
         let url = request_target(&req);
@@ -476,6 +591,65 @@ impl HttpHandler for CaptureHandler {
             );
             Response::from_parts(parts, Body::from(bytes))
         }
+    }
+
+    fn should_intercept_connect(
+        &mut self,
+        ctx: &HttpContext,
+        req: &Request<Body>,
+    ) -> impl Future<Output = bool> + Send {
+        let target = req.uri().authority().map(|authority| {
+            (
+                authority.host().to_string(),
+                authority.port_u16().unwrap_or(443),
+            )
+        });
+        let passthrough = target
+            .as_ref()
+            .map(|(host, port)| self.passthrough.matches(host, *port))
+            .unwrap_or(false);
+        if passthrough {
+            if let Some((host, port)) = target {
+                let label = if req.uri().port_u16().is_some() {
+                    format!("{host}:{port}")
+                } else {
+                    host
+                };
+                self.record_passthrough(ctx, &label, req.version(), "CONNECT 命中直通白名单");
+            }
+        }
+        async move { !passthrough }
+    }
+
+    fn should_intercept_tls(
+        &mut self,
+        ctx: &HttpContext,
+        hello: hudsucker::rustls::server::ClientHello<'_>,
+    ) -> impl Future<Output = bool> + Send {
+        let host = hello.server_name().unwrap_or_default().to_string();
+        let mut intercept = true;
+        if !host.is_empty() {
+            if self.passthrough.matches(&host, 443) {
+                self.record_passthrough(ctx, &host, Version::HTTP_11, "TLS 握手命中直通白名单");
+                intercept = false;
+            } else {
+                match self.tls_fallback.observe_handshake(&host) {
+                    TlsVerdict::Intercept => {}
+                    TlsVerdict::AutoPassthrough => {
+                        log::warn!("{host} 多次 TLS 握手失败，已自动改为直通（可能是证书固定）");
+                        self.record_passthrough(
+                            ctx,
+                            &host,
+                            Version::HTTP_11,
+                            "TLS 握手多次被客户端拒绝（证书固定），已自动直通，该域名不再解密",
+                        );
+                        intercept = false;
+                    }
+                    TlsVerdict::Passthrough => intercept = false,
+                }
+            }
+        }
+        async move { intercept }
     }
 
     fn handle_error(
@@ -928,6 +1102,7 @@ fn record_success(
             mapped: pending.mapped,
             modified: pending.modified,
             remote: pending.remote,
+            passthrough: false,
         },
         request_headers: pending.request_headers,
         response_headers,
@@ -957,6 +1132,7 @@ fn record_error(store: &CaptureStore, pending: Pending, error: String) {
             mapped: pending.mapped,
             modified: pending.modified,
             remote: pending.remote,
+            passthrough: false,
         },
         request_headers: pending.request_headers,
         response_headers: Vec::new(),
@@ -1171,4 +1347,62 @@ fn content_length(map: &HeaderMap) -> u64 {
 fn looks_static(path: &str) -> bool {
     let path = path.split('?').next().unwrap_or(path).to_ascii_lowercase();
     STATIC_EXTENSIONS.iter().any(|ext| path.ends_with(ext))
+}
+
+#[cfg(test)]
+mod tls_fallback_tests {
+    use super::*;
+
+    fn backdate_first(fallback: &TlsFallback, host: &str) {
+        let mut hosts = fallback.hosts.lock();
+        let probe = hosts.get_mut(host).expect("probe exists");
+        probe.first = Some(Instant::now() - TLS_FALLBACK_MIN_SPAN);
+    }
+
+    #[test]
+    fn repeated_failures_without_success_switch_to_passthrough() {
+        let fallback = TlsFallback::default();
+        assert!(matches!(
+            fallback.observe_handshake("pinned.test"),
+            TlsVerdict::Intercept
+        ));
+        backdate_first(&fallback, "pinned.test");
+        assert!(matches!(
+            fallback.observe_handshake("pinned.test"),
+            TlsVerdict::Intercept
+        ));
+        assert!(matches!(
+            fallback.observe_handshake("pinned.test"),
+            TlsVerdict::AutoPassthrough
+        ));
+        assert!(matches!(
+            fallback.observe_handshake("pinned.test"),
+            TlsVerdict::Passthrough
+        ));
+    }
+
+    #[test]
+    fn fast_retry_burst_does_not_trigger() {
+        let fallback = TlsFallback::default();
+        for _ in 0..6 {
+            assert!(matches!(
+                fallback.observe_handshake("preconnect.test"),
+                TlsVerdict::Intercept
+            ));
+        }
+    }
+
+    #[test]
+    fn successful_decryption_blocks_auto_passthrough() {
+        let fallback = TlsFallback::default();
+        fallback.observe_handshake("ok.test");
+        fallback.observe_success("OK.TEST");
+        backdate_first(&fallback, "ok.test");
+        for _ in 0..5 {
+            assert!(matches!(
+                fallback.observe_handshake("ok.test"),
+                TlsVerdict::Intercept
+            ));
+        }
+    }
 }

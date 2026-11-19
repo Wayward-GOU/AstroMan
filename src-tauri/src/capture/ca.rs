@@ -175,7 +175,7 @@ pub fn info(data_dir: &Path) -> CaInfo {
             thumbprint: thumbprint_pem(&material.cert_pem).unwrap_or_default(),
             created_at: material.created_at,
             expires_at: material.expires_at,
-            installed: is_trusted_pem(&material.cert_pem),
+            installed: is_trusted(&material.cert_path, &material.cert_pem),
         },
         Err(error) => {
             log::warn!("读取抓包根证书失败：{error}");
@@ -191,8 +191,8 @@ pub fn info(data_dir: &Path) -> CaInfo {
     }
 }
 
-/// 把当前 CA 装进「当前用户 → 受信任的根证书颁发机构」。
-/// Windows 用 `certutil -addstore -user Root`，不需要管理员权限。
+/// 把当前 CA 装进当前用户的信任库。
+/// Windows 用 `certutil -addstore -user Root`，macOS 用 `security add-trusted-cert`，均不需要管理员权限。
 pub fn install(data_dir: &Path) -> Result<CaInfo, String> {
     let material = ensure(data_dir)?;
     install_file(&material.cert_path)?;
@@ -216,7 +216,38 @@ fn install_file(path: &Path) -> Result<(), String> {
     }
 }
 
-#[cfg(not(windows))]
+/// macOS：默认写入用户域信任设置，`-k` 指定登录钥匙串；系统域需要管理员权限，不主动触碰。
+#[cfg(target_os = "macos")]
+fn install_file(path: &Path) -> Result<(), String> {
+    use std::process::Command;
+
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| "E_CA_INSTALL: 无法读取 HOME，请手动导入证书".to_string())?;
+    let keychain = PathBuf::from(home).join("Library/Keychains/login.keychain-db");
+    if !keychain.is_file() {
+        return Err(format!(
+            "E_CA_INSTALL: 未找到登录钥匙串 {}，请在「钥匙串访问」中手动导入证书",
+            keychain.display()
+        ));
+    }
+    let output = Command::new("/usr/bin/security")
+        .args(["add-trusted-cert", "-r", "trustRoot", "-k"])
+        .arg(&keychain)
+        .arg(path)
+        .output()
+        .map_err(|error| format!("E_CA_INSTALL: 调用 security 失败 {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format!(
+        "E_CA_INSTALL: 安装证书失败 {}。若授权被拒绝，请在「钥匙串访问」中导入该证书，\
+并把「信任 → 使用此证书时」设为「始终信任」",
+        stderr.trim()
+    ))
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn install_file(_path: &Path) -> Result<(), String> {
     Err("E_CA_INSTALL: 当前平台暂不支持一键安装，请手动导入证书".into())
 }
@@ -292,9 +323,9 @@ fn thumbprint_pem(pem: &str) -> Result<String, String> {
     Ok(thumbprint_der(&der_from_pem(pem)?))
 }
 
-fn is_trusted_pem(pem: &str) -> bool {
+fn is_trusted(cert_path: &Path, pem: &str) -> bool {
     match thumbprint_pem(pem) {
-        Ok(thumbprint) => in_root_store(&thumbprint),
+        Ok(thumbprint) => in_root_store(cert_path, &thumbprint),
         Err(error) => {
             log::warn!("计算证书指纹失败：{error}");
             false
@@ -304,7 +335,7 @@ fn is_trusted_pem(pem: &str) -> bool {
 
 /// Windows 证书管理器的「指纹」就是 SHA-1；依次查当前用户、本机的 Root 库。
 #[cfg(windows)]
-fn in_root_store(thumbprint: &str) -> bool {
+fn in_root_store(_cert_path: &Path, thumbprint: &str) -> bool {
     for root in ["HKCU", "HKLM"] {
         let key =
             format!(r"{root}\Software\Microsoft\SystemCertificates\Root\Certificates\{thumbprint}");
@@ -334,9 +365,38 @@ fn in_root_store(thumbprint: &str) -> bool {
     matches!(machine, Ok(status) if status.success())
 }
 
-#[cfg(not(windows))]
-fn in_root_store(_thumbprint: &str) -> bool {
-    // macOS / Linux 的信任库差异很大，后续单独接入；当前明确返回未安装
+/// macOS：`security verify-cert` 会同时校验证书链与用户在钥匙串里的信任设置，
+/// 退出码 0 即表示当前这张证书已被信任。不能只查同名证书是否存在，否则旧证书会误报。
+#[cfg(target_os = "macos")]
+fn in_root_store(cert_path: &Path, _thumbprint: &str) -> bool {
+    use std::process::{Command, Stdio};
+
+    match Command::new("/usr/bin/security")
+        .args(["verify-cert", "-c"])
+        .arg(cert_path)
+        .args(["-p", "ssl"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+    {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
+            log::debug!(
+                "macOS 根证书信任检测未通过：{}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            false
+        }
+        Err(error) => {
+            log::warn!("调用 security verify-cert 失败：{error}");
+            false
+        }
+    }
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn in_root_store(_cert_path: &Path, _thumbprint: &str) -> bool {
+    // Linux 发行版的信任库差异很大，后续单独接入
     false
 }
 

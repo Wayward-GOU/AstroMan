@@ -46,6 +46,12 @@ pub struct MockStartPayload {
     /// 仅支持 127.0.0.1 / localhost / 0.0.0.0
     #[serde(default)]
     pub host: Option<String>,
+    /// 允许跨域的来源白名单；为空表示不返回任何 CORS 头（浏览器默认拦截）
+    #[serde(default)]
+    pub cors_origins: Vec<String>,
+    /// 是否允许白名单来源携带凭据（Cookie / Authorization）
+    #[serde(default)]
+    pub cors_credentials: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -82,6 +88,8 @@ struct Shared {
     project_id: i64,
     conn: Mutex<Connection>,
     token: Option<String>,
+    cors_origins: Vec<String>,
+    cors_credentials: bool,
     logs: Mutex<VecDeque<MockLog>>,
     counter: AtomicU64,
     requests: AtomicU64,
@@ -155,10 +163,13 @@ impl MockServer {
         } else {
             None
         };
+        let cors_origins = normalize_origins(&payload.cors_origins);
         let shared = Arc::new(Shared {
             project_id: payload.project_id,
             conn: Mutex::new(conn),
             token: token.clone(),
+            cors_origins,
+            cors_credentials: payload.cors_credentials,
             logs: Mutex::new(VecDeque::with_capacity(LOG_CAPACITY)),
             counter: AtomicU64::new(1),
             requests: AtomicU64::new(0),
@@ -320,7 +331,7 @@ fn handle_connection(mut stream: TcpStream, shared: Arc<Shared>) {
     };
     let path = raw_path.to_string();
 
-    let cors = cors_headers(&request);
+    let cors = cors_headers(&request, &shared);
     if request.method.eq_ignore_ascii_case("OPTIONS") {
         let mut headers = cors.clone();
         headers.push((
@@ -625,14 +636,87 @@ fn write_response(
     stream.flush()
 }
 
-fn cors_headers(request: &HttpRequest) -> Vec<(String, String)> {
-    let origin = header_value(request, "origin").unwrap_or_else(|| "*".into());
-    vec![
-        ("Access-Control-Allow-Origin".into(), origin),
-        ("Access-Control-Allow-Credentials".into(), "true".into()),
-        ("Vary".into(), "Origin".into()),
-        ("Access-Control-Expose-Headers".into(), "*".into()),
-    ]
+fn normalize_origins(raw: &[String]) -> Vec<String> {
+    raw.iter()
+        .map(|item| item.trim().trim_end_matches('/').to_ascii_lowercase())
+        .filter(|item| !item.is_empty())
+        .collect()
+}
+
+/// 来源白名单匹配：`*` 放行全部；其余支持 `*` 通配（如 `http://localhost:*`）
+fn origin_allowed(origin: &str, patterns: &[String]) -> bool {
+    let origin = origin.trim().trim_end_matches('/').to_ascii_lowercase();
+    patterns
+        .iter()
+        .any(|pattern| pattern == "*" || wildcard_match(pattern, &origin))
+}
+
+/// 线性双指针通配匹配；`*` 匹配任意长度，足够覆盖来源白名单的常见写法
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let mut star: Option<usize> = None;
+    let mut mark = 0usize;
+    while ti < text.len() {
+        if pi < pattern.len() && pattern[pi] == text[ti] {
+            pi += 1;
+            ti += 1;
+        } else if pi < pattern.len() && pattern[pi] == '*' {
+            star = Some(pi);
+            mark = ti;
+            pi += 1;
+        } else if let Some(position) = star {
+            pi = position + 1;
+            mark += 1;
+            ti = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < pattern.len() && pattern[pi] == '*' {
+        pi += 1;
+    }
+    pi == pattern.len()
+}
+
+fn cors_headers(request: &HttpRequest, shared: &Shared) -> Vec<(String, String)> {
+    cors_headers_for(
+        header_value(request, "origin").as_deref(),
+        &shared.cors_origins,
+        shared.cors_credentials,
+    )
+}
+
+/// 只有命中白名单的来源才回显 CORS 头；默认不返回 ACAO，第三方页面无法读取 Mock 数据
+fn cors_headers_for(
+    origin: Option<&str>,
+    allowed: &[String],
+    credentials: bool,
+) -> Vec<(String, String)> {
+    let Some(origin) = origin.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Vec::new();
+    };
+    if !origin_allowed(origin, allowed) {
+        return Vec::new();
+    }
+    let mut headers = vec![
+        (
+            "Access-Control-Allow-Origin".to_string(),
+            origin.to_string(),
+        ),
+        ("Vary".to_string(), "Origin".to_string()),
+    ];
+    if credentials {
+        // 携带凭据时 `Expose-Headers: *` 按规范会被当成字面量，干脆不发
+        headers.push((
+            "Access-Control-Allow-Credentials".to_string(),
+            "true".to_string(),
+        ));
+    } else {
+        headers.push(("Access-Control-Expose-Headers".to_string(), "*".to_string()));
+    }
+    headers
 }
 
 fn header_value(request: &HttpRequest, name: &str) -> Option<String> {
@@ -763,6 +847,8 @@ mod tests {
                     project_id: project,
                     port: None,
                     host: None,
+                    cors_origins: Vec::new(),
+                    cors_credentials: false,
                 },
             )
             .unwrap();
@@ -785,5 +871,69 @@ mod tests {
 
         manager.stop(project);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cors_only_echoes_whitelisted_origins() {
+        // 默认不配置白名单：任何来源都拿不到 ACAO
+        assert!(cors_headers_for(Some("https://evil.example.com"), &[], false).is_empty());
+
+        let allowed = normalize_origins(&[
+            " http://localhost:5173/ ".to_string(),
+            "https://*.example.com".to_string(),
+            String::new(),
+        ]);
+        assert_eq!(
+            allowed,
+            vec![
+                "http://localhost:5173".to_string(),
+                "https://*.example.com".to_string()
+            ]
+        );
+
+        let headers = cors_headers_for(Some("http://localhost:5173"), &allowed, false);
+        assert!(headers.iter().any(|(key, value)| {
+            key.as_str() == "Access-Control-Allow-Origin"
+                && value.as_str() == "http://localhost:5173"
+        }));
+        assert!(!headers
+            .iter()
+            .any(|(key, _)| key.as_str() == "Access-Control-Allow-Credentials"));
+
+        let headers = cors_headers_for(Some("https://app.example.com"), &allowed, true);
+        assert!(headers.iter().any(|(key, value)| {
+            key.as_str() == "Access-Control-Allow-Origin"
+                && value.as_str() == "https://app.example.com"
+        }));
+        assert!(headers.iter().any(|(key, value)| {
+            key.as_str() == "Access-Control-Allow-Credentials" && value.as_str() == "true"
+        }));
+
+        // 通配不跨协议，也不匹配白名单之外的域名
+        assert!(cors_headers_for(Some("http://app.example.com"), &allowed, false).is_empty());
+        assert!(cors_headers_for(Some("https://evil.example.net"), &allowed, false).is_empty());
+    }
+
+    #[test]
+    fn origin_wildcards_match_patterns() {
+        // `*` 可跨段，`https://*.example.com` 同时匹配一级与多级子域
+        assert!(wildcard_match(
+            "http://localhost:*",
+            "http://localhost:8080"
+        ));
+        assert!(!wildcard_match("http://localhost:*", "http://localhost"));
+        assert!(wildcard_match("*", "anything"));
+        assert!(wildcard_match(
+            "https://*.example.com",
+            "https://a.example.com"
+        ));
+        assert!(wildcard_match(
+            "https://*.example.com",
+            "https://a.b.example.com"
+        ));
+        assert!(!wildcard_match(
+            "https://*.example.com",
+            "https://example.com"
+        ));
     }
 }

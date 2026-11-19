@@ -123,7 +123,9 @@ watch(keyword, (value) => {
     return
   }
   searching.value = true
-  searchTimer = window.setTimeout(() => runSearch(), 220)
+  searchTimer = window.setTimeout(() => {
+    void runSearch()
+  }, 220)
 })
 
 async function runSearch() {
@@ -139,10 +141,6 @@ async function runSearch() {
   } finally {
     searching.value = false
   }
-}
-
-function clearSearch() {
-  keyword.value = ''
 }
 
 const collectionModalOpen = ref(false)
@@ -350,7 +348,7 @@ function openRequestTab(
   }
   rememberLastRequest(projectId.value, { id, ...meta })
   lastRequest.value = readLastRequest(projectId.value)
-  router.push({ name: 'request', params: { id }, query: { projectId: projectId.value } })
+  void router.push({ name: 'request', params: { id }, query: { projectId: projectId.value } })
 }
 
 function openRequest(row: RequestSummary | RequestSearchHit) {

@@ -7,8 +7,8 @@ import StressReportList from '@/components/StressReportList.vue'
 const router = useRouter()
 
 function switchTab(key: string | number) {
-  if (key === 'stress') router.push('/stress')
-  else if (key === 'plans') router.push('/plans')
+  if (key === 'stress') void router.push('/stress')
+  else if (key === 'plans') void router.push('/plans')
 }
 </script>
 

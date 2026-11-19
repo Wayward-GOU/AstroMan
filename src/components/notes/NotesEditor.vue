@@ -8,7 +8,6 @@ import {
   notesAttachmentData,
   notesAttachmentList,
   notesAttachmentRemove,
-  notesDelete,
   notesGet,
   notesUpdate,
 } from '@/api/notes'

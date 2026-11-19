@@ -15,7 +15,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::backup::{self, BackupItem, BackupKind};
+use crate::backup::{self, BackupItem, BackupKind, RestorePlan};
 use crate::secret;
 use crate::services::backup_crypto;
 use crate::state::DbPool;
@@ -717,7 +717,8 @@ fn webdav_prune(base: &str, dir: &str, username: &str, password: &str) -> Result
     Ok(())
 }
 
-/// 从远端恢复：下载 / 拷贝 → 解密 → 校验 → 写待恢复标记（重启后替换）
+/// 从远端恢复：下载 / 拷贝 → 解密 → 校验 + 密钥确认 → 写待恢复标记（重启后替换）
+#[allow(clippy::too_many_arguments)]
 pub fn restore_from_target(
     pool: &DbPool,
     data_dir: &Path,
@@ -725,7 +726,8 @@ pub fn restore_from_target(
     target_id: i64,
     remote_name: &str,
     passphrase: &str,
-) -> Result<BackupItem, String> {
+    accept_key_mismatch: bool,
+) -> Result<RestorePlan, String> {
     let name = safe_remote_name(remote_name)?;
     let target = {
         let conn = pool.get().map_err(err)?;
@@ -763,18 +765,20 @@ pub fn restore_from_target(
     }
     let _ = std::fs::remove_file(&downloaded);
 
-    let item = match backup::validate(&restored) {
-        Ok(item) => item,
-        Err(error) => {
-            let _ = std::fs::remove_file(&restored);
-            return Err(error);
-        }
-    };
     if let Some(parent) = config_file.parent() {
         // 配置目录通常已在启动时建好；这里兜底，避免首次恢复时标记写不进去
         std::fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败：{e}"))?;
     }
-    backup::mark_restore(config_file, Path::new(&item.path))?;
+    // 与本地备份恢复共用同一段密钥校验，避免「从异地恢复」绕过 S10 的确认闸门
+    let plan = match backup::prepare_restore(config_file, &restored, accept_key_mismatch) {
+        Ok(plan) => plan,
+        Err(error) => {
+            // 未排队成功：删掉解密出来的明文快照，别把它留在备份目录；
+            // 用户确认后重新下载一次即可。
+            let _ = std::fs::remove_file(&restored);
+            return Err(error);
+        }
+    };
 
     if let Ok(conn) = pool.get() {
         let _ = crate::services::audit::write(
@@ -782,12 +786,16 @@ pub fn restore_from_target(
             "backup.restore",
             Some(&target.name),
             "ok",
-            Some(&json!({ "remoteName": name, "schemaVersion": item.schema_version })),
+            Some(&json!({
+                "remoteName": name,
+                "schemaVersion": plan.item.schema_version,
+                "keyState": plan.key_state
+            })),
             None,
         );
     }
     log::info!("已排队从异地备份恢复：{} / {name}", target.name);
-    Ok(item)
+    Ok(plan)
 }
 
 fn download_file(username: &str, password: &str, url: &str, target: &Path) -> Result<(), String> {
@@ -1160,21 +1168,23 @@ mod tests {
             target.id,
             &result.remote_name,
             "wrong passphrase",
+            false,
         )
         .unwrap_err();
         assert!(error.starts_with("E_CRYPTO"), "实际：{error}");
         assert!(!config.parent().unwrap().join("restore.pending").exists());
 
-        let item = restore_from_target(
+        let plan = restore_from_target(
             &pool,
             &dir,
             &config,
             target.id,
             &result.remote_name,
             passphrase,
+            false,
         )
         .unwrap();
-        assert!(Path::new(&item.path).exists());
+        assert!(Path::new(&plan.item.path).exists());
         assert!(config.parent().unwrap().join("restore.pending").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -1205,12 +1205,12 @@ function quoteMessage(item: ChatItem) {
   const text = visibleText(item.content)
   if (sending.value || !text || item.role === 'tool') return
   quote.value = { role: item.role, content: clipQuote(text) }
-  nextTick(() => inputRef.value?.focus?.())
+  void nextTick(() => inputRef.value?.focus?.())
 }
 
 function clearQuote() {
   quote.value = null
-  nextTick(() => inputRef.value?.focus?.())
+  void nextTick(() => inputRef.value?.focus?.())
 }
 
 /** 删除单条消息：先删库再删本地，删掉的消息不再进入后续上下文 */
@@ -2529,14 +2529,6 @@ function withAttachments(content: string): string {
   return `${content}\n\n${blocks.join('\n\n')}`
 }
 
-/** 落库时把附件正文换成摘要，大段文件内容只喂给模型，不写进数据库 */
-function forStorage(content: string): string {
-  return content.replace(
-    /```fbin-file ([^\n]+)\n([\s\S]*?)\n```/g,
-    (_match, name: string, body: string) => `【附件 ${name} · ${body.length} 字符，正文未入库】`,
-  )
-}
-
 /* ---------------- AI-13 发送前预览：本次到底会把什么发给模型 ---------------- */
 
 const PERMISSION_LABEL: Record<string, string> = {
@@ -2943,7 +2935,7 @@ async function selectSession(id: number) {
   aborted.value = false
   summaryFails.value = 0
   summaryPaused.value = false
-  nextTick(() => scrollBottom(true))
+  void nextTick(() => scrollBottom(true))
 }
 
 function resetContextState() {
@@ -3429,7 +3421,7 @@ onActivated(() => {
   void refreshSessions()
   // 设置页可能改了预算 / 摘要模型，回来时重新读一次
   void reloadAppSettings().then(() => refreshMonthUsage())
-  nextTick(() => scrollBottom(true))
+  void nextTick(() => scrollBottom(true))
 })
 </script>
 

@@ -6,8 +6,9 @@
 use tauri::{AppHandle, State};
 
 use crate::services::cluster::client::{parse_master_addr, ClusterSlaveConnectPayload};
+use crate::services::cluster::discovery::{self, DiscoveredMaster};
 use crate::services::cluster::protocol::{
-    ClusterMasterSnapshot, ClusterProtocolInfo, ClusterSlaveSnapshot,
+    ClusterDevice, ClusterMasterSnapshot, ClusterProtocolInfo, ClusterSlaveSnapshot,
 };
 use crate::services::cluster::server::{ClusterMasterStartPayload, ClusterNodeWeight};
 use crate::state::AppState;
@@ -112,4 +113,38 @@ pub fn cluster_slave_snapshot(state: State<'_, AppState>) -> ClusterSlaveSnapsho
 #[tauri::command]
 pub fn cluster_slave_disconnect(state: State<'_, AppState>) -> Result<(), String> {
     state.cluster_slave.disconnect()
+}
+
+/// 历史设备缓存：能力检测结果按稳定 deviceId 跨任务复用
+#[tauri::command]
+pub fn cluster_devices_list(
+    state: State<'_, AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<ClusterDevice>, String> {
+    let mut items =
+        crate::services::cluster::devices::list_devices(&state.pool, limit.unwrap_or(50))?;
+    let online: std::collections::HashSet<String> = state
+        .cluster
+        .snapshots()
+        .into_iter()
+        .flat_map(|session| session.nodes)
+        .filter(|node| {
+            node.role == "slave"
+                && !matches!(
+                    node.status.as_str(),
+                    "lost" | "left" | "rejected" | "done" | "disconnected"
+                )
+        })
+        .filter_map(|node| node.device_id)
+        .collect();
+    for item in &mut items {
+        item.online = online.contains(&item.node_id);
+    }
+    Ok(items)
+}
+
+/// 浏览局域网主节点：mDNS 只做便利发现，失败时手动填 IP
+#[tauri::command]
+pub async fn cluster_mdns_browse(timeout_ms: Option<u64>) -> Result<Vec<DiscoveredMaster>, String> {
+    discovery::browse_masters(timeout_ms.unwrap_or(2_500)).await
 }

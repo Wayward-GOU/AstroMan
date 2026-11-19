@@ -170,7 +170,7 @@ function genBankCard(): string {
   return base + luhnCheckDigit(base)
 }
 
-function genEmail(name: string): string {
+function genEmail(_name: string): string {
   const letters = 'abcdefghijklmnopqrstuvwxyz'
   const local = Array.from(randomBytes(6), (byte) => letters[byte % 26]).join('')
   return `${local}${randomBytes(1)[0] % 100}@${pick(DOMAINS)}`

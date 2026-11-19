@@ -1056,6 +1056,8 @@ export interface StressReport {
   startTime?: number | null
   endTime?: number | null
   createdAt: number
+  /** 外部监控指标（v17 独立列读取；老报告 / 未导入时不出现） */
+  externalMetrics?: ExternalMetricSeries[] | null
 }
 
 export interface StatusCount {
@@ -1140,7 +1142,11 @@ export interface ReportConfigSnapshot {
   slowThresholdMs?: number
   /** 本机施压能力快照（1.7.5） */
   machineCapacity?: MachineCapacitySnapshot | null
-  /** 外部监控指标（3.6.1 预留；旧报告没有该字段，读取时忽略） */
+  /**
+   * 外部监控指标（3.6.1 预留）
+   * @deprecated v1.1.1 起写入与读取都以 `StressReport.externalMetrics` 为准；
+   * 这里仅保留对按原方案写进配置快照的老数据的兼容读取。
+   */
   externalMetrics?: ExternalMetricSeries[] | null
   /** 开始压测时同主机已有其他任务在施压的警告（1.3.2，只留痕不拦截） */
   sameHostWarning?: string | null
@@ -1152,6 +1158,15 @@ export interface ReportConfigSnapshot {
   metrics?: RuntimeMetrics
   /** 分布式压测元数据（v1.1.1 一期，主从节点与合并口径） */
   cluster?: ClusterReportMeta | null
+  /** 崩溃恢复出的「不完整」报告（R3）：健康结论强制 fail，不参与基线 */
+  partial?: boolean
+  partialReason?: string
+  /** 恢复时间（毫秒） */
+  restoredAt?: number
+  /** 数据截止到压测第几秒 */
+  dataCutoffSec?: number
+  /** 从临时表恢复的采样点数 */
+  restoredSamples?: number
 }
 
 /** 压测配置带入的机器能力快照 */
@@ -1222,6 +1237,8 @@ export interface RuntimeMetrics {
   /** 自动降档轨迹（1.6.3） */
   downgradeTrail?: Array<{ atSec: number; from: string; to: string; qps: number }>
   slowRequestCount?: number
+  /** 增量落库队列满时丢弃的采样点（R3） */
+  persistDropped?: number
 }
 
 export interface ReportDetail {
@@ -1241,6 +1258,32 @@ export interface ReportDetail {
   scenarioText?: string | null
   /** 可编辑的报告总结 */
   summaryText?: string | null
+  /** 每秒 worker 状态分布（v17，R8） */
+  workerStates?: WorkerStateSample[]
+}
+
+/** 某一秒内并发 worker 的状态分布 */
+export interface WorkerStateSample {
+  elapsedSec: number
+  idle: number
+  rampWait: number
+  stageWait: number
+  rateWait: number
+  awaitHeader: number
+  readBody: number
+  think: number
+  done: number
+}
+
+/** 在途请求快照（R8） */
+export interface WorkerSnapshot {
+  index: number
+  state: string
+  method: string
+  url: string
+  stageIndex: number
+  elapsedMs: number
+  startedAt: number
 }
 
 /** 慢请求快照：定位模式与长稳报告使用 */
@@ -1278,6 +1321,8 @@ export interface StressProgress {
   recordMode: string
   /** 一次性提示（如自动降档），前端 toast 后丢弃 */
   notice?: string | null
+  /** 最近一秒的 worker 状态分布（R8） */
+  workerStates?: WorkerStateSample | null
 }
 
 export interface StressDone {
@@ -1682,6 +1727,22 @@ export interface BackupItem {
   /** 备份文件内的 schema 版本（读取失败时为 0） */
   schemaVersion: number
   tables: number
+  /** 备份创建时的密钥指纹；1.1.1 之前的老备份为 null */
+  keyId?: string | null
+  /** 与本机当前主密钥是否一致；无法判断时为 true */
+  keyMatches: boolean
+  /** match / mismatch / unknown */
+  keyState: 'match' | 'mismatch' | 'unknown' | string
+}
+
+/** 恢复预览：写恢复标记之前的影响面说明 */
+export interface BackupRestorePreview {
+  item: BackupItem
+  keyId?: string | null
+  keyState: 'match' | 'mismatch' | 'unknown' | string
+  keyMatches: boolean
+  /** 备份里 enc:v1: 的条数（恢复后可能解不开的密钥数） */
+  affectedSecrets: number
 }
 
 export interface CheckResult {
@@ -1782,6 +1843,10 @@ export interface MockStartPayload {
   /** 省略或 0 时自动分配 */
   port?: number
   host?: string
+  /** 允许跨域的来源白名单；留空表示不返回 CORS 头 */
+  corsOrigins?: string[]
+  /** 是否允许白名单来源携带凭据 */
+  corsCredentials?: boolean
 }
 
 export interface MockStatus {

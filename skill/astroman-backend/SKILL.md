@@ -38,7 +38,7 @@ description: AstroMan 的 Rust/Tauri 后端开发规范。改数据库 schema、
 | `commands/test_preflight.rs` | 运行前预检：缺接口 / 缺脚本 / 缺变量 / 依赖环，`strictScripts` 时把跳过项升级为 error |
 | `commands/test_report.rs` | 运行产物生成（HTML / JSON / JUnit / summary）与附件导出 |
 | `commands/test_pack.rs` | 套件包 `*.astromantest.json` 导入导出（含请求快照与数据集，同名冲突 skip / overwrite / rename） |
-| `test_runner.rs` | 套件执行内核：依赖跳过、失败策略、重试、并发、数据行、setup / teardown、进度事件；**不依赖 Tauri**，CLI 复用 |
+| `test_runner.rs` | 套件执行内核：依赖跳过、失败策略、重试、数据行、setup / teardown、进度事件（串行执行；`maxWorkers` / `parallelRows` 仅接受默认值）；**不依赖 Tauri**，CLI 复用 |
 | `test_assert.rs` | 6 类声明式断言：`status` / `durationMs` / `header` / `body` / `regex` / `jsonPath` |
 | `test_dataset.rs` | CSV / JSON 数据集解析，嵌套字段摊平成 `a.b.c` 供 `{{a.b.c}}` 渲染 |
 | `python_exec.rs` | Python 子进程：解释器探测、`context.json` / `result.json` 协议、超时与输出上限、附件白名单 |

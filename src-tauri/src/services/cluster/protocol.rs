@@ -10,10 +10,20 @@
 
 use serde::{Deserialize, Serialize};
 
-/// 协议版本：主从版本不一致时从节点拒绝加入，避免字段缺省导致误算
-pub const PROTOCOL_VERSION: u32 = 1;
+/// 协议版本：v2 增加能力上报、mDNS、阶段编排与断线重连
+pub const PROTOCOL_VERSION: u32 = 2;
+/// 主节点仍接受的最低从节点版本：v1 按最小能力集工作
+pub const MIN_PROTOCOL_VERSION: u32 = 1;
 /// 默认监听端口
 pub const DEFAULT_PORT: u16 = 17801;
+/// mDNS 服务类型：只做便利发现，手动填 IP 永久保留
+pub const MDNS_SERVICE_TYPE: &str = "_astroman-cluster._tcp.local.";
+/// 失联节点保留状态、允许重连的时长（秒）
+pub const RECONNECT_GRACE_SEC: u64 = 300;
+/// 从节点重连退避上限（秒）
+pub const RECONNECT_BACKOFF_MAX_SEC: u64 = 30;
+/// 编排阶段总数上限，避免一次任务把引擎拖入过多阶段
+pub const MAX_ORCHESTRATION_PHASES: usize = 32;
 /// 配对码有效期（秒）：默认 5 分钟，创建任务时可在上下限内调整
 pub const PAIR_CODE_TTL_SEC: i64 = 300;
 /// 配对码有效期下限：1 分钟
@@ -50,6 +60,10 @@ pub struct ClusterProtocolInfo {
     pub clock_rounds: u32,
     pub clock_drop_uncertainty_ms: f64,
     pub max_nodes: usize,
+    pub min_version: u32,
+    pub reconnect_grace_sec: u64,
+    pub reconnect_backoff_max_sec: u64,
+    pub mdns_service: String,
 }
 
 impl Default for ClusterProtocolInfo {
@@ -66,6 +80,10 @@ impl Default for ClusterProtocolInfo {
             clock_rounds: CLOCK_SAMPLE_ROUNDS,
             clock_drop_uncertainty_ms: CLOCK_DROP_UNCERTAINTY_MS,
             max_nodes: MAX_NODES,
+            min_version: MIN_PROTOCOL_VERSION,
+            reconnect_grace_sec: RECONNECT_GRACE_SEC,
+            reconnect_backoff_max_sec: RECONNECT_BACKOFF_MAX_SEC,
+            mdns_service: MDNS_SERVICE_TYPE.to_string(),
         }
     }
 }
@@ -80,12 +98,15 @@ pub type SparseBuckets = Vec<(u32, u64)>;
 pub enum ClusterMessage {
     Hello(HelloPayload),
     HelloAck(HelloAckPayload),
+    CapabilityReport(DeviceCapability),
+    DeviceList(DeviceListPayload),
     TimeProbe(TimeProbePayload),
     TimeAck(TimeAckPayload),
     Prepare(PreparePayload),
     PrepareAck(PrepareAckPayload),
     Preflight(PreflightPayload),
     Start(StartPayload),
+    PhaseStart(PhaseStartPayload),
     Sample(SamplePayload),
     Done(DonePayload),
     Abort(AbortPayload),
@@ -100,19 +121,72 @@ pub struct HelloPayload {
     pub version: u32,
     pub pair_code: String,
     pub node_name: String,
-    /// 从节点本机能力检测的饱和并发（可选，仅用于启动前提示）
+    /// 从节点本机能力检测的饱和并发（v1 字段，v2 改走 capabilityReport）
     #[serde(default)]
     pub capacity_concurrent: Option<u32>,
+    /// 稳定的设备标识：重连与设备列表用它区分同一台机器
+    #[serde(default)]
+    pub device_id: Option<String>,
+    /// 断线重连：携带配对时下发的令牌恢复原 job，不再消耗配对码
+    #[serde(default)]
+    pub session_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HelloAckPayload {
+    /// 协商后的协议版本：主节点回显从节点版本，v1 从节点仍能工作
     pub version: u32,
     /// 配对码单次使用：配对成功后只认令牌
     pub token: String,
     pub node_id: String,
     pub job_id: i64,
+    /// true 表示这是重连恢复，不会重新下发时钟探测
+    #[serde(default)]
+    pub resumed: bool,
+}
+
+/// 从节点能力上报：复用 machine_capacity 的最近一次检测
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceCapability {
+    #[serde(default)]
+    pub device_id: Option<String>,
+    #[serde(default)]
+    pub node_name: String,
+    #[serde(default)]
+    pub os: Option<String>,
+    #[serde(default)]
+    pub cores: u32,
+    #[serde(default)]
+    pub capacity_concurrent: u32,
+    #[serde(default)]
+    pub capacity_qps: f64,
+    #[serde(default)]
+    pub probed_at: Option<i64>,
+}
+
+/// 设备列表项：来自 cluster_devices，online 由当前任务节点状态推导
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClusterDevice {
+    pub node_id: String,
+    pub node_name: String,
+    pub last_addr: String,
+    pub last_seen_at: i64,
+    pub os: Option<String>,
+    pub cores: u32,
+    pub capacity_concurrent: u32,
+    pub capacity_qps: f64,
+    pub probed_at: Option<i64>,
+    #[serde(default)]
+    pub online: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceListPayload {
+    pub devices: Vec<ClusterDevice>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +206,139 @@ pub struct TimeAckPayload {
     pub t1: i64,
 }
 
+/// 计划级编排：主节点把每个阶段的集群总并发按权重拆到各节点
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Orchestration {
+    #[serde(default = "orchestration_version")]
+    pub version: u32,
+    pub phases: Vec<OrchestrationPhase>,
+    /// 仅支持 weighted；保留字段便于后续扩展
+    #[serde(default = "default_assignment")]
+    pub assignment: String,
+}
+
+fn orchestration_version() -> u32 {
+    1
+}
+
+fn default_assignment() -> String {
+    "weighted".to_string()
+}
+
+impl Default for Orchestration {
+    fn default() -> Self {
+        Self {
+            version: orchestration_version(),
+            phases: Vec::new(),
+            assignment: default_assignment(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrchestrationPhase {
+    /// ramp / hold / step
+    pub kind: String,
+    pub duration_sec: u32,
+    #[serde(default)]
+    pub from_concurrent: Option<u32>,
+    #[serde(default)]
+    pub to_concurrent: Option<u32>,
+    #[serde(default)]
+    pub concurrent: Option<u32>,
+}
+
+impl Orchestration {
+    /// 校验并展开为逐秒的集群总并发序列；ramp 每秒线性插值，hold/step 保持定值
+    pub fn expand_totals(&self) -> Result<Vec<u32>, String> {
+        if self.version != 1 {
+            return Err(format!("不支持的编排版本：{}", self.version));
+        }
+        if self.assignment != "weighted" {
+            return Err(format!("不支持的分配方式：{}", self.assignment));
+        }
+        if self.phases.is_empty() {
+            return Err("编排至少需要 1 个阶段".to_string());
+        }
+        if self.phases.len() > MAX_ORCHESTRATION_PHASES {
+            return Err(format!(
+                "编排最多 {MAX_ORCHESTRATION_PHASES} 个阶段，当前 {} 个",
+                self.phases.len()
+            ));
+        }
+        let mut totals: Vec<u32> = Vec::new();
+        for (index, phase) in self.phases.iter().enumerate() {
+            if phase.duration_sec == 0 {
+                return Err(format!("第 {} 个阶段时长必须大于 0", index + 1));
+            }
+            match phase.kind.as_str() {
+                "ramp" => {
+                    let from = phase
+                        .from_concurrent
+                        .ok_or_else(|| format!("第 {} 个 ramp 阶段缺少起始并发", index + 1))?;
+                    let to = phase
+                        .to_concurrent
+                        .ok_or_else(|| format!("第 {} 个 ramp 阶段缺少目标并发", index + 1))?;
+                    if from == 0 || to == 0 {
+                        return Err("阈值并发必须大于 0".to_string());
+                    }
+                    let steps = phase.duration_sec.max(1) as u64;
+                    for step in 0..steps {
+                        let ratio = if steps <= 1 {
+                            1.0
+                        } else {
+                            step as f64 / (steps - 1) as f64
+                        };
+                        let value = from as f64 + (to as f64 - from as f64) * ratio;
+                        totals.push(value.round().max(1.0) as u32);
+                    }
+                }
+                "hold" | "step" => {
+                    let value = phase
+                        .concurrent
+                        .ok_or_else(|| format!("第 {} 个阶段缺少并发值", index + 1))?;
+                    if value == 0 {
+                        return Err("阶段并发必须大于 0".to_string());
+                    }
+                    for _ in 0..phase.duration_sec {
+                        totals.push(value);
+                    }
+                }
+                other => return Err(format!("不支持的阶段类型：{other}")),
+            }
+        }
+        if totals.len() > 86_400 {
+            return Err("编排总时长不能超过 24 小时".to_string());
+        }
+        Ok(totals)
+    }
+
+    pub fn peak(&self) -> Result<u32, String> {
+        self.expand_totals()?
+            .into_iter()
+            .max()
+            .ok_or_else(|| "编排没有有效阶段".to_string())
+    }
+}
+
+/// 阶段切换通知：从节点据此刷新展示，并发已随配置里的阶段表由引擎执行
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhaseStartPayload {
+    pub index: u32,
+    /// 主节点时钟毫秒
+    pub at_ms: i64,
+    /// 该阶段集群总并发
+    pub concurrent: u32,
+    /// 本节点权重与分配到的并发
+    pub weight: f64,
+    pub node_concurrent: u32,
+    pub kind: String,
+    pub duration_sec: u32,
+}
+
 /// 下发执行配置：只传模板与变量名，变量值由各节点本地解析
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -148,6 +355,9 @@ pub struct PreparePayload {
     pub concurrent: u32,
     /// 集群总并发（展示用）
     pub total_concurrent: u32,
+    /// 计划级编排；为 None 表示固定并发或单场景
+    #[serde(default)]
+    pub orchestration: Option<Orchestration>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -288,6 +498,19 @@ pub struct ClusterNodeInfo {
     pub joined_at: i64,
     pub last_seen_at: Option<i64>,
     pub error: Option<String>,
+    /// 协商后的协议版本（1 或 2）
+    pub protocol_version: u32,
+    pub device_id: Option<String>,
+    pub capacity_concurrent: Option<u32>,
+    pub capacity_qps: Option<f64>,
+    pub cores: Option<u32>,
+    pub os: Option<String>,
+    /// 按能力归一化得到的建议权重；节点未上报能力时为 None
+    pub suggested_weight: Option<f64>,
+    /// 最近一次断线时刻；用于 5 分钟重连宽限与缺口展示
+    pub disconnected_at: Option<i64>,
+    /// 断线累计秒数（含已重连恢复的历史缺口）
+    pub gap_seconds: u64,
 }
 
 /// 主节点任务快照：前端每秒拉取 / 订阅事件
@@ -315,6 +538,10 @@ pub struct ClusterMasterSnapshot {
     pub message: Option<String>,
     pub nodes: Vec<ClusterNodeInfo>,
     pub created_at: i64,
+    /// 计划级编排（若有）
+    pub orchestration: Option<Orchestration>,
+    /// 当前阶段序号（编排任务）
+    pub current_phase: Option<u32>,
 }
 
 /// 从节点会话快照
@@ -336,6 +563,13 @@ pub struct ClusterSlaveSnapshot {
     pub error: Option<String>,
     pub missing_vars: Vec<String>,
     pub joined_at: Option<i64>,
+    pub device_id: Option<String>,
+    pub protocol_version: u32,
+    /// 断线重连中：引擎继续跑，采样等恢复后继续上报
+    pub reconnecting: bool,
+    pub phase_index: Option<u32>,
+    pub phase_concurrent: u32,
+    pub reconnect_attempts: u32,
 }
 
 /// 写入报告 config_json.cluster 的元数据
@@ -353,6 +587,9 @@ pub struct ClusterReportMeta {
     pub nodes: Vec<ClusterReportNode>,
     #[serde(default)]
     pub note: Option<String>,
+    /// 编排定义：报告可据此还原阶段边界
+    #[serde(default)]
+    pub orchestration: Option<Orchestration>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -438,5 +675,79 @@ mod tests {
         assert_eq!(info.heartbeat_misses, 3);
         assert_eq!(info.clock_rounds, 5);
         assert_eq!(info.clock_drop_uncertainty_ms, 200.0);
+        assert_eq!(info.version, 2);
+        assert_eq!(info.min_version, 1);
+        assert_eq!(info.reconnect_grace_sec, 300);
+    }
+
+    #[test]
+    fn v1_hello_ack_still_parses_without_v2_fields() {
+        let text = r#"{"type":"helloAck","version":1,"token":"t","nodeId":"node-1","jobId":9}"#;
+        let message: ClusterMessage = serde_json::from_str(text).unwrap();
+        match message {
+            ClusterMessage::HelloAck(ack) => {
+                assert_eq!(ack.version, 1);
+                assert!(!ack.resumed);
+                assert_eq!(ack.job_id, 9);
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn orchestration_expands_per_second_totals() {
+        let orchestration = Orchestration {
+            version: 1,
+            assignment: "weighted".to_string(),
+            phases: vec![
+                OrchestrationPhase {
+                    kind: "hold".to_string(),
+                    duration_sec: 2,
+                    from_concurrent: None,
+                    to_concurrent: None,
+                    concurrent: Some(5),
+                },
+                OrchestrationPhase {
+                    kind: "ramp".to_string(),
+                    duration_sec: 3,
+                    from_concurrent: Some(5),
+                    to_concurrent: Some(15),
+                    concurrent: None,
+                },
+            ],
+        };
+        assert_eq!(
+            orchestration.expand_totals().unwrap(),
+            vec![5, 5, 5, 10, 15]
+        );
+        assert_eq!(orchestration.peak().unwrap(), 15);
+    }
+
+    #[test]
+    fn orchestration_rejects_unknown_kind_and_too_many_phases() {
+        let mut orchestration = Orchestration::default();
+        orchestration.phases.push(OrchestrationPhase {
+            kind: "spike".to_string(),
+            duration_sec: 1,
+            from_concurrent: None,
+            to_concurrent: None,
+            concurrent: Some(1),
+        });
+        assert!(orchestration.expand_totals().is_err());
+
+        let orchestration = Orchestration {
+            phases: vec![
+                OrchestrationPhase {
+                    kind: "hold".to_string(),
+                    duration_sec: 1,
+                    from_concurrent: None,
+                    to_concurrent: None,
+                    concurrent: Some(1),
+                };
+                MAX_ORCHESTRATION_PHASES + 1
+            ],
+            ..Default::default()
+        };
+        assert!(orchestration.expand_totals().is_err());
     }
 }

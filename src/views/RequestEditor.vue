@@ -290,7 +290,7 @@ function goHangzaiWithContext() {
     projectId: projectId.value || undefined,
     requestId: detail.id ?? undefined,
   })
-  router.push('/ai')
+  void router.push('/ai')
 }
 
 /* ---------- 自动保存 ---------- */
@@ -356,7 +356,6 @@ const requestProtocol = computed(() => form.value.protocol || 'http')
 const isRealtime = computed(
   () => requestProtocol.value === 'sse' || requestProtocol.value === 'websocket',
 )
-const isGraphqlProtocol = computed(() => requestProtocol.value === 'graphql')
 
 const MAX_REALTIME_EVENTS = 5000
 const rtSessionId = ref('')
@@ -1385,7 +1384,7 @@ function quickOpen(value: number) {
     message.warning(`最多同时打开 ${MAX_REQUEST_TABS} 个接口，请先关闭部分标签`)
     return
   }
-  switchTab(value)
+  void switchTab(value)
 }
 
 onMounted(async () => {
@@ -1527,12 +1526,12 @@ async function goBack() {
   // 若上一页只是另一个请求标签页，则按原逻辑回项目
   const prev = previousEntry.value
   const fromHistory = prev && !prev.path.startsWith('/request/')
-  router.push(fromHistory ? backOr(`/project/${projectId.value}`) : `/project/${projectId.value}`)
+  void router.push(fromHistory ? backOr(`/project/${projectId.value}`) : `/project/${projectId.value}`)
 }
 
 /** 标签过多出现横向滚动时，把当前激活标签滚进视野 */
 function revealActiveTab() {
-  nextTick(() => {
+  void nextTick(() => {
     const active = tabsScrollEl.value?.querySelector<HTMLElement>('.req-tab.active')
     active?.scrollIntoView({ block: 'nearest', inline: 'nearest' })
   })
@@ -1546,7 +1545,7 @@ async function switchTab(id: number) {
   const token = ++switchToken
   await flushSave()
   if (token !== switchToken) return
-  router.push({
+  void router.push({
     name: 'request',
     params: { id },
     query: projectId.value ? { projectId: projectId.value } : {},
@@ -1559,20 +1558,20 @@ async function closeTab(id: number) {
   if (!isActive) return
   await flushSave()
   if (next) {
-    router.push({
+    void router.push({
       name: 'request',
       params: { id: next },
       query: projectId.value ? { projectId: projectId.value } : {},
     })
   } else {
-    router.push(`/project/${projectId.value}`)
+    void router.push(`/project/${projectId.value}`)
   }
 }
 
 async function closeAllTabs() {
   await flushSave()
   tabStore.closeAll()
-  router.push(`/project/${projectId.value}`)
+  void router.push(`/project/${projectId.value}`)
 }
 
 function deleteRequest() {
@@ -1592,13 +1591,13 @@ function deleteRequest() {
       message.success('已删除请求')
       const next = tabStore.activeId
       if (next) {
-        router.push({
+        void router.push({
           name: 'request',
           params: { id: next },
           query: projectId.value ? { projectId: projectId.value } : {},
         })
       } else {
-        router.push(projectId.value ? `/project/${projectId.value}` : '/')
+        void router.push(projectId.value ? `/project/${projectId.value}` : '/')
       }
     },
   })
@@ -2182,7 +2181,7 @@ function setRunsPage(page: number) {
   runsPage.value = next
   expandedRunId.value = null
   // 翻页后把列表顶部带回视野，避免停在上一页的滚动位置
-  nextTick(() => {
+  void nextTick(() => {
     runsPanelEl.value?.scrollIntoView({ block: 'start', behavior: 'smooth' })
   })
 }
@@ -2408,7 +2407,7 @@ async function openStress() {
   }
   const ok = await save(false)
   if (!ok) return
-  router.push({
+  void router.push({
     name: 'stress',
     query: {
       requestId: String(form.value.id ?? requestId.value),
@@ -2505,7 +2504,7 @@ function openResponseSearch() {
   // 预览是 iframe，搜索作用于源码：先退出预览
   htmlPreview.value = false
   if (responseTab.value !== 'body') responseTab.value = 'body'
-  nextTick(() => responseBodyRef.value?.openSearch())
+  void nextTick(() => responseBodyRef.value?.openSearch())
 }
 
 /** Response 面板聚焦时 Ctrl/Cmd+F 打开搜索；输入框内保留原有查找行为 */
@@ -2522,7 +2521,7 @@ function onGlobalKeydown(e: KeyboardEvent) {
 
 // 新响应或切换 Pretty/Raw 后正文滚回顶部，避免停在上一次的滚动位置
 watch([result, bodyView], () => {
-  nextTick(() => responseBodyRef.value?.scrollToTop())
+  void nextTick(() => responseBodyRef.value?.scrollToTop())
 })
 
 /* 字节数防抖：大 Body 每次按键都 new Blob 也是一笔可见开销 */
@@ -2658,7 +2657,7 @@ const isCodeEdited = computed(() => editedCodes[snippetKey.value] !== undefined)
 function startEditCode() {
   codeEditText.value = activeCode.value
   codeEditing.value = true
-  nextTick(() => {
+  void nextTick(() => {
     fitCodeArea()
     codeAreaRef.value?.focus()
   })
@@ -2691,13 +2690,13 @@ watch(codeEditText, (text) => {
   if (!codeEditing.value) return
   if (text === activeSnippet.value.code) delete editedCodes[snippetKey.value]
   else editedCodes[snippetKey.value] = text
-  nextTick(fitCodeArea)
+  void nextTick(fitCodeArea)
 })
 
 /* 编辑中切换语言：先落盘当前草稿，再载入目标语言的文本 */
 watch(snippetKey, () => {
   codeEditText.value = activeCode.value
-  if (codeEditing.value) nextTick(fitCodeArea)
+  if (codeEditing.value) void nextTick(fitCodeArea)
 })
 
 /* 关闭抽屉时退出编辑态，下次打开仍是默认的只读视图（草稿保留） */

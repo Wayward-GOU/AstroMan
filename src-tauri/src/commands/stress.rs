@@ -1,9 +1,11 @@
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::json;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
@@ -14,7 +16,8 @@ use crate::commands::http::base64_encode;
 use crate::models::{
     CapturePreset, ErrorTypeCount, HistogramBucket, RecordDetailMode, ReportError,
     ReportRequestRecord, ReportSample, RequestAuth, SlowRequest, StageSummary, StatusCount,
-    StressConfig, StressDone, StressProgress, StressReport, StressStage,
+    StressConfig, StressDone, StressProgress, StressReport, StressStage, WorkerSnapshot,
+    WorkerStateSample,
 };
 use crate::services::cluster::protocol::SamplePayload as ClusterSamplePayload;
 use crate::state::{AppState, DbPool, StressJobDraft};
@@ -28,8 +31,11 @@ const MAX_RT_MS: usize = 60_000;
 const MAX_TTFB_MS: usize = 10_000;
 /// 报告中最多保留的错误明细条数
 const MAX_ERRORS: usize = 500;
-/// 报告中最多保留的逐请求明细条数
+/// 报告里最多保留的逐请求明细条数
 const MAX_REQUEST_RECORDS: usize = 50_000;
+/// 外部监控指标：最多 10 条序列、每条 3600 点（R5 / 3.6.1）
+const MAX_EXTERNAL_SERIES: usize = 10;
+const MAX_EXTERNAL_POINTS: usize = 3600;
 /// 请求明细中错误信息的最大长度
 const MAX_RECORD_ERROR: usize = 500;
 /// 请求明细中请求体的最大长度
@@ -428,6 +434,179 @@ impl Control {
     }
 }
 
+/// 并发透视（R8）：worker 状态机。计数用原子数组，避免每 worker 一把锁。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum WorkerState {
+    Idle = 0,
+    RampWait = 1,
+    StageWait = 2,
+    RateWait = 3,
+    AwaitHeader = 4,
+    ReadBody = 5,
+    Think = 6,
+    Done = 7,
+}
+
+const WORKER_STATE_SLOTS: usize = 8;
+type WorkerStateTable = [AtomicU32; WORKER_STATE_SLOTS];
+
+fn new_worker_state_table(idle: u32) -> Arc<WorkerStateTable> {
+    let table: WorkerStateTable = std::array::from_fn(|_| AtomicU32::new(0));
+    table[WorkerState::Idle as usize].store(idle, Ordering::Relaxed);
+    Arc::new(table)
+}
+
+fn switch_worker_state(table: &WorkerStateTable, current: &mut WorkerState, next: WorkerState) {
+    if *current == next {
+        return;
+    }
+    table[*current as usize].fetch_sub(1, Ordering::Relaxed);
+    table[next as usize].fetch_add(1, Ordering::Relaxed);
+    *current = next;
+}
+
+fn worker_state_sample(table: &WorkerStateTable, elapsed_sec: u64) -> WorkerStateSample {
+    let load = |state: WorkerState| table[state as usize].load(Ordering::Relaxed);
+    WorkerStateSample {
+        elapsed_sec,
+        idle: load(WorkerState::Idle),
+        ramp_wait: load(WorkerState::RampWait),
+        stage_wait: load(WorkerState::StageWait),
+        rate_wait: load(WorkerState::RateWait),
+        await_header: load(WorkerState::AwaitHeader),
+        read_body: load(WorkerState::ReadBody),
+        think: load(WorkerState::Think),
+        done: load(WorkerState::Done),
+    }
+}
+
+/// 单个 worker 的实时槽位：只在请求开始/状态切换时写，读侧 try_lock 失败就跳过
+struct WorkerLive {
+    index: u32,
+    state: String,
+    method: String,
+    url: String,
+    stage_index: u32,
+    started_at: i64,
+    started: Option<Instant>,
+}
+
+impl Default for WorkerLive {
+    fn default() -> Self {
+        Self {
+            index: 0,
+            state: "idle".to_string(),
+            method: String::new(),
+            url: String::new(),
+            stage_index: 0,
+            started_at: 0,
+            started: None,
+        }
+    }
+}
+
+pub(crate) struct WorkerLiveSet {
+    slots: Vec<Mutex<WorkerLive>>,
+}
+
+impl WorkerLiveSet {
+    fn new(peak: u32) -> Arc<Self> {
+        let slots = (0..peak)
+            .map(|index| {
+                Mutex::new(WorkerLive {
+                    index,
+                    ..Default::default()
+                })
+            })
+            .collect();
+        Arc::new(Self { slots })
+    }
+
+    fn begin(&self, index: u32, method: &str, url: &str, stage: i64) {
+        if let Some(slot) = self.slots.get(index as usize) {
+            if let Ok(mut live) = slot.lock() {
+                live.state = "await_header".to_string();
+                live.method = method.to_string();
+                live.url = url.to_string();
+                live.stage_index = stage.max(0) as u32;
+                live.started_at = now_ms();
+                live.started = Some(Instant::now());
+            }
+        }
+    }
+
+    fn set_state(&self, index: u32, state: &str) {
+        if let Some(slot) = self.slots.get(index as usize) {
+            if let Ok(mut live) = slot.lock() {
+                live.state = state.to_string();
+            }
+        }
+    }
+
+    fn snapshot(&self, limit: usize) -> Vec<WorkerSnapshot> {
+        let mut items: Vec<(u64, WorkerSnapshot)> = self
+            .slots
+            .iter()
+            .filter_map(|slot| {
+                let live = slot.try_lock().ok()?;
+                let elapsed_ms = live
+                    .started
+                    .map(|started| started.elapsed().as_millis() as u64)
+                    .unwrap_or(0);
+                Some((
+                    elapsed_ms,
+                    WorkerSnapshot {
+                        index: live.index,
+                        state: live.state.clone(),
+                        method: live.method.clone(),
+                        url: live.url.clone(),
+                        stage_index: live.stage_index,
+                        elapsed_ms,
+                        started_at: live.started_at,
+                    },
+                ))
+            })
+            .collect();
+        items.sort_by_key(|(elapsed, _)| std::cmp::Reverse(*elapsed));
+        items
+            .into_iter()
+            .take(limit)
+            .map(|(_, item)| item)
+            .collect()
+    }
+}
+
+static LIVE_WORKERS: OnceLock<Mutex<HashMap<u64, Arc<WorkerLiveSet>>>> = OnceLock::new();
+
+fn live_workers() -> &'static Mutex<HashMap<u64, Arc<WorkerLiveSet>>> {
+    LIVE_WORKERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_live(job_id: u64, set: Arc<WorkerLiveSet>) {
+    if let Ok(mut map) = live_workers().lock() {
+        map.insert(job_id, set);
+    }
+}
+
+fn unregister_live(job_id: u64) {
+    if let Ok(mut map) = live_workers().lock() {
+        map.remove(&job_id);
+    }
+}
+
+/// 按需抓取当前在途 worker（R8 / 1.5.2）：上限 200 条，按耗时倒序
+#[tauri::command]
+pub fn stress_workers(job_id: u64) -> Result<Vec<WorkerSnapshot>, String> {
+    let map = live_workers()
+        .lock()
+        .map_err(|_| "worker 快照暂不可用".to_string())?;
+    let set = map
+        .get(&job_id)
+        .ok_or_else(|| "压测任务已结束或不存在".to_string())?;
+    Ok(set.snapshot(200))
+}
+
 struct RunCtx {
     client: reqwest::Client,
     method: reqwest::Method,
@@ -454,6 +633,10 @@ struct RunCtx {
     capture: Arc<AtomicU8>,
     /// 单请求发送字节（请求行 + 头 + 体），压测期间请求内容静态，启动时算一次
     req_bytes: u64,
+    /// R8：worker 状态计数表
+    states: Arc<WorkerStateTable>,
+    /// R8：按需 worker 快照
+    live: Arc<WorkerLiveSet>,
 }
 
 struct Attempt {
@@ -583,7 +766,13 @@ async fn read_body(mut response: reqwest::Response, keep: Option<usize>) -> (Str
     (String::from_utf8_lossy(&buffer).into_owned(), bytes)
 }
 
-async fn send_once(ctx: &RunCtx, capture: Capture) -> Attempt {
+async fn send_once(
+    ctx: &RunCtx,
+    capture: Capture,
+    states: &WorkerStateTable,
+    current: &mut WorkerState,
+    index: u32,
+) -> Attempt {
     // 是否需要为明细采集请求/响应内容
     let keep_detail = capture != Capture::Off;
     let url = match build_url(&ctx.config, &ctx.vars, &ctx.auth) {
@@ -611,6 +800,13 @@ async fn send_once(ctx: &RunCtx, capture: Capture) -> Attempt {
         String::new()
     };
     let url_text = url.to_string();
+    ctx.live.begin(
+        index,
+        ctx.method.as_str(),
+        &url_text,
+        ctx.control.stage.load(Ordering::Relaxed),
+    );
+    switch_worker_state(states, current, WorkerState::AwaitHeader);
 
     let mut builder = ctx
         .client
@@ -720,6 +916,8 @@ async fn send_once(ctx: &RunCtx, capture: Capture) -> Attempt {
     let started = Instant::now();
     match builder.send().await {
         Ok(response) => {
+            ctx.live.set_state(index, "read_body");
+            switch_worker_state(states, current, WorkerState::ReadBody);
             let ttfb_ms = started.elapsed().as_millis() as u64;
             let status = response.status();
             let response_headers = if keep_detail {
@@ -747,6 +945,7 @@ async fn send_once(ctx: &RunCtx, capture: Capture) -> Attempt {
                 },
             )
             .await;
+            ctx.live.set_state(index, "idle");
             let snippet = clip(&text, SNIPPET_LIMIT);
             let response_body = if text.trim().is_empty() {
                 None
@@ -778,20 +977,23 @@ async fn send_once(ctx: &RunCtx, capture: Capture) -> Attempt {
                 response_body,
             }
         }
-        Err(error) => Attempt {
-            status: 0,
-            ok: false,
-            url: url_text,
-            error: Some(error.to_string()),
-            snippet: String::new(),
-            ttfb_ms: 0,
-            bytes: 0,
-            body: request_body,
-            params: query,
-            headers: request_headers,
-            response_headers: None,
-            response_body: None,
-        },
+        Err(error) => {
+            ctx.live.set_state(index, "idle");
+            Attempt {
+                status: 0,
+                ok: false,
+                url: url_text,
+                error: Some(error.to_string()),
+                snippet: String::new(),
+                ttfb_ms: 0,
+                bytes: 0,
+                body: request_body,
+                params: query,
+                headers: request_headers,
+                response_headers: None,
+                response_body: None,
+            }
+        }
     }
 }
 
@@ -916,8 +1118,9 @@ fn stage_at(stages: &[StressStage], elapsed_sec: u64, fallback: u32) -> (u32, i6
     )
 }
 
-async fn take_token(ctx: &RunCtx) -> bool {
+async fn take_token(ctx: &RunCtx, states: &WorkerStateTable, current: &mut WorkerState) -> bool {
     if ctx.control.rate.load(Ordering::Relaxed) == 0 {
+        switch_worker_state(states, current, WorkerState::Idle);
         return true;
     }
     loop {
@@ -932,23 +1135,31 @@ async fn take_token(ctx: &RunCtx) -> bool {
                 .compare_exchange(tokens, tokens - 1, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
             {
+                switch_worker_state(states, current, WorkerState::Idle);
                 return true;
             }
             continue;
         }
+        switch_worker_state(states, current, WorkerState::RateWait);
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
 }
 
 async fn worker(ctx: Arc<RunCtx>, index: u32, workers: u32) {
+    let states = ctx.states.clone();
+    let mut state = WorkerState::Idle;
     let ramp_ms = if workers > 1 {
         (ctx.config.ramp_up_sec as u64 * 1000 * index as u64) / (workers - 1) as u64
     } else {
         0
     };
     let mut remaining = ramp_ms;
+    if remaining > 0 {
+        switch_worker_state(&states, &mut state, WorkerState::RampWait);
+    }
     while remaining > 0 {
         if ctx.cancel.load(Ordering::Relaxed) {
+            switch_worker_state(&states, &mut state, WorkerState::Done);
             return;
         }
         let step = remaining.min(200);
@@ -964,19 +1175,22 @@ async fn worker(ctx: Arc<RunCtx>, index: u32, workers: u32) {
 
         // 阶梯加压：未进入生效区间的 worker 等待
         if index >= ctx.control.active.load(Ordering::Relaxed) {
+            switch_worker_state(&states, &mut state, WorkerState::StageWait);
             tokio::time::sleep(Duration::from_millis(50)).await;
             continue;
         }
 
-        if !take_token(&ctx).await {
+        if !take_token(&ctx, &states, &mut state).await {
             break;
         }
+        switch_worker_state(&states, &mut state, WorkerState::Idle);
 
         // 采集开关每请求读一次，auto 降档后立即生效
         let capture = Capture::from_u8(ctx.capture.load(Ordering::Relaxed));
         ctx.metrics.concurrent.fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
-        let attempt = send_once(&ctx, capture).await;
+        let attempt = send_once(&ctx, capture, &states, &mut state, index).await;
+        switch_worker_state(&states, &mut state, WorkerState::Idle);
         let latency_ms = started.elapsed().as_millis() as u64;
         ctx.metrics.concurrent.fetch_sub(1, Ordering::Relaxed);
         ctx.metrics.record(
@@ -1074,9 +1288,12 @@ async fn worker(ctx: Arc<RunCtx>, index: u32, workers: u32) {
         }
 
         if ctx.config.think_time_ms > 0 {
+            switch_worker_state(&states, &mut state, WorkerState::Think);
             tokio::time::sleep(Duration::from_millis(ctx.config.think_time_ms)).await;
+            switch_worker_state(&states, &mut state, WorkerState::Idle);
         }
     }
+    switch_worker_state(&states, &mut state, WorkerState::Done);
 }
 
 /// 压测执行结果：命令层与套件 `kind=stress` 用例共用
@@ -1165,13 +1382,14 @@ fn target_key_of(method: &str, url: &reqwest::Url) -> String {
 }
 
 /// 采集预设 → (明细档位, TopN 条数)
-///
-/// - 容量：明细交给 auto 定档，只统计均值，不保留逐请求明细；
+/// - 容量：只看吞吐与均值，直接关闭逐请求明细（R3：与运行时长解耦）；
 /// - 定位：关闭 5 万条全量明细，改为保留 TopN 慢请求（阈值可配，0 = 全量候选）；
 /// - 自动：沿用旧行为，`topN > 0` 时额外保留慢请求。
 fn capture_plan(config: &StressConfig) -> (RecordDetailMode, u32) {
     match config.capture_mode {
-        CapturePreset::Capacity => (RecordDetailMode::Auto, 0),
+        // 容量模式只看吞吐与均值：直接关明细，避免「按估算定档 + 运行期降档」
+        // 在低估算或前十几秒全量攒明细，把内存和运行时长绑在一起（R3）
+        CapturePreset::Capacity => (RecordDetailMode::Off, 0),
         CapturePreset::Locate => (
             RecordDetailMode::Off,
             config.top_n.unwrap_or(DEFAULT_TOP_N).min(MAX_TOP_N),
@@ -1607,6 +1825,8 @@ pub(crate) fn prepare_stress(
         slow_threshold_ms,
         capture,
         req_bytes,
+        states: new_worker_state_table(peak),
+        live: WorkerLiveSet::new(peak),
     };
 
     Ok(PreparedStress {
@@ -1632,6 +1852,162 @@ pub(crate) fn prepare_stress(
 /// 每秒外送采样：集群模式注入，单机模式不传
 pub(crate) type EngineSampleSink = Arc<dyn Fn(ClusterSamplePayload) + Send + Sync>;
 
+/* ---------- R3：压测增量落库 ---------- */
+
+/// 有界队列：压测优先级是发出请求，队列满时直接丢样本并计数，绝不阻塞 tick
+const PERSIST_QUEUE_CAPACITY: usize = 1024;
+/// 攒够 50 条或 2 秒没有新数据就提交一个事务
+const PERSIST_BATCH_ROWS: usize = 50;
+const PERSIST_FLUSH_INTERVAL: Duration = Duration::from_secs(2);
+
+enum PersistMsg {
+    Sample(ReportSample),
+    Finish,
+}
+
+/// 独立写线程：不在 tokio reactor / 主连接池上做同步 SQLite 写
+pub(crate) struct JobPersist {
+    tx: SyncSender<PersistMsg>,
+    dropped: Arc<AtomicU64>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl JobPersist {
+    fn start(
+        db_path: &std::path::Path,
+        job_id: u64,
+        dropped: Arc<AtomicU64>,
+    ) -> Result<Self, String> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<PersistMsg>(PERSIST_QUEUE_CAPACITY);
+        let db_path = db_path.to_path_buf();
+        let handle = std::thread::Builder::new()
+            .name("stress-persist".to_string())
+            .spawn(move || persist_loop(&db_path, job_id, rx))
+            .map_err(|error| format!("启动压测落库线程失败：{error}"))?;
+        Ok(Self {
+            tx,
+            dropped,
+            handle: Some(handle),
+        })
+    }
+
+    fn send(&self, sample: ReportSample) {
+        if self.tx.try_send(PersistMsg::Sample(sample)).is_err() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// 收尾：确保最后一批落盘并 join 写线程，返回被丢弃的样本数
+    fn finish(mut self) -> u64 {
+        let _ = self.tx.send(PersistMsg::Finish);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        self.dropped.load(Ordering::Relaxed)
+    }
+}
+
+fn persist_loop(db_path: &std::path::Path, job_id: u64, rx: Receiver<PersistMsg>) {
+    let conn = match Connection::open(db_path) {
+        Ok(conn) => conn,
+        Err(error) => {
+            log::warn!("压测增量落库连接打开失败（本次仍会正常出报告）：{error}");
+            return;
+        }
+    };
+    let _ = conn.busy_timeout(Duration::from_secs(5));
+    let mut batch: Vec<ReportSample> = Vec::with_capacity(PERSIST_BATCH_ROWS);
+    loop {
+        match rx.recv_timeout(PERSIST_FLUSH_INTERVAL) {
+            Ok(PersistMsg::Sample(sample)) => {
+                batch.push(sample);
+                if batch.len() >= PERSIST_BATCH_ROWS {
+                    flush_job_samples(&conn, job_id, &mut batch);
+                }
+            }
+            Ok(PersistMsg::Finish) => {
+                flush_job_samples(&conn, job_id, &mut batch);
+                break;
+            }
+            Err(RecvTimeoutError::Timeout) => flush_job_samples(&conn, job_id, &mut batch),
+            Err(RecvTimeoutError::Disconnected) => {
+                flush_job_samples(&conn, job_id, &mut batch);
+                break;
+            }
+        }
+    }
+}
+
+fn flush_job_samples(conn: &Connection, job_id: u64, batch: &mut Vec<ReportSample>) {
+    if batch.is_empty() {
+        return;
+    }
+    let created_at = now_ms();
+    let result = (|| -> Result<(), String> {
+        let tx = conn.unchecked_transaction().map_err(err)?;
+        {
+            let mut stmt = tx
+                .prepare_cached(
+                    "INSERT INTO stress_job_samples
+                        (job_id, elapsed_sec, concurrent, qps, avg_rt, p50_rt, p95_rt, p99_rt,
+                         ttfb_avg, body_avg, body_p95, bytes, success_count, error_count, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                )
+                .map_err(err)?;
+            for sample in batch.iter() {
+                stmt.execute(params![
+                    job_id as i64,
+                    sample.elapsed_sec as i64,
+                    sample.concurrent as i64,
+                    sample.qps,
+                    sample.avg_rt,
+                    sample.p50_rt,
+                    sample.p95_rt,
+                    sample.p99_rt,
+                    sample.ttfb_avg,
+                    sample.body_avg,
+                    sample.body_p95,
+                    sample.bytes as i64,
+                    sample.success_count as i64,
+                    sample.error_count as i64,
+                    created_at,
+                ])
+                .map_err(err)?;
+            }
+        }
+        tx.commit().map_err(err)
+    })();
+    if let Err(error) = result {
+        log::warn!("压测增量落库失败（不影响压测本身）：{error}");
+    }
+    batch.clear();
+}
+
+/// 运行期任务头：崩溃恢复时用来还原报告头与配置快照
+fn begin_job_meta(
+    pool: &DbPool,
+    job_id: u64,
+    plan_id: Option<i64>,
+    plan_name: &str,
+    config_snapshot: &str,
+) -> Result<(), String> {
+    let conn = pool.get().map_err(err)?;
+    // job_id 在进程内单调递增，正常不会重入；重入时先清掉旧样本，避免恢复出重复曲线
+    conn.execute(
+        "DELETE FROM stress_job_samples WHERE job_id = ?1",
+        params![job_id as i64],
+    )
+    .map_err(err)?;
+    conn.execute(
+        "INSERT OR REPLACE INTO stress_job_meta
+            (job_id, plan_id, plan_name, config_json, started_at, status)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'running')",
+        params![job_id as i64, plan_id, plan_name, config_snapshot, now_ms()],
+    )
+    .map_err(err)?;
+    Ok(())
+}
+
 /// 引擎运行选项
 ///
 /// 单机压测使用默认值；集群模式传入统一起跑时刻与采样外送回调。
@@ -1641,6 +2017,8 @@ pub(crate) struct EngineOptions {
     pub start_at_ms: Option<i64>,
     /// 每秒采样外送：主节点合并本地与从节点曲线
     pub sink: Option<EngineSampleSink>,
+    /// 运行期增量落库（R3）：仅单机压测注入，集群从节点不落本地库
+    pub persist: Option<JobPersist>,
 }
 
 /// 不落库的引擎结果：单机报告包装与集群合并共用
@@ -1648,6 +2026,8 @@ pub(crate) struct EngineOptions {
 pub(crate) struct EngineOutcome {
     pub report: StressReport,
     pub samples: Vec<ReportSample>,
+    /// R8：每秒 worker 状态分布
+    pub worker_states: Vec<WorkerStateSample>,
     pub errors: Vec<ReportError>,
     pub requests: Vec<ReportRequestRecord>,
     pub slow_requests: Vec<SlowRequest>,
@@ -1686,16 +2066,51 @@ pub(crate) struct EngineSparseMetrics {
 async fn drive_stress(
     prepared: PreparedStress,
     pool: DbPool,
+    db_path: PathBuf,
     job_id: u64,
     progress: Option<&(dyn Fn(StressProgress) + Send + Sync)>,
     watch: Option<&Arc<AtomicBool>>,
 ) -> StressExecOutcome {
-    let outcome = run_engine(prepared, job_id, progress, watch, EngineOptions::default()).await;
+    // 运行期先写任务头与追加型样本；崩溃后由启动扫描生成「不完整」报告
+    let plan_id = prepared.ctx.config.plan_id;
+    let plan_name = prepared.name.clone();
+    let config_snapshot = prepared.config_snapshot.clone();
+    let dropped = Arc::new(AtomicU64::new(0));
+    let persist = match begin_job_meta(&pool, job_id, plan_id, &plan_name, &config_snapshot) {
+        Ok(()) => match JobPersist::start(&db_path, job_id, dropped.clone()) {
+            Ok(writer) => Some(writer),
+            Err(error) => {
+                log::warn!("{error}（本次压测仍会正常出报告）");
+                if let Ok(conn) = pool.get() {
+                    let _ = conn.execute(
+                        "DELETE FROM stress_job_meta WHERE job_id = ?1",
+                        params![job_id as i64],
+                    );
+                }
+                None
+            }
+        },
+        Err(error) => {
+            log::warn!("压测增量落库未启用：{error}");
+            None
+        }
+    };
+    // 只有任务头与写线程都就绪时才让 save_report 收尾临时表；
+    // 落库不可用时不能让报告保存跟着失败
+    let tracked = persist.is_some();
+    let options = EngineOptions {
+        persist,
+        ..EngineOptions::default()
+    };
+    let outcome = run_engine(prepared, job_id, progress, watch, options).await;
+    let persist_dropped = dropped.load(Ordering::Relaxed);
     let (report_id, save_message) = match save_report(
         &pool,
         ReportPayload {
             report: &outcome.report,
+            job_id: if tracked { Some(job_id) } else { None },
             samples: &outcome.samples,
+            worker_states: &outcome.worker_states,
             errors: &outcome.errors,
             requests: &outcome.requests,
             stages: &outcome.stages,
@@ -1710,6 +2125,25 @@ async fn drive_stress(
         Ok(id) => (Some(id), None),
         Err(error) => (None, Some(format!("报告保存失败：{error}"))),
     };
+    if let Ok(conn) = pool.get() {
+        if report_id.is_some() {
+            // 事务里已把样本删掉，这里只收尾任务头；即使此刻崩溃，
+            // 启动扫描看到 status='saved' 也只会清理、不会重复生成报告
+            let _ = conn.execute(
+                "DELETE FROM stress_job_meta WHERE job_id = ?1",
+                params![job_id as i64],
+            );
+        } else {
+            // 报告没写成：保留样本并标记 failed，下次启动生成「不完整」报告
+            let _ = conn.execute(
+                "UPDATE stress_job_meta SET status = 'failed' WHERE job_id = ?1",
+                params![job_id as i64],
+            );
+        }
+    }
+    if persist_dropped > 0 {
+        log::warn!("压测增量落库队列已满，丢弃 {persist_dropped} 个采样点（压测本身未受影响）");
+    }
     StressExecOutcome {
         report_id,
         report: outcome.report,
@@ -1723,7 +2157,7 @@ pub(crate) async fn run_engine(
     job_id: u64,
     progress: Option<&(dyn Fn(StressProgress) + Send + Sync)>,
     watch: Option<&Arc<AtomicBool>>,
-    options: EngineOptions,
+    mut options: EngineOptions,
 ) -> EngineOutcome {
     let PreparedStress {
         mut ctx,
@@ -1756,6 +2190,7 @@ pub(crate) async fn run_engine(
     }
     let sink = options.sink;
     let ctx = Arc::new(ctx);
+    register_live(job_id, ctx.live.clone());
     let start = ctx.start;
     let deadline = ctx.deadline;
     let cancel = ctx.cancel.clone();
@@ -1768,6 +2203,8 @@ pub(crate) async fn run_engine(
     }
 
     let mut samples: Vec<ReportSample> = Vec::new();
+    // R8：与采样点同一时间轴，长压测按 sample_step 降频，避免报告体积失控
+    let mut worker_states: Vec<WorkerStateSample> = Vec::new();
     let mut errors: Vec<ReportError> = Vec::new();
     let mut requests: Vec<ReportRequestRecord> = Vec::new();
     let mut slow_requests: Vec<SlowRequest> = Vec::new();
@@ -1868,7 +2305,7 @@ pub(crate) async fn run_engine(
             last_sample_at = now_sample;
             last_sample_sec = elapsed;
             let qps = total.saturating_sub(prev_total) as f64 / dt;
-            samples.push(ReportSample {
+            let sample = ReportSample {
                 elapsed_sec: elapsed,
                 concurrent: metrics.concurrent.load(Ordering::Relaxed),
                 qps,
@@ -1882,7 +2319,13 @@ pub(crate) async fn run_engine(
                 bytes: bytes.saturating_sub(prev_bytes),
                 success_count: success.saturating_sub(prev_success),
                 error_count: failure.saturating_sub(prev_errors),
-            });
+            };
+            // R3：追加型临时表，有界队列满时丢弃并计数，不阻塞主循环
+            if let Some(persist) = options.persist.as_ref() {
+                persist.send(sample.clone());
+            }
+            samples.push(sample);
+            worker_states.push(worker_state_sample(&ctx.states, elapsed));
 
             // 集群模式外送本秒增量：QPS / 计数 / 耗时累加 / 稀疏直方图
             if let Some(sink) = &sink {
@@ -1953,6 +2396,7 @@ pub(crate) async fn run_engine(
             // 只下发增量采样点，避免长压测下每秒 clone 全量序列
             let delta: Vec<ReportSample> = samples[emitted.min(samples.len())..].to_vec();
             emitted = samples.len();
+            let latest_states = worker_state_sample(&ctx.states, elapsed);
             sink(StressProgress {
                 job_id,
                 name: name.clone(),
@@ -1978,6 +2422,7 @@ pub(crate) async fn run_engine(
                     .label()
                     .to_string(),
                 notice: notice.take(),
+                worker_states: Some(latest_states),
             });
         }
 
@@ -2050,6 +2495,9 @@ pub(crate) async fn run_engine(
     let stage_summaries = summarize_stages(&stages, &samples);
     let error_types = metrics.error_types();
 
+    // R3：收尾写线程，确保最后一批样本落盘；丢弃数并入运行期指标
+    let persist_dropped = options.persist.take().map_or(0, JobPersist::finish);
+
     // 运行期指标并入配置快照：避免为统计项新增表列，读取集中在 ReportDetail.config
     let config_snapshot = with_runtime_metrics(
         &config_snapshot,
@@ -2064,6 +2512,7 @@ pub(crate) async fn run_engine(
             "cpuPeakCores": (monitor.cpu_peak * 10.0).round() / 10.0,
             "memPeakMb": monitor.mem_peak_mb,
             "sampleIntervalSec": sample_step,
+            "persistDropped": persist_dropped,
         }),
     );
 
@@ -2107,6 +2556,7 @@ pub(crate) async fn run_engine(
         start_time: Some(start_time),
         end_time: Some(end_time),
         created_at: end_time,
+        external_metrics: None,
     };
 
     // 合并用原始桶：百分位按桶重算，不能对各节点分位数取平均
@@ -2135,9 +2585,11 @@ pub(crate) async fn run_engine(
         records_dropped: metrics.records_dropped.load(Ordering::Relaxed),
     };
 
+    unregister_live(job_id);
     EngineOutcome {
         report,
         samples,
+        worker_states,
         errors,
         requests,
         slow_requests,
@@ -2211,6 +2663,7 @@ pub async fn stress_start(
         prepared.config_snapshot = with_overlap(&prepared.config_snapshot, &overlaps);
     }
     let pool = state.pool.clone();
+    let db_path = state.db_path.clone();
     let registry = state.stress_jobs.clone();
     tauri::async_runtime::spawn(async move {
         let progress_app = app.clone();
@@ -2220,7 +2673,7 @@ pub async fn stress_start(
             progress_registry.set_qps(job_id, progress.rps);
             let _ = progress_app.emit("stress:progress", &progress);
         };
-        let outcome = drive_stress(prepared, pool, job_id, Some(&sink), None).await;
+        let outcome = drive_stress(prepared, pool, db_path, job_id, Some(&sink), None).await;
         // 报告已落库，任务从注册表移除；窗口仍可通过 done 事件展示结果
         registry.finish(job_id);
         let elapsed_sec = outcome
@@ -2280,7 +2733,7 @@ pub async fn run_stress_case(
         prepared.config_snapshot = with_overlap(&prepared.config_snapshot, &overlaps);
     }
     let pool = state.pool.clone();
-    let outcome = drive_stress(prepared, pool, job_id, None, watch).await;
+    let outcome = drive_stress(prepared, pool, state.db_path.clone(), job_id, None, watch).await;
     state.stress_jobs.finish(job_id);
     Ok(outcome)
 }
@@ -2478,7 +2931,12 @@ fn with_overlap(snapshot: &str, job_ids: &[u64]) -> String {
 /// 报告落库入参：单机压测与集群合并共用同一套表结构
 pub(crate) struct ReportPayload<'a> {
     pub report: &'a StressReport,
+    /// 单机压测的任务号：落库事务里顺手把临时样本标记为已保存并删除；
+    /// 集群合并等不经过运行期临时表时传 None
+    pub job_id: Option<u64>,
     pub samples: &'a [ReportSample],
+    /// R8：每秒 worker 状态分布
+    pub worker_states: &'a [WorkerStateSample],
     pub errors: &'a [ReportError],
     pub requests: &'a [ReportRequestRecord],
     pub stages: &'a [StageSummary],
@@ -2492,6 +2950,25 @@ pub(crate) struct ReportPayload<'a> {
     pub config: &'a str,
 }
 
+/// 外部指标写入限流：最多 10 条序列、每条 3600 点（超出截断）
+///
+/// 现在恒为空数组，但 R11 导入时就直接受这几条上限保护，
+/// 避免一条长序列把报告详情拖慢。
+fn bounded_external_metrics(
+    list: &[crate::models::ExternalMetricSeries],
+) -> Vec<crate::models::ExternalMetricSeries> {
+    list.iter()
+        .take(MAX_EXTERNAL_SERIES)
+        .map(|series| {
+            let mut bounded = series.clone();
+            if bounded.points.len() > MAX_EXTERNAL_POINTS {
+                bounded.points.truncate(MAX_EXTERNAL_POINTS);
+            }
+            bounded
+        })
+        .collect()
+}
+
 pub(crate) fn save_report(pool: &DbPool, payload: ReportPayload<'_>) -> Result<i64, String> {
     let report = payload.report;
     let mut conn = pool.get().map_err(err)?;
@@ -2503,6 +2980,20 @@ pub(crate) fn save_report(pool: &DbPool, payload: ReportPayload<'_>) -> Result<i
     let body_histogram_text = serde_json::to_string(payload.body_histogram).map_err(err)?;
     let slow_requests_text = serde_json::to_string(payload.slow_requests).map_err(err)?;
     let types_text = serde_json::to_string(payload.error_types).map_err(err)?;
+    // 外部指标写独立列；老报告为 NULL。写入侧限流，避免大序列撑大报告。
+    let external_metrics_text = match report.external_metrics.as_deref() {
+        Some(list) if !list.is_empty() => {
+            let bounded = bounded_external_metrics(list);
+            Some(serde_json::to_string(&bounded).map_err(err)?)
+        }
+        _ => None,
+    };
+    // R8：并发透视状态分布，空数组不落库，老报告读取为 None
+    let worker_states_text = if payload.worker_states.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(payload.worker_states).map_err(err)?)
+    };
 
     tx.execute(
         "INSERT INTO test_reports
@@ -2511,10 +3002,11 @@ pub(crate) fn save_report(pool: &DbPool, payload: ReportPayload<'_>) -> Result<i
              stddev_rt, ttfb_avg, ttfb_p95, apdex, bytes_total, max_qps, avg_qps, target_rps,
              error_rate, concurrency, status, config_json, stages_json, codes_json,
              histogram_json, error_types_json, start_time, end_time, created_at,
-             body_histogram_json, slow_requests_json, run_group_id)
+             body_histogram_json, slow_requests_json, run_group_id, external_metrics_json,
+             worker_states_json)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
                  ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
-                 ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37)",
+                 ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39)",
         params![
             report.plan_id,
             report.plan_name,
@@ -2553,6 +3045,8 @@ pub(crate) fn save_report(pool: &DbPool, payload: ReportPayload<'_>) -> Result<i
             body_histogram_text,
             slow_requests_text,
             report.run_group_id,
+            external_metrics_text,
+            worker_states_text,
         ],
     )
     .map_err(err)?;
@@ -2680,6 +3174,20 @@ pub(crate) fn save_report(pool: &DbPool, payload: ReportPayload<'_>) -> Result<i
         let _ = tx.execute_batch("ROLLBACK TO req_rows; RELEASE req_rows");
     }
 
+    // 报告与「临时样本已消费」在同一事务：提交后崩溃也不会重复生成不完整报告
+    if let Some(job_id) = payload.job_id {
+        tx.execute(
+            "UPDATE stress_job_meta SET status = 'saved' WHERE job_id = ?1",
+            params![job_id as i64],
+        )
+        .map_err(err)?;
+        tx.execute(
+            "DELETE FROM stress_job_samples WHERE job_id = ?1",
+            params![job_id as i64],
+        )
+        .map_err(err)?;
+    }
+
     tx.commit().map_err(err)?;
     Ok(report_id)
 }
@@ -2705,6 +3213,185 @@ mod tests {
         // 越界按 full 处理，避免脏值把采集关掉
         assert_eq!(Capture::from_u8(9), Capture::Full);
         assert_eq!(Capture::Off.label(), "off");
+    }
+
+    fn sample_at(sec: u64) -> ReportSample {
+        ReportSample {
+            elapsed_sec: sec,
+            concurrent: 10,
+            qps: 100.0,
+            avg_rt: 20.0,
+            p50_rt: 18.0,
+            p95_rt: 40.0,
+            p99_rt: 60.0,
+            ttfb_avg: 8.0,
+            body_avg: 5.0,
+            body_p95: 9.0,
+            bytes: 1000,
+            success_count: 9,
+            error_count: 1,
+        }
+    }
+
+    fn test_state(tag: &str) -> AppState {
+        let root = crate::util::test_dir(&format!("stress-persist-{tag}"));
+        let _ = std::fs::remove_dir_all(&root);
+        AppState::headless(root.join("data"), root.join("config")).unwrap()
+    }
+
+    #[test]
+    fn job_samples_persist_incrementally() {
+        let state = test_state("incremental");
+        begin_job_meta(&state.pool, 5, None, "persist", "{}").unwrap();
+        let dropped = Arc::new(AtomicU64::new(0));
+        let writer = JobPersist::start(&state.db_path, 5, dropped.clone()).unwrap();
+        writer.send(sample_at(1));
+        writer.send(sample_at(2));
+        let dropped_count = writer.finish();
+        assert_eq!(dropped_count, 0);
+
+        let conn = state.pool.get().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM stress_job_samples WHERE job_id = 5",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM stress_job_meta WHERE job_id = 5",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "running");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&state.data_dir);
+    }
+
+    #[test]
+    fn writer_backpressure_does_not_stall() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<PersistMsg>(1);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let writer = JobPersist {
+            tx,
+            dropped: dropped.clone(),
+            handle: None,
+        };
+
+        let started = Instant::now();
+        for sec in 0..200 {
+            writer.send(sample_at(sec));
+        }
+        let elapsed = started.elapsed();
+        drop(rx);
+
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "队列满时必须立即丢弃，不能阻塞压测 tick：{elapsed:?}"
+        );
+        assert!(writer.finish() >= 190, "除首条外都应计入丢弃");
+    }
+
+    #[test]
+    fn capacity_mode_skips_detail_records() {
+        let mut config: StressConfig =
+            serde_json::from_str(r#"{"url":"http://127.0.0.1/x"}"#).unwrap();
+        config.capture_mode = CapturePreset::Capacity;
+        let (detail, top_n) = capture_plan(&config);
+        assert_eq!(detail, RecordDetailMode::Off);
+        assert_eq!(top_n, 0);
+    }
+
+    fn report_fixture() -> StressReport {
+        StressReport {
+            id: 0,
+            plan_id: None,
+            run_group_id: None,
+            plan_name: "persist".to_string(),
+            request_id: None,
+            total_requests: 18,
+            success_count: 16,
+            error_count: 2,
+            avg_rt: 20.0,
+            min_rt: 18.0,
+            max_rt: 60.0,
+            p50_rt: 18.0,
+            p75_rt: 20.0,
+            p90_rt: 30.0,
+            p95_rt: 40.0,
+            p99_rt: 60.0,
+            p999_rt: 60.0,
+            stddev_rt: 2.0,
+            ttfb_avg: 8.0,
+            ttfb_p95: 9.0,
+            apdex: 1.0,
+            bytes_total: 2000,
+            max_qps: 100.0,
+            avg_qps: 100.0,
+            target_rps: 0.0,
+            error_rate: 11.1,
+            concurrency: 10,
+            status: "completed".to_string(),
+            start_time: Some(0),
+            end_time: Some(2000),
+            created_at: 2000,
+            external_metrics: None,
+        }
+    }
+
+    #[test]
+    fn finished_job_cleans_temp_rows() {
+        let state = test_state("cleaned");
+        begin_job_meta(&state.pool, 9, None, "clean", "{}").unwrap();
+        let dropped = Arc::new(AtomicU64::new(0));
+        let writer = JobPersist::start(&state.db_path, 9, dropped).unwrap();
+        writer.send(sample_at(1));
+        writer.send(sample_at(2));
+        writer.finish();
+
+        let report = report_fixture();
+        save_report(
+            &state.pool,
+            ReportPayload {
+                report: &report,
+                job_id: Some(9),
+                samples: &[],
+                worker_states: &[],
+                errors: &[],
+                requests: &[],
+                stages: &[],
+                status_codes: &[],
+                histogram: &[],
+                body_histogram: &[],
+                slow_requests: &[],
+                error_types: &[],
+                config: "{}",
+            },
+        )
+        .unwrap();
+
+        let conn = state.pool.get().unwrap();
+        let samples: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM stress_job_samples WHERE job_id = 9",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(samples, 0, "正常落库后必须清掉临时样本");
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM stress_job_meta WHERE job_id = 9",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "saved");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&state.data_dir);
     }
 
     #[test]
@@ -2801,7 +3488,7 @@ mod tests {
         let capacity: StressConfig =
             serde_json::from_str(r#"{"url":"http://127.0.0.1/x","captureMode":"capacity"}"#)
                 .unwrap();
-        assert_eq!(capture_plan(&capacity), (RecordDetailMode::Auto, 0));
+        assert_eq!(capture_plan(&capacity), (RecordDetailMode::Off, 0));
 
         let locate: StressConfig =
             serde_json::from_str(r#"{"url":"http://127.0.0.1/x","captureMode":"locate"}"#).unwrap();
@@ -2810,6 +3497,45 @@ mod tests {
         let mut custom = locate.clone();
         custom.top_n = Some(50);
         assert_eq!(capture_plan(&custom), (RecordDetailMode::Off, 50));
+    }
+
+    #[test]
+    fn worker_states_sum_equals_concurrency() {
+        let table = new_worker_state_table(64);
+        let mut current = WorkerState::Idle;
+        let transitions = [
+            WorkerState::RampWait,
+            WorkerState::AwaitHeader,
+            WorkerState::ReadBody,
+            WorkerState::Think,
+            WorkerState::RateWait,
+            WorkerState::StageWait,
+            WorkerState::Idle,
+        ];
+        for next in transitions {
+            switch_worker_state(&table, &mut current, next);
+            let sample = worker_state_sample(&table, 1);
+            let sum = sample.idle
+                + sample.ramp_wait
+                + sample.stage_wait
+                + sample.rate_wait
+                + sample.await_header
+                + sample.read_body
+                + sample.think
+                + sample.done;
+            assert_eq!(sum, 64, "状态切换后总数必须始终等于并发数");
+        }
+    }
+
+    #[test]
+    fn workers_snapshot_is_capped() {
+        let set = WorkerLiveSet::new(500);
+        for index in 0..500 {
+            set.begin(index, "GET", "http://127.0.0.1/x", 0);
+        }
+        let rows = set.snapshot(200);
+        assert_eq!(rows.len(), 200);
+        assert!(rows.iter().all(|row| row.state == "await_header"));
     }
 
     #[test]

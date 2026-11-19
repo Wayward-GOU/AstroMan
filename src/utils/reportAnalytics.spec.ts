@@ -1,6 +1,15 @@
 import { describe, expect, it } from 'vitest'
-import type { ReportDetail, ReportSample, StageSummary } from '@/types/models'
-import { detectKnee, downsample, percentile, qpsOverview, qpsP10, scoreReport, selfCheck } from './reportAnalytics'
+import type { ReportDetail, ReportSample, StageSummary, WorkerStateSample } from '@/types/models'
+import {
+  detectKnee,
+  diagnoseWorkerStates,
+  downsample,
+  percentile,
+  qpsOverview,
+  qpsP10,
+  scoreReport,
+  selfCheck,
+} from './reportAnalytics'
 
 function sample(elapsedSec: number, qps: number, p95: number): ReportSample {
   return {
@@ -184,5 +193,63 @@ describe('reportAnalytics', () => {
     expect(result.length).toBe(300)
     expect(result[0]).toBe(0)
     expect(result[result.length - 1]).toBe(999)
+  })
+})
+
+describe('diagnoseWorkerStates', () => {
+  function states(elapsedSec: number, overrides: Partial<WorkerStateSample> = {}): WorkerStateSample {
+    return {
+      elapsedSec,
+      idle: 0,
+      rampWait: 0,
+      stageWait: 0,
+      rateWait: 0,
+      awaitHeader: 0,
+      readBody: 0,
+      think: 0,
+      done: 0,
+      ...overrides,
+    }
+  }
+
+  it('没有状态采样时不出结论', () => {
+    expect(diagnoseWorkerStates([])).toEqual([])
+    expect(diagnoseWorkerStates([states(1)])).toEqual([])
+  })
+
+  it('限速等待持续过半时提示 rate_wait', () => {
+    const samples = [1, 2, 3].map((sec) => states(sec, { rateWait: 80, idle: 20 }))
+    const findings = diagnoseWorkerStates(samples)
+    expect(findings.map((item) => item.key)).toContain('rate_wait')
+    expect(findings[0].detail).toContain('疑似')
+  })
+
+  it('单 tick 噪声不触发诊断', () => {
+    const samples = [states(1, { awaitHeader: 100 }), states(2, { idle: 100 }), states(3, { idle: 100 })]
+    expect(diagnoseWorkerStates(samples)).toEqual([])
+  })
+
+  it('等待分布切换后不会沿用旧结论', () => {
+    const samples = [
+      states(1, { awaitHeader: 100 }),
+      states(2, { awaitHeader: 100 }),
+      states(3, { readBody: 100 }),
+      states(4, { readBody: 100 }),
+      states(5, { readBody: 100 }),
+    ]
+    const keys = diagnoseWorkerStates(samples).map((item) => item.key)
+    expect(keys).toContain('read_body')
+    expect(keys).not.toContain('await_header')
+  })
+
+  it('超时集中时结合错误类型给出 timeout 提示', () => {
+    const samples = [states(1, { idle: 100 }), states(2, { idle: 100 }), states(3, { idle: 100 })]
+    const findings = diagnoseWorkerStates(samples, {
+      errorTypes: [
+        { errorType: 'timeout', count: 9 },
+        { errorType: 'connect', count: 1 },
+      ],
+    })
+    expect(findings.map((item) => item.key)).toContain('timeout')
   })
 })

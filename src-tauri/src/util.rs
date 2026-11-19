@@ -58,6 +58,7 @@ pub fn is_db_busy(text: &str) -> bool {
 ///
 /// Windows 上 `reg`、`certutil`、`icacls` 这类控制台程序默认会闪一个黑窗；
 /// 定时轮询证书状态时会被用户看成“狂弹 CMD”，统一加上 `CREATE_NO_WINDOW`。
+#[cfg(windows)]
 pub fn hidden_command(program: &str) -> std::process::Command {
     #[allow(unused_mut)]
     let mut command = std::process::Command::new(program);

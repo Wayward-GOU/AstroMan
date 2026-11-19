@@ -33,14 +33,6 @@ function camelCase(name: string): string {
   return pascal.charAt(0).toLowerCase() + pascal.slice(1)
 }
 
-function snakeCase(name: string): string {
-  return name
-    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
-    .replace(/[^A-Za-z0-9]+/g, '_')
-    .replace(/^_+|_+$/g, '')
-    .toLowerCase() || 'field'
-}
-
 function uniqueName(base: string, used: Set<string>): string {
   let name = base
   let index = 2

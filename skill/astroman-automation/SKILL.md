@@ -43,7 +43,7 @@ test_preflight(suiteId, envId)        # 阻断项 + 提醒项，可为空
 
 - 运行状态：`queued → running → completed / stopped / error`；用例状态：`passed / failed / skipped / error`
 - 停止走 `test_run_stop`（`AppState` 里的取消标记），**一秒内**必须中断，压测用例也要被打断
-- 同一套件同时只允许一个 queued / running（`test_runs` 查询拦），并发靠套件内 `max_workers`
+- 同一套件同时只允许一个 queued / running（`test_runs` 查询拦）；当前**串行执行**，配置了 `maxWorkers > 1` 或 `parallelRows` 会在启动时直接报错
 - 引擎**不能 import Tauri**：CLI 复用同一入口，事件由调用方消费
 
 ## 套件配置（`SuiteConfig`）
@@ -51,10 +51,10 @@ test_preflight(suiteId, envId)        # 阻断项 + 提醒项，可为空
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `fail_fast` | false | 首个失败即停；用例级 `continue_on_failure` 可覆盖 |
-| `max_workers` | 1 | 并发用例数 |
+| `max_workers` | 1 | 仅接受 1；>1 会报错（并行调度未实现） |
 | `default_timeout_ms` | 30 000 | 单用例默认超时 |
 | `retries` / `retry_on_failure` | 0 / true | 重试次数与是否只在失败时重试 |
-| `parallel_rows` | false | 数据行是否并行 |
+| `parallel_rows` | false | 仅接受 false；true 会报错（数据行并行未实现） |
 | `cookie_mode` | 继承环境 | 套件内 Cookie 共享策略 |
 | `strict_scripts` | false | 预检把「会被跳过的 JS 钩子」升级为 error |
 | `suite_timeout_sec` | 0 | 0 表示不限；CLI `--timeout` 可覆盖 |

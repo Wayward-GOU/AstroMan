@@ -11,9 +11,11 @@ pub mod ca;
 pub mod handler;
 pub mod har;
 pub mod intercept;
+pub mod persist;
 pub mod proxy;
 pub mod store;
 pub mod sysproxy;
+pub mod upstream;
 
 #[cfg(test)]
 mod tests;
@@ -55,6 +57,14 @@ pub struct CaptureConfig {
     pub ignore_patterns: Vec<String>,
     pub capture_static: bool,
     pub upstream_proxy: Option<String>,
+    /// `memory` / `archive-meta` / `archive-full`，按会话生效（R7）
+    #[serde(default)]
+    pub archive_mode: persist::ArchiveMode,
+    #[serde(default)]
+    pub archive_name: Option<String>,
+    /// 生产登录态等域名默认排除，支持 `*.example.com`
+    #[serde(default)]
+    pub archive_exclude: Vec<String>,
 }
 
 impl Default for CaptureConfig {
@@ -66,6 +76,9 @@ impl Default for CaptureConfig {
             ignore_patterns: Vec::new(),
             capture_static: true,
             upstream_proxy: None,
+            archive_mode: persist::ArchiveMode::Memory,
+            archive_name: None,
+            archive_exclude: Vec::new(),
         }
     }
 }
@@ -83,6 +96,12 @@ pub struct CaptureStatus {
     pub ca_installed: bool,
     pub sysproxy_on: bool,
     pub upstream_proxy: Option<String>,
+    /// 本次录制是否真的走了上游代理（R6）
+    #[serde(default)]
+    pub upstream_active: bool,
+    /// 命中 SSL 直通白名单的连接数（R6）
+    #[serde(default)]
+    pub passthrough_count: u64,
     pub last_error: Option<String>,
 }
 
@@ -99,6 +118,8 @@ impl Default for CaptureStatus {
             ca_installed: false,
             sysproxy_on: false,
             upstream_proxy: None,
+            upstream_active: false,
+            passthrough_count: 0,
             last_error: None,
         }
     }
@@ -108,6 +129,7 @@ struct Control {
     shutdown: Option<oneshot::Sender<()>>,
     join: Option<std::thread::JoinHandle<()>>,
     config: CaptureConfig,
+    archive: Option<persist::ArchiveWriter>,
 }
 
 pub struct CaptureManager {
@@ -116,22 +138,41 @@ pub struct CaptureManager {
     store: Arc<CaptureStore>,
     intercept: Arc<InterceptState>,
     control: Mutex<Control>,
+    pool: Option<crate::state::DbPool>,
 }
 
 impl CaptureManager {
-    /// 仅测试用：以默认预算构造，生产路径走 `new_with_limits`（按档位）
+    /// 仅测试用：以默认预算构造，生产路径走 `new_with_pool`（按档位）
     #[cfg(test)]
     pub fn new(data_dir: PathBuf) -> Self {
-        Self::new_with_limits(data_dir, crate::services::profile::CaptureLimits::default())
+        Self::new_with_limits_and_pool(
+            data_dir,
+            crate::services::profile::CaptureLimits::default(),
+            None,
+        )
     }
 
-    /// 按性能档位初始化抓包预算（P-05）
-    pub fn new_with_limits(
+    /// 生产路径：带数据库池，用于会话归档；启动时顺带做一次保留清理。
+    pub fn new_with_pool(
         data_dir: PathBuf,
         limits: crate::services::profile::CaptureLimits,
+        pool: crate::state::DbPool,
+    ) -> Self {
+        Self::new_with_limits_and_pool(data_dir, limits, Some(pool))
+    }
+
+    fn new_with_limits_and_pool(
+        data_dir: PathBuf,
+        limits: crate::services::profile::CaptureLimits,
+        pool: Option<crate::state::DbPool>,
     ) -> Self {
         // 上次异常退出可能没来得及恢复系统代理，启动时先清理
         sysproxy::restore_stale(&data_dir);
+        if let Some(pool) = &pool {
+            if let Err(error) = persist::cleanup(pool, &data_dir) {
+                log::warn!("启动时清理抓包归档失败：{error}");
+            }
+        }
         Self {
             data_dir: data_dir.clone(),
             status: Arc::new(Mutex::new(CaptureStatus::default())),
@@ -142,7 +183,9 @@ impl CaptureManager {
                 shutdown: None,
                 join: None,
                 config: CaptureConfig::default(),
+                archive: None,
             }),
+            pool,
         }
     }
 
@@ -320,6 +363,7 @@ impl CaptureManager {
         let mut status = self.status.lock().clone();
         status.flow_count = self.store.total();
         status.dropped = self.store.dropped();
+        status.passthrough_count = self.store.passthrough_count();
         status
     }
 
@@ -356,6 +400,19 @@ impl CaptureManager {
             Some(config) => config,
             None => control.config.clone(),
         };
+        // 上次异常退出未收尾的归档先落盘，避免 writer 线程悬空
+        if let Some(writer) = control.archive.take() {
+            self.store.set_archive(None);
+            writer.finish();
+        }
+        // 只支持 http://；socks5 / https 代理在启动前就明确失败
+        let upstream = config
+            .upstream_proxy
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(upstream::ProxySpec::parse)
+            .transpose()?;
         let ip: IpAddr = config
             .bind_addr
             .parse()
@@ -365,11 +422,15 @@ impl CaptureManager {
         status.last_error = None;
         status.port = 0;
         status.bind_addr = ip.to_string();
-        status.upstream_proxy = config.upstream_proxy.clone();
+        // 状态里只回显脱敏地址，避免把代理密码带到前端
+        status.upstream_proxy = upstream.as_ref().map(upstream::ProxySpec::label);
+        status.upstream_active = upstream.is_some();
+        status.passthrough_count = 0;
         status.started_at = crate::util::now_ms();
         status.flow_count = 0;
         status.dropped = 0;
         status.sysproxy_on = false;
+        status.session_id = None;
         self.store.clear();
 
         let material = match ca::ensure(&self.data_dir) {
@@ -414,6 +475,44 @@ impl CaptureManager {
                 return Err(error);
             }
         };
+
+        let mut archive_writer = None;
+        if config.archive_mode.is_archive() {
+            let Some(pool) = self.pool.as_ref() else {
+                status.state = CaptureState::Error;
+                status.last_error = Some("E_ARCHIVE: 当前环境未启用数据库归档".into());
+                return Err("E_ARCHIVE: 当前环境未启用数据库归档".into());
+            };
+            if let Err(error) = persist::cleanup(pool, &self.data_dir) {
+                log::warn!("新建抓包会话前清理归档失败：{error}");
+            }
+            let session_id = match persist::create_session(pool, &config, &status.bind_addr, port) {
+                Ok(id) => id,
+                Err(error) => {
+                    status.state = CaptureState::Error;
+                    status.last_error = Some(error.clone());
+                    return Err(error);
+                }
+            };
+            let writer = match persist::ArchiveWriter::start(
+                pool.clone(),
+                self.data_dir.clone(),
+                session_id,
+                config.archive_mode,
+                config.archive_exclude.clone(),
+            ) {
+                Ok(writer) => writer,
+                Err(error) => {
+                    let _ = persist::delete_session(pool, &self.data_dir, session_id);
+                    status.state = CaptureState::Error;
+                    status.last_error = Some(error.clone());
+                    return Err(error);
+                }
+            };
+            self.store.set_archive(Some(writer.sender()));
+            status.session_id = Some(session_id);
+            archive_writer = Some(writer);
+        }
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let shared = self.status.clone();
@@ -467,6 +566,14 @@ impl CaptureManager {
         let join = match spawned {
             Ok(join) => join,
             Err(error) => {
+                self.store.set_archive(None);
+                if let Some(writer) = archive_writer {
+                    writer.finish();
+                }
+                if let (Some(pool), Some(session_id)) = (self.pool.as_ref(), status.session_id) {
+                    let _ = persist::delete_session(pool, &self.data_dir, session_id);
+                }
+                status.session_id = None;
                 let message = format!("E_THREAD: 启动代理线程失败 {error}");
                 status.state = CaptureState::Error;
                 status.last_error = Some(message.clone());
@@ -479,18 +586,23 @@ impl CaptureManager {
         control.config = config;
         control.shutdown = Some(shutdown_tx);
         control.join = Some(join);
+        control.archive = archive_writer;
         Ok(status.clone())
     }
 
     pub fn stop(&self) -> Result<CaptureStatus, String> {
-        let (shutdown, join) = {
+        let (shutdown, join, archive) = {
             let mut control = self.control.lock();
             let mut status = self.status.lock();
             if status.state == CaptureState::Idle {
                 return Ok(status.clone());
             }
             status.state = CaptureState::Stopping;
-            (control.shutdown.take(), control.join.take())
+            (
+                control.shutdown.take(),
+                control.join.take(),
+                control.archive.take(),
+            )
         };
 
         // 停止时把挂起的断点全部放行，否则代理线程会一直等到超时
@@ -505,10 +617,25 @@ impl CaptureManager {
         if let Err(error) = sysproxy::disable(&self.data_dir) {
             log::warn!("停止录制时恢复系统代理失败：{error}");
         }
-        if let Some(join) = join {
+        let join_result = if let Some(join) = join {
             join.join()
-                .map_err(|_| "E_THREAD: 代理线程异常退出".to_string())?;
+                .map_err(|_| "E_THREAD: 代理线程异常退出".to_string())
+        } else {
+            Ok(())
+        };
+
+        // 代理线程已退出，才能确定不会再有新的归档消息
+        self.store.set_archive(None);
+        if let Some(writer) = archive {
+            let stats = writer.finish();
+            log::info!(
+                "抓包会话归档完成：{} 条，队列丢弃 {} 条，body {} 字节",
+                stats.persisted,
+                stats.dropped,
+                stats.body_bytes
+            );
         }
+        join_result?;
 
         let mut status = self.status.lock();
         status.state = CaptureState::Idle;

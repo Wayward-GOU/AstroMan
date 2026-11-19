@@ -65,7 +65,7 @@ function cancelQueryTimer() {
 
 /** 只切换 mark 上的高亮类，不重新着色整段正文，大响应翻找也不会卡 */
 function paintCurrent() {
-  nextTick(() => {
+  void nextTick(() => {
     const pre = preEl.value
     if (!pre) return
     pre.querySelectorAll('mark.hl-current').forEach((el) => el.classList.remove('hl-current'))
@@ -101,7 +101,7 @@ function openSearch(initial = '') {
     query.value = initial
     current.value = 0
   }
-  nextTick(() => inputRef.value?.focus?.())
+  void nextTick(() => inputRef.value?.focus?.())
 }
 
 /** 双击字段名 / 字符串：直接以该内容为关键字查找全部同名字段 */
@@ -136,7 +136,7 @@ watch(
   () => props.text,
   () => {
     current.value = 0
-    nextTick(() => {
+    void nextTick(() => {
       if (preEl.value) preEl.value.scrollTop = 0
     })
   },

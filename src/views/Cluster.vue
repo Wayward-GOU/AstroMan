@@ -10,11 +10,15 @@ import { useProjectStore } from '@/stores/project'
 import * as api from '@/api'
 import { copyToClipboard } from '@/utils/clipboard'
 import type {
+  ClusterDevice,
   ClusterMasterSnapshot,
   ClusterNodeInfo,
   ClusterProtocolInfo,
   ClusterSampleEvent,
   ClusterSlaveSnapshot,
+  DiscoveredMaster,
+  Orchestration,
+  OrchestrationPhase,
 } from '@/types/cluster'
 import type {
   CapturePreset,
@@ -56,7 +60,41 @@ const totalConcurrent = ref(20)
 const port = ref(17801)
 const pairTtlMin = ref(5)
 const masterName = ref('')
+const listenAddr = ref('0.0.0.0')
 const creating = ref(false)
+
+/** 并发编排：固定并发 / 复用计划的阶梯 / 自定义 ramp、hold、step */
+type OrchestrationMode = 'off' | 'plan' | 'custom'
+const orchestrationMode = ref<OrchestrationMode>('off')
+const MAX_ORCHESTRATION_PHASES = 32
+const customPhases = ref<OrchestrationPhase[]>([
+  { kind: 'ramp', durationSec: 30, fromConcurrent: 1, toConcurrent: 20 },
+  { kind: 'hold', durationSec: 60, concurrent: 20 },
+])
+
+function newPhase(kind: OrchestrationPhase['kind']): OrchestrationPhase {
+  const peak = Math.max(1, numberOr(totalConcurrent.value, 20))
+  return kind === 'ramp'
+    ? { kind, durationSec: 30, fromConcurrent: 1, toConcurrent: peak }
+    : { kind, durationSec: 60, concurrent: peak }
+}
+
+function addPhase() {
+  if (customPhases.value.length >= MAX_ORCHESTRATION_PHASES) return
+  const last = customPhases.value[customPhases.value.length - 1]
+  const kind = last?.kind === 'ramp' ? 'hold' : 'step'
+  customPhases.value.push(newPhase(kind))
+}
+
+function removePhase(index: number) {
+  customPhases.value.splice(index, 1)
+}
+
+const PHASE_OPTIONS = [
+  { value: 'ramp', label: '爬坡 ramp' },
+  { value: 'hold', label: '保持 hold' },
+  { value: 'step', label: '阶梯 step' },
+]
 
 /** 计划保存的 settings 快照，字段与 StressTest.vue 的 settings 一致 */
 interface PlanSettings {
@@ -161,12 +199,81 @@ const planSummaryText = computed(() =>
     : `${numberOr(planSettings.value.concurrent, 20)} 并发 × ${planDuration.value}s`,
 )
 
-/** 分布式任务按固定并发执行，前端在创建前说明按峰值折算 */
 const planStageAlert = computed(() =>
   planStagesMode.value
-    ? `分布式任务按固定并发执行：该阶梯计划将按峰值 ${planPeakConcurrent.value} 并发、总时长 ${planDuration.value}s 运行`
+    ? `该阶梯计划将转换为 ${planStageList.value.length} 个 step 阶段编排下发，各节点按阶段同步切换并发`
     : '',
 )
+
+function normalizedPhase(phase: OrchestrationPhase): OrchestrationPhase | null {
+  const durationSec = Math.floor(numberOr(phase.durationSec, 0))
+  if (durationSec <= 0) return null
+  if (phase.kind === 'ramp') {
+    const from = Math.floor(numberOr(phase.fromConcurrent, 0))
+    const to = Math.floor(numberOr(phase.toConcurrent, 0))
+    if (from <= 0 || to <= 0) return null
+    return { kind: 'ramp', durationSec, fromConcurrent: from, toConcurrent: to, concurrent: null }
+  }
+  const concurrent = Math.floor(numberOr(phase.concurrent, 0))
+  if (concurrent <= 0) return null
+  return { kind: phase.kind, durationSec, fromConcurrent: null, toConcurrent: null, concurrent }
+}
+
+const orchestrationPhases = computed<OrchestrationPhase[]>(() => {
+  if (orchestrationMode.value === 'off') return []
+  if (orchestrationMode.value === 'plan') {
+    return planStageList.value.map((stage) => ({
+      kind: 'step' as const,
+      durationSec: stage.durationSec,
+      concurrent: stage.concurrent,
+    }))
+  }
+  return customPhases.value
+})
+
+const orchestrationPlan = computed<Orchestration | null>(() => {
+  const phases = orchestrationPhases.value
+  if (!phases.length) return null
+  const normalized = phases.map(normalizedPhase)
+  if (normalized.some((phase) => phase == null)) return null
+  return { version: 1, phases: normalized as OrchestrationPhase[], assignment: 'weighted' }
+})
+
+const orchestrationErrors = computed<string[]>(() => {
+  if (orchestrationMode.value === 'off') return []
+  const phases = orchestrationPhases.value
+  const errors: string[] = []
+  if (!phases.length) errors.push('至少需要 1 个编排阶段')
+  if (phases.length > MAX_ORCHESTRATION_PHASES) {
+    errors.push(`最多 ${MAX_ORCHESTRATION_PHASES} 个阶段，当前 ${phases.length} 个`)
+  }
+  phases.forEach((phase, index) => {
+    if (!normalizedPhase(phase)) {
+      errors.push(
+        phase.kind === 'ramp'
+          ? `第 ${index + 1} 个 ramp 阶段需填写大于 0 的起止并发与时长`
+          : `第 ${index + 1} 个 ${phase.kind} 阶段需填写大于 0 的并发与时长`,
+      )
+    }
+  })
+  return errors
+})
+
+const orchestrationPeak = computed(() =>
+  orchestrationPlan.value ? orchestrationPeakFor(orchestrationPlan.value.phases) : 0,
+)
+
+const orchestrationDuration = computed(() =>
+  orchestrationPlan.value?.phases.reduce((sum, phase) => sum + phase.durationSec, 0) ?? 0,
+)
+
+const effectiveDuration = computed(() =>
+  orchestrationPlan.value ? orchestrationDuration.value : planDuration.value,
+)
+
+watch(orchestrationPeak, (peak) => {
+  if (peak > 0) totalConcurrent.value = Math.min(MAX_CONCURRENT, peak)
+})
 
 const canCreate = computed(
   () =>
@@ -344,6 +451,59 @@ const slave = ref<ClusterSlaveSnapshot | null>(null)
 const slaveBusy = ref(false)
 const slaveForm = reactive({ masterAddr: '', pairCode: '', nodeName: '' })
 
+/* ---------- 设备列表与 mDNS 发现（R9） ---------- */
+
+const devices = ref<ClusterDevice[]>([])
+const devicesLoading = ref(false)
+const discoveredMasters = ref<DiscoveredMaster[]>([])
+const browsingMasters = ref(false)
+
+const deviceColumns = [
+  { title: '设备', key: 'name', width: 190 },
+  { title: '最近地址', key: 'addr', width: 170 },
+  { title: '能力', key: 'capacity', width: 180 },
+  { title: '最近在线', key: 'seen', width: 118 },
+]
+
+async function loadDevices() {
+  if (devicesLoading.value) return
+  devicesLoading.value = true
+  try {
+    devices.value = await api.clusterDevicesList(50)
+  } catch {
+    /* 设备缓存只做展示，读取失败不阻塞主流程 */
+  } finally {
+    devicesLoading.value = false
+  }
+}
+
+function deviceCapacityText(device: ClusterDevice): string {
+  if (!device.capacityConcurrent) return '未检测'
+  const qps = device.capacityQps > 0 ? ` · ${fmt(device.capacityQps, 0)} QPS` : ''
+  return `${device.capacityConcurrent} 并发${qps}`
+}
+
+async function browseMasters() {
+  if (browsingMasters.value) return
+  browsingMasters.value = true
+  try {
+    discoveredMasters.value = await api.clusterMdnsBrowse(3000)
+    if (!discoveredMasters.value.length) {
+      message.info('未发现局域网主节点，可直接填写地址与配对码')
+    }
+  } catch (error) {
+    message.warning(`mDNS 浏览失败，可手动填写地址：${String(error)}`)
+  } finally {
+    browsingMasters.value = false
+  }
+}
+
+function useDiscoveredMaster(item: DiscoveredMaster) {
+  const host = item.addresses[0] ?? item.host
+  slaveForm.masterAddr = `${host}:${item.port}`
+  message.success(`已填入 ${slaveForm.masterAddr}`)
+}
+
 const SLAVE_ACTIVE_STATUS = ['connecting', 'preparing', 'ready', 'running']
 
 const slaveStatus = computed(() => slave.value?.status ?? 'idle')
@@ -475,6 +635,7 @@ watch(planId, async (id) => {
   planSettings.value = {}
   planStages.value = []
   planEnvId.value = null
+  orchestrationMode.value = 'off'
   if (!id) return
   try {
     const plan = await api.planGet(id)
@@ -494,6 +655,8 @@ watch(planId, async (id) => {
     totalConcurrent.value = planStagesMode.value
       ? Math.max(1, planPeakConcurrent.value)
       : Math.max(1, numberOr(planSettings.value.concurrent, 20))
+    // 阶梯计划默认按计划编排下发；固定并发的计划保持关闭
+    orchestrationMode.value = planStagesMode.value ? 'plan' : 'off'
   } catch (error) {
     message.error(String(error))
   }
@@ -516,7 +679,7 @@ function applySession(snapshot: ClusterMasterSnapshot) {
   }
   const next: Record<string, number> = { ...weights.value }
   for (const node of snapshot.nodes) {
-    if (!weightDirty.value[node.id]) next[node.id] = node.weight
+    if (!weightDirty.value[node.id]) next[node.id] = node.suggestedWeight ?? node.weight
   }
   weights.value = next
 }
@@ -531,11 +694,12 @@ function setWeight(node: ClusterNodeInfo, value: unknown) {
 function buildConfig(detail: HttpRequestDetail): StressConfig {
   const settings = planSettings.value
   const stagesMode = planStagesMode.value
+  const orchestrated = orchestrationPlan.value
   const total = Math.max(
     1,
     Math.min(
       MAX_CONCURRENT,
-      numberOr(totalConcurrent.value, stagesMode ? planPeakConcurrent.value : 20),
+      orchestrated ? orchestrationPeak.value : numberOr(totalConcurrent.value, 20),
     ),
   )
   const sla: SlaTargets | null = settings.slaEnabled
@@ -565,10 +729,10 @@ function buildConfig(detail: HttpRequestDetail): StressConfig {
     stopErrorRate: settings.stopOnErrorRate ? numberOr(settings.stopErrorRate, 5) : null,
     stopMinRequests: settings.stopOnErrorRate ? numberOr(settings.stopMinRequests, 100) : null,
     concurrent: total,
-    durationSec: Math.max(1, planDuration.value),
-    rampUpSec: stagesMode ? 0 : Math.max(0, numberOr(settings.rampUpSec, 0)),
+    durationSec: Math.max(1, effectiveDuration.value),
+    rampUpSec: stagesMode || orchestrated ? 0 : Math.max(0, numberOr(settings.rampUpSec, 0)),
     thinkTimeMs: Math.max(0, numberOr(settings.thinkTimeMs, 0)),
-    // 主从同步启动只支持单场景，阶梯计划在页面上已折算为峰值并发 + 总时长
+    // 分布式编排由主节点展开成每节点的阶段表，配置本身保持单场景
     stages: [],
     targetRps: positiveOrNull(settings.targetRps),
     recordDetail: recordMode(settings.recordDetail),
@@ -594,6 +758,10 @@ async function createSession() {
     message.warning('请先关闭当前分布式任务')
     return
   }
+  if (orchestrationMode.value !== 'off' && (!orchestrationPlan.value || orchestrationErrors.value.length)) {
+    message.warning(orchestrationErrors.value[0] ?? '请完整填写编排阶段')
+    return
+  }
   creating.value = true
   try {
     const detail = await api.requestGet(requestId)
@@ -611,6 +779,8 @@ async function createSession() {
       port: numberOr(port.value, protocol.value?.defaultPort ?? 17801),
       pairCodeTtlSec: pairTtlSeconds.value,
       masterName: masterName.value.trim() || null,
+      listenAddr: listenAddr.value === '0.0.0.0' ? null : listenAddr.value,
+      orchestration: orchestrationPlan.value,
     })
     applySession(snapshot)
     message.success('任务已创建，把配对码发给从节点')
@@ -654,9 +824,12 @@ async function prepareSession() {
 
 function launchSession() {
   if (!session.value) return
+  const phases = session.value.orchestration?.phases.length ?? 0
   Modal.confirm({
     title: '开始分布式压测？',
-    content: `全部节点将在约 2 秒后同步起跑，总并发 ${session.value.totalConcurrent}。`,
+    content: phases
+      ? `全部节点将在约 2 秒后同步起跑，按 ${phases} 个编排阶段切换并发，峰值 ${session.value.totalConcurrent}。`
+      : `全部节点将在约 2 秒后同步起跑，总并发 ${session.value.totalConcurrent}。`,
     okText: '启动',
     cancelText: '取消',
     async onOk() {
@@ -725,7 +898,7 @@ function closeSession() {
 }
 
 function openReport() {
-  if (session.value?.reportId) router.push(`/reports/${session.value.reportId}`)
+  if (session.value?.reportId) void router.push(`/reports/${session.value.reportId}`)
 }
 
 /* ---------- 从节点操作 ---------- */
@@ -833,6 +1006,7 @@ const NODE_STATUS_TEXT: Record<string, string> = {
   ready: '就绪',
   running: '施压中',
   done: '完成',
+  disconnected: '断线 · 可重连',
   lost: '失联',
   left: '已离开',
   rejected: '拒绝',
@@ -846,6 +1020,7 @@ const NODE_STATUS_TONE: Record<string, Tone> = {
   ready: 'ok',
   running: 'live',
   done: 'ok',
+  disconnected: 'warn',
   lost: 'bad',
   left: 'idle',
   rejected: 'bad',
@@ -858,6 +1033,56 @@ function nodeStatusText(status: string): string {
 function nodeStatusTone(status: string): Tone {
   return NODE_STATUS_TONE[status] ?? 'idle'
 }
+
+const PHASE_KIND_TEXT: Record<string, string> = {
+  ramp: '爬坡',
+  hold: '保持',
+  step: '阶梯',
+}
+
+function phaseKindText(kind: string): string {
+  return PHASE_KIND_TEXT[kind] ?? kind
+}
+
+function phaseRangeText(phase: OrchestrationPhase): string {
+  return phase.kind === 'ramp'
+    ? `${phase.fromConcurrent ?? 0} → ${phase.toConcurrent ?? 0}`
+    : `${phase.concurrent ?? 0}`
+}
+
+function orchestrationPeakFor(phases: OrchestrationPhase[]): number {
+  return phases.reduce(
+    (peak, phase) =>
+      Math.max(
+        peak,
+        phase.kind === 'ramp'
+          ? Math.max(phase.fromConcurrent ?? 0, phase.toConcurrent ?? 0)
+          : phase.concurrent ?? 0,
+      ),
+    0,
+  )
+}
+
+/** 主节点当前编排阶段（0 基序号来自后端） */
+const currentPhaseInfo = computed(() => {
+  const phases = session.value?.orchestration?.phases ?? []
+  const index = session.value?.currentPhase
+  if (index == null || !phases[index]) return null
+  const phase = phases[index]
+  return {
+    index,
+    total: phases.length,
+    kind: phaseKindText(phase.kind),
+    durationSec: phase.durationSec,
+    range: phaseRangeText(phase),
+  }
+})
+
+const slavePhaseText = computed(() => {
+  if (slave.value?.phaseIndex == null) return '—'
+  const concurrent = slave.value.phaseConcurrent
+  return `第 ${slave.value.phaseIndex + 1} 阶段 · ${concurrent || '—'} 并发`
+})
 
 function fmtTime(ms: number | null | undefined): string {
   if (!ms) return '—'
@@ -876,6 +1101,8 @@ const nodeColumns = [
   { title: '分配并发', key: 'concurrent', width: 92, align: 'right' as const },
   { title: 'QPS', key: 'qps', width: 86, align: 'right' as const },
   { title: '时钟偏移', key: 'clock', width: 128, align: 'right' as const },
+  { title: '能力', key: 'capacity', width: 130 },
+  { title: '断线缺口', key: 'gap', width: 96, align: 'right' as const },
   {
     title: '丢弃采样',
     dataIndex: 'droppedSamples',
@@ -914,8 +1141,11 @@ async function copyPairInfo() {
 
 /* ---------- 生命周期 ---------- */
 
+let deviceTicks = 0
+
 async function tick() {
   nowTick.value = Date.now()
+  if (activeTab.value === 'master' && ++deviceTicks % 5 === 0) void loadDevices()
   if (polling) return
   polling = true
   try {
@@ -931,6 +1161,11 @@ async function tick() {
     polling = false
   }
 }
+
+watch(
+  () => session.value?.nodes.length ?? 0,
+  () => void loadDevices(),
+)
 
 onMounted(async () => {
   loadSlaveCache()
@@ -985,6 +1220,7 @@ onMounted(async () => {
   }
   void loadSessions()
   void loadSlaveSnapshot()
+  void loadDevices()
 })
 
 onBeforeUnmount(() => {
@@ -1088,19 +1324,20 @@ onBeforeUnmount(() => {
                     <span>{{ planEnvName || '未绑定环境（变量需在各节点本地同名环境中存在）' }}</span>
                   </div>
                 </div>
-                <div v-if="planStageAlert" class="notice warn">
+                <div v-if="planStageAlert" class="notice info">
                   <span class="nt">阶梯计划</span>
                   <span>{{ planStageAlert }}</span>
                 </div>
 
                 <a-row :gutter="12">
                   <a-col :xs="12" :md="6">
-                    <a-form-item label="总并发">
+                    <a-form-item :label="orchestrationMode === 'off' ? '总并发' : `峰值并发（编排 ${orchestrationPeak}）`">
                       <a-input-number
                         v-model:value="totalConcurrent"
                         :min="1"
                         :max="MAX_CONCURRENT"
                         :step="10"
+                        :disabled="orchestrationMode !== 'off'"
                         class="w-full"
                       />
                     </a-form-item>
@@ -1128,12 +1365,112 @@ onBeforeUnmount(() => {
                   </a-col>
                 </a-row>
 
+                <a-row :gutter="12">
+                  <a-col :xs="24" :md="14">
+                    <a-form-item label="并发编排">
+                      <a-radio-group v-model:value="orchestrationMode" size="small" button-style="solid">
+                        <a-radio-button value="off">固定并发</a-radio-button>
+                        <a-radio-button value="plan" :disabled="!planStagesMode">按计划阶梯</a-radio-button>
+                        <a-radio-button value="custom">自定义编排</a-radio-button>
+                      </a-radio-group>
+                    </a-form-item>
+                  </a-col>
+                  <a-col :xs="24" :md="10">
+                    <a-form-item label="监听网卡">
+                      <a-select v-model:value="listenAddr" size="small">
+                        <a-select-option value="0.0.0.0">0.0.0.0（全部网卡）</a-select-option>
+                        <a-select-option v-for="item in addresses" :key="item" :value="item">
+                          {{ item }}
+                        </a-select-option>
+                      </a-select>
+                    </a-form-item>
+                  </a-col>
+                </a-row>
+
+                <div v-if="orchestrationMode !== 'off'" class="orch-editor">
+                  <div class="orch-head">
+                    <span class="preview-label">阶段</span>
+                    <span class="orch-summary mono">
+                      {{ orchestrationPhases.length }} 段 · {{ orchestrationDuration }}s · 峰值
+                      {{ orchestrationPeak }}
+                    </span>
+                  </div>
+                  <div v-if="orchestrationMode === 'plan'" class="notice info">
+                    <span class="nt">计划阶梯</span>
+                    <span>按计划中的 {{ planStageList.length }} 段并发下发 step 阶段，各节点按时间点同步切换。</span>
+                  </div>
+                  <div v-else class="orch-rows">
+                    <div v-for="(phase, index) in customPhases" :key="index" class="orch-row">
+                      <span class="orch-no mono">{{ String(index + 1).padStart(2, '0') }}</span>
+                      <a-select
+                        v-model:value="phase.kind"
+                        :options="PHASE_OPTIONS"
+                        size="small"
+                        class="orch-kind"
+                      />
+                      <a-input-number
+                        v-model:value="phase.durationSec"
+                        :min="1"
+                        :max="86400"
+                        size="small"
+                        class="orch-num"
+                      />
+                      <span class="orch-unit">s</span>
+                      <template v-if="phase.kind === 'ramp'">
+                        <a-input-number
+                          v-model:value="phase.fromConcurrent"
+                          :min="1"
+                          :max="MAX_CONCURRENT"
+                          size="small"
+                          class="orch-num"
+                        />
+                        <span class="orch-unit">→</span>
+                        <a-input-number
+                          v-model:value="phase.toConcurrent"
+                          :min="1"
+                          :max="MAX_CONCURRENT"
+                          size="small"
+                          class="orch-num"
+                        />
+                      </template>
+                      <a-input-number
+                        v-else
+                        v-model:value="phase.concurrent"
+                        :min="1"
+                        :max="MAX_CONCURRENT"
+                        size="small"
+                        class="orch-num"
+                      />
+                      <a-button
+                        type="text"
+                        size="small"
+                        danger
+                        :disabled="customPhases.length <= 1"
+                        @click="removePhase(index)"
+                      >
+                        删除
+                      </a-button>
+                    </div>
+                    <a-button
+                      size="small"
+                      :disabled="customPhases.length >= MAX_ORCHESTRATION_PHASES"
+                      @click="addPhase"
+                    >
+                      添加阶段
+                    </a-button>
+                  </div>
+                  <div v-if="orchestrationErrors.length" class="notice warn">
+                    <span class="nt">编排</span>
+                    <span>{{ orchestrationErrors[0] }}</span>
+                  </div>
+                </div>
+
                 <a-button type="primary" :loading="creating" :disabled="!canCreate" @click="createSession">
                   <ThunderboltOutlined />
                   创建任务并生成配对码
                 </a-button>
                 <p class="hint">
-                  总并发按节点权重拆分，主节点同样作为施压节点参与；分布式任务按固定并发执行。
+                  总并发按节点权重拆分，主节点同样作为施压节点参与；编排阶段由主节点展开成各节点的逐阶段并发并同步切换。
                 </p>
               </a-form>
               </div>
@@ -1280,6 +1617,19 @@ onBeforeUnmount(() => {
                   · 任务 #{{ session.jobId }} · 端口 {{ session.port }}
                 </span>
               </div>
+              <div v-if="currentPhaseInfo" class="target-line">
+                <span class="preview-label">阶段</span>
+                <span class="mono">
+                  第 {{ currentPhaseInfo.index + 1 }}/{{ currentPhaseInfo.total }} 阶段 · {{ currentPhaseInfo.kind }}
+                  {{ currentPhaseInfo.range }} 并发 · {{ currentPhaseInfo.durationSec }}s
+                </span>
+              </div>
+              <div v-else-if="session.orchestration?.phases?.length" class="target-line">
+                <span class="preview-label">编排</span>
+                <span class="mono">
+                  {{ session.orchestration.phases.length }} 阶段 · 峰值 {{ orchestrationPeakFor(session.orchestration.phases) }} 并发 · 启动后按时间切换
+                </span>
+              </div>
 
               <div v-if="session.message" class="notice" :class="session.incomplete ? 'warn' : 'info'">
                 <span class="nt">{{ session.incomplete ? '注意' : '状态' }}</span>
@@ -1352,12 +1702,16 @@ onBeforeUnmount(() => {
               row-key="id"
               size="small"
               :pagination="false"
-              :scroll="{ x: 1010 }"
+              :scroll="{ x: 1260 }"
             >
               <template #bodyCell="{ column, record }">
                 <template v-if="column.key === 'name'">
                   <div class="node-name">{{ record.name }}</div>
-                  <div class="node-addr mono">{{ record.addr || '—' }}</div>
+                  <div class="node-addr mono">
+                    {{ record.addr || '—' }}
+                    <span class="node-proto">v{{ record.protocolVersion }}</span>
+                    <span v-if="record.os" class="node-proto">{{ record.os }}</span>
+                  </div>
                 </template>
                 <template v-else-if="column.key === 'role'">
                   <span class="role-pill" :class="record.role">
@@ -1383,6 +1737,14 @@ onBeforeUnmount(() => {
                     @update:value="setWeight(record, $event)"
                   />
                   <span v-else class="mono">{{ fmt(record.weight, 2) }}</span>
+                  <button
+                    v-if="session.status === 'pairing' && record.suggestedWeight != null"
+                    class="weight-suggest mono"
+                    title="按本机能力检测归一化，点击采用"
+                    @click="setWeight(record, record.suggestedWeight)"
+                  >
+                    建议 {{ fmt(record.suggestedWeight, 2) }}
+                  </button>
                 </template>
                 <template v-else-if="column.key === 'qps'">
                   <span class="mono">{{ fmt(record.qps) }}</span>
@@ -1395,6 +1757,20 @@ onBeforeUnmount(() => {
                 </template>
                 <template v-else-if="column.key === 'clock'">
                   <span class="mono">{{ clockText(record) }}</span>
+                </template>
+                <template v-else-if="column.key === 'capacity'">
+                  <template v-if="record.capacityConcurrent">
+                    <span class="mono">{{ record.capacityConcurrent }} 并发</span>
+                    <div v-if="record.cores" class="node-addr mono">
+                      {{ record.cores }} 核<template v-if="record.capacityQps"> · {{ fmt(record.capacityQps, 0) }} QPS</template>
+                    </div>
+                  </template>
+                  <span v-else class="planned-value">未检测</span>
+                </template>
+                <template v-else-if="column.key === 'gap'">
+                  <span class="mono" :class="{ 'node-dropped': record.gapSeconds > 0 }">
+                    {{ record.gapSeconds > 0 ? `${record.gapSeconds}s` : '—' }}
+                  </span>
                 </template>
                 <template v-else-if="column.key === 'dropped'">
                   <span class="mono" :class="{ 'node-dropped': record.droppedSamples > 0 }">
@@ -1418,6 +1794,52 @@ onBeforeUnmount(() => {
             </div>
           </section>
         </template>
+
+        <section class="fm-card panel device-panel">
+          <header class="panel-head">
+            <div class="panel-title">
+              <h3>历史设备</h3>
+              <span class="panel-sub">按稳定 deviceId 缓存能力检测，跨任务复用</span>
+            </div>
+            <a-button size="small" :loading="devicesLoading" @click="loadDevices">刷新</a-button>
+          </header>
+          <a-table
+            :columns="deviceColumns"
+            :data-source="devices"
+            row-key="nodeId"
+            size="small"
+            :pagination="false"
+            :scroll="{ x: 660 }"
+          >
+            <template #bodyCell="{ column, record }">
+              <template v-if="column.key === 'name'">
+                <div class="device-name">
+                  <span class="online-dot" :class="{ on: record.online }" />
+                  {{ record.nodeName || record.nodeId }}
+                  <span v-if="record.online" class="st-pill ok">在线</span>
+                </div>
+                <div class="node-addr mono">{{ record.nodeId }}</div>
+              </template>
+              <template v-else-if="column.key === 'addr'">
+                <span class="mono">{{ record.lastAddr || '—' }}</span>
+              </template>
+              <template v-else-if="column.key === 'capacity'">
+                <span class="mono">{{ deviceCapacityText(record) }}</span>
+                <div v-if="record.cores || record.os" class="node-addr mono">
+                  <template v-if="record.cores">{{ record.cores }} 核</template>
+                  <template v-if="record.cores && record.os"> · </template>
+                  <template v-if="record.os">{{ record.os }}</template>
+                </div>
+              </template>
+              <template v-else-if="column.key === 'seen'">
+                <span class="mono">{{ fmtTime(record.lastSeenAt) }}</span>
+              </template>
+            </template>
+          </a-table>
+          <div v-if="!devices.length" class="inline-empty">
+            还没有设备记录；从节点首次配对后会自动上报本机能力。
+          </div>
+        </section>
       </a-tab-pane>
 
       <a-tab-pane key="slave" tab="从节点">
@@ -1438,6 +1860,29 @@ onBeforeUnmount(() => {
                       placeholder="192.168.1.10:17801"
                       :disabled="slaveConnected"
                     />
+                    <div class="mdns-row">
+                      <a-button
+                        size="small"
+                        :loading="browsingMasters"
+                        :disabled="slaveConnected"
+                        @click="browseMasters"
+                      >
+                        搜索局域网主节点
+                      </a-button>
+                      <span class="hint inline">mDNS 失败时仍可手动填写地址</span>
+                    </div>
+                    <div v-if="discoveredMasters.length" class="mdns-list">
+                      <button
+                        v-for="item in discoveredMasters"
+                        :key="item.fullname"
+                        class="mdns-item"
+                        @click="useDiscoveredMaster(item)"
+                      >
+                        <span class="mdns-name">{{ item.nodeName || item.name }}</span>
+                        <span class="mono">{{ item.addresses[0] || item.host }}:{{ item.port }}</span>
+                        <span class="st-pill">v{{ item.version }}</span>
+                      </button>
+                    </div>
                   </a-form-item>
                   <a-form-item label="配对码">
                     <a-input
@@ -1499,12 +1944,24 @@ onBeforeUnmount(() => {
                       <b class="mono">{{ slave.nodeId || '—' }}</b>
                     </div>
                     <div class="kv">
+                      <span>设备 ID</span>
+                      <b class="mono">{{ slave.deviceId || '—' }}</b>
+                    </div>
+                    <div class="kv">
+                      <span>协议版本</span>
+                      <b class="mono">v{{ slave.protocolVersion }}</b>
+                    </div>
+                    <div class="kv">
                       <span>计划</span>
                       <b>{{ slave.planName || '等待下发' }}</b>
                     </div>
                     <div class="kv">
                       <span>分配并发</span>
                       <b class="mono">{{ slave.concurrent || '—' }}</b>
+                    </div>
+                    <div class="kv">
+                      <span>当前阶段</span>
+                      <b class="mono">{{ slavePhaseText }}</b>
                     </div>
                     <div class="kv">
                       <span>当前 QPS</span>
@@ -1526,6 +1983,13 @@ onBeforeUnmount(() => {
                       <span>目标</span>
                       <b class="mono">{{ slave.method || '—' }} {{ slave.target || '' }}</b>
                     </div>
+                  </div>
+                  <div v-if="slave.reconnecting" class="notice warn">
+                    <span class="nt">重连</span>
+                    <span>
+                      主节点连接中断，正在进行第 {{ slave.reconnectAttempts }} 次重连；本机引擎继续运行，
+                      恢复后按令牌回到原任务并补报采样。
+                    </span>
                   </div>
                   <div v-if="slave.missingVars.length" class="notice warn">
                     <span class="nt">变量</span>
@@ -1586,6 +2050,16 @@ onBeforeUnmount(() => {
                 {{ protocol ? `误差 > ${protocol.clockDropUncertaintyMs} ms` : '—' }}
               </a-descriptions-item>
               <a-descriptions-item label="单任务节点上限">{{ protocol?.maxNodes ?? '—' }}</a-descriptions-item>
+              <a-descriptions-item label="最低兼容版本">v{{ protocol?.minVersion ?? '—' }}</a-descriptions-item>
+              <a-descriptions-item label="重连宽限">
+                {{ protocol ? `${Math.round(protocol.reconnectGraceSec / 60)} 分钟` : '—' }}
+              </a-descriptions-item>
+              <a-descriptions-item label="重连退避上限">
+                {{ protocol ? `${protocol.reconnectBackoffMaxSec} 秒` : '—' }}
+              </a-descriptions-item>
+              <a-descriptions-item label="mDNS 服务">
+                <span class="mono">{{ protocol?.mdnsService ?? '—' }}</span>
+              </a-descriptions-item>
             </a-descriptions>
             <p class="hint">改动需升级主从双方版本，避免协议不兼容。</p>
           </div>
@@ -2283,6 +2757,154 @@ onBeforeUnmount(() => {
 
 .kv.wide {
   grid-column: 1 / -1;
+}
+
+/* ---------- 编排编辑 ---------- */
+.orch-editor {
+  margin: -2px 0 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--fm-border);
+  border-radius: var(--fm-radius-sm);
+  background: var(--fm-surface-alt);
+}
+
+.orch-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.orch-summary {
+  font-size: 11px;
+  color: var(--fm-muted);
+}
+
+.orch-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.orch-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.orch-no {
+  width: 18px;
+  flex: none;
+  font-size: 9.5px;
+  color: var(--fm-brass-text);
+}
+
+.orch-kind {
+  width: 112px;
+}
+
+.orch-num {
+  width: 86px;
+}
+
+.orch-unit {
+  font-size: 11px;
+  color: var(--fm-muted);
+}
+
+/* ---------- 设备列表 ---------- */
+.device-panel {
+  margin: 12px 0 0;
+}
+
+.device-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  line-height: 1.5;
+  color: var(--fm-text);
+}
+
+.online-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--fm-border-strong);
+}
+
+.online-dot.on {
+  background: var(--fm-success);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--fm-success) 14%, transparent);
+}
+
+.node-proto {
+  margin-left: 6px;
+  padding: 0 4px;
+  border: 1px solid var(--fm-border);
+  border-radius: 3px;
+  font-size: 9.5px;
+  color: var(--fm-muted);
+}
+
+.weight-suggest {
+  display: block;
+  margin-top: 2px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font-size: 10px;
+  color: var(--fm-primary);
+  cursor: pointer;
+}
+
+.weight-suggest:hover {
+  text-decoration: underline;
+}
+
+/* ---------- mDNS ---------- */
+.mdns-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.hint.inline {
+  margin: 0;
+}
+
+.mdns-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.mdns-item {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 6px 9px;
+  border: 1px solid var(--fm-border-control);
+  border-radius: var(--fm-radius-sm);
+  background: var(--fm-surface);
+  color: var(--fm-text-2);
+  text-align: left;
+  cursor: pointer;
+}
+
+.mdns-item:hover {
+  border-color: var(--fm-primary);
+}
+
+.mdns-name {
+  font-size: 12px;
+  color: var(--fm-text);
 }
 
 @media (max-width: 760px) {

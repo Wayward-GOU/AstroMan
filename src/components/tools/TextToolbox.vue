@@ -47,7 +47,6 @@ const MAX_HISTORY = 50
 let checkpoint: number | undefined
 
 const canUndo = computed(() => cursor.value > 0)
-const canRedo = computed(() => cursor.value < history.value.length - 1)
 const stats = computed(() => {
   const lines = text.value ? text.value.split('\n').length : 0
   return `${lines} 行 · ${text.value.length} 字符`

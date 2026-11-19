@@ -1,9 +1,9 @@
 # AstroMan v1.1.1 发布检查表
 
-- 文档版本：v0.2（W1–W5 代码与自动化测试完成，人工验收待执行）
-- 基线提交：`4ebd21b`（`master-develop-v1.1.1`）+ 本次未提交改动
+- 文档版本：v0.3（W1–W5 代码与自动化测试完成，人工验收待执行）
+- 基线提交：`21241b4`（`master-develop-v1.1.1`，tag `v1.1.1`）
 - 日期：2026-11-19
-- 状态：**未发布**。前端、Rust、E2E 与依赖审计已在本机通过；覆盖率为本机 LLVM 近似值，CI tarpaulin 仍需跑；7.3–7.10 人工矩阵及 R9/R10 真机项尚待 Windows 实机执行。
+- 状态：**已打 tag 并推送**，由 tag `v1.1.1` 触发 Release 工作流产出安装包草稿。前端、Rust、E2E 与依赖审计已在本机通过；覆盖率为本机 LLVM 近似值，CI tarpaulin 仍需跑；7.3–7.10 人工矩阵及 R9/R10 真机项尚待 Windows 实机执行，不得标注「实机已验证」。
 
 > 本表按《AstroMan 未完成事项技术方案》R1 / 附录 C 生成。人工项没有实际执行前不要勾「通过」，发布说明也不得声称「已验证」。
 
@@ -12,9 +12,9 @@
 | 项 | 值 |
 |---|---|
 | 版本号 | 1.1.1（`package.json` / `src-tauri/Cargo.toml` / `tauri.conf.json` 一致） |
-| 提交哈希 | `4ebd21b`（W1–W5 改动尚未提交，发布前需重新记录最终哈希） |
-| 构建产物 | `AstroMan_1.1.1_x64-setup.exe`（构建后填实际文件名） |
-| SHA256 | 构建后执行 `certutil -hashfile <安装包> SHA256` 填入 |
+| 提交哈希 | `21241b4`（`master-develop-v1.1.1`，tag `v1.1.1`） |
+| 构建产物 | 由 tag `v1.1.1` 触发 `.github/workflows/release.yml` 构建（Windows x64 / x86、macOS universal），产物在 GitHub Release 草稿中 |
+| SHA256 | 以 GitHub Release 资产为准（本机未构建 Windows 安装包） |
 | 构建环境 | Windows 10 x64 + Node 22 + Rust stable（本机；CI 不产出安装包） |
 
 ## 2. 自动化门禁
@@ -29,9 +29,11 @@
 | 类型检查 | `npx vue-tsc --noEmit` | **通过** | 与 `npm run build` 中的类型阶段一致 |
 | 类型与构建 | `npm run build` | **通过** | 产物体积门禁由 CI 再跑 |
 | 依赖安全审计 | `npm audit --omit=dev --audit-level=high --registry=https://registry.npmjs.org` | **通过**（0 vulnerabilities） | 默认 npmmirror 未实现 audit endpoint，需显式指定官方 registry |
+| 发版安全断言 | `npm run security:check`（Node 20.19.4） | **通过** | 未开启 devtools，CSP 基础指令完整；Node 18 因 `import.meta.dirname` 报错 |
 | Rust 格式 | `cargo fmt --check --all` | **通过** | 分支内历史格式已统一 |
 | Rust 静态检查 | `cargo clippy --lib --all-targets -- -D warnings` | **通过**（0 warning） | 新增代码路径：backup / db / stress / report / cluster / capture |
-| Rust 单测 | `cargo test --lib` | **通过**（451 passed / 0 failed） | 含 34 条集群用例（其中 4 条为集群验收） |
+| Rust 单测 | `cargo test --lib` | **通过**（455 passed / 0 failed） | 含 34 条集群用例（其中 4 条为集群验收） |
+| UI 硬编码门禁 | `npm run ui:check` | **通过**（255/19/487/58/115，对比度 23 套全达标） | 基线按 v1.1.1 实测刷新 |
 | 覆盖率 | `cargo llvm-cov --lib --summary-only` | **通过**（行 60.50% / 函数 57.02% / 区域 62.30%，阈值 25%） | macOS 本地近似；CI 的 Linux tarpaulin 仍须执行 |
 | E2E 冒烟 | `npm run e2e:smoke` | **通过**（6/6，14.1s） | macOS + 系统 Chrome；使用临时 Node 20.19.4 |
 

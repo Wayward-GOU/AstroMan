@@ -10,6 +10,7 @@ import {
 } from '@ant-design/icons-vue'
 import CodeArea from '@/components/CodeArea.vue'
 import JsonTree from '@/components/JsonTree.vue'
+import { copyToClipboard } from '@/utils/clipboard'
 
 const input = ref('')
 const output = ref('')
@@ -210,7 +211,7 @@ function clearAll() {
 async function copyOutput() {
   if (!output.value) return
   try {
-    await navigator.clipboard.writeText(output.value)
+    await copyToClipboard(output.value)
     message.success('已复制')
   } catch {
     message.error('复制失败')

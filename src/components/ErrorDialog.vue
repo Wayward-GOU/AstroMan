@@ -4,6 +4,7 @@ import { message } from 'ant-design-vue'
 import { CopyOutlined, ExclamationCircleFilled } from '@ant-design/icons-vue'
 import { useErrorDialogStore } from '@/stores/errorDialog'
 import { formatDateTime } from '@/utils/datetime'
+import { copyToClipboard } from '@/utils/clipboard'
 
 const store = useErrorDialogStore()
 
@@ -32,7 +33,7 @@ const copyText = computed(() => {
 
 async function copyError() {
   try {
-    await navigator.clipboard.writeText(copyText.value)
+    await copyToClipboard(copyText.value)
     message.success('错误信息已复制')
   } catch {
     message.error('复制失败，请手动选中文本复制')

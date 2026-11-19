@@ -12,6 +12,8 @@ function samples(count: number, patch: (index: number) => Partial<ReportSample> 
     p95Rt: 40,
     p99Rt: 80,
     ttfbAvg: 12,
+    bodyAvg: 8,
+    bodyP95: 10,
     bytes: 1024,
     successCount: 5000,
     errorCount: 0,
@@ -121,6 +123,45 @@ describe('buildFindings', () => {
       errorCount: index > 40 ? 10 : 0,
     }))
     expect(buildFindings(detail).length).toBeLessThanOrEqual(6)
+  })
+})
+
+describe('buildFindings · 施压端能力（3.7.3）', () => {
+  it('负载达到检测极限 80% 时提示结论谨慎', () => {
+    const detail = makeDetail()
+    detail.config = {
+      ...detail.config,
+      machineCapacity: { maxQps: 5500, reachedLimit: true, cores: 8 },
+    }
+    const titles = buildFindings(detail).map((item) => item.title)
+    expect(titles.some((title) => title.includes('客户端负载'))).toBe(true)
+  })
+
+  it('负载低于 50% 时说明瓶颈不在施压端', () => {
+    const detail = makeDetail()
+    detail.config = {
+      ...detail.config,
+      machineCapacity: { maxQps: 20_000, reachedLimit: false, cores: 8 },
+    }
+    const titles = buildFindings(detail).map((item) => item.title)
+    expect(titles.some((title) => title.includes('瓶颈不在施压端'))).toBe(true)
+  })
+})
+
+describe('buildFindings · 同主机叠加（1.3.2）', () => {
+  it('存在同主机叠加警告时提示容量口径', () => {
+    const detail = makeDetail()
+    detail.config = {
+      ...detail.config,
+      sameHostWarning: '同一主机上已有任务 #2（订单接口）在施压',
+    }
+    const titles = buildFindings(detail).map((item) => item.title)
+    expect(titles.some((title) => title.includes('同主机叠加'))).toBe(true)
+  })
+
+  it('没有警告时不出现该条目', () => {
+    const titles = buildFindings(makeDetail()).map((item) => item.title)
+    expect(titles.some((title) => title.includes('同主机叠加'))).toBe(false)
   })
 })
 

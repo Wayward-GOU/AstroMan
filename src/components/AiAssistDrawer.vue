@@ -12,6 +12,7 @@ import AstroBuddyIcon from '@/components/AstroBuddyIcon.vue'
 import { useAiAssistStore } from '@/stores/aiAssist'
 import { setHandoff } from '@/stores/handoff'
 import { renderMarkdown } from '@/utils/markdown'
+import { copyToClipboard } from '@/utils/clipboard'
 
 const store = useAiAssistStore()
 const router = useRouter()
@@ -73,7 +74,7 @@ async function copyLast() {
   const last = [...store.messages].reverse().find((item) => item.role === 'assistant' && item.content)
   if (!last) return
   try {
-    await navigator.clipboard.writeText(last.content)
+    await copyToClipboard(last.content)
     message.success('已复制')
   } catch {
     message.warning('复制失败，请手动选择文本')

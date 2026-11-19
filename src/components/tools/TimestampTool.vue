@@ -3,6 +3,7 @@ import { computed, ref } from 'vue'
 import { message } from 'ant-design-vue'
 import { CopyOutlined, ReloadOutlined } from '@ant-design/icons-vue'
 import { timestampInfo } from '@/tools/calc'
+import { copyToClipboard } from '@/utils/clipboard'
 
 const input = ref('')
 const dateInput = ref('')
@@ -52,7 +53,7 @@ function useValue(value: string) {
 
 async function copy(value: string) {
   try {
-    await navigator.clipboard.writeText(value)
+    await copyToClipboard(value)
     message.success('已复制')
   } catch {
     message.error('复制失败')

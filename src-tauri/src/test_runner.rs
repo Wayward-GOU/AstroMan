@@ -1807,7 +1807,7 @@ async fn execute_stress_case(
     // 与手工压测互斥：等待前一个压测结束，最多等到 waitTimeoutSec
     if let Some(secs) = wait_timeout {
         let deadline = Instant::now() + Duration::from_secs(secs);
-        while state.stress_running.load(Ordering::SeqCst) && Instant::now() < deadline {
+        while !state.stress_jobs.is_empty() && Instant::now() < deadline {
             if cancel.load(Ordering::SeqCst) {
                 return CaseOutcome::failed("skipped", "运行已停止".to_string());
             }
@@ -3558,6 +3558,8 @@ mod tests {
     fn stress_report_fixture(p95: f64, p99: f64, avg_qps: f64, error_rate: f64) -> StressReport {
         StressReport {
             id: 0,
+            plan_id: None,
+            run_group_id: None,
             plan_name: "fixture".to_string(),
             request_id: None,
             total_requests: 100,

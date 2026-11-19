@@ -5,6 +5,7 @@ import { CopyOutlined } from '@ant-design/icons-vue'
 import * as api from '@/api'
 import { formatDateTime } from '@/utils/datetime'
 import type { IpLookupInfo } from '@/types/models'
+import { copyToClipboard } from '@/utils/clipboard'
 
 const presets = ['8.8.8.8', '1.1.1.1', '114.114.114.114', '223.5.5.5']
 
@@ -62,7 +63,7 @@ onMounted(query)
 async function copy(value: string) {
   if (!value || value === '-') return
   try {
-    await navigator.clipboard.writeText(value)
+    await copyToClipboard(value)
     message.success('已复制')
   } catch {
     message.error('复制失败')

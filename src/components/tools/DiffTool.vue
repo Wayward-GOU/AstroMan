@@ -4,6 +4,7 @@ import { message } from 'ant-design-vue'
 import { CopyOutlined, SwapOutlined } from '@ant-design/icons-vue'
 import CodeArea from '@/components/CodeArea.vue'
 import { diffLines, diffAsText, type DiffResult } from '@/tools/analysis'
+import { copyToClipboard } from '@/utils/clipboard'
 
 const left = ref('')
 const right = ref('')
@@ -55,7 +56,7 @@ logging.level.root=debug`
 async function copyDiff() {
   if (!result.value) return
   try {
-    await navigator.clipboard.writeText(diffAsText(result.value))
+    await copyToClipboard(diffAsText(result.value))
     message.success('差异已复制')
   } catch {
     message.error('复制失败')

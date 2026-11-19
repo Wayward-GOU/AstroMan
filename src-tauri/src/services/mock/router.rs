@@ -111,15 +111,18 @@ fn compile_template(template: &str) -> Option<Regex> {
     while index < chars.len() {
         let current = chars[index];
         if current == '{' && chars.get(index + 1) == Some(&'{') {
-            if let Some(offset) = template[index..].find("}}") {
+            let closing = (index + 2..chars.len().saturating_sub(1))
+                .find(|&i| chars[i] == '}' && chars[i + 1] == '}');
+            if let Some(end) = closing {
                 pattern.push_str("[^/]+");
-                index += offset + 2;
+                index = end + 2;
                 continue;
             }
         }
         if current == '{' {
-            if let Some(offset) = template[index..].find('}') {
-                let name = &template[index + 1..index + offset];
+            let closing = (index + 1..chars.len()).find(|&i| chars[i] == '}');
+            if let Some(end) = closing {
+                let name: String = chars[index + 1..end].iter().collect();
                 // `{id:uuid}` 这类带格式说明的只取名字
                 if !name.is_empty()
                     && name
@@ -127,7 +130,7 @@ fn compile_template(template: &str) -> Option<Regex> {
                         .all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '-')
                 {
                     pattern.push_str("[^/]+");
-                    index += offset + 1;
+                    index = end + 1;
                     continue;
                 }
             }
@@ -445,6 +448,14 @@ mod tests {
         assert!(template_matches("/users/7", "/users/{{id}}"));
         assert!(!template_matches("/users/7/orders", "/users/{id}"));
         assert!(template_matches("/users/7/orders", "/users/{id}/orders"));
+    }
+
+    #[test]
+    fn template_matching_handles_chinese_paths() {
+        assert!(template_matches("/接口/用户/7", "/接口/用户/{id}"));
+        assert!(template_matches("/接口/用户/7", "/接口/用户/{{id}}"));
+        assert!(template_matches("/用户/7", "/用户/:id"));
+        assert!(!template_matches("/接口/用户/7/orders", "/接口/用户/{id}"));
     }
 
     #[test]

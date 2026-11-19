@@ -7,6 +7,7 @@ pub mod ai_policy;
 pub mod audit;
 pub mod backup_crypto;
 pub mod backup_target;
+pub mod cluster;
 pub mod contract;
 pub mod diagnostics;
 pub mod docs;

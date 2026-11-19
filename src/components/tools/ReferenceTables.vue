@@ -4,6 +4,7 @@ import { message } from 'ant-design-vue'
 import { CopyOutlined } from '@ant-design/icons-vue'
 import { ASCII_ROWS, DOCKER_ROWS, GIT_ROWS, HEADER_ROWS, HTTP_STATUS_ROWS, MIME_ROWS, REGEX_ROWS } from '@/tools/reference'
 import { COMMON_PORTS } from '@/tools/network'
+import { copyToClipboard } from '@/utils/clipboard'
 
 const props = defineProps<{
   kind: 'ascii' | 'http' | 'mime' | 'headers' | 'ports' | 'git' | 'docker' | 'regex'
@@ -81,7 +82,7 @@ const rows = computed<Row[]>(() => {
 async function copy(text?: string) {
   if (!text) return
   try {
-    await navigator.clipboard.writeText(text)
+    await copyToClipboard(text)
     message.success('已复制')
   } catch {
     message.error('复制失败')

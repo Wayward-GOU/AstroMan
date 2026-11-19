@@ -3,6 +3,7 @@ import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
 import { message } from 'ant-design-vue'
 import { save } from '@tauri-apps/plugin-dialog'
 import * as api from '@/api'
+import { copyToClipboard } from '@/utils/clipboard'
 import {
   buildPayload,
   buildQrSvg,
@@ -296,7 +297,7 @@ async function onDrop(event: DragEvent) {
 async function copyDecoded() {
   if (!decoded.value) return
   try {
-    await navigator.clipboard.writeText(decoded.value.data)
+    await copyToClipboard(decoded.value.data)
     message.success('已复制识别结果')
   } catch {
     message.error('复制失败，请手动选择文本')

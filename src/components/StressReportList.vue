@@ -45,6 +45,36 @@ function fmtNum(value: number, digits = 1) {
   return value >= 1000 ? value.toFixed(0) : value.toFixed(digits)
 }
 
+/** 列表风险标签（3.4.1）：与详情页 findings 同源条件，映射 P0 / P1 */
+interface RiskTag {
+  label: string
+  tone: 'p0' | 'p1' | 'info'
+}
+
+function riskTags(report: StressReport): RiskTag[] {
+  const tags: RiskTag[] = []
+  if (report.errorRate > 5) tags.push({ label: 'P0 稳定性', tone: 'p0' })
+  else if (report.errorRate > 1) tags.push({ label: 'P1 错误', tone: 'p1' })
+  if (report.avgRt > 0 && report.p99Rt / report.avgRt >= 3) tags.push({ label: 'P1 长尾', tone: 'p1' })
+  else if (report.avgRt > 0 && report.p99Rt / report.avgRt >= 2) tags.push({ label: '长尾观察', tone: 'info' })
+  if (report.apdex < 0.7) tags.push({ label: 'P1 体验', tone: 'p1' })
+  if (report.status === 'stopped') tags.push({ label: '手动停止', tone: 'info' })
+  return tags
+}
+
+/** 释放字节数展示，删除报告后用于提示实际回收的空间 */
+function fmtSize(bytes: number): string {
+  if (!bytes) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB']
+  let value = bytes
+  let unit = 0
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024
+    unit += 1
+  }
+  return `${value.toFixed(unit === 0 || value >= 100 ? 0 : 1)} ${units[unit]}`
+}
+
 function remove(report: StressReport) {
   Modal.confirm({
     title: `删除报告「${report.planName}」？`,
@@ -53,10 +83,14 @@ function remove(report: StressReport) {
     okType: 'danger',
     cancelText: '取消',
     async onOk() {
-      await api.reportDelete(report.id)
+      const result = await api.reportDelete(report.id)
       selectedIds.value = selectedIds.value.filter((id) => id !== report.id)
       await load()
-      message.success('已删除')
+      const freed = result.freedBytes > 0 ? `，释放 ${fmtSize(result.freedBytes)}` : ''
+      message.success(`已删除${freed}`)
+      if (result.compactError) {
+        message.warning(`数据库压缩未完成：${result.compactError}`)
+      }
     },
   })
 }
@@ -132,6 +166,13 @@ function compareMetricRows() {
               <span class="status-pill" :class="{ stopped: report.status === 'stopped' }">
                 {{ report.status === 'stopped' ? '已停止' : '已完成' }}
               </span>
+              <span
+                v-for="tag in riskTags(report)"
+                :key="tag.label"
+                class="risk-tag"
+                :class="tag.tone"
+                >{{ tag.label }}</span
+              >
             </div>
             <div class="report-time">{{ fmtTime(report.createdAt) }}</div>
           </div>
@@ -286,6 +327,24 @@ function compareMetricRows() {
 .status-pill.stopped {
   background: var(--fm-warning-soft);
   color: var(--fm-warning);
+}
+.risk-tag {
+  font-size: 10px;
+  padding: 1px 7px;
+  border-radius: 3px;
+  border: 1px solid var(--fm-border);
+  color: var(--fm-muted);
+  flex-shrink: 0;
+}
+.risk-tag.p0 {
+  color: var(--fm-danger);
+  border-color: var(--fm-danger);
+  background: var(--fm-danger-soft);
+}
+.risk-tag.p1 {
+  color: var(--fm-warning);
+  border-color: var(--fm-warning);
+  background: var(--fm-warning-soft);
 }
 .report-time {
   font-size: 11px;

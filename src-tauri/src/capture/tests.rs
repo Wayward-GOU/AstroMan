@@ -430,6 +430,7 @@ async fn repeat_without_recording_applies_overrides() {
             body: Some("edited-body".into()),
         },
         None,
+        2 * 1024 * 1024,
     )
     .await
     .expect("repeat should succeed without recording");

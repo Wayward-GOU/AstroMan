@@ -10,7 +10,7 @@
 //! 断点会挂起等待前端决定，但挂起前不持任何锁，超时或队列满都自动放行，
 //! 保证前端卡住时不会把代理拖死。
 //!
-//! body 会做两层限制：单条最多保留 2 MB，超过只存前缀并标记 truncated；
+//! body 会做两层限制：单条保留上限取自当前性能档位，超过只存前缀并标记 truncated；
 //! 另外只对文本、表单、JSON、XML 与 1 MB 内的图片做完整读取，避免大文件/SSE
 //! 被整体缓冲。请求体同理，超过上限时只转发不记录；这种情况在断点里只能改
 //! 方法、URL 和头，正文保持原样。
@@ -22,6 +22,7 @@ use crate::capture::intercept::{
 };
 use crate::capture::store::{BodyPayload, CaptureStore, FlowBrief, FlowRecord, HeaderEntry};
 use crate::capture::CaptureConfig;
+use crate::services::profile::CaptureLimits;
 use http_body_util::BodyExt;
 use hudsucker::hyper::body::Bytes;
 use hudsucker::hyper::header::{
@@ -37,12 +38,21 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// 单条 body 最多保留 2 MB（超出部分丢弃但请求/响应照常完整转发）。
-const MAX_STORED_BODY: usize = 2 * 1024 * 1024;
+/// 单条 body 的保留上限取自当前性能档位（`CaptureLimits::max_response_bytes`），
+/// 超出部分丢弃但请求/响应照常完整转发。
 /// 超过这个大小的文本响应不缓冲，避免把大文件整个读进内存。
 const MAX_COLLECT_BODY: u64 = 8 * 1024 * 1024;
 /// 图片只预览 1 MB 以内的，超过就当普通二进制跳过。
 const MAX_IMAGE_BODY: u64 = 1024 * 1024;
+
+/// 低内存档收紧采集上限，避免把大响应整段读进内存再截断
+fn collect_cap(limits: &CaptureLimits) -> u64 {
+    if limits.low_memory {
+        limits.max_response_bytes as u64
+    } else {
+        MAX_COLLECT_BODY
+    }
+}
 
 /// 静态资源扩展名，`captureStatic=false` 时跳过。
 const STATIC_EXTENSIONS: &[&str] = &[
@@ -156,7 +166,9 @@ impl HttpHandler for CaptureHandler {
             .then(|| self.intercept.weak_request_plan(&url))
             .flatten();
         let record = matched || breakpoint.is_some() || map_rule.is_some() || remote_rule.is_some();
-        let collect_body = record && plan_request_body(req.method(), req.headers());
+        let limits = self.store.limits();
+        let collect_body =
+            record && plan_request_body(req.method(), req.headers(), collect_cap(&limits));
 
         let pending = record.then(|| build_pending(&self.store, ctx, &req, url));
         let pending_slot = self.pending.clone();
@@ -185,7 +197,9 @@ impl HttpHandler for CaptureHandler {
             // 请求体只读一次：录制要展示、断点要改、本地映射要把连接读干净
             let mut req = req;
             if collect_body {
-                match collect_request_body(req, &mut pending, &store).await {
+                match collect_request_body(req, &mut pending, &store, limits.max_response_bytes)
+                    .await
+                {
                     Ok(value) => req = value,
                     Err(response) => return RequestOrResponse::Response(*response),
                 }
@@ -208,7 +222,8 @@ impl HttpHandler for CaptureHandler {
                         }
                         Decision::Request(edit) => {
                             if let Some(entry) = pending.as_mut() {
-                                req = apply_request_edit(entry, edit, req);
+                                req =
+                                    apply_request_edit(entry, edit, req, limits.max_response_bytes);
                             }
                         }
                         _ => {}
@@ -287,6 +302,7 @@ impl HttpHandler for CaptureHandler {
         let pending_slot = self.pending.clone();
         let store = self.store.clone();
         let intercept = self.intercept.clone();
+        let limits = store.limits();
 
         async move {
             let Some(mut pending) = pending_slot.lock().take() else {
@@ -297,7 +313,7 @@ impl HttpHandler for CaptureHandler {
             let mut res = res;
 
             // 流式（SSE）或超大响应不缓冲正文，断点仍可改状态码和响应头
-            if !plan_response_body(res.headers()) {
+            if !plan_response_body(res.headers(), collect_cap(&limits)) {
                 if let Some(rule) = intercept.match_breakpoint(
                     &pending.url,
                     &pending.method,
@@ -379,7 +395,12 @@ impl HttpHandler for CaptureHandler {
             };
             // 解过码的字节就是明文；没解码的压缩内容不能按 UTF-8 解释
             let plain = !encoded || decoded;
-            let mut response_body = build_body(&bytes, &response_content_type, plain);
+            let mut response_body = build_body(
+                &bytes,
+                &response_content_type,
+                plain,
+                limits.max_response_bytes,
+            );
             let response_editable =
                 plain && response_body.text.is_some() && !response_body.truncated;
             status = parts.status.as_u16();
@@ -425,7 +446,8 @@ impl HttpHandler for CaptureHandler {
                                     parts.headers.insert(CONTENT_TYPE, value);
                                 }
                             }
-                            response_body = build_body(&bytes, &edited_type, true);
+                            response_body =
+                                build_body(&bytes, &edited_type, true, limits.max_response_bytes);
                         }
                     }
                     _ => {}
@@ -571,6 +593,7 @@ async fn collect_request_body(
     req: Request<Body>,
     pending: &mut Option<Pending>,
     store: &CaptureStore,
+    stored_limit: usize,
 ) -> Result<Request<Body>, Box<Response<Body>>> {
     let content_type = pending
         .as_ref()
@@ -590,7 +613,7 @@ async fn collect_request_body(
     let plain = !parts.headers.contains_key(CONTENT_ENCODING);
     if let Some(entry) = pending.as_mut() {
         entry.request_size = bytes.len() as u64;
-        entry.request_body = build_body(&bytes, &content_type, plain);
+        entry.request_body = build_body(&bytes, &content_type, plain, stored_limit);
         entry.request_editable =
             plain && entry.request_body.text.is_some() && !entry.request_body.truncated;
         entry.body_bytes = Some(bytes.clone());
@@ -615,6 +638,7 @@ fn apply_request_edit(
     pending: &mut Pending,
     edit: RequestEdit,
     req: Request<Body>,
+    stored_limit: usize,
 ) -> Request<Body> {
     let (mut parts, body) = req.into_parts();
 
@@ -662,7 +686,7 @@ fn apply_request_edit(
     if let Some(len) = pending.body_bytes.as_ref().map(|bytes| bytes.len()) {
         let content_type = pending.request_body.content_type.clone();
         if let Some(bytes) = pending.body_bytes.as_ref() {
-            pending.request_body = build_body(bytes, &content_type, true);
+            pending.request_body = build_body(bytes, &content_type, true, stored_limit);
         }
         pending.request_size = len as u64;
         pending.request_editable =
@@ -944,10 +968,15 @@ fn record_error(store: &CaptureStore, pending: Pending, error: String) {
 /// 把字节转成前端可直接展示的 body：
 /// 文本给 `text`；图片给 `base64`；其它二进制只给大小。
 /// `allow_text=false` 表示内容仍带压缩编码，不能按 UTF-8 解释。
-pub(crate) fn build_body(bytes: &Bytes, content_type: &str, allow_text: bool) -> BodyPayload {
+pub(crate) fn build_body(
+    bytes: &Bytes,
+    content_type: &str,
+    allow_text: bool,
+    stored_limit: usize,
+) -> BodyPayload {
     let size = bytes.len() as u64;
-    let truncated = bytes.len() > MAX_STORED_BODY;
-    let slice = &bytes[..bytes.len().min(MAX_STORED_BODY)];
+    let truncated = bytes.len() > stored_limit;
+    let slice = &bytes[..bytes.len().min(stored_limit)];
     let textual = allow_text
         && (is_textual(content_type)
             || (content_type.is_empty() && std::str::from_utf8(slice).is_ok()));
@@ -983,24 +1012,24 @@ pub(crate) fn build_body(bytes: &Bytes, content_type: &str, allow_text: bool) ->
     }
 }
 
-fn plan_request_body(method: &Method, headers: &HeaderMap) -> bool {
+fn plan_request_body(method: &Method, headers: &HeaderMap, collect_limit: u64) -> bool {
     if *method == Method::GET || *method == Method::HEAD {
         return false;
     }
     let len = content_length(headers);
-    if len > MAX_COLLECT_BODY {
+    if len > collect_limit {
         return false;
     }
     len > 0 || headers.contains_key(TRANSFER_ENCODING)
 }
 
-fn plan_response_body(headers: &HeaderMap) -> bool {
+fn plan_response_body(headers: &HeaderMap, collect_limit: u64) -> bool {
     let content_type = content_type(headers);
     if content_type == "text/event-stream" {
         return false;
     }
     let len = content_length(headers);
-    if len > MAX_COLLECT_BODY {
+    if len > collect_limit {
         return false;
     }
     if is_textual(&content_type) {

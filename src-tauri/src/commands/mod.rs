@@ -1,6 +1,8 @@
 pub mod ai;
 pub mod backup;
+pub mod capacity;
 pub mod capture;
+pub mod cluster;
 pub mod collection;
 pub mod contract;
 pub mod cookie;

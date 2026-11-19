@@ -182,6 +182,19 @@ function openCleanup() {
   cleanupOpen.value = true
 }
 
+/** 清理结果里的释放字节数，按需显示为 KB / MB */
+function fmtSize(bytes: number): string {
+  if (!bytes) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB']
+  let value = bytes
+  let unit = 0
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024
+    unit += 1
+  }
+  return `${value.toFixed(unit === 0 || value >= 100 ? 0 : 1)} ${units[unit]}`
+}
+
 async function runCleanup() {
   if (!canClean.value) return
   cleaning.value = true
@@ -197,7 +210,11 @@ async function runCleanup() {
     const parts: string[] = []
     if (cleanupScope.value.includes('history')) parts.push(`历史记录 ${result.history} 条`)
     if (cleanupScope.value.includes('runs')) parts.push(`接口运行记录 ${result.runs} 条`)
-    message.success(`已清理 ${parts.join('、')}`)
+    const freed = result.freedBytes > 0 ? `，释放 ${fmtSize(result.freedBytes)}` : ''
+    message.success(`已清理 ${parts.join('、')}${freed}`)
+    if (result.compactError) {
+      message.warning(`数据库压缩未完成：${result.compactError}`)
+    }
     cleanupOpen.value = false
     await load()
   } catch (e) {

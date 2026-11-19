@@ -3,6 +3,7 @@ import { computed, ref } from 'vue'
 import { message } from 'ant-design-vue'
 import { CopyOutlined } from '@ant-design/icons-vue'
 import { colorInfo, type ColorInfo } from '@/tools/calc'
+import { copyToClipboard } from '@/utils/clipboard'
 
 const input = ref('#3D6B8F')
 const picker = ref('#3D6B8F')
@@ -31,7 +32,7 @@ function useValue(value: string) {
 
 async function copy(value: string) {
   try {
-    await navigator.clipboard.writeText(value)
+    await copyToClipboard(value)
     message.success('已复制')
   } catch {
     message.error('复制失败')

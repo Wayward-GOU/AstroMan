@@ -76,15 +76,29 @@ fn tokenize(input: &str) -> Vec<String> {
                 if c == q {
                     quote = None;
                 } else if c == '\\' && q == '"' {
-                    if let Some(&next) = chars.peek() {
-                        if next == '"' || next == '\\' || next == '$' || next == '`' {
+                    match chars.peek().copied() {
+                        Some(next @ ('"' | '$' | '`')) => {
                             chars.next();
                             current.push(next);
-                        } else {
-                            current.push(c);
                         }
-                    } else {
-                        current.push(c);
+                        // JSON-in-JSON 常见写法：外层 \" 已还原，内层 \\" 表示字面量 \"
+                        // 例如 --data-binary "{\"raw\":\"[{\\"id\\":1}]\"}"。
+                        // 按 POSIX 规则第二个反斜杠会把引号当成字符串结束符，导致内层引号全部丢失。
+                        Some('\\') if looks_like_json(&current) => {
+                            let mut look = chars.clone();
+                            look.next();
+                            if look.peek() == Some(&'"') {
+                                chars.next();
+                                chars.next();
+                                current.push('\\');
+                                current.push('"');
+                            } else {
+                                chars.next();
+                                current.push('\\');
+                            }
+                        }
+                        Some(_) => current.push(c),
+                        None => current.push(c),
                     }
                 } else {
                     current.push(c);
@@ -504,5 +518,33 @@ mod tests {
         assert_eq!(parsed.params[0].key, "q");
         // -G 的编码交给发送侧统一处理，这里必须保留原文，避免双重编码
         assert_eq!(parsed.params[0].value, "a b&c");
+    }
+
+    #[test]
+    fn keeps_escaped_quotes_in_nested_json_string() {
+        let command = r#"curl --data-binary "{\"filtersRaw\":\"[{\\"id\\":\\"interactionId\\",\\"property\\":\\"interactionId\\",\\"value\\":\\"1065314928411410442\\",\\"operator\\":\\"=\\"}]\"}" --compressed "https://example.com/test""#;
+        let parsed = curl_parse(command.to_string()).expect("应能解析");
+        assert_eq!(parsed.body_type, "json");
+        let expected = r#"{"filtersRaw":"[{\"id\":\"interactionId\",\"property\":\"interactionId\",\"value\":\"1065314928411410442\",\"operator\":\"=\"}]"}"#;
+        assert_eq!(parsed.body, expected);
+        assert!(serde_json::from_str::<serde_json::Value>(&parsed.body).is_ok());
+    }
+
+    #[test]
+    fn imports_single_quoted_nested_json_without_extra_unescaping() {
+        let command = r#"curl 'https://api.example.com/x' -H 'Content-Type: application/json' --data-raw '{"filtersRaw":"[{\"id\":\"a\"}]"}'"#;
+        let parsed = curl_parse(command.to_string()).expect("应能解析");
+        assert_eq!(parsed.body_type, "json");
+        assert_eq!(parsed.body, r#"{"filtersRaw":"[{\"id\":\"a\"}]"}"#);
+        assert!(serde_json::from_str::<serde_json::Value>(&parsed.body).is_ok());
+    }
+
+    #[test]
+    fn keeps_double_backslashes_in_json_body() {
+        let command = r#"curl --data-binary "{\"path\":\"C:\\\\tmp\",\"regex\":\"\\\\d+\"}" "https://api.example.com/x""#;
+        let parsed = curl_parse(command.to_string()).expect("应能解析");
+        assert_eq!(parsed.body_type, "json");
+        assert_eq!(parsed.body, r#"{"path":"C:\\tmp","regex":"\\d+"}"#);
+        assert!(serde_json::from_str::<serde_json::Value>(&parsed.body).is_ok());
     }
 }

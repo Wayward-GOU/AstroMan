@@ -402,12 +402,13 @@ export interface ScriptJobResult {
  * 出错或超时时返回的 `vars` 仍是执行前的快照，调用方据此丢弃半成品写入。
  */
 export function executeScriptJob(job: ScriptJob): ScriptJobResult {
-  const store = new Map(Object.entries(job.vars ?? {}))
+  const snapshot = { ...(job.vars ?? {}) }
+  const store = new Map(Object.entries(snapshot))
   if (job.phase === 'post') {
     const result = runPostScript(job.code, job.request, job.response as HttpResult, job.env, store)
     return {
       request: job.request,
-      vars: Object.fromEntries(store),
+      vars: result.error ? snapshot : Object.fromEntries(store),
       logs: result.logs,
       assertions: result.assertions,
       error: result.error,
@@ -417,7 +418,7 @@ export function executeScriptJob(job: ScriptJob): ScriptJobResult {
   const result = runPreScript(job.code, job.request, job.env, job.phase, store)
   return {
     request: result.request,
-    vars: Object.fromEntries(store),
+    vars: result.error ? snapshot : Object.fromEntries(store),
     logs: result.logs,
     assertions: [],
     error: result.error,

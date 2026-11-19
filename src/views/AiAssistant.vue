@@ -804,6 +804,7 @@ function prettyArgs(args: Record<string, unknown>): string {
 
 // 身份、核心流程与工具协议拆到 @/utils/aiPrompt，评测运行器复用同一份提示词
 import { AGENT_SYSTEM_PROMPT as SYSTEM_PROMPT } from '@/utils/aiPrompt'
+import { copyToClipboard } from '@/utils/clipboard'
 
 /* ---------------- 上下文预算（F-5） ---------------- */
 
@@ -1246,7 +1247,7 @@ async function copyMessage(item: ChatItem) {
   const text = item.content.trim()
   if (!text) return
   try {
-    await navigator.clipboard.writeText(text)
+    await copyToClipboard(text)
     notify.success('已复制')
     return
   } catch {

@@ -7,6 +7,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import {
   ApiOutlined,
   AppstoreOutlined,
+  ClusterOutlined,
   ExperimentOutlined,
   FolderOpenOutlined,
   HistoryOutlined,
@@ -44,7 +45,12 @@ const route = useRoute()
 const router = useRouter()
 const notesStore = useNotesStore()
 const hangzaiTask = useHangzaiTaskStore()
-const isBare = computed(() => Boolean(route.meta.bare))
+const isBare = computed(
+  () =>
+    Boolean(route.meta.bare) ||
+    // 独立压测窗口（stress-*）不显示主窗口侧边栏
+    (route.path === '/stress' && (route.query.newWindow === '1' || route.query.newWindow === 'true')),
+)
 
 let notesTicker: number | undefined
 let unlistenNotesChanged: UnlistenFn | null = null
@@ -137,6 +143,7 @@ const navs: NavItem[] = [
   { key: 'home', label: '工作台', hint: '概览与快速入口', to: '/', icon: AppstoreOutlined, group: '调试' },
   { key: 'projects', label: '项目管理', hint: '项目 · 集合 · 环境', to: '/projects', icon: FolderOpenOutlined, group: '调试' },
   { key: 'stress', label: '压测', hint: '选择接口发起压测', to: '/stress', icon: ThunderboltOutlined, group: '测试' },
+  { key: 'cluster', label: '分布式压测', hint: '多机施压 · 配对码 · 合并报告', to: '/cluster', icon: ClusterOutlined, group: '测试' },
   { key: 'capture', label: '抓包', hint: 'HTTP/HTTPS 录制 · 改包 · 重发', to: '/capture', icon: ApiOutlined, group: '测试' },
   { key: 'runner', label: '批量运行', hint: '集合 Runner · 数据驱动', to: '/runner', icon: PlayCircleOutlined, group: '测试' },
   { key: 'automation', label: '自动化测试', hint: '套件 · 断言 · Python · 报告', to: '/automation', icon: ExperimentOutlined, group: '测试' },
@@ -449,6 +456,9 @@ onBeforeUnmount(() => {
 const activeKey = computed(() => {
   const path = route.path
   if (path.startsWith('/stress')) return 'stress'
+  if (path.startsWith('/cluster')) return 'cluster'
+  if (path.startsWith('/plans')) return 'stress'
+  if (path.startsWith('/reports')) return 'stress'
   if (path.startsWith('/capture')) return 'capture'
   if (path.startsWith('/runner')) return 'runner'
   if (path.startsWith('/projects')) return 'projects'

@@ -42,6 +42,7 @@ import {
 } from '@/utils/lastRequest'
 import * as api from '@/api'
 import type { CollectionNode, RequestSearchHit, RequestSummary } from '@/types/models'
+import { copyToClipboard } from '@/utils/clipboard'
 
 interface TreeNode {
   key: string
@@ -363,7 +364,7 @@ function openRequest(row: RequestSummary | RequestSearchHit) {
 async function copyRowCurl(row: RequestSummary | RequestSearchHit) {
   try {
     const detail = await api.requestGet(row.id)
-    await navigator.clipboard.writeText(
+    await copyToClipboard(
       buildCurl(detail, store.activeEnvironment?.variables),
     )
     message.success(`已复制「${row.name}」的 cURL`)

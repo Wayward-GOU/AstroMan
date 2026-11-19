@@ -4,6 +4,7 @@ import { message } from 'ant-design-vue'
 import { CopyOutlined } from '@ant-design/icons-vue'
 import { ipRange, subnetInfo, type SubnetInfo } from '@/tools/network'
 import { ipToBin } from '@/tools/network'
+import { copyToClipboard } from '@/utils/clipboard'
 
 const input = ref('192.168.1.10/24')
 const showRange = ref(false)
@@ -55,7 +56,7 @@ const fields = computed(() => {
 
 async function copy(value: string) {
   try {
-    await navigator.clipboard.writeText(value)
+    await copyToClipboard(value)
     message.success('已复制')
   } catch {
     message.error('复制失败')

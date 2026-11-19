@@ -3,6 +3,7 @@ import { computed, ref, watch } from 'vue'
 import { message } from 'ant-design-vue'
 import { CopyOutlined } from '@ant-design/icons-vue'
 import { convertAllUnits, convertUnit, UNIT_GROUPS, type UnitGroup } from '@/tools/calc'
+import { copyToClipboard } from '@/utils/clipboard'
 
 const group = ref<UnitGroup>('length')
 const value = ref<number | null>(1)
@@ -52,7 +53,7 @@ const allText = computed(() =>
 async function copy(text: string) {
   if (!text) return
   try {
-    await navigator.clipboard.writeText(text)
+    await copyToClipboard(text)
     message.success('已复制')
   } catch {
     message.error('复制失败')

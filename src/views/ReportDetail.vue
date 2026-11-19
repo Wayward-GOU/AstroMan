@@ -21,9 +21,12 @@ import { reportReviewPrompt } from '@/utils/aiScenarios'
 import { formatDateTime } from '@/utils/datetime'
 import * as api from '@/api'
 import type { ReportDetail, ReportRequestRecord, ReportRequestsPage } from '@/types/models'
+import type { ClusterReportMeta } from '@/types/cluster'
 import { buildReportHtml, buildReportSheets } from '@/utils/reportExport'
 import { detectKnee, qpsOverview, scoreReport, selfCheck } from '@/utils/reportAnalytics'
+import { buildFindings, gradeReport, latencyDrift, type Finding } from '@/utils/reportNarrative'
 import { buildXlsx } from '@/utils/xlsx'
+import { copyToClipboard } from '@/utils/clipboard'
 
 const route = useRoute()
 const router = useRouter()
@@ -96,7 +99,7 @@ function openRecord(item: ReportRequestRecord) {
 async function copyText(text: string, label: string) {
   if (!text) return
   try {
-    await navigator.clipboard.writeText(text)
+    await copyToClipboard(text)
     message.success(`已复制${label}`)
   } catch {
     message.error('复制失败')
@@ -179,10 +182,58 @@ const errors = computed(() => detail.value?.errors ?? [])
 const statusCodes = computed(() => detail.value?.statusCodes ?? [])
 const errorTypes = computed(() => detail.value?.errorTypes ?? [])
 const histogram = computed(() => detail.value?.histogram ?? [])
+const bodyHistogram = computed(() => detail.value?.bodyHistogram ?? [])
+const slowRequests = computed(() => detail.value?.slowRequests ?? [])
+/** 导出体积预估（1.4.3）：明细按 1KB 请求体 + 2KB 响应体上限估算 */
+const exportEstimate = computed(() => {
+  const data = detail.value
+  if (!data) return '-'
+  const mode = data.config?.recordDetail
+  const records = mode === 'off' ? 0 : Math.min(data.report.totalRequests, 50_000)
+  const bytes =
+    records * 3_200 +
+    (data.samples?.length ?? 0) * 160 +
+    (data.slowRequests?.length ?? 0) * 800 +
+    64 * 1024
+  if (bytes >= 1024 * 1024) return `≈ ${(bytes / 1024 / 1024).toFixed(1)} MB`
+  return `≈ ${Math.max(1, Math.round(bytes / 1024))} KB`
+})
 const stages = computed(() => detail.value?.stages ?? [])
 const config = computed(() => detail.value?.config ?? null)
 const metrics = computed(() => config.value?.metrics ?? null)
 const bytesSent = computed(() => metrics.value?.bytesSent ?? 0)
+
+/* ---------- 分布式压测元数据（v1.1.1 一期） ---------- */
+const cluster = computed<ClusterReportMeta | null>(() => config.value?.cluster ?? null)
+const clusterNodes = computed(() => cluster.value?.nodes ?? [])
+
+const CLUSTER_NODE_STATUS: Record<string, string> = {
+  pairing: '配对中',
+  pairReady: '已配对',
+  preparing: '下发中',
+  preflight: '预检中',
+  ready: '就绪',
+  running: '施压中',
+  done: '已完成',
+  lost: '失联',
+  left: '已退出',
+  rejected: '被拒绝',
+}
+
+function clusterStatusText(status: string) {
+  return CLUSTER_NODE_STATUS[status] ?? status
+}
+
+function clusterStatusTone(status: string) {
+  if (status === 'done') return 'ok'
+  if (status === 'lost' || status === 'rejected') return 'bad'
+  if (status === 'left') return 'warn'
+  return ''
+}
+
+function clusterRoleText(role: string) {
+  return role === 'master' ? '主节点' : '从节点'
+}
 
 /** QPS 指标组：平均 / 峰值 / 90% 分布 / 单并发 / 目标达成率，页面与导出同一口径 */
 const qps = computed(() =>
@@ -191,9 +242,164 @@ const qps = computed(() =>
     : null,
 )
 const knee = computed(() => (detail.value ? detectKnee(detail.value) : null))
+
+/** 阶段汇总：叠加稳态 QPS 与扩展效率（口径与 HTML 导出一致） */
+const stageRows = computed(() => {
+  const steadyStages = knee.value?.stages ?? []
+  return stages.value.map((stage, index) => {
+    const steady = steadyStages[index]
+    const prev = stages.value[index - 1]
+    const concurGain =
+      prev && prev.concurrent > 0 ? (stage.concurrent - prev.concurrent) / prev.concurrent : null
+    return {
+      ...stage,
+      steadyQps: steady?.qps ?? null,
+      gain: steady?.gain ?? null,
+      efficiency:
+        steady && concurGain != null && concurGain > 0 ? steady.gain / concurGain : null,
+    }
+  })
+})
 const score = computed(() => (detail.value ? scoreReport(detail.value) : null))
 const checks = computed(() => (detail.value ? selfCheck(detail.value) : []))
 const checksPassed = computed(() => checks.value.every((item) => item.pass))
+
+/* ---------- 关键发现与结论（3.4.1） ---------- */
+const findings = computed<Finding[]>(() => (detail.value ? buildFindings(detail.value) : []))
+const gradeInfo = computed(() => (detail.value ? gradeReport(detail.value) : null))
+
+const FINDING_TAG: Record<Finding['level'], string> = {
+  bad: 'P0',
+  warn: 'P1',
+  info: '提示',
+  ok: '正常',
+}
+
+/** 前后半程 RT 漂移：>15% warn、>40% bad（与导出报告同一口径） */
+const drift = computed(() => (detail.value ? latencyDrift(detail.value) : 0))
+const driftTone = computed(() => (drift.value > 0.4 ? 'bad' : drift.value > 0.15 ? 'warn' : 'ok'))
+
+/** 采样/计数/流量不自洽的项前置到顶部（3.4.3） */
+const biasChecks = computed(() => checks.value.filter((item) => !item.pass))
+
+/* ---------- 施压端能力快照（3.7.1） ---------- */
+const capacity = computed(() => config.value?.machineCapacity ?? null)
+const capacityUsage = computed(() => {
+  const snapshot = capacity.value
+  const avg = report.value?.avgQps ?? 0
+  if (!snapshot?.maxQps || avg <= 0) return null
+  return (avg / snapshot.maxQps) * 100
+})
+
+/* ---------- 目标地址兜底（3.5.2） ---------- */
+const targetUrlInfo = computed(() => {
+  const cfg = config.value
+  const raw = cfg?.url?.trim() ?? ''
+  const resolved = cfg?.target?.resolvedUrl?.trim() ?? ''
+  const isUnresolved = (text: string) => !text || text.includes('{{')
+  if (raw && !isUnresolved(raw)) {
+    return { url: raw, source: 'config' as const, note: '' }
+  }
+  if (resolved && !isUnresolved(resolved)) {
+    return { url: resolved, source: 'resolved' as const, note: '' }
+  }
+  const first = requestItems.value.find((item) => item.url && !isUnresolved(item.url))
+  if (first) {
+    return {
+      url: first.url,
+      source: 'record' as const,
+      note: '旧报告未保存解析后地址，这里取首条请求明细的 URL',
+    }
+  }
+  return {
+    url: '',
+    source: 'none' as const,
+    note: '未记录解析后地址，请重新压测',
+  }
+})
+
+/* ---------- 基线对比（3.4.4） ---------- */
+const baseline = ref<ReportDetail | null>(null)
+const baselineLoading = ref(false)
+
+async function loadBaseline() {
+  const id = config.value?.baselineReportId
+  if (!id || id === reportId.value) {
+    baseline.value = null
+    return
+  }
+  baselineLoading.value = true
+  try {
+    baseline.value = await api.reportGet(id)
+  } catch {
+    baseline.value = null
+  } finally {
+    baselineLoading.value = false
+  }
+}
+
+watch(
+  () => config.value?.baselineReportId,
+  () => {
+    void loadBaseline()
+  },
+)
+
+interface BaselineRow {
+  label: string
+  current: string
+  base: string
+  delta: string
+  tone: 'ok' | 'warn' | 'bad' | 'muted'
+}
+
+const baselineRows = computed<BaselineRow[]>(() => {
+  const current = report.value
+  const base = baseline.value?.report
+  if (!current || !base) return []
+  const ratio = (value: number, origin: number) =>
+    origin > 0 ? ((value - origin) / origin) * 100 : null
+  const deltaText = (value: number | null) =>
+    value === null ? '—' : `${value >= 0 ? '+' : ''}${value.toFixed(1)}%`
+  const latencyRow = (label: string, value: number, origin: number) => {
+    const pct = ratio(value, origin)
+    return {
+      label,
+      current: `${fmtNum(value)} ms`,
+      base: `${fmtNum(origin)} ms`,
+      delta: deltaText(pct),
+      tone: pct === null ? 'muted' : pct > 40 ? 'bad' : pct > 15 ? 'warn' : 'ok',
+    } as BaselineRow
+  }
+  const qpsPct = ratio(current.avgQps, base.avgQps)
+  const errPct = ratio(current.errorRate, base.errorRate)
+  return [
+    latencyRow('P95 延迟', current.p95Rt, base.p95Rt),
+    latencyRow('P99 延迟', current.p99Rt, base.p99Rt),
+    latencyRow('平均延迟', current.avgRt, base.avgRt),
+    {
+      label: '平均 QPS',
+      current: fmtNum(current.avgQps),
+      base: fmtNum(base.avgQps),
+      delta: deltaText(qpsPct),
+      tone: qpsPct === null ? 'muted' : qpsPct < -20 ? 'bad' : qpsPct < -5 ? 'warn' : 'ok',
+    },
+    {
+      label: '错误率',
+      current: `${current.errorRate.toFixed(2)}%`,
+      base: `${base.errorRate.toFixed(2)}%`,
+      delta: deltaText(errPct),
+      tone:
+        errPct === null
+          ? 'muted'
+          : current.errorRate - base.errorRate > 0.5
+            ? 'bad'
+            : current.errorRate - base.errorRate > 0.1
+              ? 'warn'
+              : 'ok',
+    },
+  ]
+})
 
 const recordModeText = computed(() => {
   const mode = metrics.value?.recordMode ?? config.value?.recordDetail
@@ -273,8 +479,12 @@ function clearDetails() {
     okType: 'danger',
     cancelText: '取消',
     async onOk() {
-      const removed = await api.reportClearDetails(report.value!.id)
-      message.success(`已清理 ${removed.toLocaleString()} 条明细`)
+      const result = await api.reportClearDetails(report.value!.id)
+      const freed = result.freedBytes > 0 ? `，释放 ${fmtBytes(result.freedBytes)}` : ''
+      message.success(`已清理 ${result.removed.toLocaleString()} 条明细${freed}`)
+      if (result.compactError) {
+        message.warning(`数据库压缩未完成：${result.compactError}`)
+      }
       await loadRequests()
     },
   })
@@ -308,6 +518,18 @@ const errorSeries = computed(() => [
 const durationSec = computed(() => {
   if (!report.value?.startTime || !report.value?.endTime) return 0
   return Math.max(0, Math.round((report.value.endTime - report.value.startTime) / 1000))
+})
+
+/** 420 秒这类原始秒数对人不友好，概览按小时/分/秒展示 */
+const durationLabel = computed(() => {
+  const total = durationSec.value
+  if (total <= 0) return '—'
+  const hours = Math.floor(total / 3600)
+  const minutes = Math.floor((total % 3600) / 60)
+  const seconds = total % 60
+  if (hours > 0) return `${hours} 小时 ${String(minutes).padStart(2, '0')} 分`
+  if (minutes > 0) return `${minutes} 分 ${String(seconds).padStart(2, '0')} 秒`
+  return `${seconds} 秒`
 })
 
 const successRate = computed(() => 100 - (report.value?.errorRate ?? 0))
@@ -363,7 +585,7 @@ const verdict = computed(() => {
   }
   return {
     title: '压测通过',
-    desc: `APDEX ${r.apdex.toFixed(3)}，错误率 ${r.errorRate.toFixed(2)}%`,
+    desc: `APDEX ${r.apdex.toFixed(3)} · 错误率 ${r.errorRate.toFixed(2)}%`,
     tone: 'ok',
   }
 })
@@ -411,6 +633,49 @@ const slaChecks = computed(() => {
 const slaPassed = computed(() => slaChecks.value.length === 0 || slaChecks.value.every((r) => r.pass))
 
 const maxHistogram = computed(() => Math.max(1, ...histogram.value.map((b) => b.count)))
+const maxBodyHistogram = computed(() => Math.max(1, ...bodyHistogram.value.map((b) => b.count)))
+const slowMaxLatency = computed(() =>
+  Math.max(1, ...slowRequests.value.map((item) => item.latencyMs)),
+)
+
+/** 旧报告没有 body_avg / body_p95 / body_histogram，不能按 0 展示 */
+const bodyMetricsAvailable = computed(
+  () =>
+    bodyHistogram.value.length > 0 ||
+    samples.value.some((sample) => sample.bodyAvg != null || sample.bodyP95 != null),
+)
+
+/** 按请求数加权的 Body 平均（逐秒采样点加权，旧报告无该字段时返回 null） */
+const avgBody = computed<number | null>(() => {
+  if (!bodyMetricsAvailable.value) return null
+  let sum = 0
+  let weight = 0
+  for (const sample of samples.value) {
+    const count = sample.successCount + sample.errorCount
+    sum += (sample.bodyAvg || 0) * count
+    weight += count
+  }
+  return weight ? sum / weight : null
+})
+
+/** Body P95 从报告层直方图算；分位数不能由两个分位数相减 */
+const p95Body = computed<number | null>(() => {
+  if (!bodyMetricsAvailable.value) return null
+  const buckets = bodyHistogram.value
+  const total = buckets.reduce((acc, item) => acc + item.count, 0)
+  if (!total) {
+    return Math.max(0, ...samples.value.map((sample) => sample.bodyP95 || 0))
+  }
+  const target = total * 0.95
+  let acc = 0
+  for (const bucket of buckets) {
+    acc += bucket.count
+    if (acc >= target) {
+      return Number.isFinite(bucket.maxMs) ? (bucket.minMs + bucket.maxMs) / 2 : bucket.minMs
+    }
+  }
+  return 0
+})
 
 const maxCodeCount = computed(() => Math.max(1, ...statusCodes.value.map((s) => s.count)))
 const codeTotal = computed(() => statusCodes.value.reduce((sum, s) => sum + s.count, 0))
@@ -420,7 +685,9 @@ const modeLabel = computed(() => (config.value?.mode === 'stages' ? '阶梯加�
 
 function fmtNum(v: number | undefined | null, digits = 1) {
   if (v === undefined || v === null || Number.isNaN(v)) return '-'
-  return v >= 1000 ? v.toFixed(0) : v.toFixed(digits)
+  // 千位分隔，避免 3870 / 3988 这类吞吐数字难以扫读
+  if (Math.abs(v) >= 1000) return v.toLocaleString('zh-CN', { maximumFractionDigits: 0 })
+  return v.toFixed(digits)
 }
 
 function fmtBytes(v: number | undefined | null) {
@@ -437,6 +704,16 @@ function fmtBytes(v: number | undefined | null) {
 
 function fmtTime(ts?: number | null) {
   return formatDateTime(ts)
+}
+
+/** 压测内相对时间：12.3s / 1m02s / 1h02m */
+function fmtDuration(ms?: number | null) {
+  if (!ms || ms < 0) return '0s'
+  const sec = ms / 1000
+  if (sec < 60) return `${sec.toFixed(1)}s`
+  const min = Math.floor(sec / 60)
+  if (min < 60) return `${min}m${String(Math.floor(sec % 60)).padStart(2, '0')}s`
+  return `${Math.floor(min / 60)}h${String(min % 60).padStart(2, '0')}m`
 }
 
 function codeTone(code: number) {
@@ -515,8 +792,9 @@ function remove() {
     okType: 'danger',
     cancelText: '取消',
     async onOk() {
-      await api.reportDelete(report.value!.id)
-      message.success('已删除')
+      const result = await api.reportDelete(report.value!.id)
+      const freed = result.freedBytes > 0 ? `，释放 ${fmtBytes(result.freedBytes)}` : ''
+      message.success(`已删除${freed}`)
       router.push('/stress')
     },
   })
@@ -546,6 +824,8 @@ function remove() {
         </a-button>
         <template #overlay>
           <a-menu @click="onExportMenu">
+            <a-menu-item key="estimate" disabled>预估导出体积 {{ exportEstimate }}</a-menu-item>
+            <a-menu-divider />
             <a-menu-item key="json">JSON 归档（完整数据）</a-menu-item>
             <a-menu-item key="html">HTML 报告（可视化）</a-menu-item>
             <a-menu-item key="excel">Excel 表格（多工作表）</a-menu-item>
@@ -578,17 +858,35 @@ function remove() {
             <div class="meta-row">
               <span>开始于 {{ fmtTime(report.startTime) }}</span>
               <span class="dot-sep">·</span>
-              <span>耗时 {{ durationSec }} 秒</span>
+              <span>耗时 {{ durationLabel }}</span>
               <span class="dot-sep">·</span>
-              <span>峰值并发 {{ report.concurrency }}</span>
+              <span>峰值并发 {{ fmtNum(report.concurrency, 0) }}</span>
               <span v-if="qps?.target" class="dot-sep">·</span>
               <span v-if="qps?.target">目标 {{ fmtNum(qps.target, 0) }} QPS</span>
               <span v-if="qps?.attainment != null" class="dot-sep">·</span>
               <span v-if="qps?.attainment != null">达成 {{ fmtNum(qps.attainment, 0) }}%</span>
             </div>
-            <div v-if="config?.url" class="target-line">
-              <span class="method-chip">{{ config.method || 'GET' }}</span>
-              <span class="target-url mono" :title="config.url">{{ config.url }}</span>
+            <div v-if="targetUrlInfo.url || targetUrlInfo.note" class="target-line">
+              <span class="method-chip">{{ config?.method || 'GET' }}</span>
+              <span
+                v-if="targetUrlInfo.url"
+                class="target-url mono"
+                :title="`${targetUrlInfo.url}（点击复制）`"
+                @click="copyText(targetUrlInfo.url, '地址')"
+                >{{ targetUrlInfo.url }}</span
+              >
+              <span
+                v-if="targetUrlInfo.url"
+                class="target-copy"
+                title="复制地址"
+                @click="copyText(targetUrlInfo.url, '地址')"
+              >
+                <CopyOutlined />
+              </span>
+              <span v-else class="target-url missing">{{ targetUrlInfo.note }}</span>
+              <span v-if="targetUrlInfo.url && targetUrlInfo.note" class="target-note">
+                {{ targetUrlInfo.note }}
+              </span>
             </div>
           </div>
           <div class="verdict" :class="verdict.tone">
@@ -599,6 +897,48 @@ function remove() {
               <div class="verdict-title">{{ verdict.title }}</div>
               <div class="verdict-desc">{{ verdict.desc }}</div>
             </div>
+          </div>
+        </div>
+
+        <div class="fm-card findings-card">
+          <div class="card-head">
+            <div>
+              <div class="card-title">关键发现</div>
+              <div class="card-sub">按风险从高到低排列，P0/P1 标签与导出报告一致</div>
+            </div>
+            <span v-if="gradeInfo" class="grade-badge" :class="gradeInfo.grade">
+              {{ gradeInfo.label }}
+            </span>
+          </div>
+          <div v-if="gradeInfo" class="grade-statement">
+            {{ gradeInfo.statement }}
+            <span class="grade-reason">{{ gradeInfo.reason }}</span>
+          </div>
+
+          <div v-if="biasChecks.length" class="bias-banner">
+            <b>数据自洽性提示</b>
+            <span>
+              {{ biasChecks.map((item) => `${item.label}：${item.detail}`).join('；') }}
+            </span>
+          </div>
+
+          <div class="finding-list">
+            <div v-for="(item, index) in findings" :key="index" class="finding-row" :class="item.level">
+              <span class="finding-tag">{{ FINDING_TAG[item.level] }}</span>
+              <div class="finding-body">
+                <div class="finding-title">{{ item.title }}</div>
+                <div class="finding-detail">{{ item.detail }}</div>
+              </div>
+            </div>
+            <div v-if="!findings.length" class="inline-empty">样本不足，暂未生成关键发现</div>
+          </div>
+
+          <div class="drift-row">
+            <span class="drift-label">响应时间漂移（后半程 vs 前半程）</span>
+            <span class="drift-value mono" :class="driftTone">
+              {{ drift > 0 ? '+' : '' }}{{ (drift * 100).toFixed(1) }}%
+            </span>
+            <span class="drift-rule">&gt;15% 告警，&gt;40% 严重</span>
           </div>
         </div>
 
@@ -642,9 +982,97 @@ function remove() {
           <div class="metric-card fm-card">
             <span class="m-label">APDEX</span>
             <span class="m-value mono" :class="apdexGrade.tone">{{ report.apdex.toFixed(3) }}
-              <i>{{ apdexGrade.label }}</i>
+              <i class="m-tag" :class="apdexGrade.tone">{{ apdexGrade.label }}</i>
             </span>
           </div>
+        </div>
+
+        <div class="fm-card capacity-card">
+          <div class="card-head">
+            <div>
+              <div class="card-title">施压端能力</div>
+              <div class="card-sub">客户端极限来自本机回环检测，只用于判断施压端余量</div>
+            </div>
+            <span v-if="capacity" class="capacity-badge">
+              客户端极限 {{ capacity.reachedLimit === false ? '≥ ' : '' }}{{ fmtNum(capacity.maxQps, 0) }} QPS
+            </span>
+            <span v-else class="capacity-badge muted">未检测本机施压能力</span>
+          </div>
+          <div v-if="capacity" class="capacity-grid">
+            <div class="capacity-cell">
+              <span>本次平均</span>
+              <b>{{ fmtNum(report.avgQps, 0) }} QPS</b>
+            </div>
+            <div class="capacity-cell">
+              <span>客户端负载占比</span>
+              <b :class="capacityUsage !== null && capacityUsage >= 80 ? 'bad' : 'ok'">
+                {{ capacityUsage === null ? '—' : `${capacityUsage.toFixed(1)}%` }}
+              </b>
+            </div>
+            <div class="capacity-cell">
+              <span>检测时间</span>
+              <b>{{ fmtTime(capacity.probedAt) }}</b>
+            </div>
+            <div class="capacity-cell">
+              <span>CPU 核数</span>
+              <b>{{ capacity.cores ?? '—' }} 核</b>
+            </div>
+            <div class="capacity-cell">
+              <span>检测峰值 CPU</span>
+              <b>{{ capacity.cpuPeak ? `${capacity.cpuPeak.toFixed(1)} 核` : '—' }}</b>
+            </div>
+            <div class="capacity-cell">
+              <span>饱和并发</span>
+              <b>{{ capacity.saturationConcurrent ?? '—' }}</b>
+            </div>
+          </div>
+          <div v-if="capacity" class="capacity-note">
+            回环检测值，非目标系统容量，实际受网络 RTT 与目标侧影响。
+            <template v-if="capacityUsage !== null && capacityUsage < 50">
+              客户端余量充足，瓶颈不在施压端。
+            </template>
+            <template v-else-if="capacityUsage !== null && capacityUsage >= 80">
+              客户端接近能力上限，结论需谨慎。
+            </template>
+          </div>
+          <div v-else class="capacity-note">
+            在「设置 → 本机施压能力」完成检测后，新生成的报告会自动带上该快照；导出报告不会推断数值。
+          </div>
+        </div>
+
+        <div v-if="config?.baselineReportId" class="fm-card baseline-card">
+          <div class="card-head">
+            <div>
+              <div class="card-title">基线对比</div>
+              <div class="card-sub">对照历史报告 #{{ config.baselineReportId }}，延迟上升或吞吐下降需关注</div>
+            </div>
+            <a-spin v-if="baselineLoading" size="small" />
+            <span v-else-if="!baseline" class="capacity-badge muted">基线报告不存在或已删除</span>
+          </div>
+          <template v-if="baseline">
+            <div class="baseline-head">
+              <span>{{ baseline.report.planName }}</span>
+              <span>{{ fmtTime(baseline.report.startTime) }}</span>
+              <span>并发 {{ fmtNum(baseline.report.concurrency, 0) }}</span>
+              <a-button type="link" size="small" @click="router.push(`/reports/${baseline!.report.id}`)">
+                查看基线
+              </a-button>
+            </div>
+            <div class="baseline-table">
+              <div class="baseline-row baseline-head-row">
+                <span>指标</span>
+                <span>本次</span>
+                <span>基线</span>
+                <span>变化</span>
+              </div>
+              <div v-for="row in baselineRows" :key="row.label" class="baseline-row">
+                <span class="baseline-label">{{ row.label }}</span>
+                <span class="mono">{{ row.current }}</span>
+                <span class="mono muted">{{ row.base }}</span>
+                <span class="mono" :class="row.tone">{{ row.delta }}</span>
+              </div>
+            </div>
+          </template>
         </div>
 
         <div class="fm-card text-card">
@@ -787,6 +1215,14 @@ function remove() {
                 <span class="p-value mono">{{ fmtNum(report.ttfbP95) }} ms</span>
               </div>
               <div class="extra-item">
+                <span class="p-label">Body 平均</span>
+                <span class="p-value mono">{{ avgBody == null ? '—' : `${fmtNum(avgBody)} ms` }}</span>
+              </div>
+              <div class="extra-item">
+                <span class="p-label">Body P95</span>
+                <span class="p-value mono">{{ p95Body == null ? '—' : `${fmtNum(p95Body)} ms` }}</span>
+              </div>
+              <div class="extra-item">
                 <span class="p-label">总传输字节</span>
                 <span class="p-value mono">{{ fmtBytes(report.bytesTotal) }}</span>
               </div>
@@ -829,7 +1265,7 @@ function remove() {
                     :style="{ width: `${Math.max(2, (item.count / maxErrorTypeCount) * 100)}%` }"
                   />
                 </div>
-                <span class="code-count mono">{{ item.count }}</span>
+                <span class="code-count mono">{{ item.count.toLocaleString() }}</span>
                 <span class="code-ratio mono">
                   {{ report.errorCount > 0 ? ((item.count / report.errorCount) * 100).toFixed(1) : '0.0' }}%
                 </span>
@@ -879,13 +1315,32 @@ function remove() {
             </div>
             <div v-else class="inline-empty">没有直方图数据</div>
           </div>
+          <div class="fm-card chart-card">
+            <div class="chart-head">
+              <span class="chart-title">响应体读取耗时</span>
+              <span class="chart-sub">body = 总耗时 − TTFB，单位 ms</span>
+            </div>
+            <div v-if="bodyHistogram.length" class="histogram">
+              <div v-for="bucket in bodyHistogram" :key="bucket.label" class="hist-row">
+                <span class="hist-label">{{ bucket.label }}</span>
+                <div class="hist-track">
+                  <div
+                    class="hist-bar body"
+                    :style="{ width: `${(bucket.count / maxBodyHistogram) * 100}%` }"
+                  />
+                </div>
+                <span class="hist-count mono">{{ bucket.count.toLocaleString() }}</span>
+              </div>
+            </div>
+            <div v-else class="inline-empty">历史报告未记录响应体耗时直方图</div>
+          </div>
         </div>
 
         <div v-if="stages.length" class="fm-card table-card">
           <div class="card-head">
             <div>
               <div class="card-title">阶段汇总</div>
-              <div class="card-sub">阶梯加压各阶段的执行情况</div>
+              <div class="card-sub">阶梯加压各阶段的执行情况；扩展效率 = 吞吐增幅 ÷ 并发增幅</div>
             </div>
           </div>
           <div class="data-table">
@@ -898,20 +1353,31 @@ function remove() {
                   <th>请求数</th>
                   <th>错误数</th>
                   <th>平均 QPS</th>
+                  <th>稳态 QPS</th>
                   <th>平均延迟</th>
                   <th>P95</th>
+                  <th>吞吐增幅</th>
+                  <th>扩展效率</th>
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="(stage, i) in stages" :key="stage.index">
+                <tr v-for="(stage, i) in stageRows" :key="stage.index">
                   <td class="mono">{{ i + 1 }}</td>
-                  <td class="mono">{{ stage.concurrent }}</td>
+                  <td class="mono">{{ fmtNum(stage.concurrent, 0) }}</td>
                   <td class="mono">{{ stage.durationSec }}s</td>
                   <td class="mono">{{ stage.requests.toLocaleString() }}</td>
                   <td class="mono" :class="{ bad: stage.errors > 0 }">{{ stage.errors }}</td>
                   <td class="mono">{{ fmtNum(stage.avgQps) }}</td>
+                  <td class="mono">{{ stage.steadyQps == null ? '—' : fmtNum(stage.steadyQps) }}</td>
                   <td class="mono">{{ fmtNum(stage.avgRt) }} ms</td>
                   <td class="mono">{{ fmtNum(stage.p95Rt) }} ms</td>
+                  <td class="mono">{{ stage.gain == null ? '—' : `${(stage.gain * 100).toFixed(1)}%` }}</td>
+                  <td
+                    class="mono"
+                    :class="{ bad: stage.efficiency != null && stage.efficiency < 0.7 }"
+                  >
+                    {{ stage.efficiency == null ? '—' : `${(stage.efficiency * 100).toFixed(0)}%` }}
+                  </td>
                 </tr>
               </tbody>
             </table>
@@ -981,7 +1447,14 @@ function remove() {
             </div>
             <div class="config-item wide">
               <span class="c-label">请求 URL</span>
-              <span class="c-value mono">{{ config.url }}</span>
+              <span
+                v-if="targetUrlInfo.url"
+                class="c-value mono c-value-url"
+                :title="`${targetUrlInfo.url}（点击复制）`"
+                @click="copyText(targetUrlInfo.url, '地址')"
+                >{{ targetUrlInfo.url }}</span
+              >
+              <span v-else class="c-value mono c-value-url missing">{{ targetUrlInfo.note }}</span>
             </div>
             <div class="config-item">
               <span class="c-label">请求头</span>
@@ -1017,6 +1490,143 @@ function remove() {
             </div>
           </div>
           <div v-else class="inline-empty">历史报告未保存配置快照</div>
+        </div>
+
+        <div v-if="cluster" class="fm-card table-card cluster-card">
+          <div class="card-head">
+            <div>
+              <div class="card-title">分布式压测</div>
+              <div class="card-sub">主从节点合并口径，页面数值为主节点汇聚结果</div>
+            </div>
+            <span v-if="cluster.incomplete" class="head-note cluster-note-bad">结果不完整</span>
+          </div>
+
+          <a-alert
+            v-if="cluster.incomplete"
+            type="warning"
+            show-icon
+            class="cluster-alert"
+            message="本次合并结果不完整"
+            :description="cluster.note || '有节点失联或提前退出，吞吐与延迟可能偏低。'"
+          />
+
+          <div class="config-grid">
+            <div class="config-item">
+              <span class="c-label">协议版本</span>
+              <span class="c-value mono">v{{ cluster.protocolVersion }}</span>
+            </div>
+            <div class="config-item">
+              <span class="c-label">主节点</span>
+              <span class="c-value mono">{{ cluster.masterNode || '—' }}</span>
+            </div>
+            <div class="config-item">
+              <span class="c-label">总并发</span>
+              <span class="c-value mono">{{ fmtNum(cluster.totalConcurrent, 0) }}</span>
+            </div>
+            <div class="config-item">
+              <span class="c-label">起跑时间</span>
+              <span class="c-value mono">{{ cluster.startedAt ? fmtTime(cluster.startedAt) : '—' }}</span>
+            </div>
+            <div class="config-item">
+              <span class="c-label">结束时间</span>
+              <span class="c-value mono">{{ cluster.finishedAt ? fmtTime(cluster.finishedAt) : '—' }}</span>
+            </div>
+            <div class="config-item">
+              <span class="c-label">丢弃采样</span>
+              <span class="c-value mono">{{ fmtNum(cluster.droppedSamples, 0) }} 条</span>
+            </div>
+          </div>
+
+          <div class="data-table cluster-nodes">
+            <table>
+              <thead>
+                <tr>
+                  <th>节点</th>
+                  <th class="col-narrow">角色</th>
+                  <th>地址</th>
+                  <th class="col-narrow">权重</th>
+                  <th class="col-narrow">分配并发</th>
+                  <th class="col-narrow">状态</th>
+                  <th>平均 QPS</th>
+                  <th>CPU 峰值</th>
+                  <th>内存峰值</th>
+                  <th>时钟偏移</th>
+                  <th class="col-narrow">丢弃采样</th>
+                  <th>施压窗口</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="(node, index) in clusterNodes" :key="`${node.name}-${index}`">
+                  <td>{{ node.name || '—' }}</td>
+                  <td class="mono">{{ clusterRoleText(node.role) }}</td>
+                  <td class="mono cluster-addr">{{ node.addr || '—' }}</td>
+                  <td class="mono">{{ fmtNum(node.weight, 2) }}</td>
+                  <td class="mono">{{ fmtNum(node.concurrent, 0) }}</td>
+                  <td class="mono" :class="clusterStatusTone(node.status)">
+                    {{ clusterStatusText(node.status) }}
+                  </td>
+                  <td class="mono">{{ fmtNum(node.qpsAvg) }}</td>
+                  <td class="mono">{{ node.cpuPeak ? `${node.cpuPeak.toFixed(2)} 核` : '未采集' }}</td>
+                  <td class="mono">{{ node.memPeakMb ? fmtBytes(node.memPeakMb * 1024 * 1024) : '未采集' }}</td>
+                  <td class="mono">
+                    {{ node.clockOffsetMs != null ? `${node.clockOffsetMs} ± ${node.clockUncertaintyMs} ms` : '—' }}
+                  </td>
+                  <td class="mono" :class="{ bad: node.droppedSamples > 0 }">{{ node.droppedSamples }}</td>
+                  <td class="mono cluster-window">
+                    {{ node.startMs ? fmtTime(node.startMs) : '—' }}
+                    <template v-if="node.endMs && node.startMs">
+                      · {{ fmtDuration(node.endMs - node.startMs) }}
+                    </template>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+            <div v-if="!clusterNodes.length" class="inline-empty">未记录节点明细</div>
+          </div>
+        </div>
+
+        <div v-if="slowRequests.length" class="section-head">
+          <div>
+            <h2 class="section-title">TopN 慢请求</h2>
+            <div class="section-desc">
+              定位模式保留的最慢 {{ slowRequests.length }} 条请求，按总耗时降序
+            </div>
+          </div>
+        </div>
+        <div v-if="slowRequests.length" class="fm-card request-card">
+          <div class="data-table request-table">
+            <table>
+              <thead>
+                <tr>
+                  <th class="req-index">#</th>
+                  <th class="req-time">发生时间</th>
+                  <th class="req-method-col">方法</th>
+                  <th class="req-url-col">URL</th>
+                  <th>状态</th>
+                  <th>总耗时</th>
+                  <th>TTFB</th>
+                  <th>Body</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="(item, index) in slowRequests" :key="`${item.elapsedMs}-${index}`">
+                  <td class="req-index mono">{{ index + 1 }}</td>
+                  <td class="req-time mono">{{ fmtDuration(item.elapsedMs) }}</td>
+                  <td class="req-method-col">
+                    <span class="req-method">{{ item.method }}</span>
+                  </td>
+                  <td class="req-url-col mono" :title="item.url">{{ item.url }}</td>
+                  <td class="mono" :class="{ bad: item.status >= 400 }">{{ item.status || '-' }}</td>
+                  <td class="mono slow-cell">
+                    <span class="slow-bar" :style="{ width: `${(item.latencyMs / slowMaxLatency) * 100}%` }" />
+                    <span>{{ fmtNum(item.latencyMs, 0) }} ms</span>
+                  </td>
+                  <td class="mono">{{ fmtNum(item.ttfbMs, 0) }} ms</td>
+                  <td class="mono">{{ fmtNum(item.bodyMs, 0) }} ms</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
         </div>
 
         <div class="section-head">
@@ -1319,7 +1929,8 @@ function remove() {
 .title-row {
   display: flex;
   align-items: center;
-  gap: 10px;
+  flex-wrap: wrap;
+  gap: 6px 10px;
 }
 
 .status-dot {
@@ -1364,9 +1975,11 @@ function remove() {
 .meta-row {
   display: flex;
   align-items: center;
-  gap: 8px;
+  flex-wrap: wrap;
+  gap: 4px 8px;
   margin-top: 8px;
   font-size: 11px;
+  line-height: 1.6;
   color: var(--fm-muted);
 }
 
@@ -1376,10 +1989,10 @@ function remove() {
 
 .target-line {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 8px;
   margin-top: 8px;
-  max-width: 560px;
+  max-width: 100%;
 }
 
 .method-chip {
@@ -1394,11 +2007,26 @@ function remove() {
 }
 
 .target-url {
-  font-size: 11px;
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  line-height: 1.5;
   color: var(--fm-text-2);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: normal;
+  word-break: break-all;
+  cursor: copy;
+}
+
+.target-copy {
+  flex-shrink: 0;
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--fm-muted);
+  cursor: pointer;
+}
+
+.target-copy:hover {
+  color: var(--fm-primary);
 }
 
 .verdict {
@@ -1464,14 +2092,37 @@ function remove() {
   font-weight: 700;
   font-variant-numeric: tabular-nums;
   line-height: 1.3;
+  white-space: nowrap;
 }
 
 .m-value i {
   font-style: normal;
-  font-size: 9px;
+  font-size: 10px;
   font-weight: 500;
   color: var(--fm-muted);
-  margin-left: 2px;
+  margin-left: 4px;
+}
+
+/* APDEX 评级标签：与数值拉开间距，避免 1.000优秀 糊在一起 */
+.m-tag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 7px;
+  font-size: 10px;
+  font-weight: 600;
+  vertical-align: 1px;
+  background: var(--fm-success-soft);
+  color: var(--fm-success);
+}
+
+.m-tag.warn {
+  background: var(--fm-warning-soft);
+  color: var(--fm-warning);
+}
+
+.m-tag.bad {
+  background: var(--fm-danger-soft);
+  color: var(--fm-danger);
 }
 
 .m-value.warn {
@@ -1801,6 +2452,28 @@ function remove() {
   border-radius: 999px;
   background: linear-gradient(90deg, var(--fm-primary), var(--fm-primary-dark));
   transition: width 0.3s ease;
+}
+
+.hist-bar.body {
+  background: linear-gradient(90deg, var(--fm-warning), var(--fm-danger));
+}
+
+/* TopN 慢请求：耗时条嵌在单元格里，直观看出最慢的那几条 */
+.slow-cell {
+  position: relative;
+  min-width: 110px;
+}
+
+.slow-bar {
+  position: absolute;
+  inset: 4px auto 4px 4px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--fm-danger) 18%, transparent);
+  pointer-events: none;
+}
+
+.slow-cell span:last-child {
+  position: relative;
 }
 
 .hist-count {
@@ -2208,11 +2881,48 @@ function remove() {
   white-space: nowrap;
 }
 
+/* 配置快照里的完整 URL：占满整行、可换行、点击复制（3.1.2） */
+.c-value-url {
+  grid-column: 1 / -1;
+  overflow: visible;
+  white-space: normal;
+  word-break: break-all;
+  font-weight: 500;
+  line-height: 1.55;
+  cursor: copy;
+  user-select: all;
+}
+
 .inline-empty {
   padding: 22px 0;
   text-align: center;
   font-size: 11px;
   color: var(--fm-muted);
+}
+
+/* ---------- 分布式压测 ---------- */
+.cluster-card {
+  margin-top: 16px;
+}
+
+.cluster-alert {
+  margin: 4px 0 12px;
+}
+
+.cluster-note-bad {
+  color: var(--fm-danger);
+}
+
+.cluster-nodes {
+  margin-top: 12px;
+}
+
+.cluster-addr {
+  word-break: break-all;
+}
+
+.cluster-window {
+  white-space: nowrap;
 }
 
 /* ---------- 错误明细 ---------- */
@@ -2330,6 +3040,13 @@ function remove() {
 }
 
 @media (max-width: 1180px) {
+  .overview {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .verdict {
+    max-width: none;
+  }
   .metrics {
     grid-template-columns: repeat(4, minmax(0, 1fr));
   }
@@ -2344,6 +3061,18 @@ function remove() {
   }
   .percentile-grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 760px) {
+  .metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .percentile-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .drift-rule {
+    margin-left: 0;
   }
 }
 
@@ -2451,6 +3180,272 @@ function remove() {
   line-height: 1.6;
   color: var(--fm-muted);
 }
+
+/* ---------- 关键发现 ---------- */
+.findings-card {
+  margin-top: 12px;
+}
+.grade-badge {
+  font-size: 11px;
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-weight: 600;
+}
+.grade-badge.pass {
+  color: var(--fm-success);
+  background: var(--fm-success-soft);
+}
+.grade-badge.conditional {
+  color: var(--fm-warning);
+  background: var(--fm-warning-soft);
+}
+.grade-badge.fail {
+  color: var(--fm-danger);
+  background: var(--fm-danger-soft);
+}
+.grade-statement {
+  font-size: 12.5px;
+  color: var(--fm-text);
+  line-height: 1.7;
+  margin-bottom: 10px;
+}
+.grade-reason {
+  color: var(--fm-muted);
+  font-size: 11.5px;
+  margin-left: 6px;
+}
+.bias-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  background: var(--fm-warning-soft);
+  border: 1px solid var(--fm-warning);
+  border-radius: var(--fm-radius-sm);
+}
+.bias-banner b {
+  flex-shrink: 0;
+  padding: 0 7px;
+  font-size: 10.5px;
+  line-height: 1.7;
+  white-space: nowrap;
+  color: var(--fm-warning);
+  border: 1px solid var(--fm-warning);
+  background: var(--fm-surface);
+}
+.bias-banner span {
+  color: var(--fm-text-2);
+}
+.finding-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.finding-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--fm-border);
+  border-left-width: 3px;
+  border-radius: var(--fm-radius-sm);
+  background: var(--fm-surface-alt);
+}
+.finding-row.bad {
+  border-left-color: var(--fm-danger);
+}
+.finding-row.warn {
+  border-left-color: var(--fm-warning);
+}
+.finding-row.info {
+  border-left-color: var(--fm-primary);
+}
+.finding-row.ok {
+  border-left-color: var(--fm-success);
+}
+.finding-tag {
+  flex-shrink: 0;
+  min-width: 34px;
+  text-align: center;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: var(--fm-surface);
+  color: var(--fm-text-2);
+  border: 1px solid var(--fm-border);
+}
+.finding-row.bad .finding-tag {
+  color: var(--fm-danger);
+  border-color: var(--fm-danger);
+}
+.finding-row.warn .finding-tag {
+  color: var(--fm-warning);
+  border-color: var(--fm-warning);
+}
+.finding-row.ok .finding-tag {
+  color: var(--fm-success);
+  border-color: var(--fm-success);
+}
+.finding-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--fm-text);
+}
+.finding-detail {
+  font-size: 11.5px;
+  line-height: 1.65;
+  color: var(--fm-muted);
+  margin-top: 2px;
+}
+.drift-row {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--fm-border);
+  font-size: 12px;
+}
+.drift-label {
+  color: var(--fm-text-2);
+  font-weight: 500;
+}
+.drift-value {
+  font-weight: 700;
+}
+.drift-value.ok {
+  color: var(--fm-success);
+}
+.drift-value.warn {
+  color: var(--fm-warning);
+}
+.drift-value.bad {
+  color: var(--fm-danger);
+}
+.drift-rule {
+  color: var(--fm-muted);
+  font-size: 11px;
+  margin-left: auto;
+}
+
+/* ---------- 施压端能力 ---------- */
+.capacity-card {
+  margin-top: 12px;
+}
+.capacity-badge {
+  font-size: 11px;
+  padding: 2px 10px;
+  border-radius: 999px;
+  color: var(--fm-primary);
+  background: var(--fm-primary-soft);
+  font-weight: 600;
+}
+.capacity-badge.muted {
+  color: var(--fm-muted);
+  background: var(--fm-surface-alt);
+  font-weight: 400;
+}
+.capacity-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 8px;
+}
+.capacity-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  border: 1px solid var(--fm-border);
+  background: var(--fm-surface-alt);
+}
+.capacity-cell span {
+  font-size: 10.5px;
+  color: var(--fm-muted);
+}
+.capacity-cell b {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fm-text);
+}
+.capacity-cell b.ok {
+  color: var(--fm-success);
+}
+.capacity-cell b.bad {
+  color: var(--fm-danger);
+}
+.capacity-note {
+  margin-top: 8px;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--fm-muted);
+}
+
+/* ---------- 基线对比 ---------- */
+.baseline-card {
+  margin-top: 12px;
+}
+.baseline-head {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  font-size: 11.5px;
+  color: var(--fm-muted);
+  margin-bottom: 8px;
+}
+.baseline-table {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--fm-border);
+}
+.baseline-row {
+  display: grid;
+  grid-template-columns: 1.2fr 1fr 1fr 1fr;
+  gap: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+  border-top: 1px solid var(--fm-border);
+}
+.baseline-row:first-child {
+  border-top: none;
+}
+.baseline-head-row {
+  font-size: 11px;
+  color: var(--fm-muted);
+  background: var(--fm-surface-alt);
+}
+.baseline-label {
+  color: var(--fm-text-2);
+}
+.baseline-row .muted {
+  color: var(--fm-muted);
+}
+.baseline-row .ok {
+  color: var(--fm-success);
+}
+.baseline-row .warn {
+  color: var(--fm-warning);
+}
+.baseline-row .bad {
+  color: var(--fm-danger);
+}
+.baseline-row .muted.tone {
+  color: var(--fm-muted);
+}
+.target-note {
+  font-size: 10.5px;
+  color: var(--fm-warning);
+  margin-left: 8px;
+}
+.target-url.missing,
+.c-value-url.missing {
+  color: var(--fm-warning);
+}
+
 @media (max-width: 1180px) {
   .text-grid {
     grid-template-columns: 1fr;

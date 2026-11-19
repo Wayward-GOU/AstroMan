@@ -1,5 +1,36 @@
 import { describe, expect, it } from 'vitest'
-import { extractCurlCommand } from '../curl'
+import { buildCurl, extractCurlCommand } from '../curl'
+import type { EnvVariable, HttpRequestDetail, RequestAuth } from '@/types/models'
+
+function auth(patch: Partial<RequestAuth> = {}): RequestAuth {
+  return {
+    kind: 'none',
+    token: '',
+    username: '',
+    password: '',
+    key: '',
+    value: '',
+    addTo: 'header',
+    ...patch,
+  }
+}
+
+function detail(patch: Partial<HttpRequestDetail> = {}): HttpRequestDetail {
+  return {
+    collectionId: 1,
+    name: '测试接口',
+    method: 'GET',
+    url: 'https://api.example.com/items',
+    headers: [],
+    params: [],
+    bodyType: 'none',
+    body: '',
+    preScript: '',
+    postScript: '',
+    assertions: '',
+    ...patch,
+  }
+}
 
 describe('extractCurlCommand', () => {
   it('从代码块里取出完整命令，保留换行与长 Body', () => {
@@ -32,5 +63,53 @@ describe('extractCurlCommand', () => {
       '上面这条即可',
     ].join('\n')
     expect(extractCurlCommand(text)).toBe("curl 'https://a.example.com/x' -X POST")
+  })
+})
+
+describe('buildCurl', () => {
+  it('把 Bearer Auth 写进 Authorization 头', () => {
+    const code = buildCurl(detail({ auth: auth({ kind: 'bearer', token: 'abc' }) }))
+    expect(code).toContain("-H 'Authorization: Bearer abc'")
+  })
+
+  it('Basic Auth 用 -u，避免占位符提前被 base64', () => {
+    const code = buildCurl(
+      detail({ auth: auth({ kind: 'basic', username: '{{user}}', password: '{{pass}}' }) }),
+    )
+    expect(code).toContain("-u '{{user}}:{{pass}}'")
+    expect(code).not.toContain('Authorization')
+  })
+
+  it('API Key 放到查询参数，且不编码 {{变量}}', () => {
+    const code = buildCurl(
+      detail({
+        url: 'https://api.example.com/x',
+        params: [{ key: 'page', value: '{{pageNo}}', enabled: true }],
+        auth: auth({ kind: 'apikey', addTo: 'query', key: 'apiKey', value: '{{apiKey}}' }),
+      }),
+    )
+    expect(code).toContain('https://api.example.com/x?page={{pageNo}}&apiKey={{apiKey}}')
+  })
+
+  it('手写 Authorization 优先于 Auth 配置', () => {
+    const code = buildCurl(
+      detail({
+        headers: [{ key: 'Authorization', value: 'Token manual', enabled: true }],
+        auth: auth({ kind: 'bearer', token: 'abc' }),
+      }),
+    )
+    expect(code).toContain('Authorization: Token manual')
+    expect(code).not.toContain('Bearer abc')
+  })
+
+  it('环境变量仍能在导出结果里替换', () => {
+    const variables: EnvVariable[] = [
+      { key: 'word', value: 'a b', isSecret: false, sortOrder: 1 },
+    ]
+    const code = buildCurl(
+      detail({ params: [{ key: 'q', value: '{{word}}', enabled: true }] }),
+      variables,
+    )
+    expect(code).toContain('q=a%20b')
   })
 })

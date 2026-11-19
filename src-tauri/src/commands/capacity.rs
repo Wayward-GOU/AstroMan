@@ -49,7 +49,9 @@ impl CapacityState {
     /// 开始检测；已在运行或压测任务非空时返回可读原因
     pub fn try_begin(&self, stress_busy: bool) -> Result<Arc<AtomicBool>, String> {
         if stress_busy {
-            return Err("有压测任务正在运行，检测会与压测互相干扰；请先停止全部压测任务".to_string());
+            return Err(
+                "有压测任务正在运行，检测会与压测互相干扰；请先停止全部压测任务".to_string(),
+            );
         }
         if self
             .running
@@ -169,9 +171,8 @@ struct Loopback {
 
 impl Loopback {
     fn start() -> Result<Self, String> {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|error| {
-            format!("无法启动本机检测服务（127.0.0.1 随机端口）：{error}")
-        })?;
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .map_err(|error| format!("无法启动本机检测服务（127.0.0.1 随机端口）：{error}"))?;
         listener
             .set_nonblocking(true)
             .map_err(|error| format!("设置检测服务非阻塞失败：{error}"))?;
@@ -226,7 +227,8 @@ fn serve_connection(mut stream: TcpStream, stop: Arc<AtomicBool>) {
             }
             Err(ref error) if error.kind() == ErrorKind::WouldBlock => continue,
             Err(ref error)
-                if error.kind() == ErrorKind::TimedOut || error.kind() == ErrorKind::Interrupted =>
+                if error.kind() == ErrorKind::TimedOut
+                    || error.kind() == ErrorKind::Interrupted =>
             {
                 continue
             }
@@ -503,7 +505,11 @@ pub async fn capacity_probe(
         let max_qps = samples.iter().map(|item| item.qps).fold(0.0, f64::max);
         let saturation = samples
             .iter()
-            .max_by(|a, b| a.qps.partial_cmp(&b.qps).unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|a, b| {
+                a.qps
+                    .partial_cmp(&b.qps)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
             .map(|item| item.concurrent)
             .unwrap_or(0);
         let max_stage = STAGES[STAGES.len() - 1];
@@ -511,7 +517,9 @@ pub async fn capacity_probe(
         let reached_limit = saturation < max_stage
             || samples
                 .last()
-                .map(|item| item.cpu / cores as f32 >= CPU_LIMIT_RATIO || item.error_rate >= ERROR_LIMIT)
+                .map(|item| {
+                    item.cpu / cores as f32 >= CPU_LIMIT_RATIO || item.error_rate >= ERROR_LIMIT
+                })
                 .unwrap_or(false);
         let result = CapacityResult {
             probed_at: now_ms(),

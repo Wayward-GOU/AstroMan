@@ -22,7 +22,7 @@ use tokio_tungstenite::tungstenite::Message;
 use super::host::ClusterApp;
 use super::protocol::{
     AbortPayload, ClusterMessage, ClusterSlaveSnapshot, DonePayload, ErrorPayload, HelloAckPayload,
-    HelloPayload, PingPayload, PongPayload, PrepareAckPayload, PreparePayload, PreflightPayload,
+    HelloPayload, PingPayload, PongPayload, PreflightPayload, PrepareAckPayload, PreparePayload,
     StartPayload, TimeAckPayload, TimeProbePayload, DEFAULT_PORT, HEARTBEAT_MISSES, HEARTBEAT_SEC,
     MAX_MESSAGE_BYTES, PROTOCOL_VERSION,
 };
@@ -98,7 +98,8 @@ pub fn parse_master_addr(input: &str) -> Result<MasterAddr, String> {
         .is_some_and(|ip| !super::is_private(ip))
     {
         return Err("集群只允许局域网地址，请填写主节点的内网 IP".to_string());
-    }    let addr = format!("{host}:{port}");
+    }
+    let addr = format!("{host}:{port}");
     Ok(MasterAddr {
         host,
         ws_url: format!("ws://{addr}/"),
@@ -331,10 +332,7 @@ impl ClusterSlave {
         running.abort.store(true, Ordering::SeqCst);
         {
             let mut state = running.state.lock();
-            if !matches!(
-                state.status.as_str(),
-                "done" | "lost" | "rejected" | "left"
-            ) {
+            if !matches!(state.status.as_str(), "done" | "lost" | "rejected" | "left") {
                 state.status = "left".to_string();
             }
             state.qps = 0.0;
@@ -395,7 +393,12 @@ async fn run_slave(
     {
         Ok(Ok(pair)) => pair.0,
         Ok(Err(error)) => {
-            finish_with_error(app.as_ref(), &state, "lost", format!("连接主节点失败：{error}"));
+            finish_with_error(
+                app.as_ref(),
+                &state,
+                "lost",
+                format!("连接主节点失败：{error}"),
+            );
             return;
         }
         Err(_) => {
@@ -434,7 +437,11 @@ async fn run_slave(
     let capacity = pool
         .get()
         .ok()
-        .and_then(|conn| crate::commands::capacity::latest_result(&conn).ok().flatten())
+        .and_then(|conn| {
+            crate::commands::capacity::latest_result(&conn)
+                .ok()
+                .flatten()
+        })
         .map(|item| item.saturation_concurrent)
         .filter(|value| *value > 0);
     let _ = tx.send(ClusterMessage::Hello(HelloPayload {
@@ -786,7 +793,13 @@ fn prepare_local(
     config.concurrent = payload.concurrent.max(1);
     // 长稳确认已在主节点完成，各节点不再重复拦截
     config.long_run_ack = true;
-    if config.name.as_deref().map(str::trim).unwrap_or("").is_empty() {
+    if config
+        .name
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
         config.name = Some(payload.plan_name.clone());
     }
     let target = config.url.clone();
@@ -850,9 +863,7 @@ async fn run_session<S>(
     at_ms: i64,
 ) -> RunEnd
 where
-    S: futures_util::Stream<
-            Item = Result<Message, tokio_tungstenite::tungstenite::Error>,
-        > + Unpin,
+    S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
     let state_for_sink = state.clone();
     let tx_for_sink = tx.clone();
@@ -1017,10 +1028,7 @@ fn done_payload(outcome: &EngineOutcome, offset_ms: f64) -> DonePayload {
 /// 只校正起止时间戳；逐秒采样的 `elapsed_sec` 是相对量，天然不受时钟差影响。
 pub(crate) fn align_window(start_ms: i64, end_ms: i64, offset_ms: f64) -> (i64, i64) {
     let shift = offset_ms.round() as i64;
-    (
-        start_ms.saturating_sub(shift),
-        end_ms.saturating_sub(shift),
-    )
+    (start_ms.saturating_sub(shift), end_ms.saturating_sub(shift))
 }
 
 /* ---------- 目标预检 ---------- */
@@ -1088,7 +1096,12 @@ async fn preflight_target(url_text: &str) -> Preflight {
             break;
         }
         match tokio::time::timeout(left, TcpStream::connect(addr)).await {
-            Ok(Ok(_)) => return Preflight { ok: true, error: None },
+            Ok(Ok(_)) => {
+                return Preflight {
+                    ok: true,
+                    error: None,
+                }
+            }
             Ok(Err(error)) => last_error = format!("{addr}: {error}"),
             Err(_) => last_error = format!("{addr}: 连接超时"),
         }
@@ -1117,7 +1130,12 @@ fn set_status(state: &Arc<Mutex<SlaveState>>, status: &str, error: Option<String
     }
 }
 
-fn finish_with_error(app: &dyn ClusterApp, state: &Arc<Mutex<SlaveState>>, status: &str, message: String) {
+fn finish_with_error(
+    app: &dyn ClusterApp,
+    state: &Arc<Mutex<SlaveState>>,
+    status: &str,
+    message: String,
+) {
     set_status(state, status, Some(message));
     emit_state(app, state);
 }

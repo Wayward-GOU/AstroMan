@@ -894,7 +894,8 @@ pub struct CapacityResult {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct StressReport {    pub id: i64,
+pub struct StressReport {
+    pub id: i64,
     pub plan_id: Option<i64>,
     /// 同批多报告分组号
     pub run_group_id: Option<i64>,

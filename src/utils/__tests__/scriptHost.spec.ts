@@ -149,6 +149,22 @@ describe('executeScriptJob', () => {
 
     expect(result.vars).toMatchObject({ existed: '1', stage: 'pre' })
   })
+
+  it('脚本中途抛错时变量回滚到执行前快照', () => {
+    const result = executeScriptJob({
+      phase: 'pre',
+      code: `
+        vars.set('half', 'written')
+        throw new Error('boom')
+      `,
+      request: { ...baseRequest },
+      env: {},
+      vars: { existed: '1' },
+    })
+
+    expect(result.error).toContain('boom')
+    expect(result.vars).toEqual({ existed: '1' })
+  })
 })
 
 describe('runScriptJob 降级', () => {

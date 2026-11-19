@@ -1130,11 +1130,7 @@ fn plan_run(config: &StressConfig) -> (Vec<StressStage>, u32, u64) {
     let peak = if stages.is_empty() {
         config.concurrent.clamp(1, MAX_CONCURRENT)
     } else {
-        stages
-            .iter()
-            .map(|item| item.concurrent)
-            .max()
-            .unwrap_or(1)
+        stages.iter().map(|item| item.concurrent).max().unwrap_or(1)
     };
     let total_sec = if stages.is_empty() {
         let max = if config.plan_id.is_some() {
@@ -1367,7 +1363,9 @@ pub(crate) fn prepare_stress(
     // 环境优先级：显式 envId → 计划/请求所属项目的激活环境（4.3）
     let resolved_env = resolve_env(&conn, &config)?;
     // 开始压测瞬间读取最近一次本机能力检测结果，写入报告快照（1.7.5）
-    let machine_capacity = crate::commands::capacity::latest_result(&conn).ok().flatten();
+    let machine_capacity = crate::commands::capacity::latest_result(&conn)
+        .ok()
+        .flatten();
     let mut vars = match resolved_env.id {
         Some(env_id) => crate::commands::http::load_vars(&conn, env_id)?,
         None => HashMap::new(),
@@ -1692,14 +1690,7 @@ async fn drive_stress(
     progress: Option<&(dyn Fn(StressProgress) + Send + Sync)>,
     watch: Option<&Arc<AtomicBool>>,
 ) -> StressExecOutcome {
-    let outcome = run_engine(
-        prepared,
-        job_id,
-        progress,
-        watch,
-        EngineOptions::default(),
-    )
-    .await;
+    let outcome = run_engine(prepared, job_id, progress, watch, EngineOptions::default()).await;
     let (report_id, save_message) = match save_report(
         &pool,
         ReportPayload {
@@ -2209,12 +2200,10 @@ pub async fn stress_start(
         concurrent: prepared.peak,
     };
     // 任务数 / 并发之和 / 同目标三项校验在同一把锁内完成
-    let (job_id, job_cancel, overlaps) = state.stress_jobs.try_reserve(
-        draft,
-        max_jobs,
-        max_total,
-        config.ignore_overlap,
-    )?;
+    let (job_id, job_cancel, overlaps) =
+        state
+            .stress_jobs
+            .try_reserve(draft, max_jobs, max_total, config.ignore_overlap)?;
     let mut prepared = prepared;
     // 停止按钮走注册表：必须把注册表的取消位换成引擎实际监听的那一个
     prepared.ctx.cancel = job_cancel;
@@ -2416,18 +2405,14 @@ pub fn open_stress_window(
         })
         .or_else(|| {
             plan_id.and_then(|id| {
-                state
-                    .pool
-                    .get()
-                    .ok()
-                    .and_then(|conn| {
-                        conn.query_row("SELECT name FROM test_plans WHERE id = ?1", [id], |row| {
-                            row.get::<_, String>(0)
-                        })
-                        .optional()
-                        .ok()
-                        .flatten()
+                state.pool.get().ok().and_then(|conn| {
+                    conn.query_row("SELECT name FROM test_plans WHERE id = ?1", [id], |row| {
+                        row.get::<_, String>(0)
                     })
+                    .optional()
+                    .ok()
+                    .flatten()
+                })
             })
         })
         .map(|name| format!("压测 · {name}"))
@@ -2454,15 +2439,11 @@ pub fn open_stress_window(
             let _ = window.set_focus();
             return;
         }
-        match WebviewWindowBuilder::new(
-            &handle,
-            &thread_label,
-            WebviewUrl::App(url.into()),
-        )
-        .title(title)
-        .inner_size(1280.0, 860.0)
-        .min_inner_size(960.0, 640.0)
-        .build()
+        match WebviewWindowBuilder::new(&handle, &thread_label, WebviewUrl::App(url.into()))
+            .title(title)
+            .inner_size(1280.0, 860.0)
+            .min_inner_size(960.0, 640.0)
+            .build()
         {
             Ok(window) => {
                 let _ = window.set_focus();
@@ -2817,10 +2798,9 @@ mod tests {
 
     #[test]
     fn capture_plan_modes_match_product_rules() {
-        let capacity: StressConfig = serde_json::from_str(
-            r#"{"url":"http://127.0.0.1/x","captureMode":"capacity"}"#,
-        )
-        .unwrap();
+        let capacity: StressConfig =
+            serde_json::from_str(r#"{"url":"http://127.0.0.1/x","captureMode":"capacity"}"#)
+                .unwrap();
         assert_eq!(capture_plan(&capacity), (RecordDetailMode::Auto, 0));
 
         let locate: StressConfig =

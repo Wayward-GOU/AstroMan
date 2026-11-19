@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
+use encoding_rs::Encoding;
 use rusqlite::{params, Connection};
 use tauri::State;
 
@@ -290,7 +291,8 @@ pub(crate) async fn execute_with(
         has_cookie,
     };
 
-    // 显式指定协议或连接超时时用一次性客户端，否则复用共享连接池
+    // 每次跳转都要在 send_chain 里记跳链、并遵守「是否跟随」开关，
+    // 所以手工请求统一使用不自动重定向的客户端；显式协议/超时仍走一次性客户端。
     let overrides = payload.protocol.is_some() || payload.connect_timeout_ms.is_some();
     let (client, probe) = if overrides {
         state.client_for_request(
@@ -300,7 +302,10 @@ pub(crate) async fn execute_with(
             false,
         )?
     } else {
-        (state.client(payload.insecure), state.connector_probe())
+        (
+            state.manual_client(payload.insecure),
+            state.connector_probe(),
+        )
     };
 
     // 取消登记
@@ -624,13 +629,12 @@ fn build_body_plan(
 
 fn apply_body(
     builder: reqwest::RequestBuilder,
-    plan: &RequestPlan,
-    method: &reqwest::Method,
+    body: Option<&PlannedBody>,
 ) -> reqwest::RequestBuilder {
-    if method == reqwest::Method::GET || method == reqwest::Method::HEAD {
+    let Some(body) = body else {
         return builder;
-    }
-    match &plan.body {
+    };
+    match body {
         PlannedBody::None => builder,
         PlannedBody::Bytes(bytes) => builder.body(bytes.clone()),
         PlannedBody::Multipart(parts) => {
@@ -646,6 +650,20 @@ fn apply_body(
             builder.multipart(form)
         }
     }
+}
+
+/// 同源判定用于决定跳转时是否继续携带 Authorization / Cookie
+fn same_origin(a: &reqwest::Url, b: &reqwest::Url) -> bool {
+    a.scheme() == b.scheme()
+        && a.host_str().map(str::to_ascii_lowercase) == b.host_str().map(str::to_ascii_lowercase)
+        && a.port_or_known_default() == b.port_or_known_default()
+}
+
+fn is_sensitive_header(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "authorization" | "cookie" | "proxy-authorization"
+    )
 }
 
 struct ChainOutcome {
@@ -727,6 +745,9 @@ async fn send_chain(
 ) -> Result<ChainOutcome, SendError> {
     let mut url = plan.url.clone();
     let mut method = plan.method.clone();
+    // HEAD 语义上不带体；GET 允许带体（Postman 等工具同样支持），
+    // 只有在重定向降级为 GET 时才丢弃原请求体。
+    let mut send_body = plan.method != reqwest::Method::HEAD;
     let mut hops: Vec<RedirectHop> = Vec::new();
     let mut ttfb = Duration::ZERO;
 
@@ -735,7 +756,12 @@ async fn send_chain(
             .request(method.clone(), url.clone())
             .timeout(plan.timeout);
 
+        // 跳到其他源时，凭据类 Header 不能跟着过去
+        let credential_forwarding = same_origin(&plan.url, &url);
         for (key, value) in &plan.headers {
+            if !credential_forwarding && is_sensitive_header(key) {
+                continue;
+            }
             builder = builder.header(key.as_str(), value.as_str());
         }
 
@@ -753,7 +779,7 @@ async fn send_chain(
             }
         }
 
-        builder = apply_body(builder, plan, &method);
+        builder = apply_body(builder, if send_body { Some(&plan.body) } else { None });
 
         let started = Instant::now();
         let response = send_with_cancel(builder, cancel).await?;
@@ -808,6 +834,7 @@ async fn send_chain(
                     && method != reqwest::Method::HEAD)
             {
                 method = reqwest::Method::GET;
+                send_body = false;
             }
             drain_response(response).await;
             url = next;
@@ -844,7 +871,8 @@ async fn send_chain(
     )))
 }
 
-/// 发送并响应取消：取消位每 50ms 轮询一次，实测 1s 内可中止
+/// 发送并响应取消：取消位每 50ms 轮询一次；取消时直接丢弃发送 future，
+/// 让底层连接跟着中断，而不是只停止等待结果。
 async fn send_with_cancel(
     builder: reqwest::RequestBuilder,
     cancel: Option<&AtomicBool>,
@@ -861,25 +889,19 @@ async fn send_with_cancel(
             message: "已取消".to_string(),
         });
     }
-    let (tx, mut rx) = tokio::sync::oneshot::channel();
-    let future = builder.send();
-    tokio::spawn(async move {
-        let _ = tx.send(future.await);
-    });
+    let mut send = Box::pin(builder.send());
     loop {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        if flag.load(Ordering::SeqCst) {
-            return Err(SendError {
-                cancelled: true,
-                message: "已取消".to_string(),
-            });
-        }
-        match rx.try_recv() {
-            Ok(Ok(response)) => return Ok(response),
-            Ok(Err(error)) => return Err(SendError::failed(error.to_string())),
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => continue,
-            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                return Err(SendError::failed("请求通道已关闭"))
+        tokio::select! {
+            result = &mut send => {
+                return result.map_err(|e| SendError::failed(e.to_string()));
+            }
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                if flag.load(Ordering::SeqCst) {
+                    return Err(SendError {
+                        cancelled: true,
+                        message: "已取消".to_string(),
+                    });
+                }
             }
         }
     }
@@ -959,7 +981,41 @@ enum BodyClass {
     Binary(&'static str),
 }
 
-/// 先解压（reqwest 已做）→ 看 Content-Type → 嗅探魔数 → 校验 UTF-8
+/// 从 Content-Type 中取显式 charset；未声明时返回 None，不擅自猜测
+fn charset_of(content_type: &str) -> Option<&'static Encoding> {
+    content_type.split(';').skip(1).find_map(|part| {
+        let (name, value) = part.split_once('=')?;
+        if !name.trim().eq_ignore_ascii_case("charset") {
+            return None;
+        }
+        Encoding::for_label(value.trim().trim_matches('"').as_bytes())
+    })
+}
+
+/// HTML 常见写法只在 <meta charset> 里声明编码，从头部前 2KB 嗅探一次
+fn charset_from_meta(head: &[u8]) -> Option<&'static Encoding> {
+    let window = &head[..head.len().min(2048)];
+    let text = String::from_utf8_lossy(window).to_ascii_lowercase();
+    for (index, _) in text.match_indices("charset=") {
+        let rest = &text[index + "charset=".len()..];
+        let label = rest
+            .trim_start_matches(|c: char| c == '"' || c == '\'')
+            .split(|c: char| c == '"' || c == '\'' || c == ';' || c == '>' || c.is_whitespace())
+            .next()
+            .unwrap_or("");
+        if let Some(encoding) = Encoding::for_label(label.as_bytes()) {
+            return Some(encoding);
+        }
+    }
+    None
+}
+
+/// 声明优先，其次才看 HTML meta；两者都没有时不做猜测
+fn declared_charset(content_type: &str, head: &[u8]) -> Option<&'static Encoding> {
+    charset_of(content_type).or_else(|| charset_from_meta(head))
+}
+
+/// 先解压（reqwest 已做）→ 看 Content-Type → 嗅探魔数 → 校验 UTF-8 / 声明的 charset
 fn classify(content_type: &str, disposition: &str, head: &[u8]) -> BodyClass {
     let lower = content_type.to_ascii_lowercase();
     let base = lower.split(';').next().unwrap_or("").trim().to_string();
@@ -974,8 +1030,8 @@ fn classify(content_type: &str, disposition: &str, head: &[u8]) -> BodyClass {
         || base == "image/svg+xml";
 
     if textual {
-        // 声明是文本但字节不是 UTF-8：按二进制处理，绝不输出乱码
-        return if looks_utf8(head) {
+        // 非 UTF-8 字节只有在服务端明确声明 charset（Header 或 HTML meta）时才按文本解码
+        return if looks_utf8(head) || declared_charset(&lower, head).is_some() {
             BodyClass::Text
         } else {
             BodyClass::Binary(extension_for(&base, head))
@@ -986,7 +1042,7 @@ fn classify(content_type: &str, disposition: &str, head: &[u8]) -> BodyClass {
         if sniff_magic(head).is_some() {
             return BodyClass::Binary(extension_for(&base, head));
         }
-        return if looks_utf8(head) {
+        return if looks_utf8(head) || declared_charset(&lower, head).is_some() {
             BodyClass::Text
         } else {
             BodyClass::Binary("bin")
@@ -1102,6 +1158,7 @@ async fn read_body(
         }
     }
 
+    let charset = declared_charset(&content_type, &head);
     match classify(&content_type, &disposition, &head) {
         BodyClass::Binary(ext) => {
             write_binary(
@@ -1124,6 +1181,7 @@ async fn read_body(
                 &content_type,
                 raw_bytes,
                 max_body,
+                charset,
             )
             .await
         }
@@ -1194,6 +1252,14 @@ async fn write_binary(
     }
 }
 
+/// 有声明 charset 时按声明解码（含 BOM 处理），否则按 UTF-8 容错解码
+fn decode_text(buffer: &[u8], charset: Option<&'static Encoding>) -> String {
+    match charset {
+        Some(encoding) => encoding.decode(buffer).0.into_owned(),
+        None => String::from_utf8_lossy(buffer).into_owned(),
+    }
+}
+
 async fn collect_text(
     response: &mut reqwest::Response,
     head: Vec<u8>,
@@ -1202,6 +1268,7 @@ async fn collect_text(
     content_type: &str,
     raw_bytes: u64,
     max_body: usize,
+    charset: Option<&'static Encoding>,
 ) -> BodyOutcome {
     let mut buffer = head;
     let mut bytes = buffer.len() as u64;
@@ -1253,7 +1320,7 @@ async fn collect_text(
         }
     }
 
-    let text = String::from_utf8_lossy(&buffer).into_owned();
+    let text = decode_text(&buffer, charset);
     let trimmed = text.trim_start();
     let kind =
         if content_type.contains("json") || trimmed.starts_with('{') || trimmed.starts_with('[') {
@@ -1465,6 +1532,27 @@ mod tests {
     }
 
     #[test]
+    fn decodes_declared_gbk_charset() {
+        let chinese = [0xD6, 0xD0, 0xCE, 0xC4];
+        assert_eq!(
+            classify("text/plain; charset=gbk", "", &chinese),
+            BodyClass::Text
+        );
+        let charset = charset_of("application/json; charset=GB18030");
+        assert_eq!(decode_text(&chinese, charset), "中文");
+    }
+
+    #[test]
+    fn reads_charset_from_html_meta() {
+        let mut html = b"<html><head><meta charset=\"gbk\"></head><body>".to_vec();
+        html.extend_from_slice(&[0xD6, 0xD0, 0xCE, 0xC4]);
+        html.extend_from_slice(b"</body></html>");
+        assert_eq!(classify("text/html", "", &html), BodyClass::Text);
+        let charset = declared_charset("text/html", &html);
+        assert!(decode_text(&html, charset).contains("中文"));
+    }
+
+    #[test]
     fn backoff_respects_retry_after_and_caps() {
         assert_eq!(backoff_ms(1, None), 200);
         assert_eq!(backoff_ms(3, None), 800);
@@ -1489,5 +1577,53 @@ mod tests {
         assert_eq!(base64_encode(b"user:pass"), "dXNlcjpwYXNz");
         assert_eq!(base64_encode(b"a"), "YQ==");
         assert_eq!(base64_encode(b"ab"), "YWI=");
+    }
+
+    #[test]
+    fn apply_body_keeps_get_body_but_allows_head_to_drop_it() {
+        let client = reqwest::Client::new();
+        let body = PlannedBody::Bytes(b"{\"q\":1}".to_vec());
+        let get = apply_body(client.get("https://example.com/search"), Some(&body))
+            .build()
+            .expect("应能构建 GET");
+        assert!(get.body().is_some());
+        let head = apply_body(client.head("https://example.com/search"), None)
+            .build()
+            .expect("应能构建 HEAD");
+        assert!(head.body().is_none());
+    }
+
+    #[test]
+    fn redirect_credentials_only_stay_on_the_same_origin() {
+        let parse = |value: &str| reqwest::Url::parse(value).unwrap();
+        assert!(same_origin(
+            &parse("https://api.example.com/v1/login"),
+            &parse("https://api.example.com/v2/data")
+        ));
+        assert!(same_origin(
+            &parse("https://api.example.com/a"),
+            &parse("https://api.example.com:443/b")
+        ));
+        assert!(!same_origin(
+            &parse("https://api.example.com/a"),
+            &parse("https://cdn.example.com/b")
+        ));
+        assert!(!same_origin(
+            &parse("https://api.example.com/a"),
+            &parse("http://api.example.com/b")
+        ));
+        assert!(is_sensitive_header("Authorization"));
+        assert!(is_sensitive_header("cookie"));
+        assert!(!is_sensitive_header("Content-Type"));
+    }
+
+    #[tokio::test]
+    async fn cancelling_before_send_returns_cancelled_without_network() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let flag = AtomicBool::new(true);
+        let client = reqwest::Client::new();
+        let result = send_with_cancel(client.get("http://127.0.0.1:9"), Some(&flag)).await;
+        assert!(matches!(result, Err(error) if error.cancelled));
+        assert_eq!(flag.load(Ordering::SeqCst), true);
     }
 }

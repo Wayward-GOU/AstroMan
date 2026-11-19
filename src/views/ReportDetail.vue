@@ -203,7 +203,7 @@ const config = computed(() => detail.value?.config ?? null)
 const metrics = computed(() => config.value?.metrics ?? null)
 const bytesSent = computed(() => metrics.value?.bytesSent ?? 0)
 
-/* ---------- 分布式压测元数据（V1.2 一期） ---------- */
+/* ---------- 分布式压测元数据（v1.1.1 一期） ---------- */
 const cluster = computed<ClusterReportMeta | null>(() => config.value?.cluster ?? null)
 const clusterNodes = computed(() => cluster.value?.nodes ?? [])
 

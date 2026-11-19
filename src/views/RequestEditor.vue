@@ -3288,6 +3288,7 @@ const responseHeaders = computed(() => {
                   </div>
                   <div class="script-label">Query</div>
                   <CodeArea
+                    :key="'gql-query-' + requestId"
                     ref="gqlQueryAreaRef"
                     v-model="gqlQuery"
                     fill
@@ -3296,7 +3297,14 @@ const responseHeaders = computed(() => {
                     placeholder="query { user(id: 1) { id name } }"
                   />
                   <div class="script-label">Variables（JSON 对象，可留空）</div>
-                  <CodeArea v-model="gqlVarsText" fill searchable :rows="5" placeholder='{"id": 1}' />
+                  <CodeArea
+                    :key="'gql-vars-' + requestId"
+                    v-model="gqlVarsText"
+                    fill
+                    searchable
+                    :rows="5"
+                    placeholder='{"id": 1}'
+                  />
                   <div v-if="gqlVarsError" class="gql-error">{{ gqlVarsError }}</div>
                 </div>
 
@@ -3314,6 +3322,7 @@ const responseHeaders = computed(() => {
 
                 <CodeArea
                   v-else-if="form.bodyType !== 'none'"
+                  :key="'body-' + requestId"
                   v-model="form.body"
                   fill
                   searchable

@@ -17,8 +17,8 @@ use std::collections::BTreeMap;
 use serde_json::json;
 
 use super::protocol::{
-    ClusterReportMeta, ClusterReportNode, DonePayload, SamplePayload, PROTOCOL_VERSION,
-    CLOCK_DROP_UNCERTAINTY_MS,
+    ClusterReportMeta, ClusterReportNode, DonePayload, SamplePayload, CLOCK_DROP_UNCERTAINTY_MS,
+    PROTOCOL_VERSION,
 };
 use crate::commands::stress::EngineOutcome;
 use crate::models::{ErrorTypeCount, HistogramBucket, ReportSample, StatusCount, StressReport};
@@ -145,24 +145,16 @@ pub(crate) fn merge(request: MergeRequest) -> MergedReport {
             dropped_samples += node.samples.len() as u64;
         }
 
-        let node_start = node
-            .done
-            .as_ref()
-            .map(|done| done.start_ms)
-            .or_else(|| {
-                node.samples
-                    .first()
-                    .map(|sample| request.started_at + sample.elapsed_sec as i64 * 1000)
-            });
-        let node_end = node
-            .done
-            .as_ref()
-            .map(|done| done.end_ms)
-            .or_else(|| {
-                node.samples
-                    .last()
-                    .map(|sample| request.started_at + sample.elapsed_sec as i64 * 1000)
-            });
+        let node_start = node.done.as_ref().map(|done| done.start_ms).or_else(|| {
+            node.samples
+                .first()
+                .map(|sample| request.started_at + sample.elapsed_sec as i64 * 1000)
+        });
+        let node_end = node.done.as_ref().map(|done| done.end_ms).or_else(|| {
+            node.samples
+                .last()
+                .map(|sample| request.started_at + sample.elapsed_sec as i64 * 1000)
+        });
 
         if let Some(done) = &node.done {
             total += done.total;
@@ -225,10 +217,17 @@ pub(crate) fn merge(request: MergeRequest) -> MergedReport {
             clock_offset_ms: node.clock_offset_ms,
             clock_uncertainty_ms: node.clock_uncertainty_ms,
             dropped_samples: if trusted {
-                node.done.as_ref().map(|done| done.dropped_samples).unwrap_or(0)
+                node.done
+                    .as_ref()
+                    .map(|done| done.dropped_samples)
+                    .unwrap_or(0)
             } else {
                 node.samples.len() as u64
-                    + node.done.as_ref().map(|done| done.dropped_samples).unwrap_or(0)
+                    + node
+                        .done
+                        .as_ref()
+                        .map(|done| done.dropped_samples)
+                        .unwrap_or(0)
             },
             start_ms: node_start.unwrap_or(request.started_at),
             end_ms: node_end.unwrap_or(request.finished_at),
@@ -268,7 +267,11 @@ pub(crate) fn merge(request: MergeRequest) -> MergedReport {
     let max_qps = samples.iter().map(|sample| sample.qps).fold(0.0, f64::max);
     let avg_rt = ratio(sum_rt, total);
     let ttfb_avg = ratio(sum_ttfb, total);
-    let min_rt = latency.keys().next().map(|value| *value as f64).unwrap_or(0.0);
+    let min_rt = latency
+        .keys()
+        .next()
+        .map(|value| *value as f64)
+        .unwrap_or(0.0);
     let max_rt = latency
         .keys()
         .next_back()
@@ -611,8 +614,7 @@ mod tests {
         assert!((merged.samples[0].qps - 40.0).abs() < 0.01);
         assert!((merged.report.max_qps - 40.0).abs() < 0.01);
         // 集群元数据写进配置快照
-        let config: serde_json::Value =
-            serde_json::from_str(&merged.config_snapshot).unwrap();
+        let config: serde_json::Value = serde_json::from_str(&merged.config_snapshot).unwrap();
         assert_eq!(config["mode"], "cluster");
         assert_eq!(config["cluster"]["totalConcurrent"], 16);
         assert_eq!(merged.meta.nodes.len(), 2);
@@ -631,7 +633,11 @@ mod tests {
         let merged = merge(MergeRequest {
             incomplete: true,
             ..request(vec![
-                node("a", vec![sample(1, 10.0, 10, vec![(20, 10)])], Some(done(100, vec![(20, 100)]))),
+                node(
+                    "a",
+                    vec![sample(1, 10.0, 10, vec![(20, 10)])],
+                    Some(done(100, vec![(20, 100)])),
+                ),
                 lost,
             ])
         });
@@ -653,7 +659,11 @@ mod tests {
         );
         skewed.clock_uncertainty_ms = CLOCK_DROP_UNCERTAINTY_MS + 1.0;
         let merged = merge(request(vec![
-            node("a", vec![sample(1, 10.0, 10, vec![(20, 10)])], Some(done(50, vec![(20, 50)]))),
+            node(
+                "a",
+                vec![sample(1, 10.0, 10, vec![(20, 10)])],
+                Some(done(50, vec![(20, 50)])),
+            ),
             skewed,
         ]));
         // 曲线只含主节点，采样被丢弃并计数
@@ -672,8 +682,16 @@ mod tests {
 
         let (dir, pool) = crate::notes::test_pool("cluster-merge-report");
         let merged = merge(request(vec![
-            node("master", vec![sample(1, 10.0, 10, vec![(10, 10)])], Some(done(100, vec![(10, 100)]))),
-            node("slave", vec![sample(1, 10.0, 10, vec![(20, 10)])], Some(done(100, vec![(20, 100)]))),
+            node(
+                "master",
+                vec![sample(1, 10.0, 10, vec![(10, 10)])],
+                Some(done(100, vec![(10, 100)])),
+            ),
+            node(
+                "slave",
+                vec![sample(1, 10.0, 10, vec![(20, 10)])],
+                Some(done(100, vec![(20, 100)])),
+            ),
         ]));
         let errors: Vec<ReportError> = Vec::new();
         let requests: Vec<ReportRequestRecord> = Vec::new();

@@ -721,15 +721,17 @@ pub fn plan_export(
                     keys.sort();
                     env_cache.insert(env_id, (name.unwrap_or_default(), keys, vars_map));
                 }
-                env_cache.get(&env_id).map(|(name, keys, values)| PlanEnvSnapshot {
-                    name: name.clone(),
-                    vars: keys.clone(),
-                    values: if include_sensitive {
-                        values.clone()
-                    } else {
-                        HashMap::new()
-                    },
-                })
+                env_cache
+                    .get(&env_id)
+                    .map(|(name, keys, values)| PlanEnvSnapshot {
+                        name: name.clone(),
+                        vars: keys.clone(),
+                        values: if include_sensitive {
+                            values.clone()
+                        } else {
+                            HashMap::new()
+                        },
+                    })
             }
             None => None,
         };
@@ -815,11 +817,7 @@ fn find_request_by_target(
     .map_err(err)
 }
 
-fn find_env_by_name(
-    conn: &Connection,
-    project_id: i64,
-    name: &str,
-) -> Result<Option<i64>, String> {
+fn find_env_by_name(conn: &Connection, project_id: i64, name: &str) -> Result<Option<i64>, String> {
     conn.query_row(
         "SELECT id FROM environments WHERE project_id = ?1 AND name = ?2 ORDER BY id ASC LIMIT 1",
         params![project_id, name],
@@ -1110,7 +1108,8 @@ mod tests {
 
     #[test]
     fn parse_export_file_rejects_foreign_format() {
-        let payload = r#"{"format":"other/v1","exportedAt":0,"includesSensitive":false,"plans":[]}"#;
+        let payload =
+            r#"{"format":"other/v1","exportedAt":0,"includesSensitive":false,"plans":[]}"#;
         let error = parse_export_file(payload).unwrap_err();
         assert!(error.contains("不支持的计划文件格式"));
 
@@ -1146,7 +1145,11 @@ mod tests {
         let templates = plan_templates();
         let ids: Vec<String> = templates
             .iter()
-            .filter_map(|item| item.get("id").and_then(|id| id.as_str()).map(str::to_string))
+            .filter_map(|item| {
+                item.get("id")
+                    .and_then(|id| id.as_str())
+                    .map(str::to_string)
+            })
             .collect();
         for expected in [
             "baseline",

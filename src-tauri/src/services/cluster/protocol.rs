@@ -14,8 +14,12 @@ use serde::{Deserialize, Serialize};
 pub const PROTOCOL_VERSION: u32 = 1;
 /// 默认监听端口
 pub const DEFAULT_PORT: u16 = 17801;
-/// 配对码有效期（秒）
+/// 配对码有效期（秒）：默认 5 分钟，创建任务时可在上下限内调整
 pub const PAIR_CODE_TTL_SEC: i64 = 300;
+/// 配对码有效期下限：1 分钟
+pub const MIN_PAIR_CODE_TTL_SEC: i64 = 60;
+/// 配对码有效期上限：1 小时
+pub const MAX_PAIR_CODE_TTL_SEC: i64 = 3600;
 /// 配对码位数
 pub const PAIR_CODE_DIGITS: usize = 6;
 /// 心跳间隔（秒）
@@ -38,6 +42,8 @@ pub struct ClusterProtocolInfo {
     pub version: u32,
     pub default_port: u16,
     pub pair_code_ttl_sec: i64,
+    pub min_pair_code_ttl_sec: i64,
+    pub max_pair_code_ttl_sec: i64,
     pub pair_code_digits: usize,
     pub heartbeat_sec: u64,
     pub heartbeat_misses: u32,
@@ -52,6 +58,8 @@ impl Default for ClusterProtocolInfo {
             version: PROTOCOL_VERSION,
             default_port: DEFAULT_PORT,
             pair_code_ttl_sec: PAIR_CODE_TTL_SEC,
+            min_pair_code_ttl_sec: MIN_PAIR_CODE_TTL_SEC,
+            max_pair_code_ttl_sec: MAX_PAIR_CODE_TTL_SEC,
             pair_code_digits: PAIR_CODE_DIGITS,
             heartbeat_sec: HEARTBEAT_SEC,
             heartbeat_misses: HEARTBEAT_MISSES,
@@ -296,6 +304,8 @@ pub struct ClusterMasterSnapshot {
     pub port: u16,
     pub pair_code: Option<String>,
     pub pair_code_expires_at: Option<i64>,
+    /// 本任务创建时选定的配对码有效期（秒），每次配对成功后按此值刷新
+    pub pair_code_ttl_sec: i64,
     pub local_addresses: Vec<String>,
     pub total_concurrent: u32,
     pub start_at_ms: Option<i64>,
@@ -422,6 +432,8 @@ mod tests {
         let info = ClusterProtocolInfo::default();
         assert_eq!(info.default_port, 17801);
         assert_eq!(info.pair_code_ttl_sec, 300);
+        assert_eq!(info.min_pair_code_ttl_sec, 60);
+        assert_eq!(info.max_pair_code_ttl_sec, 3600);
         assert_eq!(info.heartbeat_sec, 2);
         assert_eq!(info.heartbeat_misses, 3);
         assert_eq!(info.clock_rounds, 5);

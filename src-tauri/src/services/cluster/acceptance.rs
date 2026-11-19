@@ -188,6 +188,7 @@ async fn pair_cluster(
         config,
         env_name,
         port: Some(0),
+        pair_code_ttl_sec: None,
         master_name: Some("主-验收".to_string()),
     };
     let snapshot = master
@@ -212,7 +213,11 @@ async fn pair_cluster(
     let slave_id = {
         let mut found = None;
         wait_until(Duration::from_secs(10), || {
-            let snapshot = master.state().cluster.snapshot(job_id).expect("读主节点快照");
+            let snapshot = master
+                .state()
+                .cluster
+                .snapshot(job_id)
+                .expect("读主节点快照");
             found = snapshot
                 .nodes
                 .iter()
@@ -255,8 +260,8 @@ fn create_env(node: &MockNode, name: &str, vars: &[(&str, &str)]) -> i64 {
 
 async fn baseline_qps(node: &MockNode, config: StressConfig) -> f64 {
     let state = node.state();
-    let prepared = prepare_stress(&state, config, Arc::new(AtomicBool::new(false)))
-        .expect("单机基线准备");
+    let prepared =
+        prepare_stress(&state, config, Arc::new(AtomicBool::new(false))).expect("单机基线准备");
     let outcome = run_engine(
         prepared,
         0,
@@ -272,10 +277,7 @@ async fn baseline_qps(node: &MockNode, config: StressConfig) -> f64 {
     outcome.report.avg_qps
 }
 
-fn report_of_master(
-    node: &MockNode,
-    report_id: i64,
-) -> (i64, f64, String, String) {
+fn report_of_master(node: &MockNode, report_id: i64) -> (i64, f64, String, String) {
     let conn = node.state().pool.get().expect("取主节点数据库连接");
     conn.query_row(
         "SELECT total_requests, avg_qps, config_json, status FROM test_reports WHERE id = ?1",
@@ -347,7 +349,11 @@ async fn smoke_round(target: &TestTarget) -> (f64, f64, f64) {
     let nodes = cluster["nodes"].as_array().expect("节点元数据");
     assert_eq!(nodes.len(), 2);
     for node in nodes {
-        assert_eq!(node["concurrent"].as_u64(), Some(8), "16 并发应平均分给两节点");
+        assert_eq!(
+            node["concurrent"].as_u64(),
+            Some(8),
+            "16 并发应平均分给两节点"
+        );
     }
     let slave_node = nodes
         .iter()
@@ -359,7 +365,11 @@ async fn smoke_round(target: &TestTarget) -> (f64, f64, f64) {
         "从节点应记录时钟偏移"
     );
 
-    master.state().cluster.close(job_id).expect("关闭主节点会话");
+    master
+        .state()
+        .cluster
+        .close(job_id)
+        .expect("关闭主节点会话");
     let _ = slave.state().cluster_slave.disconnect();
     master.cleanup();
     slave.cleanup();
@@ -432,13 +442,20 @@ async fn unreachable_target_is_blocked_at_preflight() {
         .await
         .expect_err("目标不可达时准备必须失败");
     assert!(error.contains("从-验收"), "错误信息应带从节点名：{error}");
-    assert!(error.contains("无法访问目标"), "错误信息应说明预检失败：{error}");
+    assert!(
+        error.contains("无法访问目标"),
+        "错误信息应说明预检失败：{error}"
+    );
 
     let snapshot = master.state().cluster.snapshot(job_id).expect("读快照");
     assert_eq!(snapshot.status, "failed");
     assert_eq!(snapshot.nodes[1].status, "rejected");
 
-    master.state().cluster.close(job_id).expect("关闭主节点会话");
+    master
+        .state()
+        .cluster
+        .close(job_id)
+        .expect("关闭主节点会话");
     let _ = slave.state().cluster_slave.disconnect();
     master.cleanup();
     slave.cleanup();
@@ -517,9 +534,12 @@ async fn lost_slave_marks_report_incomplete() {
     assert!(finished, "从节点失联后主节点应继续跑完并生成报告");
     let snapshot = master.state().cluster.snapshot(job_id).expect("读最终快照");
     assert!(snapshot.incomplete, "失联时最终状态应标注不完整");
-    let report_id = snapshot
-        .report_id
-        .unwrap_or_else(|| panic!("失联也应生成合并报告：{}", snapshot.message.unwrap_or_default()));
+    let report_id = snapshot.report_id.unwrap_or_else(|| {
+        panic!(
+            "失联也应生成合并报告：{}",
+            snapshot.message.unwrap_or_default()
+        )
+    });
 
     let (total, _qps, config_json, status) = report_of_master(&master, report_id);
     assert_eq!(status, "completed");
@@ -528,7 +548,10 @@ async fn lost_slave_marks_report_incomplete() {
     let cluster = config.get("cluster").expect("报告应带集群元数据");
     assert_eq!(cluster["incomplete"], true);
     assert!(
-        cluster["note"].as_str().unwrap_or("").contains("结果不完整"),
+        cluster["note"]
+            .as_str()
+            .unwrap_or("")
+            .contains("结果不完整"),
         "备注应说明结果不完整：{}",
         cluster["note"]
     );
@@ -538,7 +561,11 @@ async fn lost_slave_marks_report_incomplete() {
         .expect("从节点元数据");
     assert_eq!(lost_node["status"], "lost");
 
-    master.state().cluster.close(job_id).expect("关闭主节点会话");
+    master
+        .state()
+        .cluster
+        .close(job_id)
+        .expect("关闭主节点会话");
     master.cleanup();
     slave.cleanup();
 }
@@ -565,8 +592,7 @@ async fn missing_env_var_is_reported_by_name() {
     .expect("构造缺变量配置");
     config.env_id = Some(master_env);
 
-    let (job_id, slave_id) =
-        pair_cluster(&master, &slave, config, Some("prod".to_string())).await;
+    let (job_id, slave_id) = pair_cluster(&master, &slave, config, Some("prod".to_string())).await;
 
     let error = master
         .state()
@@ -583,7 +609,11 @@ async fn missing_env_var_is_reported_by_name() {
     assert!(error.contains("从-验收"), "错误信息应带从节点名：{error}");
     assert!(error.contains("token"), "错误信息应带缺失变量名：{error}");
 
-    master.state().cluster.close(job_id).expect("关闭主节点会话");
+    master
+        .state()
+        .cluster
+        .close(job_id)
+        .expect("关闭主节点会话");
     let _ = slave.state().cluster_slave.disconnect();
     drop(target);
     master.cleanup();

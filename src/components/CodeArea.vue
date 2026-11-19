@@ -12,12 +12,25 @@ import {
   keymap,
   lineNumbers,
   placeholder as placeholderExtension,
+  type Command,
   type DecorationSet,
   type ViewUpdate,
 } from '@codemirror/view'
-import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands'
+import {
+  defaultKeymap,
+  history,
+  historyKeymap,
+  indentLess,
+  indentMore,
+} from '@codemirror/commands'
 import { highlightSelectionMatches, openSearchPanel, search, searchKeymap } from '@codemirror/search'
-import { HighlightStyle, StreamLanguage, bracketMatching, syntaxHighlighting } from '@codemirror/language'
+import {
+  HighlightStyle,
+  StreamLanguage,
+  bracketMatching,
+  indentUnit,
+  syntaxHighlighting,
+} from '@codemirror/language'
 import { tags } from '@lezer/highlight'
 
 const props = withDefaults(
@@ -273,6 +286,17 @@ function placeholderExtensionFor(value: string): Extension {
   return value ? placeholderExtension(value) : []
 }
 
+/** 单光标 Tab 与旧版一致插入两个空格；有选区时仍按行缩进 */
+const insertTwoSpaces: Command = (view) => {
+  if (view.state.selection.ranges.some((range) => !range.empty)) return indentMore(view)
+  view.dispatch({
+    ...view.state.replaceSelection('  '),
+    scrollIntoView: true,
+    userEvent: 'input',
+  })
+  return true
+}
+
 function buildExtensions(): Extension[] {
   return [
     lineNumbers(),
@@ -282,10 +306,16 @@ function buildExtensions(): Extension[] {
     drawSelection(),
     dropCursor(),
     EditorState.allowMultipleSelections.of(true),
+    indentUnit.of('  '),
     search({ top: true }),
     highlightSelectionMatches(),
     templateVars,
-    keymap.of([...defaultKeymap, ...searchKeymap, ...historyKeymap, indentWithTab]),
+    keymap.of([
+      ...defaultKeymap,
+      ...searchKeymap,
+      ...historyKeymap,
+      { key: 'Tab', run: insertTwoSpaces, shift: indentLess },
+    ]),
     EditorView.contentAttributes.of({
       spellcheck: 'false',
       autocapitalize: 'off',
@@ -308,6 +338,7 @@ function buildExtensions(): Extension[] {
 onMounted(() => {
   const host = hostRef.value
   if (!host) return
+  lastEmitted = props.modelValue
   viewRef.value = new EditorView({
     state: EditorState.create({ doc: props.modelValue, extensions: buildExtensions() }),
     parent: host,

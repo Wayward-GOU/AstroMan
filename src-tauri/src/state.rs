@@ -82,6 +82,9 @@ impl Default for AppSettings {
 struct HttpClients {
     normal: reqwest::Client,
     insecure: reqwest::Client,
+    /// 手工请求专用：不自动跟随重定向，由 send_chain 逐跳处理
+    manual: reqwest::Client,
+    manual_insecure: reqwest::Client,
     /// 建连探针：用来判断本次请求是「新建连接」还是「复用连接」
     probe: std::sync::Arc<crate::net_probe::ConnectorProbe>,
 }
@@ -316,7 +319,10 @@ impl StressJobRegistry {
 ///
 /// 同主机判定忽略方法与路径：任何方法、任何路径落到同一主机端口都算同机施压。
 fn host_prefix_of(target_key: &str) -> String {
-    let rest = target_key.split_once(' ').map(|(_, tail)| tail).unwrap_or(target_key);
+    let rest = target_key
+        .split_once(' ')
+        .map(|(_, tail)| tail)
+        .unwrap_or(target_key);
     let scheme_end = rest.find("://").map(|idx| idx + 3).unwrap_or(0);
     match rest[scheme_end..].find('/') {
         Some(idx) => rest[..scheme_end + idx].to_string(),
@@ -546,6 +552,16 @@ impl AppState {
             clients.insecure.clone()
         } else {
             clients.normal.clone()
+        }
+    }
+
+    /// 手工发送用客户端：不自动跟随重定向，跟随与否完全由 send_chain 决定
+    pub fn manual_client(&self, insecure: bool) -> reqwest::Client {
+        let clients = self.clients.read();
+        if insecure {
+            clients.manual_insecure.clone()
+        } else {
+            clients.manual.clone()
         }
     }
 
@@ -960,6 +976,24 @@ fn build_clients(settings: &AppSettings) -> Result<HttpClients, String> {
             Some(probe.clone()),
             false,
         )?,
+        manual: build_client_full(
+            settings,
+            false,
+            10_000,
+            false,
+            None,
+            Some(probe.clone()),
+            false,
+        )?,
+        manual_insecure: build_client_full(
+            settings,
+            true,
+            10_000,
+            false,
+            None,
+            Some(probe.clone()),
+            false,
+        )?,
         probe,
     })
 }
@@ -1166,13 +1200,28 @@ mod tests {
     fn registry_warns_same_host_without_blocking() {
         let registry = StressJobRegistry::new();
         let (a, _, _) = registry
-            .try_reserve(draft("a", "GET https://api.example.com:8443/users", 100), 3, 1000, false)
+            .try_reserve(
+                draft("a", "GET https://api.example.com:8443/users", 100),
+                3,
+                1000,
+                false,
+            )
             .unwrap();
         let (b, _, _) = registry
-            .try_reserve(draft("b", "POST https://api.example.com:8443/orders", 100), 3, 1000, false)
+            .try_reserve(
+                draft("b", "POST https://api.example.com:8443/orders", 100),
+                3,
+                1000,
+                false,
+            )
             .unwrap();
         let (c, _, _) = registry
-            .try_reserve(draft("c", "GET https://other.example.com/users", 100), 3, 1000, false)
+            .try_reserve(
+                draft("c", "GET https://other.example.com/users", 100),
+                3,
+                1000,
+                false,
+            )
             .unwrap();
         // 同 scheme/host/port 不同 path 或方法只警告：列出对方任务
         let others = registry.same_host_others("GET https://api.example.com:8443/orders");

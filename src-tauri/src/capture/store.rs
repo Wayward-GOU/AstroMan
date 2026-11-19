@@ -154,6 +154,11 @@ impl CaptureStore {
         }
     }
 
+    /// 当前档位预算：单条 body 截断与采集上限都要跟着它走
+    pub fn limits(&self) -> crate::services::profile::CaptureLimits {
+        self.inner.lock().limits
+    }
+
     pub fn next_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }

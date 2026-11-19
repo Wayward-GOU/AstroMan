@@ -82,7 +82,10 @@ pub fn reclaim_space(state: &AppState) -> Result<(u64, u64), String> {
 /// 返回 (释放字节, 失败原因)。数据删除本身已经提交，压缩失败不影响删除结果。
 pub fn compact_after_delete(state: &AppState) -> (u64, Option<String>) {
     if !state.stress_jobs.is_empty() {
-        return (0, Some("压测正在运行，已跳过压缩；请压测结束后重新清理".into()));
+        return (
+            0,
+            Some("压测正在运行，已跳过压缩；请压测结束后重新清理".into()),
+        );
     }
     let _guard = state.heavy_ops.lock();
     match reclaim_space(state) {
@@ -318,7 +321,8 @@ fn rebuild_test_plans_v15(conn: &rusqlite::Connection) -> Result<(), String> {
         .query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
         .map(|value| value != 0)
         .unwrap_or(true);
-    conn.execute_batch("PRAGMA foreign_keys = OFF").map_err(err)?;
+    conn.execute_batch("PRAGMA foreign_keys = OFF")
+        .map_err(err)?;
     let result = (|| -> Result<(), String> {
         let tx = conn.unchecked_transaction().map_err(err)?;
         tx.execute_batch(

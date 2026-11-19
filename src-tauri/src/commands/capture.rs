@@ -208,6 +208,7 @@ pub(crate) async fn repeat_request(
     detail: &FlowDetail,
     overrides: RepeatOverride,
     proxy_port: Option<u16>,
+    stored_limit: usize,
 ) -> Result<RepeatResult, String> {
     let RepeatOverride {
         method,
@@ -302,7 +303,12 @@ pub(crate) async fn repeat_request(
         .bytes()
         .await
         .map_err(|error| format!("E_REPEAT: 读取响应失败 {error}"))?;
-    let body = build_body(&Bytes::copy_from_slice(&bytes), &content_type, true);
+    let body = build_body(
+        &Bytes::copy_from_slice(&bytes),
+        &content_type,
+        true,
+        stored_limit,
+    );
 
     Ok(RepeatResult {
         recorded: proxy_port.is_some(),
@@ -343,6 +349,7 @@ pub async fn capture_repeat(
             body,
         },
         proxy_port,
+        state.profile().limits.max_response_bytes,
     )
     .await
 }

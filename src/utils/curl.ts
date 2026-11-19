@@ -1,4 +1,5 @@
 import type { EnvVariable, HttpRequestDetail, KeyValueItem } from '@/types/models'
+import { base64Encode } from '@/tools/transforms'
 
 export interface Snippet {
   key: string
@@ -25,14 +26,61 @@ function resolveVariables(text: string, variables?: EnvVariable[]): string {
   })
 }
 
-function buildUrl(request: HttpRequestDetail): string {
+/** 编码查询参数，但保留 {{变量}} 原样，避免导出后变量失效 */
+function encodeQueryPart(value: string): string {
+  return value
+    .split(/(\{\{[^{}]*\}\})/)
+    .map((part, index) => (index % 2 === 1 ? part : encodeURIComponent(part)))
+    .join('')
+}
+
+function authHeader(request: HttpRequestDetail): KeyValueItem | null {
+  const auth = request.auth
+  if (!auth || auth.kind === 'none') return null
+  if (auth.kind === 'bearer' || auth.kind === 'oauth2') {
+    const token = (auth.token ?? '').trim()
+    return token ? { key: 'Authorization', value: `Bearer ${token}`, enabled: true } : null
+  }
+  if (auth.kind === 'basic') {
+    return {
+      key: 'Authorization',
+      value: `Basic ${base64Encode(`${auth.username ?? ''}:${auth.password ?? ''}`)}`,
+      enabled: true,
+    }
+  }
+  if (auth.kind === 'apikey') {
+    const key = (auth.key ?? '').trim()
+    return key && auth.addTo !== 'query'
+      ? { key, value: auth.value ?? '', enabled: true }
+      : null
+  }
+  return null
+}
+
+function authQuery(request: HttpRequestDetail): [string, string] | null {
+  const auth = request.auth
+  if (auth?.kind !== 'apikey' || auth.addTo !== 'query') return null
+  const key = (auth.key ?? '').trim()
+  return key ? [key, auth.value ?? ''] : null
+}
+
+function buildUrl(request: HttpRequestDetail, variables?: EnvVariable[]): string {
   const params = enabled(request.params)
   let url = (request.url ?? '').trim()
-  if (!params.length) return url
+  const pairs = params.map((item) => {
+    const key = resolveVariables(item.key, variables)
+    const value = resolveVariables(item.value ?? '', variables)
+    return `${encodeQueryPart(key)}=${encodeQueryPart(value)}`
+  })
+  const extra = authQuery(request)
+  if (extra) {
+    const key = resolveVariables(extra[0], variables)
+    const value = resolveVariables(extra[1], variables)
+    pairs.push(`${encodeQueryPart(key)}=${encodeQueryPart(value)}`)
+  }
+  if (!pairs.length) return url
   url = url.replace(/[?&]$/, '')
-  const query = params
-    .map((item) => `${encodeURIComponent(item.key)}=${encodeURIComponent(item.value ?? '')}`)
-    .join('&')
+  const query = pairs.join('&')
   return url.includes('?') ? `${url}&${query}` : `${url}?${query}`
 }
 
@@ -52,6 +100,10 @@ function formPairs(body: string): string[] {
 
 function headerList(request: HttpRequestDetail): KeyValueItem[] {
   const list = enabled(request.headers).map((item) => ({ ...item }))
+  const added = authHeader(request)
+  if (added && !list.some((item) => item.key.toLowerCase() === added.key.toLowerCase())) {
+    list.push(added)
+  }
   const bodyType = request.bodyType ?? 'none'
   const body = (request.body ?? '').trim()
   // multipart 的 Content-Type 必须由工具自动生成 boundary，不能手写
@@ -89,14 +141,28 @@ function parseFormFields(body: string): { key: string; value: string; kind: stri
   }
 }
 
+/** Basic 认证用 curl -u 表达，避免把占位符提前 base64 后无法再替换 */
+function basicAuthPair(request: HttpRequestDetail): string | null {
+  const auth = request.auth
+  if (auth?.kind !== 'basic') return null
+  const hasManual = enabled(request.headers).some(
+    (item) => item.key.toLowerCase() === 'authorization',
+  )
+  if (hasManual) return null
+  return `${auth.username ?? ''}:${auth.password ?? ''}`
+}
+
 /** 把请求配置转换成可分享的 cURL 命令；传入环境变量时会替换 {{变量}}，敏感变量保持占位符 */
 export function buildCurl(request: HttpRequestDetail, variables?: EnvVariable[]): string {
   const method = (request.method || 'GET').toUpperCase()
-  const parts: string[] = [`curl -X ${method} ${quote(buildUrl(request))}`]
+  const parts: string[] = [`curl -X ${method} ${quote(buildUrl(request, variables))}`]
+  const basicPair = basicAuthPair(request)
 
   for (const header of headerList(request)) {
+    if (basicPair && header.key.toLowerCase() === 'authorization') continue
     parts.push(`  -H ${quote(`${header.key}: ${header.value ?? ''}`)}`)
   }
+  if (basicPair) parts.push(`  -u ${quote(basicPair)}`)
 
   const bodyType = request.bodyType ?? 'none'
   const body = (request.body ?? '').trim()
@@ -126,7 +192,7 @@ export function buildCurl(request: HttpRequestDetail, variables?: EnvVariable[])
 /** 原始 HTTP 报文，方便直接贴给后端同学 */
 export function buildHttpRaw(request: HttpRequestDetail, variables?: EnvVariable[]): string {
   const method = (request.method || 'GET').toUpperCase()
-  const url = buildUrl(request)
+  const url = buildUrl(request, variables)
   let path = url
   let host = ''
   try {
@@ -169,7 +235,7 @@ export function buildFetch(request: HttpRequestDetail, variables?: EnvVariable[]
       .join('\n')
     if (appends) {
       options.push('  body: form,')
-      const code = `const form = new FormData()\n${appends}\n\nconst response = await fetch(${quoteJs(buildUrl(request))}, {\n${options.join('\n')}\n})\n\nconst data = await response.text()\nconsole.log(response.status, data)`
+      const code = `const form = new FormData()\n${appends}\n\nconst response = await fetch(${quoteJs(buildUrl(request, variables))}, {\n${options.join('\n')}\n})\n\nconst data = await response.text()\nconsole.log(response.status, data)`
       return resolveVariables(code, variables)
     }
   }
@@ -188,7 +254,7 @@ export function buildFetch(request: HttpRequestDetail, variables?: EnvVariable[]
   } else if (bodyType !== 'none' && body) {
     options.push(`  body: ${quoteJs(body)},`)
   }
-  const code = `const response = await fetch(${quoteJs(buildUrl(request))}, {\n${options.join('\n')}\n})\n\nconst data = await response.text()\nconsole.log(response.status, data)`
+  const code = `const response = await fetch(${quoteJs(buildUrl(request, variables))}, {\n${options.join('\n')}\n})\n\nconst data = await response.text()\nconsole.log(response.status, data)`
   return resolveVariables(code, variables)
 }
 
@@ -198,7 +264,7 @@ export function buildPython(request: HttpRequestDetail, variables?: EnvVariable[
   const headerEntries = headerList(request)
     .map((item) => `    ${quoteJs(item.key)}: ${quoteJs(item.value ?? '')},`)
     .join('\n')
-  const lines = ['import requests', '', `url = ${quoteJs(buildUrl(request))}`]
+  const lines = ['import requests', '', `url = ${quoteJs(buildUrl(request, variables))}`]
   if (headerEntries) lines.push(`headers = {\n${headerEntries}\n}`)
   const bodyType = request.bodyType ?? 'none'
   const body = (request.body ?? '').trim()

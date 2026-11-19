@@ -438,6 +438,11 @@ async fn run_sse(
                     break;
                 }
             };
+            // 收到数据说明连接是健康的，重连额度随之复位，
+            // 否则长期连接的多次正常重连会累计到上限后永久停连。
+            if attempts > 0 {
+                attempts = 0;
+            }
             total_bytes += chunk.len() as u64;
             if total_bytes > MAX_BYTES {
                 mark_closed(

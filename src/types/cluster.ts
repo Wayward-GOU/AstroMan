@@ -1,5 +1,5 @@
 /**
- * 分布式压测（V1.2 一期）共享类型
+ * 分布式压测（v1.1.1 一期）共享类型
  *
  * 字段与 `src-tauri/src/services/cluster/protocol.rs` 保持一致；
  * 一期为主从模型，主节点同时作为施压节点参与压测。
@@ -11,6 +11,8 @@ export interface ClusterProtocolInfo {
   version: number
   defaultPort: number
   pairCodeTtlSec: number
+  minPairCodeTtlSec: number
+  maxPairCodeTtlSec: number
   pairCodeDigits: number
   heartbeatSec: number
   heartbeatMisses: number
@@ -66,6 +68,8 @@ export interface ClusterMasterSnapshot {
   port: number
   pairCode?: string | null
   pairCodeExpiresAt?: number | null
+  /** 本任务创建时选定的配对码有效期（秒） */
+  pairCodeTtlSec: number
   localAddresses: string[]
   totalConcurrent: number
   startAtMs?: number | null
@@ -105,6 +109,8 @@ export interface ClusterMasterStartPayload {
   /** 环境名：从节点按名称在本地库查找，主节点不下发变量值 */
   envName?: string | null
   port?: number | null
+  /** 配对码有效期（秒）：缺省 300，允许 60–3600 */
+  pairCodeTtlSec?: number | null
   /** 主节点自身显示名，缺省取本机计算机名 */
   masterName?: string | null
 }

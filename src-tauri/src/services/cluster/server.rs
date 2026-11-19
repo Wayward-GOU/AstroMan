@@ -32,18 +32,17 @@ use super::host::ClusterApp;
 use super::merge::{self, MergeNode, MergeRequest};
 use super::protocol::{
     AbortPayload, ClusterMasterSnapshot, ClusterMessage, ClusterNodeInfo, DonePayload,
-    ErrorPayload, HelloAckPayload, HelloPayload, PingPayload, PongPayload, PrepareAckPayload,
-    PreparePayload, PreflightPayload, SamplePayload, StartPayload, TimeAckPayload,
+    ErrorPayload, HelloAckPayload, HelloPayload, PingPayload, PongPayload, PreflightPayload,
+    PrepareAckPayload, PreparePayload, SamplePayload, StartPayload, TimeAckPayload,
     TimeProbePayload, CLOCK_SAMPLE_ROUNDS, DEFAULT_PORT, HEARTBEAT_MISSES, HEARTBEAT_SEC,
-    MAX_MESSAGE_BYTES, MAX_NODES, PAIR_CODE_DIGITS, PAIR_CODE_TTL_SEC, PROTOCOL_VERSION,
+    MAX_MESSAGE_BYTES, MAX_NODES, MAX_PAIR_CODE_TTL_SEC, MIN_PAIR_CODE_TTL_SEC, PAIR_CODE_DIGITS,
+    PAIR_CODE_TTL_SEC, PROTOCOL_VERSION,
 };
 use crate::commands::stress::{
     prepare_stress, run_engine, save_report, EngineOptions, EngineOutcome, EngineSampleSink,
     PreparedStress, ReportPayload,
 };
-use crate::models::{
-    ReportError, ReportRequestRecord, SlowRequest, StressConfig,
-};
+use crate::models::{ReportError, ReportRequestRecord, SlowRequest, StressConfig};
 use crate::state::{DbPool, StressJobDraft};
 use crate::util::{err, now_ms};
 
@@ -73,9 +72,25 @@ pub struct ClusterMasterStartPayload {
     pub env_name: Option<String>,
     #[serde(default)]
     pub port: Option<u16>,
+    /// 配对码有效期（秒）：缺省 5 分钟，每次配对成功后按该值刷新
+    #[serde(default)]
+    pub pair_code_ttl_sec: Option<i64>,
     /// 主节点自身在集群中的显示名
     #[serde(default)]
     pub master_name: Option<String>,
+}
+
+/// 校验并归一化配对码有效期：缺省 300 秒，允许 1 分钟到 1 小时
+fn resolve_pair_code_ttl(value: Option<i64>) -> Result<i64, String> {
+    let ttl = value.unwrap_or(PAIR_CODE_TTL_SEC);
+    if !(MIN_PAIR_CODE_TTL_SEC..=MAX_PAIR_CODE_TTL_SEC).contains(&ttl) {
+        return Err(format!(
+            "配对码有效期需在 {} 到 {} 分钟之间",
+            MIN_PAIR_CODE_TTL_SEC / 60,
+            MAX_PAIR_CODE_TTL_SEC / 60
+        ));
+    }
+    Ok(ttl)
 }
 
 /// 单节点权重：缺省为 1，主节点与从节点一视同仁
@@ -182,10 +197,7 @@ impl NodeState {
     }
 
     fn is_active(&self) -> bool {
-        !matches!(
-            self.status.as_str(),
-            "lost" | "left" | "rejected" | "done"
-        )
+        !matches!(self.status.as_str(), "lost" | "left" | "rejected" | "done")
     }
 }
 
@@ -223,6 +235,7 @@ struct MasterSession {
     required_vars: Vec<String>,
     total_concurrent: u32,
     port: u16,
+    pair_code_ttl_sec: i64,
     created_at: i64,
     local_addresses: Vec<String>,
     db: DbPool,
@@ -296,17 +309,15 @@ impl ClusterMaster {
             })
             .unwrap_or_else(|| payload.config.url.trim().to_string());
         let port = payload.port.unwrap_or(DEFAULT_PORT);
+        let pair_code_ttl = resolve_pair_code_ttl(payload.pair_code_ttl_sec)?;
         let listener = TcpListener::bind(("0.0.0.0", port))
             .await
             .map_err(|error| format!("集群端口 {port} 监听失败：{error}"))?;
-        let port = listener
-            .local_addr()
-            .map_err(err)?
-            .port();
+        let port = listener.local_addr().map_err(err)?.port();
         let created_at = now_ms();
         let pair_code = PairCode {
             code: new_pair_code(),
-            expires_at: created_at + PAIR_CODE_TTL_SEC * 1000,
+            expires_at: created_at + pair_code_ttl * 1000,
         };
         let local_addresses = super::local_addresses();
         let master_name = payload
@@ -348,6 +359,7 @@ impl ClusterMaster {
             required_vars,
             total_concurrent,
             port,
+            pair_code_ttl_sec: pair_code_ttl,
             created_at,
             local_addresses,
             db: pool,
@@ -395,10 +407,7 @@ impl ClusterMaster {
             .values()
             .map(|running| running.session.clone())
             .collect();
-        sessions
-            .iter()
-            .map(|session| session.snapshot())
-            .collect()
+        sessions.iter().map(|session| session.snapshot()).collect()
     }
 
     fn session(&self, job_id: i64) -> Result<Arc<MasterSession>, String> {
@@ -460,9 +469,7 @@ impl MasterSession {
         let now = now_ms();
         let state = self.state.lock();
         let (pair_code, pair_expires) = match &state.pair_code {
-            Some(code) if code.expires_at > now => {
-                (Some(code.code.clone()), Some(code.expires_at))
-            }
+            Some(code) if code.expires_at > now => (Some(code.code.clone()), Some(code.expires_at)),
             _ => (None, None),
         };
         let elapsed_sec = state
@@ -479,6 +486,7 @@ impl MasterSession {
             port: self.port,
             pair_code,
             pair_code_expires_at: pair_expires,
+            pair_code_ttl_sec: self.pair_code_ttl_sec,
             local_addresses: self.local_addresses.clone(),
             total_concurrent: self.total_concurrent,
             start_at_ms: state.start_at_ms,
@@ -495,7 +503,13 @@ impl MasterSession {
         self.app.emit_master(self.snapshot());
     }
 
-    fn set_job_status(&self, status: &str, message: Option<&str>, incomplete: bool, finished: bool) {
+    fn set_job_status(
+        &self,
+        status: &str,
+        message: Option<&str>,
+        incomplete: bool,
+        finished: bool,
+    ) {
         let finished_at = finished.then(now_ms);
         if let Err(error) = update_job(
             &self.db,
@@ -564,6 +578,7 @@ impl MasterSession {
         tx: mpsc::UnboundedSender<ClusterMessage>,
     ) -> Result<String, String> {
         let now = now_ms();
+        let ttl_sec = self.pair_code_ttl_sec;
         let (node_id, token, probes, pair_expires) = {
             let mut state = self.state.lock();
             if state.status != "pairing" {
@@ -616,7 +631,7 @@ impl MasterSession {
                 }
                 candidate
             };
-            let pair_expires = now + PAIR_CODE_TTL_SEC * 1000;
+            let pair_expires = now + ttl_sec * 1000;
             state.pair_code = Some(PairCode {
                 code: next_code,
                 expires_at: pair_expires,
@@ -654,7 +669,12 @@ impl MasterSession {
                 samples: Vec::new(),
                 done: None,
             });
-            (id, Uuid::new_v4().simple().to_string(), probes, pair_expires)
+            (
+                id,
+                Uuid::new_v4().simple().to_string(),
+                probes,
+                pair_expires,
+            )
         };
 
         let ack = ClusterMessage::HelloAck(HelloAckPayload {
@@ -987,8 +1007,7 @@ impl MasterSession {
                 .map(|node| (node.id.clone(), node.weight))
                 .collect();
             let weights = resolve_weights(&participants, &weights)?;
-            let allocations =
-                allocate_concurrency(self.total_concurrent, &participants, &weights)?;
+            let allocations = allocate_concurrency(self.total_concurrent, &participants, &weights)?;
             for node in &mut state.nodes {
                 if let Some((_, weight)) = weights.iter().find(|(id, _)| id == &node.id) {
                     node.weight = *weight;
@@ -1068,7 +1087,10 @@ impl MasterSession {
                     .iter()
                     .filter(|node| {
                         node.role == "slave"
-                            && !matches!(node.status.as_str(), "ready" | "lost" | "left" | "rejected")
+                            && !matches!(
+                                node.status.as_str(),
+                                "ready" | "lost" | "left" | "rejected"
+                            )
                     })
                     .map(|node| node.name.clone())
                     .collect();
@@ -1261,9 +1283,7 @@ impl MasterSession {
         if stopped && !aborted {
             let running = self.state.lock().status == "running";
             if running {
-                let _ = self.abort(Some(
-                    "主节点本地压测已停止，集群任务随之结束".to_string(),
-                ));
+                let _ = self.abort(Some("主节点本地压测已停止，集群任务随之结束".to_string()));
             }
         }
         self.maybe_finalize();
@@ -1347,7 +1367,9 @@ impl MasterSession {
                 plan_id: (self.plan_id > 0).then_some(self.plan_id),
                 plan_name: self.plan_name.clone(),
                 request_id: local.as_ref().and_then(|(request_id, _, _)| *request_id),
-                run_group_id: local.as_ref().and_then(|(_, run_group_id, _)| *run_group_id),
+                run_group_id: local
+                    .as_ref()
+                    .and_then(|(_, run_group_id, _)| *run_group_id),
                 total_concurrent: self.total_concurrent,
                 started_at: state.start_at_ms.unwrap_or(self.created_at),
                 finished_at,
@@ -1928,12 +1950,10 @@ fn setup_ready(state: &SessionState) -> bool {
 /// 所有节点都已结算：done / lost / left / rejected；主节点本地引擎也在内
 fn nodes_settled(state: &SessionState) -> bool {
     !state.nodes.is_empty()
-        && state.nodes.iter().all(|node| {
-            matches!(
-                node.status.as_str(),
-                "done" | "lost" | "left" | "rejected"
-            )
-        })
+        && state
+            .nodes
+            .iter()
+            .all(|node| matches!(node.status.as_str(), "done" | "lost" | "left" | "rejected"))
 }
 
 fn new_pair_code() -> String {
@@ -2193,6 +2213,16 @@ mod tests {
     }
 
     #[test]
+    fn pair_code_ttl_defaults_and_bounds() {
+        assert_eq!(resolve_pair_code_ttl(None).unwrap(), PAIR_CODE_TTL_SEC);
+        assert_eq!(resolve_pair_code_ttl(Some(900)).unwrap(), 900);
+        assert!(resolve_pair_code_ttl(Some(30)).is_err());
+        assert!(resolve_pair_code_ttl(Some(7200)).is_err());
+        assert_eq!(resolve_pair_code_ttl(Some(60)).unwrap(), 60);
+        assert_eq!(resolve_pair_code_ttl(Some(3600)).unwrap(), 3600);
+    }
+
+    #[test]
     fn clock_metrics_follow_ntp_single_sample() {
         // 从节点比主节点快 5 分钟，RTT 40ms
         let (offset, uncertainty) = clock_metrics(1_000, 301_020, 1_040);
@@ -2215,7 +2245,10 @@ mod tests {
 
         let two = vec![("master".to_string(), 1.0), ("a".to_string(), 1.0)];
         let allocation = allocate_concurrency(16, &two, &two).unwrap();
-        assert_eq!(allocation, vec![("master".to_string(), 8), ("a".to_string(), 8)]);
+        assert_eq!(
+            allocation,
+            vec![("master".to_string(), 8), ("a".to_string(), 8)]
+        );
 
         let skewed = vec![
             ("master".to_string(), 2.0),
@@ -2253,10 +2286,7 @@ mod tests {
         assert!(names.contains(&"token".to_string()));
         assert!(names.contains(&"user".to_string()));
         assert!(!names.contains(&"hidden".to_string()));
-        assert_eq!(
-            names.iter().filter(|name| *name == "token").count(),
-            1
-        );
+        assert_eq!(names.iter().filter(|name| *name == "token").count(), 1);
     }
 
     #[test]
@@ -2358,7 +2388,9 @@ mod tests {
         assert!(!nodes_settled(&state));
         state.nodes[0].status = "done".to_string();
         assert!(nodes_settled(&state));
-        state.nodes.push(NodeState::master("s".to_string(), String::new(), 1));
+        state
+            .nodes
+            .push(NodeState::master("s".to_string(), String::new(), 1));
         state.nodes[1].status = "lost".to_string();
         assert!(nodes_settled(&state));
     }

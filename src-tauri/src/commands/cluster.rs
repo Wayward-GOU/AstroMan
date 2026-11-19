@@ -32,10 +32,7 @@ pub async fn cluster_master_create(
     payload: ClusterMasterStartPayload,
 ) -> Result<ClusterMasterSnapshot, String> {
     state.policy().ensure_lan(Some("0.0.0.0"))?;
-    state
-        .cluster
-        .create(state.pool.clone(), app, payload)
-        .await
+    state.cluster.create(state.pool.clone(), app, payload).await
 }
 
 /// 任务快照：前端每秒轮询或按 `cluster:master` 事件刷新
@@ -100,7 +97,9 @@ pub fn cluster_slave_connect(
 ) -> Result<ClusterSlaveSnapshot, String> {
     let master = parse_master_addr(&payload.master_addr)?;
     state.policy().ensure_lan(Some(&master.host))?;
-    state.cluster_slave.connect(state.pool.clone(), app, payload)
+    state
+        .cluster_slave
+        .connect(state.pool.clone(), app, payload)
 }
 
 /// 从节点会话快照：前端可按 `cluster:slave` 事件刷新

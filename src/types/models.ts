@@ -1150,7 +1150,7 @@ export interface ReportConfigSnapshot {
   agent?: AgentInfo
   /** 运行期指标（发送字节、丢弃计数、资源峰值等） */
   metrics?: RuntimeMetrics
-  /** 分布式压测元数据（V1.2 一期，主从节点与合并口径） */
+  /** 分布式压测元数据（v1.1.1 一期，主从节点与合并口径） */
   cluster?: ClusterReportMeta | null
 }
 

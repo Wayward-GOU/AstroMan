@@ -144,13 +144,12 @@ pub fn data_cleanup(
     drop(conn);
 
     // DELETE 只把页标成空闲，文件不会缩小；按需截断 WAL 并 VACUUM，把实际释放量返回给前端
-    let (freed_bytes, compact_error) = if vacuum.unwrap_or(false)
-        && (history_count > 0 || runs_count > 0)
-    {
-        crate::db::compact_after_delete(&state)
-    } else {
-        (0, None)
-    };
+    let (freed_bytes, compact_error) =
+        if vacuum.unwrap_or(false) && (history_count > 0 || runs_count > 0) {
+            crate::db::compact_after_delete(&state)
+        } else {
+            (0, None)
+        };
 
     Ok(CleanupResult {
         history: history_count,

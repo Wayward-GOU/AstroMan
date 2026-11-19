@@ -435,7 +435,7 @@ export const capacityGet = () => invoke<CapacityResult | null>('capacity_get')
 
 export const capacityCancel = () => invoke<void>('capacity_cancel')
 
-// 分布式压测（V1.2 一期）：主从会话都常驻后端进程，页面只是视图
+// 分布式压测（v1.1.1 一期）：主从会话都常驻后端进程，页面只是视图
 export const clusterProtocolInfo = () => invoke<ClusterProtocolInfo>('cluster_protocol_info')
 
 export const clusterLocalAddresses = () => invoke<string[]>('cluster_local_addresses')

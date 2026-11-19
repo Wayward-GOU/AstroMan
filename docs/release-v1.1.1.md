@@ -1,7 +1,7 @@
 # AstroMan v1.1.1 发布检查表
 
 - 文档版本：v0.3（W1–W5 代码与自动化测试完成，人工验收待执行）
-- 基线提交：`21241b4`（`master-develop-v1.1.1`，tag `v1.1.1`）
+- 基线提交：`21241b4`（`master-develop-v1.1.1`），tag `v1.1.1` 指向本文档所在提交
 - 日期：2026-11-19
 - 状态：**已打 tag 并推送**，由 tag `v1.1.1` 触发 Release 工作流产出安装包草稿。前端、Rust、E2E 与依赖审计已在本机通过；覆盖率为本机 LLVM 近似值，CI tarpaulin 仍需跑；7.3–7.10 人工矩阵及 R9/R10 真机项尚待 Windows 实机执行，不得标注「实机已验证」。
 
@@ -12,7 +12,7 @@
 | 项 | 值 |
 |---|---|
 | 版本号 | 1.1.1（`package.json` / `src-tauri/Cargo.toml` / `tauri.conf.json` 一致） |
-| 提交哈希 | `21241b4`（`master-develop-v1.1.1`，tag `v1.1.1`） |
+| 提交哈希 | 代码 `21241b4`；tag `v1.1.1` 指向本文档所在提交 |
 | 构建产物 | 由 tag `v1.1.1` 触发 `.github/workflows/release.yml` 构建（Windows x64 / x86、macOS universal），产物在 GitHub Release 草稿中 |
 | SHA256 | 以 GitHub Release 资产为准（本机未构建 Windows 安装包） |
 | 构建环境 | Windows 10 x64 + Node 22 + Rust stable（本机；CI 不产出安装包） |

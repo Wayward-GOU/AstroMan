@@ -21,7 +21,11 @@ mod seed;
 /// 15 = 压测 v1.1.1（plan 的 request_id 可空且 SET NULL、机器容量表、
 ///      报告分组 / 响应体耗时直方图 / TopN 慢请求、采样响应体耗时）
 /// 16 = 分布式压测一期（cluster_jobs / cluster_workers，报告仍复用 test_reports）
-pub const DB_VERSION: i64 = 16;
+/// 17 = 参数 / Token 池（data_pools / data_pool_items）
+/// 18 = 池健康度（data_pool_items 过期 / 冷却 / 失败次数 / 最近使用）
+/// 19 = Token 刷新配置（data_pools.refresh_mode / refresh_json）与集群节点级采样表
+/// 20 = 池自定义列（data_pools.columns_json / data_pool_items.data_json）
+pub const DB_VERSION: i64 = 20;
 
 /// 每条连接都要应用的 SQLite 参数（P-06）。
 ///
@@ -277,6 +281,49 @@ const COLUMN_MIGRATIONS: &[(&str, &str, &str)] = &[
     ("test_reports", "slow_requests_json", "TEXT"),
     ("report_samples", "body_avg", "REAL DEFAULT 0"),
     ("report_samples", "body_p95", "REAL DEFAULT 0"),
+    // v18：池条目健康度（管理页状态筛选 / 刷新健康度）
+    (
+        "data_pool_items",
+        "expires_at",
+        "INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "data_pool_items",
+        "cooldown_until",
+        "INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "data_pool_items",
+        "fail_count",
+        "INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "data_pool_items",
+        "last_used_at",
+        "INTEGER NOT NULL DEFAULT 0",
+    ),
+    // v19：Token 刷新配置（none / http），配置体为 JSON
+    (
+        "data_pools",
+        "refresh_mode",
+        "TEXT NOT NULL DEFAULT 'none'",
+    ),
+    (
+        "data_pools",
+        "refresh_json",
+        "TEXT NOT NULL DEFAULT '{}'",
+    ),
+    // v20：池自定义列定义与整行数据（Excel 模板导入）
+    (
+        "data_pools",
+        "columns_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    ),
+    (
+        "data_pool_items",
+        "data_json",
+        "TEXT NOT NULL DEFAULT '{}'",
+    ),
 ];
 
 fn column_exists(conn: &rusqlite::Connection, table: &str, column: &str) -> Result<bool, String> {
@@ -484,7 +531,9 @@ fn seed_database(pool: &DbPool) -> Result<(), String> {
         seed::upgrade_sample(&conn)?;
     }
     // 示例测试套件幂等补齐：新库与老库升级都能看到可直接运行的回归例子
-    seed::ensure_sample_suite(&conn)
+    seed::ensure_sample_suite(&conn)?;
+    // 数据池示例幂等补齐：自定义列池 + 示例请求 + 示例压测计划（只追加一次）
+    seed::ensure_sample_pool_examples(&conn)
 }
 
 #[cfg(test)]
@@ -681,6 +730,108 @@ mod tests {
             )
             .unwrap();
         assert_eq!(suites, 1);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seeds_sample_pool_examples() {
+        let (dir, pool) = temp_pool("sample-pool-examples");
+        init(&pool).unwrap();
+        // 重复初始化保持幂等
+        init(&pool).unwrap();
+
+        let conn = pool.get().unwrap();
+        let columns: String = conn
+            .query_row(
+                "SELECT columns_json FROM data_pools WHERE name = '示例账号池（自定义列）'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(columns, r#"["phone","password","token"]"#);
+        let items: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM data_pool_items WHERE pool_id = (
+                    SELECT id FROM data_pools WHERE name = '示例账号池（自定义列）'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(items, 3, "示例池应有 3 条可直接预览的数据");
+
+        let plans: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM test_plans WHERE name = '示例压测：自定义列数据池'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(plans, 1, "示例压测计划应只插入一次");
+
+        let requests: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM requests WHERE collection_id = (
+                    SELECT id FROM collections WHERE name = '07 数据池示例'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(requests, 3, "数据池示例集合应包含 3 个请求（含 Excel 导入示例）");
+
+        let import_columns: String = conn
+            .query_row(
+                "SELECT columns_json FROM data_pools WHERE name = '示例参数池（Excel 模板导入）'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(import_columns, r#"["value","region","level"]"#);
+        let import_items: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM data_pool_items WHERE pool_id = (
+                    SELECT id FROM data_pools WHERE name = '示例参数池（Excel 模板导入）'
+                 ) AND data_json LIKE '%region%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(import_items, 4, "导入池应有 4 条带 region 列的示例数据");
+
+        let import_plan: String = conn
+            .query_row(
+                "SELECT config_json FROM test_plans WHERE name = '示例压测：Excel 导入池（逐请求轮换）'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("应内置 Excel 导入池压测计划");
+        assert!(import_plan.contains(r#""mode":"per_request""#));
+        assert!(import_plan.contains(r#""column":"*""#));
+
+        // 只有基础标记的老库：再次启动仍要补上导入流程示例
+        conn.execute(
+            "DELETE FROM app_meta WHERE key = ?1",
+            params!["sample_pool_flow_v20_seeded"],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM test_plans WHERE name = ?1",
+            params!["示例压测：Excel 导入池（逐请求轮换）"],
+        )
+        .unwrap();
+        drop(conn);
+        init(&pool).unwrap();
+        let conn = pool.get().unwrap();
+        let restored: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM test_plans WHERE name = '示例压测：Excel 导入池（逐请求轮换）'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(restored, 1, "老库升级后应补回导入流程示例计划");
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
     }

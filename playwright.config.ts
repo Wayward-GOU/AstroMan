@@ -50,5 +50,8 @@ export default defineConfig({
     { name: 'smoke', testMatch: /smoke\.spec\.ts/ },
     { name: 'visual', testMatch: /visual\.spec\.ts/ },
     { name: 'enterprise', testMatch: /enterprise\.spec\.ts/ },
+    // v1.1.2 第四批：集群审批 / 分配模式、报告峰值与旧报告降级
+    { name: 'cluster', testMatch: /cluster\.spec\.ts/ },
+    { name: 'report', testMatch: /report\.spec\.ts/ },
   ],
 })

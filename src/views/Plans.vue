@@ -21,10 +21,13 @@ import PageHeader from '@/components/PageHeader.vue'
 import LineChart from '@/components/LineChart.vue'
 import { useProjectStore } from '@/stores/project'
 import * as api from '@/api'
+import { ensurePoolPreview } from '@/utils/poolGate'
 import type {
   PlanImportPreview,
   PlanSummary,
+  PoolBinding,
   StressReport,
+  StressStage,
   TestPlan,
 } from '@/types/models'
 
@@ -133,12 +136,35 @@ function switchTab(key: string | number) {
   else if (key === 'reports') router.push('/reports')
 }
 
-function runPlan(plan: { id: number }) {
+/** 计划详情 / 列表运行前统一做池预览，失败或取消都不进入压测页 */
+async function planPoolGate(planId: number): Promise<boolean> {
+  const loaded = detail.value?.id === planId ? detail.value : await api.planGet(planId)
+  const config = loaded.config as {
+    settings?: { poolBindings?: PoolBinding[]; mode?: string; concurrent?: number }
+    stages?: StressStage[]
+  } | null
+  const bindings = config?.settings?.poolBindings ?? []
+  if (!bindings.length) return true
+  const vuCount =
+    config?.settings?.mode === 'stages'
+      ? Math.max(0, ...(config?.stages ?? []).map((stage) => Number(stage.concurrent) || 0))
+      : Number(config?.settings?.concurrent ?? 0)
+  return ensurePoolPreview(bindings, vuCount, '运行计划前确认参数 / Token 池')
+}
+
+async function runPlan(plan: { id: number }) {
+  try {
+    if (!(await planPoolGate(plan.id))) return
+  } catch (e) {
+    message.error(String(e))
+    return
+  }
   router.push({ path: '/stress', query: { planId: String(plan.id) } })
 }
 
 async function runInWindow(plan: { id: number }) {
   try {
+    if (!(await planPoolGate(plan.id))) return
     await api.stressOpenWindow(plan.id, null)
   } catch (e) {
     message.error(String(e))

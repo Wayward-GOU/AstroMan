@@ -1,4 +1,5 @@
 import type { ReportDetail, ReportSample, StageSummary } from '@/types/models'
+import type { ReportPeaks } from '@/types/cluster'
 
 /**
  * 压测报告分析算法集合
@@ -6,6 +7,16 @@ import type { ReportDetail, ReportSample, StageSummary } from '@/types/models'
  * 这里的全部函数只做「纯计算」，不依赖 Vue / DOM，便于单测与在 HTML 导出中复用。
  * 指标口径与《AstroMan压测能力提升与报告优化技术方案》4.0 节保持一致。
  */
+
+/**
+ * 统一读取峰值专题：集群报告取 config.cluster.peaks，单机报告取 config.metricsPeaks。
+ * 报告页、导出、AI 都走这里，避免三处各算一遍导致口径漂移。
+ */
+export function reportPeaks(detail: ReportDetail): ReportPeaks | null {
+  const config = detail.config
+  if (!config) return null
+  return config.cluster?.peaks ?? config.metricsPeaks ?? null
+}
 
 /** 整数千位分隔，用于吞吐/计数文案，与页面和导出报告一致 */
 const int = (value: number) => Math.round(value).toLocaleString('zh-CN')

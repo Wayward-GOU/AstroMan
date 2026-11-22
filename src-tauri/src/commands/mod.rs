@@ -21,6 +21,7 @@ pub mod mock;
 pub mod notes;
 pub mod oauth;
 pub mod plan;
+pub mod pool;
 pub mod project;
 pub mod python;
 pub mod realtime;

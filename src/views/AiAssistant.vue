@@ -55,11 +55,14 @@ import {
   aiUsageClear,
   aiUsageLogs,
   aiUsageStats,
+  clusterMasterSessions,
   fileExists,
   fileReadText,
   fileWriteText,
+  poolList,
   requestRevisionRollbackTrace,
   settingsGet,
+  stressJobs,
   testCaseGet,
   testDatasetGet,
   testPreflight,
@@ -889,6 +892,56 @@ function historyItems(): AiMessage[] {
 }
 
 /**
+ * 现场上下文（v1.1.2）：只带任务 / 集群 / 池的计数与状态，
+ * 不带令牌、变量值、配对码或地址，避免把敏感信息塞进模型上下文。
+ */
+const workspaceContext = ref('')
+
+async function refreshWorkspaceContext() {
+  const parts: string[] = []
+  try {
+    const [jobs, sessions, pools] = await Promise.all([
+      stressJobs().catch(() => []),
+      clusterMasterSessions().catch(() => []),
+      poolList().catch(() => []),
+    ])
+    if (jobs.length) {
+      parts.push(
+        `运行中的压测：${jobs
+          .map((job) => `#${job.id}「${job.name}」${job.concurrent} 并发 ${job.elapsedSec}s`)
+          .join('；')}`,
+      )
+    }
+    const activeSessions = sessions.filter(
+      (item) => item.status === 'pairing' || item.status === 'preparing' || item.status === 'running',
+    )
+    if (activeSessions.length) {
+      parts.push(
+        `集群会话：${activeSessions
+          .map(
+            (item) =>
+              `#${item.jobId}「${item.name}」${item.status} ${item.nodes.length} 节点${
+                item.status === 'pairing' ? `，待审批 ${item.pending.length}` : ''
+              }`,
+          )
+          .join('；')}`,
+      )
+    }
+    if (pools.length) {
+      parts.push(
+        `数据池：${pools
+          .map((pool) => `${pool.name}（${pool.kind === 'token' ? 'Token' : '参数'} ${pool.itemCount} 条）`)
+          .join('；')}`,
+      )
+    }
+  } catch {
+    workspaceContext.value = ''
+    return
+  }
+  workspaceContext.value = parts.length ? `【现场上下文】${parts.join(' / ')}` : ''
+}
+
+/**
  * system → 会话摘要 → 预算内的最近原文。
  * 超出预算时硬裁剪并显式告诉模型「省略了 N 条」，避免它假装记得。
  */
@@ -899,6 +952,7 @@ function toHistory(): AiMessage[] {
   // 系统提示词、摘要与页面现场固定占用，先扣掉再给历史分配
   const reserved =
     estimateTokens(SYSTEM_PROMPT) +
+    estimateTokens(workspaceContext.value) +
     backendPromptTokens.value +
     (summaryText ? estimateTokens(summaryText) + 8 : 0) +
     (handoffText ? estimateTokens(handoffText) + 8 : 0) +
@@ -907,6 +961,7 @@ function toHistory(): AiMessage[] {
   contextDropped.value = plan.dropped
   contextTokens.value = plan.tokens + reserved
   const head: AiMessage[] = [{ role: 'system', content: SYSTEM_PROMPT }]
+  if (workspaceContext.value) head.push({ role: 'system', content: workspaceContext.value })
   if (summaryText) head.push({ role: 'system', content: `${SUMMARY_PREFIX}${summaryText}` })
   if (handoffText) head.push({ role: 'system', content: handoffText })
   if (plan.dropped > 0) {
@@ -961,6 +1016,8 @@ async function ask(extra: AiMessage[] = []) {
 
   const rid = newRequestId()
   requestId.value = rid
+  // 现场上下文每轮刷新，避免模型拿过期状态做判断；失败不影响正常对话
+  await refreshWorkspaceContext()
   const history = toHistory()
   // 原生 function calling：轮次将尽 / 已强制收尾时不再下发工具，让模型直接给结论
   const useNative =
@@ -2852,9 +2909,42 @@ async function maybeSummarize(force = false) {
   }
 }
 
-/** Enter 直接发送；Shift / Ctrl / ⌘ + Enter 换行；输入法组字状态下不触发 */
+/**
+ * 输入法保护：部分浏览器/输入法在“回车确认候选词”时 isComposing 已经是 false，
+ * 只靠 event.isComposing 会把确认键误判成发送。这里额外用 composition 状态 +
+ * compositionend 时间窗兜底。
+ */
+let imeComposing = false
+let imeEndedAt = 0
+
+function onCompositionStart() {
+  imeComposing = true
+  imeEndedAt = 0
+}
+
+function onCompositionEnd() {
+  imeComposing = false
+  imeEndedAt = Date.now()
+}
+
+function isImeKey(event: KeyboardEvent) {
+  return imeComposing
+    || event.isComposing
+    || event.keyCode === 229
+    || event.key === 'Process'
+    || Date.now() - imeEndedAt < 80
+}
+
+/** Enter 直接发送；Shift + Enter 换行；Ctrl + Enter 发送；输入法组字/确认候选词时不触发 */
 function onEnter(event: KeyboardEvent) {
-  if (event.shiftKey || event.ctrlKey || event.metaKey || event.isComposing) return
+  if (event.shiftKey || event.ctrlKey || event.metaKey || isImeKey(event)) return
+  event.preventDefault()
+  void send()
+}
+
+/** Ctrl + Enter 发送，同样避开输入法确认键 */
+function onCtrlEnter(event: KeyboardEvent) {
+  if (isImeKey(event)) return
   event.preventDefault()
   void send()
 }
@@ -3871,7 +3961,9 @@ onActivated(() => {
                 :disabled="sending"
                 placeholder="和航仔聊聊，或让它帮你操作软件…（Enter 发送，Shift + Enter 换行，可直接粘贴截图）"
                 @keydown.enter="onEnter"
-                @keydown.ctrl.enter.prevent="send"
+                @keydown.ctrl.enter="onCtrlEnter"
+                @compositionstart="onCompositionStart"
+                @compositionend="onCompositionEnd"
                 @paste="onPasteImages"
               />
               <a-button

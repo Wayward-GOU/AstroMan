@@ -7,12 +7,12 @@ description: AstroMan 内置 AI 助手「航仔」的开发与维护规范。接
 
 航仔 是内置在 AstroMan 里的接口调试助手：用户自备模型 API Key，它既能纯聊天，也能通过「工具」直接操作软件（建项目、建请求、发请求、压测、跑自动化测试套件、导入导出），并把每次工具调用单独落库供用户审计。
 
-## 现状速览（v1.0.9，先读这张表）
+## 现状速览（v1.1.2，先读这张表）
 
 | 能力 | 落点 |
 |---|---|
-| **92 个工具**（79 业务 + 12 工具箱 + `tool_search`），其中 22 个是自动化测试域、7 个是抓包域 | `aiTools.ts` 的 `SPECS` / `SCHEMAS` / `WRITE_TOOLS` / `CORE_TOOL_NAMES` / `TOOL_KEYWORDS` |
-| 自动化测试：套件 / 用例 / 运行 / 报告 | 12 个 `test_*` 工具 → `commands/test_suite.rs`、`test_case.rs`、`test_run.rs`、`test_report.rs`、`test_preflight.rs`；流程见 §自动化测试域 |
+| **126 个工具**（113 业务 + 12 工具箱 + `tool_search`），其中 22 个自动化测试域、7 个抓包域、17 个集群域、7 个池工具 | `aiTools.ts` 的 `SPECS` / `SCHEMAS` / `WRITE_TOOLS` / `CORE_TOOL_NAMES` / `TOOL_KEYWORDS` |
+| 自动化测试：套件 / 用例 / 运行 / 报告 | 22 个 `test_*` 工具 → `commands/test_suite.rs`、`test_case.rs`、`test_run.rs`、`test_report.rs`、`test_preflight.rs`；流程见 §自动化测试域 |
 | 停止生成 / 自动重试 / 工具硬超时 | `ai.rs` 的 `ai_chat_cancel` + `request_id` 注册表、`retry` 事件；`aiTools.ts` 的 `toolTimeoutOf` / `withTimeout` / `ToolTimeoutError` |
 | 上下文预算与异步摘要 | `contextBudget.ts` / `modelMeta.ts`；`ai_sessions.summary / summary_until`；对话页预算条 |
 | 注入隔离、密钥掩码、CSP | `untrusted.ts` 三入口包裹；`api_key_masked` / `has_key`；`tauri.conf.json` 的 `csp` |
@@ -43,7 +43,7 @@ description: AstroMan 内置 AI 助手「航仔」的开发与维护规范。接
 | `src-tauri/src/models.rs` | `AiProvider`（`api_key_masked` / `has_key` / `max_tokens` / `timeout_secs`）、`AiMessage`、`AiChatPayload`、`AiStreamEvent`、`AiSession`（`pinned` / `summary`）、`AiStoredMessage`、`AiToolLog`（`round` / `trace_id` / `timeout`）、`AiUsageLog` / `AiUsagePage` / `AiUsageDay` |
 | `src-tauri/src/db/schema.sql` | `ai_providers`、`ai_sessions`、`ai_messages`、`ai_tool_logs`、`ai_usage_logs` 五张在用表（另有遗留的 `ai_conversations`，代码已不读写，见 §数据表） |
 | `src-tauri/src/commands/test_suite.rs` / `test_case.rs` / `test_run.rs` / `test_report.rs` / `test_preflight.rs` | 测试域工具的后端命令：`test_suite_*` / `test_case_*` / `test_run_*` / `test_report_generate` / `test_preflight`（工具侧只做参数归一、字段裁剪与中文键，业务逻辑在后端） |
-| `src/utils/aiTools.ts` | **工具注册表**：**92 个工具**（79 业务 + 12 工具箱 + `tool_search`，含 22 个测试域与 7 个抓包域工具）的声明、参数解析、执行、中文名、`danger` 标记、`isWriteTool()` 写操作判定（`WRITE_TOOLS` 48 项）、`SCHEMAS` 入参校验、`TOOL_KEYWORDS` 检索别名、`toolTimeoutOf()` 超时档位、`ToolResult` 输出信封、目录分层 |
+| `src/utils/aiTools.ts` | **工具注册表**：**126 个工具**（113 业务 + 12 工具箱 + `tool_search`，含 22 个测试域、7 个抓包域、17 个集群域与 7 个池工具）的声明、参数解析、执行、中文名、`danger` 标记、`isWriteTool()` 写操作判定（`WRITE_TOOLS` 48 项）、`SCHEMAS` 入参校验、`TOOL_KEYWORDS` 检索别名、`toolTimeoutOf()` 超时档位、`ToolResult` 输出信封、目录分层 |
 | `src/utils/aiProtocol.ts` | fenced 块解析：`parseSegments` / `normalizePseudoFence` / `liftNativeCalls` / `stripNativeTags` / `sanitizeAssistant` / `callKey` |
 | `src/utils/contextBudget.ts` | token 估算 `estimateTokens` / `estimateMessages`、预算裁剪 `buildContext`、摘要前缀 `SUMMARY_PREFIX` |
 | `src/utils/modelMeta.ts` | 模型 → 上下文窗口映射 `contextWindowOf`、预算比例 `contextBudgetOf`（窗口 60%，下限 2000） |
@@ -55,11 +55,11 @@ description: AstroMan 内置 AI 助手「航仔」的开发与维护规范。接
 | `src/components/AiAssistDrawer.vue` | 全局右侧抽屉，`App.vue` 挂载，所有页面 AI 入口共用；打开后先停在「开始分析？」确认页（显示上下文体量），点按钮才真正调模型 |
 | `src/components/AiConfirmCard.vue` | 写操作结构化确认卡：任务 / 影响对象 / 计划 / 参数表 / 风险 / 预检；`labelMap` + `rowLabel()` 负责参数名中文化（`id` 按工具前缀标成测试套件 / 测试用例），布尔值显示「是 / 否」，`kind` 值走 `testCaseKindLabel()` |
 | `src/views/AiAssistant.vue` | 对话页：会话侧栏（搜索 / 置顶 / 导出）+ 消息操作 + 工具卡片 + 预算条 + 复盘时间线 + 模型服务抽屉 + 「自动执行工具」开关；工具调度（`ask` / `afterReply` / `runToolSegment`）与 `CONFIRM_TEXT` 文案表都在这里 |
-| `src/utils/__tests__/` | vitest：`aiProtocol` / `aiTools` / `contextBudget` / `untrusted` 四组纯函数用例（全量 14 spec / 160 条，见 `astroman-testing`） |
+| `src/utils/__tests__/` | vitest：`aiProtocol` / `aiTools` / `contextBudget` / `untrusted` 四组纯函数用例（全量 35 spec / 322 条，见 `astroman-testing`） |
 | `src/views/AiUsage.vue` | 用量统计独立页（`/ai/usage`）：6 张指标卡 + 每日 token 柱 + 调用记录 / 模型汇总 / 工具准确率三 Tab + 右侧抽屉 |
 | `src/views/AiToolLogs.vue` | 工具调用记录页（`/ai/logs`）：指标卡、趋势柱、表格、详情抽屉 |
 | `src/views/Settings.vue` | 设置页「AI 辅助（航仔）」卡片：已上线说明 + 「打开航仔」「用量统计」 |
-| `src/views/Dashboard.vue` | 首页使用说明：第 07 步「用航仔 提效」、3 张 AI 技巧卡、3 条 AI FAQ |
+| `src/views/Dashboard.vue` | 首页使用说明：第 11 步「用航仔 提效」、3 张 AI 技巧卡、3 条 AI FAQ |
 | `src/App.vue` | 全局挂载 `<AstroBuddy>` 宇航员挂件作为 AI 入口（可拖拽，`/ai` 页隐藏）+ `<AiAssistDrawer />` |
 | `src/api/index.ts` | `aiProvider*`、`aiChat`、`aiChatCancel`、`aiModelsList`、`aiExecute`、`aiSession*`、`aiMessage*`、`aiToolLog*`、`aiUsage*`，以及测试域 `testSuite*` / `testCase*` / `testRun*` / `testPreflight` / `testReportGenerate` |
 
@@ -291,7 +291,7 @@ Rust 侧 `ai_chat(payload, on_event: Channel<AiStreamEvent>)`，逐块 `on_event
 
 改规则时的顺序：`agent_hard_rules.md`（需求） → `SCHEMAS` / `MAX_TOOL_ROUNDS` / `danger` / `WRITE_TOOLS` → 前端提示文案 → 本表。
 
-### 工具清单（79 业务 + 12 工具箱 + `tool_search` = 92）
+### 工具清单（113 业务 + 12 工具箱 + `tool_search` = 126）
 
 | 分类 | 工具 |
 |---|---|
@@ -299,7 +299,9 @@ Rust 侧 `ai_chat(payload, on_event: Channel<AiStreamEvent>)`，逐块 `on_event
 | 集合 | `collection_tree` `collection_create` `collection_rename` `collection_delete` |
 | 请求 | `request_list` `request_get` `request_search` `request_options` `request_create` `request_batch_create` `request_update` `request_script_save` `request_delete` `curl_import` `send_request` `run_batch` |
 | 环境 | `env_list` `env_create` `env_var_save` `env_activate` `env_delete` `env_script_save` |
-| 压测 | `plan_list` `plan_get` `plan_save` `plan_delete` `stress_start` `stress_stop` `report_list` `report_get` `report_export` `report_requests` `report_delete` `run_list` |
+| 压测 | `plan_list` `plan_get` `plan_save` `plan_delete` `stress_start` `stress_stop` `stress_budget_get` `report_list` `report_get` `report_export` `report_requests` `report_delete` `run_list` |
+| 分布式压测 | `cluster_status` `cluster_session_get` `cluster_nodes` `cluster_samples` `cluster_diagnostics` `cluster_discovered_masters` `cluster_pending_joins` `cluster_start` `cluster_prepare` `cluster_launch` `cluster_var_audit` `cluster_stop` `cluster_close` `cluster_approve_join` `cluster_reject_join` `cluster_auto_accept` `cluster_join_master` |
+| 数据池 | `pool_list` `pool_get` `pool_preview` `pool_create` `pool_import` `pool_delete` `pool_bind_plan` |
 | 自动化测试 | `test_suite_list` `test_suite_get` `test_suite_create` `test_suite_update` `test_suite_delete` `test_case_create` `test_case_update` `test_case_delete` `test_run_start` `test_run_stop` `test_run_get` `test_report_export` `test_dataset_list` `test_dataset_get` `test_dataset_save` `test_dataset_delete` `test_suite_import` `test_suite_export` `test_run_list` `test_artifact_list` `test_artifact_export` `test_preflight` |
 | 抓包 | `capture_status` `capture_flow_list` `capture_flow_get` `capture_start` `capture_stop` `capture_repeat` `capture_export` |
 | 数据 | `history_list` `history_export` `history_stats` `workspace_stats` `dashboard_metrics` `cookie_list` |
@@ -307,13 +309,13 @@ Rust 侧 `ai_chat(payload, on_event: Channel<AiStreamEvent>)`，逐块 `on_event
 | 工具箱 | `toolbox_json_format` `toolbox_json_to_entity` `toolbox_json_to_sql` `toolbox_convert` `toolbox_timestamp` `toolbox_base64` `toolbox_hash` `toolbox_url` `toolbox_regex` `toolbox_jwt` `toolbox_diff` `toolbox_uuid` |
 | 元工具 | `tool_search`（按中英文关键词检索长尾工具用法） |
 
-数一遍是 79 个业务工具 + 12 个工具箱 + `tool_search` = **92**。这个数字被算错过好几次（历史文档写过 61 / 62 / 74 / 75），原因是拿 `grep -o "name: '[a-z_0-9]*'"` 统计时会多出一个空匹配，直接多数一个。可靠算法：
+数一遍是 113 个业务工具 + 12 个工具箱 + `tool_search` = **126**。这个数字被算错过好几次（历史文档写过 61 / 62 / 74 / 75 / 92），原因是拿 `grep -o "name: '[a-z_0-9]*'"` 统计时会多出一个空匹配，直接多数一个。可靠算法：
 
 ```bash
 node -e "const s=require('fs').readFileSync('src/utils/aiTools.ts','utf8');const n=[...s.slice(s.indexOf('const SPECS')).matchAll(/name: '([a-z][a-z0-9_]*)'/g)].map(m=>m[1]);console.log(n.length, new Set(n).size)"
 ```
 
-输出两个数都是 `92` 才算对。新增或删除工具后跑 `npx vitest run src/utils/__tests__/aiTools.spec.ts`，并同步本节标题、§现状速览、§工具目录分层里的核心数。
+输出两个数都是 `126` 才算对。新增或删除工具后跑 `npx vitest run src/utils/__tests__/aiTools.spec.ts`，并同步本节标题、§现状速览、§工具目录分层里的核心数。
 
 ### 工具目录分层（T-12）
 
@@ -322,7 +324,7 @@ node -e "const s=require('fs').readFileSync('src/utils/aiTools.ts','utf8');const
 - 测试域只有 `test_suite_list` / `test_run_start` / `test_run_get` 进核心（够覆盖「列套件 → 跑 → 看结果」主线），建 / 改 / 删 / 数据集 / 导入导出 / 附件 / 预检全部走 `tool_search` 检索；`TOOL_KEYWORDS` 里用 `{ words: ['测试','套件','用例','回归'], tools: ['test_'] }` 等前缀规则覆盖全族
 - 抓包 7 个工具全部是长尾（不进核心），靠 `{ words: ['抓包','录制','流量','har'], tools: ['capture_'] }` 检索；提示词里只写「抓包 / 流量」的使用规则，不占核心目录字符
 - 新增工具时：核心工具补进 `CORE_TOOL_NAMES` 并写清参数；长尾工具只写一行 `desc` + `args`，同时补 `TOOL_KEYWORDS`
-- `toolCatalogStats()` 返回 `{ core, full, ratio }`，单测约束 `ratio ≤ 0.7`、目录长度 < 4200，防止提示词重新膨胀；92 个工具时 core/full ≈ 0.45，还有余量但要克制
+- `toolCatalogStats()` 返回 `{ core, full, ratio }`，单测约束 `ratio ≤ 0.7`、目录长度 < 4200，防止提示词重新膨胀；126 个工具时 core/full 约 0.3，还有余量但要克制
 
 ### 工具输出信封（T-11）
 
@@ -672,7 +674,7 @@ node -e "const s=require('fs').readFileSync('src/utils/aiTools.ts','utf8');const
 ```powershell
 # 前端（根目录）
 npm.cmd run build            # vue-tsc --noEmit + vite build
-npm.cmd run test             # vitest：全量 14 spec / 160 条，AI 相关 4 组
+npm.cmd run test             # vitest：全量 35 spec / 322 条，AI 相关 4 组
 npx vitest run src/utils/__tests__/aiTools.spec.ts   # 只跑工具注册表（含 ratio / 参数校验）
 
 # 后端（src-tauri）

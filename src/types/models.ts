@@ -1,4 +1,4 @@
-import type { ClusterReportMeta } from './cluster'
+import type { ClusterReportMeta, ReportPeaks } from './cluster'
 
 export interface Project {
   id: number
@@ -213,8 +213,16 @@ export interface AppSettings {
   budgetHardStop?: boolean
   /** 失败回退链：逗号分隔的 provider id；空 = 关闭（AI-12） */
   aiFallbackIds?: string
-  /** 跨任务并发之和上限（默认 1000，硬上限 2000） */
+  /** 跨任务并发之和上限；0 表示不限（v1.1.2 起由本机预算约束） */
   stressMaxConcurrent?: number
+  /** 并发预算模式：auto（按机器能力）/ manual（手动上限） */
+  stressBudgetMode?: string
+  /** 同时运行的压测任务上限；0 表示不限 */
+  stressMaxJobs?: number
+  /** 允许注入的系统环境变量白名单，逗号分隔，支持 PREFIX* */
+  stressOsEnvAllow?: string
+  /** 是否广播/监听局域网发现 */
+  clusterDiscoveryEnabled?: boolean
 }
 
 /** 企业策略（policy.json / W4-2） */
@@ -918,6 +926,8 @@ export interface StressConfig {
   bodyType: string
   body?: string | null
   envId?: number | null
+  /** 集群变量策略：master_wins（默认）/ local_wins */
+  varPolicy?: 'master_wins' | 'local_wins'
   /** 运行期变量：优先级高于环境变量，不落库 */
   vars?: Record<string, string>
   insecure?: boolean
@@ -930,6 +940,16 @@ export interface StressConfig {
   durationSec: number
   rampUpSec: number
   thinkTimeMs: number
+  /** 思考时间分布：fixed / uniform / normal / lognormal（8.7） */
+  thinkTimeMode?: string
+  thinkTimeMinMs?: number
+  thinkTimeMaxMs?: number
+  thinkTimeMeanMs?: number
+  thinkTimeStdMs?: number
+  /** 预热曲线：linear / step / spike */
+  rampUpMode?: string
+  /** 每个 VU 起始相位随机抖动上限（毫秒） */
+  vuStartJitterMs?: number
   stages?: StressStage[]
   targetRps?: number | null
   sla?: SlaTargets | null
@@ -947,6 +967,8 @@ export interface StressConfig {
   baselineReportId?: number | null
   /** 超过 2 小时的长稳启动确认 */
   longRunAck?: boolean
+  /** 参数池 / Token 池绑定（v1.1.2） */
+  poolBindings?: PoolBinding[]
 }
 
 /** capacity：容量模式；locate：定位模式；auto：沿用 recordDetail 并自动降档 */
@@ -970,6 +992,167 @@ export interface StressJobSummary {
 
 /** full：每请求记录；sample：1% 采样；off：不记录；auto：引擎按 QPS 定档 */
 export type RecordDetailMode = 'full' | 'sample' | 'off' | 'auto'
+
+/** 池绑定：把某个池映射到配置变量或认证字段 */
+export interface PoolBinding {
+  /** 池名称 */
+  pool: string
+  /** 目标：vars 变量名 / auth.token / auth.username / auth.password */
+  target: string
+  /**
+   * 取哪一列注入：'' 旧行为（首列）/ '*' 全部列同名注入 / 具体列名
+   */
+  column?: string
+  /** per_vu：每个 VU 固定一条；per_request：逐请求轮换；random：随机 */
+  mode: 'per_vu' | 'per_request' | 'random'
+  /** 401 时切换到下一条并重试一次 */
+  refreshOn401?: boolean
+}
+
+/** Token 刷新配置（v19）：mode = none / http */
+export interface PoolRefreshConfig {
+  mode: string
+  method: string
+  url: string
+  headers: KeyValueItem[]
+  body: string
+  /** 响应 JSON 路径，如 $.data.accessToken */
+  tokenPath: string
+  /** 过期时间路径，如 $.data.expiresIn（秒或毫秒） */
+  expiresPath: string
+  /** 缺少过期时间时的兜底有效期（秒），0 = 不过期 */
+  expiresInSec: number
+}
+
+/** 跨报告节点级曲线（v19） */
+export interface ReportNodePoint {
+  sec: number
+  qps: number
+  concurrent: number
+  p95: number
+  errors: number
+}
+
+export interface ReportNodeSeries {
+  reportId: number
+  node: string
+  role: string
+  points: ReportNodePoint[]
+}
+
+/** 池摘要（列表页） */
+export interface PoolSummary {
+  id: number
+  name: string
+  kind: string
+  /** 敏感池：默认脱敏，管理页需显式 reveal */
+  sensitive: boolean
+  description: string
+  /** 自定义列定义；数组顺序即展示顺序，首列为 value 镜像 */
+  columns: string[]
+  itemCount: number
+  enabledCount?: number
+  /** 健康度分项（v18 数据池管理页） */
+  activeCount?: number
+  invalidCount?: number
+  expiredCount?: number
+  coolingCount?: number
+  lastUsedAt?: number
+  createdAt: number
+  updatedAt: number
+}
+
+/** 池条目状态：active / cooling / invalid / expired / disabled */
+export type PoolItemStatus = 'active' | 'cooling' | 'invalid' | 'expired' | 'disabled'
+
+/** 数据池管理页条目（敏感池 value / data 始终为掩码） */
+export interface PoolItemView {
+  id: number
+  index: number
+  /** 首列镜像 */
+  value: string
+  /** 各列数据：key 为列名，敏感池已逐值脱敏 */
+  data: Record<string, string>
+  masked: boolean
+  account?: string | null
+  weight: number
+  enabled: boolean
+  status: PoolItemStatus
+  expiresAt: number
+  failCount: number
+  lastUsedAt: number
+  createdAt: number
+}
+
+export interface PoolHealth {
+  total: number
+  active: number
+  invalid: number
+  expired: number
+  cooling: number
+  disabled: number
+}
+
+export interface PoolItemsPage {
+  items: PoolItemView[]
+  total: number
+  page: number
+  pageSize: number
+  health: PoolHealth
+}
+
+/** 池内条目（默认脱敏） */
+export interface PoolItem {
+  id: number
+  poolId: number
+  label?: string | null
+  value?: string | null
+  account?: string | null
+  masked?: string | null
+  hash?: string | null
+  weight: number
+  enabled?: boolean
+  createdAt: number
+}
+
+/** 池预览：开跑前查看分配与问题（secret 默认脱敏） */
+export interface PoolPreview {
+  bindings: Array<{
+    pool: string
+    target: string
+    /** 绑定的列：'' 旧行为 / '*' 全部列 / 具体列名 */
+    column?: string
+    mode: string
+    refreshOn401: boolean
+    itemCount: number
+    vusCovered: number
+    /** 本绑定实际注入的目标变量名 */
+    targets?: string[]
+    sample: Array<{
+      id: number
+      value: string
+      /** 各列样例值（已脱敏） */
+      data?: Record<string, string>
+      account?: string | null
+      weight: number
+    }>
+    assignments: Array<{
+      vu: number
+      itemId: number
+      value: string
+      account?: string | null
+    }>
+  }>
+  identityPreview: Array<{
+    target: string
+    pool: string
+    uniqueItems: number
+    vusCovered: number
+  }>
+  problems: string[]
+  vuCount: number
+  masked: boolean
+}
 
 export interface ReportSample {
   elapsedSec: number
@@ -1053,6 +1236,10 @@ export interface StressReport {
   errorRate: number
   concurrency: number
   status: string
+  /** 是否来自集群压测（v1.1.2） */
+  isCluster?: boolean
+  /** 峰值 QPS（v1.1.2：集群取 cluster.peaks，单机取 metricsPeaks） */
+  peakQps?: number
   startTime?: number | null
   endTime?: number | null
   createdAt: number
@@ -1152,6 +1339,28 @@ export interface ReportConfigSnapshot {
   metrics?: RuntimeMetrics
   /** 分布式压测元数据（v1.1.1 一期，主从节点与合并口径） */
   cluster?: ClusterReportMeta | null
+  /** 单机峰值专题（与集群 config.cluster.peaks 同结构） */
+  metricsPeaks?: ReportPeaks | null
+  /** 参数 / Token 池运行统计（v1.1.2，只含计数与序号，不含明文） */
+  pools?: PoolReportStat[] | null
+}
+
+/** 报告里的池统计（config_json.pools） */
+export interface PoolReportStat {
+  name: string
+  items: number
+  used: number
+  requests: number
+  refreshed: number
+  invalid: number
+  exhausted?: boolean
+  /** 集群报告的统计范围：cluster 全部节点 / master 仅主节点 / 缺省为本机 */
+  nodeScope?: string
+  /** 贡献该池统计的节点名（nodeScope=cluster 时） */
+  nodes?: string[]
+  /** 各节点用量明细（集群汇总时） */
+  byNode?: Array<{ name: string; used: number; requests: number; refreshed: number }>
+  perItem?: Array<{ index: number; requests: number }>
 }
 
 /** 压测配置带入的机器能力快照 */

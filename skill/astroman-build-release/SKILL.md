@@ -13,8 +13,8 @@ description: AstroMan 的打包、图标、托盘与发布流程。需要构建 
 | Windows 安装包 | `npm run build:win` | `AstroMan_<版本>_x64-setup.exe`（NSIS） |
 | macOS 安装包 | `npm run build:mac` | `AstroMan_<版本>_universal.dmg` |
 | 仅校验 Rust | `cd src-tauri && cargo check` | — |
-| 前端单测 | `npm run test` | vitest：14 spec / 160 条 |
-| Rust 单测 | `cd src-tauri && cargo test --lib` | 140 条 |
+| 前端单测 | `npm run test` | vitest：35 spec / 322 条 |
+| Rust 单测 | `cd src-tauri && cargo test --lib` | 426 条（6 ignored） |
 | 覆盖率（本地） | `cd src-tauri && cargo tarpaulin --config tarpaulin.toml --engine llvm` | `target/coverage/` |
 | 版本号 | `npm run version:check` / `npm run version:set 1.0.9` | 三处版本一致 |
 

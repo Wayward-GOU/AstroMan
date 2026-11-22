@@ -22,6 +22,8 @@ import * as api from '@/api'
 import type {
   Environment,
   PlanSummary,
+  PoolItem,
+  PoolSummary,
   PreflightReport,
   Project,
   RequestSearchHit,
@@ -501,6 +503,44 @@ async function saveSettings() {
 
 /* ---------- 运行 ---------- */
 const runEnvId = ref<number | undefined>(undefined)
+
+/* 参数池（可选）：每次运行取一条，注入为运行时变量 */
+const pools = ref<PoolSummary[]>([])
+const poolId = ref<number | null>(null)
+const poolTarget = ref('')
+const poolItemsList = ref<PoolItem[]>([])
+let poolCursor = 0
+
+async function loadPools() {
+  try {
+    pools.value = await api.poolList()
+  } catch {
+    pools.value = []
+  }
+}
+
+async function loadPoolItems() {
+  poolItemsList.value = []
+  if (!poolId.value) return
+  try {
+    const items = await api.poolItems(poolId.value, true)
+    poolItemsList.value = items.filter((item) => item.enabled !== false && (item.value ?? '') !== '')
+  } catch (error) {
+    message.error(String(error))
+  }
+}
+
+watch(poolId, loadPoolItems)
+
+function pickPoolVars(): Record<string, string> | undefined {
+  const target = poolTarget.value.trim()
+  const items = poolItemsList.value
+  if (!poolId.value || !target || !items.length) return undefined
+  const item = items[poolCursor % items.length]
+  poolCursor += 1
+  return item?.value ? { [target]: item.value } : undefined
+}
+
 const preflightOpen = ref(false)
 const preflight = ref<PreflightReport | null>(null)
 const runDrawer = reactive({ open: false, runId: 0, detail: null as RunDetail | null })
@@ -519,8 +559,17 @@ let pollTimer: number | null = null
 async function startRun() {
   if (!suite.value) return
   const envId = runEnvId.value ?? suite.value.suite.envId
+  if (poolId.value && !poolTarget.value.trim()) {
+    message.warning('已选择参数池，请填写占位符名（请求里用 {{名字}} 引用）')
+    return
+  }
+  if (poolId.value && !poolItemsList.value.length) {
+    message.warning('所选参数池没有可用条目，请先在数据池导入')
+    return
+  }
+  const poolVars = pickPoolVars()
   try {
-    const report = await api.testPreflight(suite.value.suite.id, envId)
+    const report = await api.testPreflight(suite.value.suite.id, envId, poolVars)
     preflight.value = report
     if (!report.runnable) {
       preflightOpen.value = true
@@ -531,7 +580,11 @@ async function startRun() {
     return
   }
   try {
-    const runId = await api.testRunStart(suite.value.suite.id, envId)
+    const runId = await api.testRunStart(
+      suite.value.suite.id,
+      envId,
+      poolVars ? { vars: poolVars } : undefined,
+    )
     runDrawer.open = true
     runDrawer.runId = runId
     activeCase.value = null
@@ -663,7 +716,7 @@ watch(() => suite.value?.suite.id, fillSettings)
 onMounted(async () => {
   try {
     await loadProjects()
-    await Promise.all([loadSuites(), loadContext()])
+    await Promise.all([loadSuites(), loadContext(), loadPools()])
   } catch (error) {
     message.error(String(error))
   }
@@ -782,6 +835,22 @@ onBeforeUnmount(stopPolling)
                 运行
               </a-button>
             </div>
+          </div>
+
+          <div v-if="pools.length" class="run-pools">
+            <span class="run-pools-label">参数池</span>
+            <a-select
+              v-model:value="poolId"
+              allow-clear
+              size="small"
+              style="width: 150px"
+              placeholder="不使用"
+              :options="pools.map((p) => ({ label: p.name, value: p.id }))"
+            />
+            <template v-if="poolId">
+              <a-input v-model:value="poolTarget" size="small" style="width: 170px" placeholder="占位符名，如 phone" />
+              <span class="run-pools-hint">每次运行轮换一条；请求里写 &#123;&#123;占位符名&#125;&#125; 生效</span>
+            </template>
           </div>
 
           <a-tabs v-model:activeKey="tab" size="small" class="suite-tabs">
@@ -1473,6 +1542,23 @@ onBeforeUnmount(stopPolling)
   display: flex;
   flex-direction: column;
   padding: 0 16px;
+}
+
+.run-pools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 16px 8px;
+}
+
+.run-pools-label {
+  font-size: 11px;
+  color: var(--fm-muted);
+}
+
+.run-pools-hint {
+  font-size: 11px;
+  color: var(--fm-muted);
 }
 
 .suite-tabs :deep(.ant-tabs-nav) {

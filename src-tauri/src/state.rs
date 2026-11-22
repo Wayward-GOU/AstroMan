@@ -53,8 +53,16 @@ pub struct AppSettings {
     pub budget_hard_stop: bool,
     /// 失败回退链：逗号分隔的 provider id，按顺序尝试；空 = 关闭（AI-12）
     pub ai_fallback_ids: String,
-    /// 压测跨任务并发之和上限，默认 1000，硬上限 2000（v1.1.1）
+    /// 压测跨任务并发之和上限（v1.1.2 起仅手动模式使用；自动模式由预算计算）
     pub stress_max_concurrent: i64,
+    /// 并发预算模式：auto（按 CPU/内存/fd 自动计算）/ manual（用户指定）
+    pub stress_budget_mode: String,
+    /// 同时运行的压测任务数上限；0 = 不限制
+    pub stress_max_jobs: i64,
+    /// OS 环境变量白名单（逗号分隔），供 `{{os:NAME}}` 使用；空 = 全部禁止
+    pub stress_os_env_allow: String,
+    /// 是否允许局域网自动发现（UDP 17802）
+    pub cluster_discovery_enabled: bool,
 }
 
 impl Default for AppSettings {
@@ -75,7 +83,123 @@ impl Default for AppSettings {
             budget_hard_stop: false,
             ai_fallback_ids: String::new(),
             stress_max_concurrent: 1000,
+            stress_budget_mode: "auto".to_string(),
+            stress_max_jobs: 0,
+            stress_os_env_allow: String::new(),
+            cluster_discovery_enabled: true,
         }
+    }
+}
+
+/* ---------- v1.1.2 并发预算 ---------- */
+
+/// 并发预算模式
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BudgetMode {
+    /// 按 CPU / 内存 / 文件句柄 / 最近能力检测自动计算
+    Auto,
+    /// 用户在设置页手动指定
+    Manual,
+}
+
+impl BudgetMode {
+    pub fn normalize(raw: &str) -> Self {
+        if raw.eq_ignore_ascii_case("manual") {
+            BudgetMode::Manual
+        } else {
+            BudgetMode::Auto
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BudgetMode::Auto => "auto",
+            BudgetMode::Manual => "manual",
+        }
+    }
+}
+
+/// 预算来源：把「为什么是这个数」完整暴露给设置页
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BudgetSources {
+    pub cores: u32,
+    pub mem_gb: f64,
+    pub fd_limit: u64,
+    pub probe_saturation: Option<u32>,
+    pub by_cpu: u32,
+    pub by_fd: u32,
+    pub by_mem: u32,
+    /// 本次预算实际被哪一项压住：cpu / fd / mem / probe / manual
+    pub limited_by: String,
+    pub computed_at: i64,
+}
+
+/// 本机并发预算快照
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConcurrencyBudget {
+    /// auto / manual
+    pub mode: String,
+    /// 本机所有压测任务并发之和的上限
+    pub machine_limit: u32,
+    /// 单任务上限（正常等于 machine_limit）
+    pub per_job_limit: u32,
+    /// 当前活跃任务数
+    pub active_jobs: usize,
+    /// 任务数上限；0 = 不限
+    pub max_jobs: usize,
+    pub sources: BudgetSources,
+}
+
+/// 任务登记失败的类别
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReserveErrorKind {
+    JobsFull,
+    BudgetExceeded,
+    SameTarget,
+}
+
+impl ReserveErrorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReserveErrorKind::JobsFull => "jobsFull",
+            ReserveErrorKind::BudgetExceeded => "budgetExceeded",
+            ReserveErrorKind::SameTarget => "sameTarget",
+        }
+    }
+}
+
+/// 结构化登记错误：前端可原样展示「当前总并发 + 本次 > 预算」
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReserveError {
+    pub kind: String,
+    pub requested: u32,
+    pub current_total: u32,
+    pub budget: u32,
+    pub active_jobs: Vec<JobBrief>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobBrief {
+    pub id: u64,
+    pub name: String,
+    pub concurrent: u32,
+}
+
+impl std::fmt::Display for ReserveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl From<ReserveError> for String {
+    fn from(value: ReserveError) -> Self {
+        value.message
     }
 }
 
@@ -163,6 +287,7 @@ impl StressJobRegistry {
     /// 登记新任务：任务数、跨任务并发之和、同目标三项校验在同一把锁内完成，
     /// 避免多个窗口同时通过校验后一起启动。
     ///
+    /// `max_jobs = 0` 表示不限制任务数；`max_total` 为本机并发预算。
     /// 返回 (jobId, 取消位, 被忽略的冲突任务 id)；同目标冲突且未声明忽略时返回错误。
     pub fn try_reserve(
         &self,
@@ -170,19 +295,43 @@ impl StressJobRegistry {
         max_jobs: usize,
         max_total: u32,
         ignore_overlap: bool,
-    ) -> Result<(u64, Arc<AtomicBool>, Vec<u64>), String> {
+    ) -> Result<(u64, Arc<AtomicBool>, Vec<u64>), ReserveError> {
         let mut jobs = self.jobs.lock();
-        if jobs.len() >= max_jobs {
-            return Err(format!(
-                "最多同时运行 {max_jobs} 个压测任务，请先停止其中一个"
-            ));
+        let active: Vec<JobBrief> = {
+            let mut items: Vec<JobBrief> = jobs
+                .values()
+                .map(|job| JobBrief {
+                    id: job.id,
+                    name: job.name.clone(),
+                    concurrent: job.concurrent,
+                })
+                .collect();
+            items.sort_by_key(|item| item.id);
+            items
+        };
+        if max_jobs > 0 && active.len() >= max_jobs {
+            return Err(ReserveError {
+                kind: ReserveErrorKind::JobsFull.as_str().to_string(),
+                requested: draft.concurrent,
+                current_total: active.iter().map(|job| job.concurrent).sum(),
+                budget: max_total,
+                active_jobs: active,
+                message: format!("最多同时运行 {max_jobs} 个压测任务，请先停止其中一个"),
+            });
         }
-        let total: u32 = jobs.values().map(|job| job.concurrent).sum();
+        let total: u32 = active.iter().map(|job| job.concurrent).sum();
         if total.saturating_add(draft.concurrent) > max_total {
-            return Err(format!(
-                "跨任务并发之和将达 {}，超过上限 {max_total}；请调低并发或先停止其他任务",
-                total.saturating_add(draft.concurrent)
-            ));
+            return Err(ReserveError {
+                kind: ReserveErrorKind::BudgetExceeded.as_str().to_string(),
+                requested: draft.concurrent,
+                current_total: total,
+                budget: max_total,
+                active_jobs: active,
+                message: format!(
+                    "当前总并发 {total} + 本次 {} 超过本机预算 {max_total}，请调低并发或先停止其他任务",
+                    draft.concurrent
+                ),
+            });
         }
         let overlaps: Vec<u64> = jobs
             .values()
@@ -190,10 +339,17 @@ impl StressJobRegistry {
             .map(|job| job.id)
             .collect();
         if !overlaps.is_empty() && !ignore_overlap {
-            return Err(format!(
-                "目标接口正在被任务 #{} 压测，同时施压会互相干扰；如确认继续请在配置中勾选「忽略同目标检查」",
-                overlaps[0]
-            ));
+            return Err(ReserveError {
+                kind: ReserveErrorKind::SameTarget.as_str().to_string(),
+                requested: draft.concurrent,
+                current_total: total,
+                budget: max_total,
+                active_jobs: active,
+                message: format!(
+                    "目标接口正在被任务 #{} 压测，同时施压会互相干扰；如确认继续请在配置中勾选「忽略同目标检查」",
+                    overlaps[0]
+                ),
+            });
         }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let cancel = Arc::new(AtomicBool::new(false));
@@ -614,12 +770,78 @@ impl AppState {
         self.policy.read().policy.clone()
     }
 
-    /// 压测并行限制：(最多任务数, 跨任务并发之和上限)
+    /// 压测并行限制：(最多任务数, 本机并发预算)
+    ///
+    /// v1.1.2 起不再有固定 3 个任务、2000 并发的硬编码：任务数 0 = 不限，
+    /// 并发按 CPU / 内存 / 文件句柄 / 能力检测自动计算，或由用户手动指定。
     pub fn stress_limits(&self) -> (usize, u32) {
-        /// 同时运行的任务数上限（产品口径固定 3）
-        const MAX_STRESS_JOBS: usize = 3;
-        let total = self.settings.read().stress_max_concurrent.clamp(1, 2000) as u32;
-        (MAX_STRESS_JOBS, total)
+        let budget = self.budget();
+        (budget.max_jobs, budget.machine_limit)
+    }
+
+    /// 计算当前生效的并发预算（自动或手动）
+    pub fn budget(&self) -> ConcurrencyBudget {
+        let settings = self.settings.read();
+        let cores = std::thread::available_parallelism()
+            .map(|value| value.get() as u32)
+            .unwrap_or(4);
+        let mem_gb = total_memory_bytes() as f64 / (1024.0 * 1024.0 * 1024.0);
+        let fd_limit = fd_limit();
+        let probe_saturation = latest_probe_saturation(&self.pool);
+        let by_cpu = cores.saturating_mul(512);
+        let by_fd = (fd_limit as f64 * 0.8) as u32;
+        let by_mem = (mem_gb * 256.0) as u32;
+        let mode = BudgetMode::normalize(&settings.stress_budget_mode);
+        let (machine_limit, limited_by) = match mode {
+            BudgetMode::Manual => {
+                let manual = settings.stress_max_concurrent.clamp(1, 100_000) as u32;
+                (manual, "manual".to_string())
+            }
+            BudgetMode::Auto => {
+                let candidate = by_cpu.max(probe_saturation.unwrap_or(0));
+                let upper = by_fd.min(by_mem).min(100_000);
+                let limit = candidate.max(1000).min(upper.max(1));
+                let limited_by = if limit == by_fd {
+                    "fd"
+                } else if limit == by_mem {
+                    "mem"
+                } else if probe_saturation.is_some_and(|value| value >= limit && value > by_cpu) {
+                    "probe"
+                } else {
+                    "cpu"
+                };
+                (limit, limited_by.to_string())
+            }
+        };
+        ConcurrencyBudget {
+            mode: mode.as_str().to_string(),
+            machine_limit,
+            per_job_limit: machine_limit,
+            active_jobs: self.stress_jobs.len(),
+            max_jobs: settings.stress_max_jobs.max(0) as usize,
+            sources: BudgetSources {
+                cores,
+                mem_gb,
+                fd_limit,
+                probe_saturation,
+                by_cpu,
+                by_fd,
+                by_mem,
+                limited_by,
+                computed_at: crate::util::now_ms(),
+            },
+        }
+    }
+
+    /// 更新预算模式并落盘；返回更新后的预算
+    pub fn set_budget(&self, mode: &str, manual_limit: Option<i64>) -> Result<ConcurrencyBudget, String> {
+        let mut next = self.settings();
+        next.stress_budget_mode = BudgetMode::normalize(mode).as_str().to_string();
+        if let Some(limit) = manual_limit {
+            next.stress_max_concurrent = limit.clamp(1, 100_000);
+        }
+        self.update_settings(next)?;
+        Ok(self.budget())
     }
 
     /// 策略文件解析错误（没有错误时为 None）
@@ -675,11 +897,13 @@ impl AppState {
             next.monthly_budget = 0.0;
         }
         next.summary_provider_id = next.summary_provider_id.max(0);
-        // 压测并发上限：0 / 负数按默认 1000，超过硬上限按 2000
+        // 并发预算：模式归一化，手动值允许 1..=100000，不再有 2000 硬上限
+        next.stress_budget_mode = BudgetMode::normalize(&next.stress_budget_mode).as_str().to_string();
         if next.stress_max_concurrent <= 0 {
             next.stress_max_concurrent = 1000;
         }
-        next.stress_max_concurrent = next.stress_max_concurrent.min(2000);
+        next.stress_max_concurrent = next.stress_max_concurrent.clamp(1, 100_000);
+        next.stress_max_jobs = next.stress_max_jobs.max(0);
         let mut seen = std::collections::HashSet::new();
         next.ai_fallback_ids = next
             .ai_fallback_ids
@@ -779,6 +1003,49 @@ impl AppState {
     pub fn test_release(&self, run_id: i64) {
         self.test_cancels.lock().remove(&run_id);
     }
+}
+
+/// 本机物理内存（字节）
+pub fn total_memory_bytes() -> u64 {
+    let mut system = sysinfo::System::new();
+    system.refresh_memory();
+    system.total_memory()
+}
+
+/// 进程可打开文件数上限；Windows 没有 fd 概念，按 8192 兜底
+fn fd_limit() -> u64 {
+    #[cfg(unix)]
+    {
+        // SAFETY: getrlimit 只写入调用方提供的结构体，参数合法
+        unsafe {
+            let mut limit: libc::rlimit = std::mem::zeroed();
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
+                let value = limit.rlim_cur as u64;
+                // RLIM_INFINITY 在部分平台是极大值，按 100 万兜底，避免预算失真
+                if value > 0 && value < 1_000_000 {
+                    return value;
+                }
+                if value >= 1_000_000 {
+                    return 1_000_000;
+                }
+            }
+        }
+        2560
+    }
+    #[cfg(not(unix))]
+    {
+        8192
+    }
+}
+
+/// 最近一次能力检测的饱和并发（没有结果时为 None）
+fn latest_probe_saturation(pool: &DbPool) -> Option<u32> {
+    let conn = pool.get().ok()?;
+    crate::commands::capacity::latest_result(&conn)
+        .ok()
+        .flatten()
+        .map(|result| result.saturation_concurrent)
+        .filter(|value| *value > 0)
 }
 
 /// 把旧版默认目录的数据库文件复制到新目录（只在目标还没有数据库时执行，不覆盖任何数据）
@@ -1156,13 +1423,13 @@ mod tests {
         let error = registry
             .try_reserve(draft("c", "GET http://h:80/c", 100), 2, 1000, false)
             .unwrap_err();
-        assert!(error.contains("最多同时运行"));
+        assert!(error.message.contains("最多同时运行"));
         // 跨任务并发之和上限
         registry.finish(first);
         let error = registry
             .try_reserve(draft("c", "GET http://h:80/c", 700), 2, 1000, false)
             .unwrap_err();
-        assert!(error.contains("超过上限"));
+        assert!(error.message.contains("超过本机预算"));
         registry.finish(second);
         assert!(registry.is_empty());
     }
@@ -1177,7 +1444,7 @@ mod tests {
         let error = registry
             .try_reserve(draft("b", "GET http://h:80/api", 100), 3, 1000, false)
             .unwrap_err();
-        assert!(error.contains("目标接口正在被任务"));
+        assert!(error.message.contains("目标接口正在被任务"));
         // 忽略同目标时允许启动，并把冲突任务 id 交给调用方留痕
         let (id, cancel, overlaps) = registry
             .try_reserve(draft("b", "GET http://h:80/api", 100), 3, 1000, true)

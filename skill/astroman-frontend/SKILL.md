@@ -25,23 +25,43 @@ description: AstroMan 前端开发规范（Vue 3 + Ant Design Vue + Pinia + 设�
 
 ## 代码编辑器（`components/CodeArea.vue`）
 
-请求 Body、GraphQL、AES/JWT 等工具页共用这一个组件，编辑器的排版、着色、快捷键只在这里改。
+请求 Body、GraphQL、工具页共用这一个组件，编辑器的排版、着色、快捷键只在这里改。v1.1.1 起基于 CodeMirror 6，只渲染可视区域，不要再改回 textarea + 高亮层叠加。
 
 | prop | 说明 |
 |---|---|
 | `v-model` | 文本内容 |
 | `rows` / `fill` | 固定高度（`rows * 20 + 20`）或撑满父容器 |
 | `readonly` / `placeholder` | 只读、占位文案 |
-| `commentable` | 开启 `Ctrl / ⌘ + /` 行注释切换：按行加 `// `，整块已注释则取消；保留缩进、跳过空行、光标与选区跟随 |
 | `language` | `'plain' \| 'json'`，JSON 模式启用语法着色（请求编辑器只在 `form.bodyType === 'json'` 时传 `json`） |
+| `searchable` | 显示查找替换入口（`Ctrl / ⌘ + F` 始终可用） |
 
 实现要点：
 
-- 原生 textarea 不能局部着色：下层 `<pre class="highlight">` 渲染高亮 HTML，上层 textarea 文字透明（`.editor.overlay { color: transparent; caret-color: var(--fm-text) }`），只保留光标与选区
-- 两层字体、字号、行高、padding 必须完全一致；`onScroll` 同时同步 gutter 的 `scrollTop` 与高亮层的 `scrollTop / scrollLeft`
-- `highlightJson()` 顺序扫描字符串 → 行注释 / 块注释 → `{{变量}}` → 数字 → 标点；字符串优先处理，所以 `"https://a.com/x"` 里的 `//` 不会被当成注释
-- 输入法组合期间（`compositionstart` / `compositionend`）临时去掉 overlay 类，否则中文拼音与候选字不可见
+- JSON 着色兼容注释与 `{{变量}}`：字符串内变量额外加底色（`cm-template-var`），所以带变量的 JSON 不会因为 `{{...}}` 打断着色
 - 注释只用于编辑态：发送前由 Rust 的 `util::strip_json_comments` 剥离（见 `astroman-backend`），前端不负责删注释
+- 格式化走 `utils/formatJson.ts`：`formatJsonAsync` 在 Worker 里解析，Worker 不可用时退回主线程；不要在大 Body 上直接 `JSON.parse`
+
+## JSON 模板格式化（`utils/formatJson.ts`）
+
+- `formatJsonTemplateAsync(text)` 专供请求 Body：先把 `{{...}}` 换成哨兵（字符串内只换文本、裸值补引号），格式化后按编号还原，`"ts": {{timestamp}}` 这类数值占位也能格式化且引号不变
+- 请求编辑器「格式化 JSON」必须用它，不要换回 `formatJsonAsync`；普通 JSON 行为保持不变
+- 用例在 `src/utils/__tests__/formatJson.spec.ts`（裸值 / 字符串内 / 数组 / 普通 JSON 四种）
+
+## 数据池页（`views/DataPools.vue`）
+
+- 左栏池列表 + 右栏条目：池类型（Token / 参数）、是否敏感、列定义、条目数与健康度都在池摘要里；新建池弹窗里先编辑列，再创建
+- 动态列：表格列来自 `pool.columns`，数据取 `item.data`；不要再固定「值 / 账号」两列
+- Excel：`下载 Excel 模板` 与 `导入 Excel` 只调 Rust 命令（`pool_excel_template` / `pool_excel_import`），前端只负责保存路径与文件选择，**不要在前端解析 xlsx**
+- 改列弹窗提交差量 `{ from?, name }[]`，后端在事务里迁移；列名规则与 24 列上限由后端校验，前端只做即时提示
+- 敏感池「查看明文」一次展示整行 `data`，30 秒后自动隐藏
+
+## 压测绑定与集群页（`views/StressTest.vue` / `views/Cluster.vue`）
+
+- 绑定行的列选择：`"*"` 表示全部列同名注入（隐藏目标输入），具体列默认把目标填成列名；同池多绑定只能选同一 mode
+- 开跑前统一走 `utils/poolGate.ts::ensurePoolPreview`，预览失败或用户取消都要阻止启动
+- 集群节点表有「兼容」列：`poolColumns` 与 `envBundle` 任意为假都是旧版；计划含自定义列绑定时禁用「下发配置」并给出原因
+- 切片体量：会话快照的 `poolEstimate` / `poolSliceLimitBytes` 用来显示「数据池体量」提示，节点 `poolSliceBytes` 显示在能力列，≥80% 变黄
+- 不要在集群页让用户给从节点单独配池或配刷新；池由主节点统一切片下发
 
 ## 工作台与数据大屏
 

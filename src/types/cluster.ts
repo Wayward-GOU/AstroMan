@@ -23,9 +23,10 @@ export interface ClusterProtocolInfo {
 
 export type ClusterNodeRole = 'master' | 'slave'
 
-/** pairing / pairReady / preparing / preflight / ready / running / done / lost / left / rejected */
+/** pairing / pending / pairReady / preparing / preflight / ready / running / done / lost / left / rejected */
 export type ClusterNodeStatus =
   | 'pairing'
+  | 'pending'
   | 'pairReady'
   | 'preparing'
   | 'preflight'
@@ -35,6 +36,35 @@ export type ClusterNodeStatus =
   | 'lost'
   | 'left'
   | 'rejected'
+
+/** 节点能力：核数 / 内存 / 本机预算 */
+export interface NodeCapacity {
+  cores: number
+  memGb: number
+  machineLimit: number
+}
+
+/** 采集健康度：ok / waiting / gap / lost / done */
+export interface SampleHealth {
+  state: string
+  firstSampleMs?: number | null
+  lastSampleMs?: number | null
+  expected: number
+  received: number
+  lost: number
+  gapSec: number
+  message?: string | null
+}
+
+/** 引擎累计计数（从节点心跳回传） */
+export interface EngineStats {
+  statsAtMs: number
+  total: number
+  success: number
+  errors: number
+  qps: number
+  concurrent: number
+}
 
 export interface ClusterNodeInfo {
   id: string
@@ -54,6 +84,81 @@ export interface ClusterNodeInfo {
   joinedAt: number
   lastSeenAt?: number | null
   error?: string | null
+  capacity?: NodeCapacity | null
+  /** 本次分配并发 */
+  quota: number
+  health: SampleHealth
+  peakQps: number
+  peakConcurrent: number
+  vuStart: number
+  vuCount: number
+  /** 最近一次心跳回传的引擎累计计数 */
+  engineStats?: EngineStats | null
+  /** 最近一次 PrepareAck 报告的缺失变量（含 os:NAME） */
+  missingVars?: string[]
+  /** 从节点是否支持池自定义列 / 自动注入（v20） */
+  poolColumns: boolean
+  /** 是否提供加密公钥：旧节点为 false 时只能读取本机同名环境 */
+  envBundle: boolean
+  /** 本次下发给该节点的池切片字节数（prepare 后才有） */
+  poolSliceBytes?: number | null
+}
+
+/** 数据池体量预估：创建任务时按池条目算一次 */
+export interface PoolSizeEstimate {
+  pools: number
+  items: number
+  bytes: number
+}
+
+/** 变量体检：单个变量在某个从节点上的状态 */
+export interface VarAuditNodeState {
+  /** ok / missing / pending / unknown */
+  state: string
+  detail?: string | null
+}
+
+/** 变量体检：表格一行 */
+export interface VarAuditItem {
+  name: string
+  /** user / secret / os / pool */
+  kind: string
+  /** 主节点环境里是否有值 */
+  masterHasValue: boolean
+  /** env / os / pool / none */
+  source: string
+  message?: string | null
+  /** nodeId → 状态 */
+  nodeStates: Record<string, VarAuditNodeState>
+}
+
+export interface VarAuditNode {
+  id: string
+  name: string
+  addr: string
+  status: string
+}
+
+/** 变量体检：只读报告，不含变量值 */
+export interface VarAuditReport {
+  jobId: number
+  envName?: string | null
+  varPolicy: string
+  envVarCount: number
+  secretCount: number
+  nodes: VarAuditNode[]
+  items: VarAuditItem[]
+}
+
+/** 待接受节点（审批模式） */
+export interface PendingNodeInfo {
+  requestId: string
+  nodeId: string
+  name: string
+  addr: string
+  deviceId?: string | null
+  capacity?: NodeCapacity | null
+  requestedAt: number
 }
 
 /** 主节点任务快照 */
@@ -72,18 +177,30 @@ export interface ClusterMasterSnapshot {
   pairCodeTtlSec: number
   localAddresses: string[]
   totalConcurrent: number
+  /** 分配模式：auto / even / custom */
+  allocationMode: string
+  /** 本机并发预算（主节点） */
+  budget: number
   startAtMs?: number | null
   elapsedSec: number
   reportId?: number | null
   incomplete: boolean
   message?: string | null
   nodes: ClusterNodeInfo[]
+  /** 待接受节点（审批模式） */
+  pending: PendingNodeInfo[]
+  autoAccept: boolean
+  discovery: boolean
+  /** 数据池体量预估；无池绑定时为 null */
+  poolEstimate?: PoolSizeEstimate | null
+  /** 单节点池切片字节上限 */
+  poolSliceLimitBytes: number
   createdAt: number
 }
 
 /** 从节点会话快照 */
 export interface ClusterSlaveSnapshot {
-  /** idle / connecting / preparing / ready / running / done / lost / left / rejected */
+  /** idle / connecting / pending / preparing / ready / running / done / lost / left / rejected */
   status: string
   masterAddr: string
   nodeName: string
@@ -98,6 +215,7 @@ export interface ClusterSlaveSnapshot {
   error?: string | null
   missingVars: string[]
   joinedAt?: number | null
+  engineStats?: EngineStats | null
 }
 
 /** 创建主节点任务：Total 并发取自 config.concurrent，节点间按权重拆分 */
@@ -119,16 +237,70 @@ export interface ClusterMasterStartPayload {
 export interface ClusterNodeWeight {
   nodeId: string
   weight: number
+  /** 该节点最少分配并发，缺省 1 */
+  minConcurrent?: number | null
+  /** 该节点最多分配并发，缺省取本机预算 */
+  maxConcurrent?: number | null
 }
 
 /** 从节点加入 */
 export interface ClusterSlaveConnectPayload {
   /** 主节点地址：`192.168.1.10:17801`，端口可省略 */
   masterAddr: string
-  /** 6 位单次配对码 */
+  /** 6 位单次配对码：审批模式可留空 */
   pairCode: string
+  /** 加入方式：code（配对码）/ request（发现后申请，需审批） */
+  joinMode?: 'code' | 'request' | null
   /** 节点名：缺省取本机计算机名 */
   nodeName?: string | null
+}
+
+/** 发现到的主节点 */
+export interface DiscoveredMaster {
+  instanceId: string
+  name: string
+  host: string
+  port: number
+  addr: string
+  jobId: number
+  status: string
+  joinMode: string
+  nodeCount: number
+  maxNodes: number
+  capacity?: { cores: number; memMb: number; budget: number } | null
+  lastSeenMs: number
+  latencyMs: number
+}
+
+/** 发现监听状态 */
+export interface DiscoveryStatus {
+  running: boolean
+  port: number
+  ttlSec: number
+  error?: string | null
+}
+
+/** 并发预算来源 */
+export interface BudgetSources {
+  cores: number
+  memGb: number
+  fdLimit: number
+  probeSaturation?: number | null
+  byCpu: number
+  byFd: number
+  byMem: number
+  limitedBy: string
+  computedAt: number
+}
+
+/** 本机并发预算 */
+export interface StressBudget {
+  mode: 'auto' | 'manual'
+  machineLimit: number
+  perJobLimit: number
+  activeJobs: number
+  maxJobs: number
+  sources: BudgetSources
 }
 
 /** 每秒采样（W1/W4 合并用，前端一般只读快照） */
@@ -165,7 +337,42 @@ export interface ClusterReportMeta {
   finishedAt: number
   droppedSamples: number
   nodes: ClusterReportNode[]
+  peaks?: ReportPeaks | null
+  nodeSeries: NodeSeries[]
   note?: string | null
+}
+
+/** 单个峰值指标 */
+export interface PeakMetric {
+  value: number
+  atMs: number
+  second: number
+  heldSec: number
+  topNode?: string | null
+}
+
+/** 报告峰值专题 */
+export interface ReportPeaks {
+  qps: PeakMetric
+  concurrent: PeakMetric
+  bandwidth: PeakMetric
+  p95: PeakMetric
+  p99: PeakMetric
+  errorRate: PeakMetric
+}
+
+export interface NodeSeries {
+  node: string
+  role: string
+  points: SeriesPoint[]
+}
+
+export interface SeriesPoint {
+  sec: number
+  qps: number
+  concurrent: number
+  p95: number
+  errors: number
 }
 
 export interface ClusterReportNode {
@@ -183,4 +390,9 @@ export interface ClusterReportNode {
   droppedSamples: number
   startMs: number
   endMs: number
+  peakQps: number
+  peakConcurrent: number
+  /** 贡献占比（0~1） */
+  share: number
+  health: SampleHealth
 }

@@ -598,6 +598,24 @@ CREATE INDEX IF NOT EXISTS idx_collections_project ON collections(project_id, pa
 CREATE INDEX IF NOT EXISTS idx_requests_collection ON requests(collection_id);
 CREATE INDEX IF NOT EXISTS idx_env_variables_env ON env_variables(env_id);
 CREATE INDEX IF NOT EXISTS idx_samples_report ON report_samples(report_id, elapsed_sec);
+
+-- 集群节点级每秒采样（v19）：支持跨报告按节点查询曲线
+CREATE TABLE IF NOT EXISTS cluster_report_samples (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_id     INTEGER NOT NULL REFERENCES test_reports(id) ON DELETE CASCADE,
+    node          TEXT    NOT NULL,
+    role          TEXT    NOT NULL DEFAULT 'slave',
+    elapsed_sec   INTEGER NOT NULL,
+    concurrent    INTEGER DEFAULT 0,
+    qps           REAL    DEFAULT 0,
+    p95_rt        REAL    DEFAULT 0,
+    error_count   INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_cluster_samples_report
+    ON cluster_report_samples(report_id, node, elapsed_sec);
+CREATE INDEX IF NOT EXISTS idx_cluster_samples_node
+    ON cluster_report_samples(node, elapsed_sec);
+
 CREATE INDEX IF NOT EXISTS idx_errors_report ON report_errors(report_id);
 CREATE INDEX IF NOT EXISTS idx_history_created ON request_history(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_runs_request ON request_runs(request_id, created_at DESC);
@@ -695,3 +713,38 @@ CREATE TABLE IF NOT EXISTS graphql_schemas (
     UNIQUE(project_id, endpoint)
 );
 CREATE INDEX IF NOT EXISTS idx_graphql_schemas_project ON graphql_schemas(project_id, fetched_at DESC);
+
+-- 参数 / Token 池（v1.1.2 W6）：批量导入、按 VU 粘性、逐请求轮换
+CREATE TABLE IF NOT EXISTS data_pools (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT    NOT NULL,
+    kind        TEXT    NOT NULL DEFAULT 'parameter',
+    sensitive   INTEGER NOT NULL DEFAULT 0,
+    description TEXT    NOT NULL DEFAULT '',
+    -- Token 刷新（v19）：none / http，配置以 JSON 存放，运行期按池单飞刷新
+    refresh_mode TEXT   NOT NULL DEFAULT 'none',
+    refresh_json TEXT   NOT NULL DEFAULT '{}',
+    -- 自定义列（v20）：按顺序保存列名数组，如 ["phone","password","token"]
+    columns_json TEXT   NOT NULL DEFAULT '[]',
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_data_pools_name ON data_pools(name);
+
+CREATE TABLE IF NOT EXISTS data_pool_items (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    pool_id       INTEGER NOT NULL REFERENCES data_pools(id) ON DELETE CASCADE,
+    value         TEXT    NOT NULL,
+    account       TEXT,
+    weight        REAL    NOT NULL DEFAULT 1,
+    enabled       INTEGER NOT NULL DEFAULT 1,
+    created_at    INTEGER NOT NULL,
+    -- 健康度相关（v18）：过期时间、冷却截止、连续失败次数、最近使用时间
+    expires_at    INTEGER NOT NULL DEFAULT 0,
+    cooldown_until INTEGER NOT NULL DEFAULT 0,
+    fail_count    INTEGER NOT NULL DEFAULT 0,
+    last_used_at  INTEGER NOT NULL DEFAULT 0,
+    -- 整行数据（v20）：{"phone":"...","password":"..."}；value/account 为兼容镜像
+    data_json     TEXT    NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_data_pool_items_pool ON data_pool_items(pool_id, id);

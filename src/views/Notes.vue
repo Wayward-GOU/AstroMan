@@ -456,8 +456,30 @@ async function saveQuick() {
   }
 }
 
+let quickImeComposing = false
+let quickImeEndedAt = 0
+
+function onQuickCompositionStart() {
+  quickImeComposing = true
+  quickImeEndedAt = 0
+}
+
+function onQuickCompositionEnd() {
+  quickImeComposing = false
+  quickImeEndedAt = Date.now()
+}
+
+/** 部分浏览器/输入法回车确认候选词时 isComposing 已为 false，需要额外时间窗兜底 */
+function isImeKey(event: KeyboardEvent) {
+  return quickImeComposing
+    || event.isComposing
+    || event.keyCode === 229
+    || event.key === 'Process'
+    || Date.now() - quickImeEndedAt < 80
+}
+
 function onQuickKeydown(event: KeyboardEvent) {
-  if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+  if (event.key === 'Enter' && !event.shiftKey && !isImeKey(event)) {
     event.preventDefault()
     void saveQuick()
   }
@@ -965,6 +987,8 @@ onBeforeUnmount(() => {
             placeholder="记一笔…  试试：明天10点 交周报 #工作 !"
             allow-clear
             @keydown="onQuickKeydown"
+            @compositionstart="onQuickCompositionStart"
+            @compositionend="onQuickCompositionEnd"
             @paste="onQuickPaste"
           >
             <template #suffix>

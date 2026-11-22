@@ -29,16 +29,21 @@ AstroMan/
 │  ├─ types/models.ts # 与 Rust models.rs 对应的 TS 类型
 │  ├─ utils/          # scriptRunner（脚本引擎）、cryptoScript、rsa、curl、xlsx、diff、mybatis、markdown
 │  │                  # 报告：reportExport（HTML/Excel/JSON）、reportAnalytics（QPS/拐点/体检/自洽）、reportNarrative
+│  │                  # 压测 / 池：clusterAllocation（分配算法）、poolGate（开跑前预览）、formatJson（支持 {{变量}} 模板）
 │  │                  # 记事本：notesGrouping（分组/排序）、notesImage（压缩/哈希）、notesQuickParse（自然语言解析）、notesTags（标签配色）
-│  │                  # AI：aiTools（92 个工具：79 业务 + 12 工具箱 + tool_search）、aiProtocol（围栏协议）、contextBudget（token 预算）、modelMeta（窗口）、untrusted（注入隔离）、aiPricing（费用）、promptText（压缩）
+│  │                  # AI：aiTools（126 个工具：113 业务 + 12 工具箱 + tool_search）、aiProtocol（围栏协议）、contextBudget（token 预算）、modelMeta（窗口）、untrusted（注入隔离）、aiPricing（费用）、promptText（压缩）
 │  └─ views/          # Dashboard / Projects / Project / RequestEditor / StressTest / Runner / Automation / Reports / History
 │                     # Tools / SystemMonitor / Settings / Environment / ReportDetail / AiAssistant / AiUsage / AiToolLogs
+│                     # Plans（压测计划中心）、Cluster（分布式压测）、DataPools（参数池 / Token 池）
 │                     # Capture（抓包：流量列表 / 详情 / 设置抽屉 / 重发弹窗 / 拦截）
 │                     # Notes（记事本与待办）、QuickCapture（Ctrl+Alt+N 迷你快速记录，独立窗口）
 ├─ src-tauri/
 │  ├─ src/commands/   # 每个文件一个业务域，全部 #[tauri::command]；测试域为 test_suite/test_case/test_pack/test_preflight/test_run/test_report
+│  │                  # stress.rs（单机压测）/ cluster.rs（分布式压测）/ pool.rs（参数池 / Token 池）
 │  │                  # capture.rs：抓包启停、清单、CA、系统代理、HAR / ZIP、改参重发、断点 / 映射 / 弱网
 │  │                  # notes.rs：待办 CRUD、计数、标签、设置、附件、截图识别
+│  ├─ src/services/   # pool.rs（池 CRUD / 列迁移 / 导入 / 预览）、pool_excel.rs（Excel 模板与导入，calamine + rust_xlsxwriter）
+│  │                  # cluster/：server（主节点）/ client（从节点）/ protocol（v2）/ env_bundle（X25519 + AES-GCM）/ pool_refresh / merge
 │  ├─ src/capture/    # 抓包内核：mod（生命周期）/ proxy / handler / store / ca / sysproxy / har / archive / intercept（断点 / 映射 / 弱网）
 │  ├─ src/notes/      # 待办领域：mod（CRUD / 设置 / 静默时段）/ quick（迷你窗口 + 全局快捷键）/ reminder（30 秒调度）/ attachment（哈希去重）/ vision（截图识别）
 │  ├─ src/db/         # schema.sql + mod.rs（init → migrate → seed）+ seed.rs
@@ -68,11 +73,11 @@ npm run tauri dev  # 完整桌面应用
 npm run build      # vue-tsc --noEmit + vite build
 npm run build:win  # tauri build --bundles nsis
 npm run build:mac  # tauri build --target universal-apple-darwin --bundles dmg
-npm run test       # vitest run：14 spec / 160 条
+npm run test       # vitest run：35 spec / 322 条
 npm run version:check       # 三处版本号一致性校验，不一致退出码 1
 npm run version:set 1.0.9   # 一次写入 package.json / tauri.conf.json / Cargo.toml
 cargo check        # 在 src-tauri 目录执行
-cargo test --lib   # 140 条 Rust 用例
+cargo test --lib   # 426 条 Rust 用例（6 ignored）
 cargo tarpaulin --config tarpaulin.toml   # 覆盖率门槛；Windows 本地加 --engine llvm
 ```
 
@@ -139,14 +144,14 @@ Windows 下 `cargo check` 在受限沙箱里会命中 `D:\Software\Rust\cargo\.g
 | skill | 用途 |
 |---|---|
 | `astroman-add-feature` | 端到端新增功能（命令 → api → 页面 → 注册） |
-| `astroman-backend` | Rust 命令、SQLite 迁移、压测引擎、主密钥与钥匙串规范 |
-| `astroman-frontend` | 页面骨架、主题变量、脚本引擎、导出 |
+| `astroman-backend` | Rust 命令、SQLite 迁移、压测引擎、数据池与 Excel 导入、分布式压测协议与池切片、主密钥与钥匙串规范 |
+| `astroman-frontend` | 页面骨架、主题变量、CodeMirror 编辑器与 JSON 模板格式化、数据池 / 压测绑定 / 集群页、脚本引擎、导出 |
 | `astroman-appearance` | 21 套主题的变量约定与新增流程、对比度校验、航仔贴图与拖拽、线框图标 |
 | `astroman-dashboard` | 工作台首页区块、历史记录页数据大屏、引导 / 技巧 / FAQ 文案口径、Runner 与测试场景介绍 |
 | `astroman-capture` | 抓包模块：MITM 代理、录制上限、根证书、系统代理、手机与微信边界、HAR / ZIP 导出、改参重发、断点 / 映射 / 弱网 |
 | `astroman-notes` | 记事本与待办：四种类型、标签与 50% 抽屉、提醒 / 重复 / 稍后 / 暂停 / 免打扰、快速记录、截图识别、附件去重、数据表 |
 | `astroman-automation` | 自动化测试子系统：套件 / 用例 / 断言 / 数据集 / Python 钩子 / 运行产物 / CLI 退出码 / 压测门禁 |
 | `astroman-toolbox` | 离线工具箱：92 个工具的注册契约、两种接入方式、新增流程、搜索别名与工具清单同步 |
-| `astroman-ai` | AI 助手「航仔」：双模式、三协议、流式渲染、上下文预算与摘要、停止/重试/工具超时、注入隔离、92 个工具与目录分层、写操作确认卡、消息操作、复盘时间线、会话管理 |
+| `astroman-ai` | AI 助手「航仔」：双模式、三协议、流式渲染、上下文预算与摘要、停止/重试/工具超时、注入隔离、126 个工具与目录分层、写操作确认卡、消息操作、复盘时间线、会话管理 |
 | `astroman-testing` | vitest / cargo test / tarpaulin 覆盖率 / CI 四道门禁 / 版本号同步与沙箱坑 |
 | `astroman-build-release` | 构建、打包与发布 |

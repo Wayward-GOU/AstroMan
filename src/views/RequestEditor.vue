@@ -46,7 +46,7 @@ import { useWorkspaceStore, type RequestTurnState, type RequestWorkspaceSnapshot
 import { setHandoff } from '@/stores/handoff'
 import { formatDateTime } from '@/utils/datetime'
 import { buildSnippets, type Snippet } from '@/utils/curl'
-import { formatJsonAsync } from '@/utils/formatJson'
+import { formatJsonTemplateAsync } from '@/utils/formatJson'
 import { findMatches } from '@/utils/jsonHighlight'
 import { replaceAllLiteral } from '@/utils/bodyReplace'
 import { diffLines, diffStats, type DiffLine } from '@/utils/diff'
@@ -2566,7 +2566,7 @@ async function formatBody() {
   }
   const hide = message.loading('正在格式化…', 0)
   try {
-    form.value.body = await formatJsonAsync(text)
+    form.value.body = await formatJsonTemplateAsync(text)
     message.success('已格式化')
   } catch {
     message.error('JSON 解析失败，请检查格式')

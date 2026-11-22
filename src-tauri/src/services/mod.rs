@@ -18,6 +18,8 @@ pub mod mock;
 pub mod openapi;
 pub mod paths;
 pub mod policy;
+pub mod pool;
+pub mod pool_excel;
 pub mod profile;
 pub mod realtime;
 pub mod request;

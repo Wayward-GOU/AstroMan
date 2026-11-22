@@ -5,6 +5,7 @@ import { message, Modal } from 'ant-design-vue'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import {
   ThunderboltOutlined,
+  DatabaseOutlined,
   ArrowLeftOutlined,
   StopOutlined,
   PlayCircleOutlined,
@@ -24,6 +25,7 @@ import { useProjectStore } from '@/stores/project'
 import { useAiAssistStore } from '@/stores/aiAssist'
 import { useErrorDialogStore } from '@/stores/errorDialog'
 import { stressPlanPrompt } from '@/utils/aiScenarios'
+import { ensurePoolPreview } from '@/utils/poolGate'
 import * as api from '@/api'
 import type {
   CapturePreset,
@@ -32,6 +34,10 @@ import type {
   HttpRequestDetail,
   PlanSummary,
   PlanTemplate,
+  PoolBinding,
+  PoolItem,
+  PoolPreview,
+  PoolSummary,
   RecordDetailMode,
   ReportSample,
   RequestSearchHit,
@@ -372,8 +378,8 @@ async function startFromConfig() {
 }
 
 
-/** 并发上限，与后端 stress.rs 的 MAX_CONCURRENT 保持一致 */
-const MAX_CONCURRENT = 5000
+/** 并发上限，与后端 stress.rs 的 MAX_CONCURRENT 保持一致（绝对安全上限） */
+const MAX_CONCURRENT = 100000
 /** 超过该并发给出资源提示 */
 const HIGH_CONCURRENT_HINT = 1000
 
@@ -390,6 +396,16 @@ const settings = reactive({
   durationSec: 30,
   rampUpSec: 5,
   thinkTimeMs: 0,
+  /** 思考时间分布（8.7）：fixed / uniform / normal / lognormal */
+  thinkTimeMode: 'fixed',
+  thinkTimeMinMs: 100,
+  thinkTimeMaxMs: 500,
+  thinkTimeMeanMs: 300,
+  thinkTimeStdMs: 100,
+  /** 预热曲线：linear / step / spike */
+  rampUpMode: 'linear',
+  /** 每个 VU 起始相位随机抖动上限（毫秒） */
+  vuStartJitterMs: 0,
   timeoutMs: 30000,
   connectTimeoutMs: 10000,
   followRedirects: true,
@@ -407,10 +423,266 @@ const settings = reactive({
   baselineReportId: null as number | null,
   /** 超过 2 小时必须确认（1.4.1） */
   longRunAck: false,
+  /** 参数池 / Token 池绑定（v1.1.2；v20 支持 column） */
+  poolBindings: [] as PoolBinding[],
 })
 
 /** 本次运行忽略同目标检查（1.3.2），仅本次有效 */
 const ignoreOverlap = ref(false)
+
+/* ---------- 参数池 / Token 池（v1.1.2） ---------- */
+const pools = ref<PoolSummary[]>([])
+const poolPreview = ref<PoolPreview | null>(null)
+const poolPreviewLoading = ref(false)
+
+async function loadPools() {
+  try {
+    pools.value = await api.poolList()
+  } catch {
+    pools.value = []
+  }
+}
+
+/** 当前池的自定义列；旧池 / 旧接口没有 columns 时返回空数组 */
+function poolColumns(name: string): string[] {
+  return pools.value.find((item) => item.name === name)?.columns ?? []
+}
+
+/** 绑定行的列选项：全部列自动注入 + 当前池的每个列名 */
+function poolColumnOptions(name: string) {
+  return [
+    { label: '全部列（同名注入）', value: '*' },
+    ...poolColumns(name).map((column) => ({ label: column, value: column })),
+  ]
+}
+
+function addPoolBinding() {
+  settings.poolBindings.push({
+    pool: pools.value[0]?.name ?? '',
+    target: 'token',
+    mode: 'per_vu',
+    refreshOn401: true,
+    column: '',
+  })
+}
+
+/** 切换池：列选择回到旧行为（'' 取首列），并清空旧预览 */
+function onPoolChange(binding: PoolBinding) {
+  binding.column = ''
+  poolPreview.value = null
+}
+
+/** 切换列：指定具体列时把占位符默认填成列名；'*' 不需要占位符 */
+function setBindingColumn(binding: PoolBinding, value: unknown) {
+  const next = typeof value === 'string' ? value : ''
+  const previous = binding.column ?? ''
+  binding.column = next
+  if (next && next !== '*') {
+    const target = binding.target.trim()
+    if (!target || target === previous) binding.target = next
+  }
+  poolPreview.value = null
+}
+
+/** 页头快捷入口：定位到参数池绑定区，未选接口时先弹出接口选择 */
+function jumpToPoolBinding() {
+  if (!request.value) {
+    message.info('先选择一个要压测的接口，再绑定数据池')
+    openConfig()
+    return
+  }
+  if (!settings.poolBindings.length) addPoolBinding()
+  nextTick(() => {
+    document.getElementById('pool-binding')?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  })
+}
+
+/** 目标占位符候选：当前请求里已写的 {{变量}} + 常用名字 */
+const POOL_TARGET_PRESETS = ['token', 'phone', 'uid', 'account', 'auth.token', 'auth.username', 'auth.password']
+const poolTargetOptions = computed(() => {
+  const found = new Set<string>(POOL_TARGET_PRESETS)
+  const collect = (text?: string | null) => {
+    if (!text) return
+    for (const match of text.matchAll(/\{\{\s*([^{}]+?)\s*\}\}/g)) {
+      const name = match[1].trim()
+      if (name) found.add(name)
+    }
+  }
+  const detail = request.value
+  if (detail) {
+    collect(detail.url)
+    collect(detail.body)
+    for (const item of detail.headers ?? []) {
+      collect(item.key)
+      collect(item.value)
+    }
+    for (const item of detail.params ?? []) {
+      collect(item.key)
+      collect(item.value)
+    }
+    if (detail.auth) {
+      collect(detail.auth.token)
+      collect(detail.auth.username)
+      collect(detail.auth.password)
+      collect(detail.auth.key)
+      collect(detail.auth.value)
+    }
+  }
+  for (const binding of settings.poolBindings) {
+    if (binding.target.trim()) found.add(binding.target.trim())
+  }
+  return [...found].map((value) => ({ value }))
+})
+
+function removePoolBinding(index: number) {
+  settings.poolBindings.splice(index, 1)
+  poolPreview.value = null
+}
+
+async function previewPools() {
+  if (!settings.poolBindings.length) {
+    message.info('请先添加池绑定')
+    return
+  }
+  const missing = settings.poolBindings.find(
+    (item) => !item.pool || (item.column !== '*' && !item.target.trim()),
+  )
+  if (missing) {
+    message.warning('每个绑定都需要选择池；非「全部列」模式还需填写目标变量')
+    return
+  }
+  poolPreviewLoading.value = true
+  try {
+    poolPreview.value = await api.poolPreview(
+      settings.poolBindings,
+      settings.mode === 'fixed'
+        ? settings.concurrent
+        : Math.max(...stages.value.map((item) => item.concurrent), 0),
+      false,
+    )
+  } catch (error) {
+    message.error(String(error))
+  } finally {
+    poolPreviewLoading.value = false
+  }
+}
+
+/** 预览样例：自动注入时拼接整行数据，指定列时只显示该列 */
+function previewSampleText(binding: PoolPreview['bindings'][number]): string {
+  const texts = binding.sample.slice(0, 3).map((item) => {
+    if (binding.column === '*') {
+      const data = item.data ?? {}
+      return Object.values(data).join('/')
+    }
+    if (binding.column) return item.data?.[binding.column] ?? item.value
+    return item.value
+  })
+  return texts.filter(Boolean).join('、') || '无数据'
+}
+
+/* ---------- 池管理弹窗 ---------- */
+const poolManagerOpen = ref(false)
+const poolManagerBusy = ref(false)
+const newPoolName = ref('')
+const newPoolKind = ref<'parameter' | 'token'>('token')
+const newPoolSensitive = ref(true)
+const activePoolId = ref<number | null>(null)
+const activePoolItems = ref<PoolItem[]>([])
+const poolImportText = ref('')
+
+async function openPoolManager() {
+  poolManagerOpen.value = true
+  await loadPools()
+  // 池列表加载完成后才能确定默认选中的池，避免打开弹窗时列表为空
+  const target = activePoolId.value ?? pools.value[0]?.id ?? null
+  if (target) await openPoolItems(target)
+  else {
+    activePoolId.value = null
+    activePoolItems.value = []
+  }
+}
+
+async function createPool() {
+  const name = newPoolName.value.trim()
+  if (!name) {
+    message.warning('请输入池名称')
+    return
+  }
+  poolManagerBusy.value = true
+  try {
+    const created = await api.poolCreate({
+      name,
+      kind: newPoolKind.value,
+      sensitive: newPoolSensitive.value,
+      description: '',
+    })
+    newPoolName.value = ''
+    await loadPools()
+    await openPoolItems(created.id)
+    message.success('池已创建')
+  } catch (error) {
+    message.error(String(error))
+  } finally {
+    poolManagerBusy.value = false
+  }
+}
+
+async function openPoolItems(poolId: number) {
+  activePoolId.value = poolId
+  try {
+    activePoolItems.value = await api.poolItems(poolId, false)
+  } catch (error) {
+    message.error(String(error))
+    activePoolItems.value = []
+  }
+}
+
+async function importPoolItems() {
+  if (!activePoolId.value) return
+  if (!poolImportText.value.trim()) {
+    message.warning('请输入要导入的数据')
+    return
+  }
+  poolManagerBusy.value = true
+  try {
+    const count = await api.poolImport(activePoolId.value, poolImportText.value)
+    poolImportText.value = ''
+    await openPoolItems(activePoolId.value)
+    await loadPools()
+    message.success(`已导入 ${count} 条`)
+  } catch (error) {
+    message.error(String(error))
+  } finally {
+    poolManagerBusy.value = false
+  }
+}
+
+async function removePoolItem(itemId: number) {
+  if (!activePoolId.value) return
+  try {
+    await api.poolDeleteItem(itemId)
+    await openPoolItems(activePoolId.value)
+    await loadPools()
+  } catch (error) {
+    message.error(String(error))
+  }
+}
+
+async function deletePool(poolId: number) {
+  try {
+    await api.poolDelete(poolId)
+    if (activePoolId.value === poolId) {
+      activePoolId.value = null
+      activePoolItems.value = []
+    }
+    await loadPools()
+    message.success('池已删除')
+  } catch (error) {
+    message.error(String(error))
+  }
+}
+
+
 
 /** 长稳压测阈值：超过必须勾选风险确认 */
 const LONG_RUN_SECONDS = 7200
@@ -550,6 +822,7 @@ onMounted(async () => {
     void loadTemplates()
     void loadBaselineReports()
     void loadCapacity()
+    void loadPools()
   } catch (e) {
     message.error(String(e))
   } finally {
@@ -855,6 +1128,12 @@ async function start() {
     }
   }
 
+  // 开跑前强制执行池预览：预览失败或用户取消都不允许启动（无池绑定直接通过）
+  const vuCount = settings.mode === 'fixed' ? settings.concurrent : peakConcurrent.value
+  if (!(await ensurePoolPreview(settings.poolBindings, vuCount, '开始压测前确认参数 / Token 池'))) {
+    return
+  }
+
   await warnSameHost()
 
   progress.value = null
@@ -886,6 +1165,13 @@ async function start() {
       durationSec: totalSeconds.value,
       rampUpSec: settings.mode === 'fixed' ? settings.rampUpSec : 0,
       thinkTimeMs: settings.thinkTimeMs,
+      thinkTimeMode: settings.thinkTimeMode,
+      thinkTimeMinMs: settings.thinkTimeMinMs,
+      thinkTimeMaxMs: settings.thinkTimeMaxMs,
+      thinkTimeMeanMs: settings.thinkTimeMeanMs,
+      thinkTimeStdMs: settings.thinkTimeStdMs,
+      rampUpMode: settings.rampUpMode,
+      vuStartJitterMs: settings.vuStartJitterMs,
       stages: settings.mode === 'stages' ? stages.value.map((item) => ({ ...item })) : [],
       targetRps: settings.targetRps > 0 ? settings.targetRps : null,
       recordDetail: settings.recordDetail,
@@ -898,6 +1184,7 @@ async function start() {
       ignoreOverlap: ignoreOverlap.value,
       baselineReportId: settings.baselineReportId ?? null,
       longRunAck: settings.longRunAck,
+      poolBindings: settings.poolBindings.map((item) => ({ ...item })),
       sla: settings.slaEnabled
         ? {
             p95Ms: settings.slaP95 > 0 ? settings.slaP95 : null,
@@ -972,6 +1259,10 @@ function backToRequest() {
       title="接口压测"
       subtitle="选择项目与接口、配置压测参数，在本地发起真实并发请求"
     >
+      <a-button @click="jumpToPoolBinding">
+        <template #icon><DatabaseOutlined /></template>
+        数据池绑定
+      </a-button>
       <a-button :disabled="!request" @click="aiPlan">
         <template #icon><AiSparkIcon /></template>
         AI 生成计划
@@ -1136,6 +1427,106 @@ function backToRequest() {
               </div>
             </div>
 
+            <div id="pool-binding" class="field">
+              <div class="label pool-label">
+                <span>参数池 / Token 池</span>
+                <span>
+                  <a-button size="small" type="link" @click="openPoolManager">管理池</a-button>
+                  <a-button size="small" type="link" :disabled="running" @click="addPoolBinding">
+                    + 添加绑定
+                  </a-button>
+                </span>
+              </div>
+              <div v-if="!settings.poolBindings.length" class="hint">
+                未绑定池时按普通变量取值；绑定后每个 VU 固定取一条或逐请求轮换，适合多账号 / 多 Token / 多手机号场景
+              </div>
+              <div v-if="settings.poolBindings.length" class="hint">
+                目标只是占位符名：在请求的 URL / Query / Header / Body / 认证字段里写
+                &#123;&#123;目标名&#125;&#125; 都能取到池值，不限于 token；下拉会列出当前请求里已有的占位符。
+                选「全部列」时列名即变量名，会自动注入该条目的所有列。
+              </div>
+              <div v-for="(binding, index) in settings.poolBindings" :key="index" class="pool-row">
+                <a-select
+                  v-model:value="binding.pool"
+                  size="small"
+                  style="width: 30%"
+                  :disabled="running"
+                  placeholder="选择池"
+                  @change="onPoolChange(binding)"
+                >
+                  <a-select-option v-for="pool in pools" :key="pool.id" :value="pool.name">
+                    {{ pool.name }}（{{ pool.itemCount }}）
+                  </a-select-option>
+                </a-select>
+                <a-select
+                  v-if="poolColumns(binding.pool).length"
+                  :value="binding.column"
+                  size="small"
+                  style="width: 18%"
+                  :disabled="running"
+                  placeholder="默认（首列）"
+                  :options="poolColumnOptions(binding.pool)"
+                  @change="setBindingColumn(binding, $event)"
+                />
+                <a-auto-complete
+                  v-if="binding.column !== '*'"
+                  v-model:value="binding.target"
+                  size="small"
+                  :style="{ width: poolColumns(binding.pool).length ? '22%' : '30%' }"
+                  :disabled="running"
+                  :options="poolTargetOptions"
+                  placeholder="占位符名，如 phone / token"
+                />
+                <span v-else class="hint column-hint">列名即变量名</span>
+                <a-select
+                  v-model:value="binding.mode"
+                  size="small"
+                  style="width: 20%"
+                  :disabled="running"
+                >
+                  <a-select-option value="per_vu">每 VU 固定</a-select-option>
+                  <a-select-option value="per_request">逐请求轮换</a-select-option>
+                  <a-select-option value="random">随机</a-select-option>
+                </a-select>
+                <a-button size="small" danger type="text" :disabled="running" @click="removePoolBinding(index)">
+                  删除
+                </a-button>
+              </div>
+              <div v-if="settings.poolBindings.length" class="pool-actions">
+                <a-checkbox
+                  v-for="(binding, index) in settings.poolBindings"
+                  :key="`r-${index}`"
+                  v-model:checked="binding.refreshOn401"
+                  :disabled="running"
+                >
+                  {{ binding.column === '*' ? binding.pool : binding.target || '绑定' }} 401 自动换下一条
+                </a-checkbox>
+                <a-button size="small" :loading="poolPreviewLoading" @click="previewPools">
+                  预览分配
+                </a-button>
+              </div>
+              <div v-if="poolPreview" class="pool-preview">
+                <div v-if="poolPreview.problems.length" class="pool-problems">
+                  <div v-for="(problem, index) in poolPreview.problems" :key="index">⚠ {{ problem }}</div>
+                </div>
+                <div v-else class="hint">未发现池配置问题</div>
+                <div class="pool-sample">
+                  <div v-for="binding in poolPreview.bindings" :key="binding.pool" class="pool-sample-item">
+                    <span class="mono">
+                      {{ binding.pool }} →
+                      {{ binding.column === '*' ? '自动注入' : binding.column || binding.target }}
+                    </span>
+                    <span v-if="binding.column === '*'" class="hint">
+                      自动注入：{{ (binding.targets ?? []).join('、') || '无列定义' }}
+                    </span>
+                    <span v-else class="hint">列：{{ binding.column || '首列（默认）' }}</span>
+                    <span class="hint">覆盖 {{ binding.vusCovered }} 个 VU · 共 {{ binding.itemCount }} 条</span>
+                    <span class="mono">{{ previewSampleText(binding) }}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
             <template v-if="settings.mode === 'fixed'">
               <div class="field">
                 <div class="label">并发数</div>
@@ -1155,6 +1546,16 @@ function backToRequest() {
                 <div class="field">
                   <div class="label">预热时长（秒）</div>
                   <a-input-number v-model:value="settings.rampUpSec" :min="0" :max="600" style="width: 100%" />
+                  <a-select v-model:value="settings.rampUpMode" size="small" style="width: 100%; margin-top: 6px">
+                    <a-select-option value="linear">线性进场</a-select-option>
+                    <a-select-option value="step">阶梯进场</a-select-option>
+                    <a-select-option value="spike">后段冲刺</a-select-option>
+                  </a-select>
+                  <div class="hint">
+                    VU 起始抖动
+                    <a-input-number v-model:value="settings.vuStartJitterMs" :min="0" :max="60000" :step="100" size="small" style="width: 90px; margin-left: 6px" />
+                    毫秒
+                  </div>
                 </div>
               </div>
             </template>
@@ -1207,8 +1608,31 @@ function backToRequest() {
 
             <div class="field-row">
               <div class="field">
-                <div class="label">思考时间（毫秒）</div>
-                <a-input-number v-model:value="settings.thinkTimeMs" :min="0" :max="60000" :step="100" style="width: 100%" />
+                <div class="label">思考时间</div>
+                <a-select v-model:value="settings.thinkTimeMode" size="small" style="width: 100%">
+                  <a-select-option value="fixed">固定间隔</a-select-option>
+                  <a-select-option value="uniform">均匀分布</a-select-option>
+                  <a-select-option value="normal">正态分布</a-select-option>
+                  <a-select-option value="lognormal">对数正态</a-select-option>
+                </a-select>
+                <a-input-number
+                  v-if="settings.thinkTimeMode === 'fixed'"
+                  v-model:value="settings.thinkTimeMs"
+                  :min="0"
+                  :max="60000"
+                  :step="100"
+                  style="width: 100%; margin-top: 6px"
+                  addon-after="ms"
+                />
+                <div v-else-if="settings.thinkTimeMode === 'uniform'" class="field-row" style="margin-top: 6px">
+                  <a-input-number v-model:value="settings.thinkTimeMinMs" :min="0" :max="60000" :step="100" addon-after="ms" />
+                  <a-input-number v-model:value="settings.thinkTimeMaxMs" :min="0" :max="60000" :step="100" addon-after="ms" />
+                </div>
+                <div v-else class="field-row" style="margin-top: 6px">
+                  <a-input-number v-model:value="settings.thinkTimeMeanMs" :min="0" :max="60000" :step="100" addon-before="均值" addon-after="ms" />
+                  <a-input-number v-model:value="settings.thinkTimeStdMs" :min="0" :max="60000" :step="50" addon-before="标准差" addon-after="ms" />
+                </div>
+                <div class="hint">模拟真实用户停顿时长；固定间隔沿用毫秒值</div>
               </div>
               <div class="field">
                 <div class="label">超时（毫秒）</div>
@@ -1689,10 +2113,30 @@ function backToRequest() {
                       :max="600"
                       style="width: 100%"
                     />
+                    <div class="label ramp-label">进场方式</div>
+                    <a-segmented
+                      v-model:value="settings.rampUpMode"
+                      block
+                      :options="[
+                        { label: '线性', value: 'linear' },
+                        { label: '阶梯', value: 'step' },
+                        { label: '后段冲刺', value: 'spike' },
+                      ]"
+                    />
                     <div class="hint">并发从 0 逐步升到目标值的时间，需小于持续时间</div>
                   </div>
+                  <div class="field">
+                    <div class="label">VU 起始抖动（毫秒）</div>
+                    <a-input-number
+                      v-model:value="settings.vuStartJitterMs"
+                      :min="0"
+                      :max="60000"
+                      :step="100"
+                      style="width: 100%"
+                    />
+                    <div class="hint">每个线程额外随机延迟，避免同一毫秒集中进场</div>
+                  </div>
                 </template>
-
                 <template v-else>
                   <div class="field">
                     <div class="label stage-label">
@@ -1760,6 +2204,105 @@ function backToRequest() {
               </div>
             </div>
 
+            <!-- 参数池 / Token 池 -->
+            <div class="param-card">
+              <div class="param-head">
+                <span class="param-title">参数池 / Token 池</span>
+                <span class="param-sub">Data Pools</span>
+                <span class="param-head-actions">
+                  <a-button size="small" type="link" @click="openPoolManager">管理池</a-button>
+                  <a-button size="small" type="link" :disabled="running" @click="addPoolBinding">
+                    + 添加绑定
+                  </a-button>
+                </span>
+              </div>
+              <div class="param-body">
+                <div v-if="!settings.poolBindings.length" class="hint">
+                  多账号 / 多 Token / 多手机号可在这里绑定：选池、填占位符名，请求任意位置写
+                  &#123;&#123;名字&#125;&#125; 即可取到池值；选「全部列」时列名即变量名
+                </div>
+                <div v-for="(binding, index) in settings.poolBindings" :key="index" class="pool-row">
+                  <a-select
+                    v-model:value="binding.pool"
+                    size="small"
+                    style="width: 30%"
+                    :disabled="running"
+                    placeholder="选择池"
+                    @change="onPoolChange(binding)"
+                  >
+                    <a-select-option v-for="pool in pools" :key="pool.id" :value="pool.name">
+                      {{ pool.name }}（{{ pool.itemCount }}）
+                    </a-select-option>
+                  </a-select>
+                  <a-select
+                    v-if="poolColumns(binding.pool).length"
+                    :value="binding.column"
+                    size="small"
+                    style="width: 18%"
+                    :disabled="running"
+                    placeholder="默认（首列）"
+                    :options="poolColumnOptions(binding.pool)"
+                    @change="setBindingColumn(binding, $event)"
+                  />
+                  <a-auto-complete
+                    v-if="binding.column !== '*'"
+                    v-model:value="binding.target"
+                    size="small"
+                    :style="{ width: poolColumns(binding.pool).length ? '22%' : '30%' }"
+                    :disabled="running"
+                    :options="poolTargetOptions"
+                    placeholder="占位符名，如 phone / token"
+                  />
+                  <span v-else class="hint column-hint">列名即变量名</span>
+                  <a-select
+                    v-model:value="binding.mode"
+                    size="small"
+                    style="width: 20%"
+                    :disabled="running"
+                  >
+                    <a-select-option value="per_vu">每 VU 固定</a-select-option>
+                    <a-select-option value="per_request">逐请求轮换</a-select-option>
+                    <a-select-option value="random">随机</a-select-option>
+                  </a-select>
+                  <a-button size="small" danger type="text" :disabled="running" @click="removePoolBinding(index)">
+                    删除
+                  </a-button>
+                </div>
+                <div v-if="settings.poolBindings.length" class="pool-actions">
+                  <a-checkbox
+                    v-for="(binding, index) in settings.poolBindings"
+                    :key="`r-${index}`"
+                    v-model:checked="binding.refreshOn401"
+                    :disabled="running"
+                  >
+                    {{ binding.column === '*' ? binding.pool : binding.target || '绑定' }} 401 自动换下一条
+                  </a-checkbox>
+                  <a-button size="small" :loading="poolPreviewLoading" @click="previewPools">
+                    预览分配
+                  </a-button>
+                </div>
+                <div v-if="poolPreview" class="pool-preview">
+                  <div v-if="poolPreview.problems.length" class="pool-problems">
+                    <div v-for="(problem, index) in poolPreview.problems" :key="index">⚠ {{ problem }}</div>
+                  </div>
+                  <div v-else class="hint">未发现池配置问题</div>
+                  <div class="pool-sample">
+                    <div v-for="binding in poolPreview.bindings" :key="binding.pool" class="pool-sample-item">
+                      <span class="mono">
+                        {{ binding.pool }} →
+                        {{ binding.column === '*' ? '自动注入' : binding.column || binding.target }}
+                      </span>
+                      <span v-if="binding.column === '*'" class="hint">
+                        自动注入：{{ (binding.targets ?? []).join('、') || '无列定义' }}
+                      </span>
+                      <span v-else class="hint">列：{{ binding.column || '首列（默认）' }}</span>
+                      <span class="hint">覆盖 {{ binding.vusCovered }} 个 VU · 共 {{ binding.itemCount }} 条</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
             <!-- 流量与节奏 -->
             <div class="param-card">
               <div class="param-head">
@@ -1769,15 +2312,31 @@ function backToRequest() {
               <div class="param-body">
                 <div class="field-row">
                   <div class="field">
-                    <div class="label">思考时间（毫秒）</div>
+                    <div class="label">思考时间</div>
+                    <a-select v-model:value="settings.thinkTimeMode" size="small" style="width: 100%">
+                      <a-select-option value="fixed">固定间隔</a-select-option>
+                      <a-select-option value="uniform">均匀分布</a-select-option>
+                      <a-select-option value="normal">正态分布</a-select-option>
+                      <a-select-option value="lognormal">对数正态</a-select-option>
+                    </a-select>
                     <a-input-number
+                      v-if="settings.thinkTimeMode === 'fixed'"
                       v-model:value="settings.thinkTimeMs"
                       :min="0"
                       :max="60000"
                       :step="100"
-                      style="width: 100%"
+                      style="width: 100%; margin-top: 6px"
+                      addon-after="ms"
                     />
-                    <div class="hint">每个线程两次请求之间的固定间隔</div>
+                    <div v-else-if="settings.thinkTimeMode === 'uniform'" class="field-row" style="margin-top: 6px">
+                      <a-input-number v-model:value="settings.thinkTimeMinMs" :min="0" :max="60000" :step="100" addon-after="ms" />
+                      <a-input-number v-model:value="settings.thinkTimeMaxMs" :min="0" :max="60000" :step="100" addon-after="ms" />
+                    </div>
+                    <div v-else class="field-row" style="margin-top: 6px">
+                      <a-input-number v-model:value="settings.thinkTimeMeanMs" :min="0" :max="60000" :step="100" addon-before="均值" addon-after="ms" />
+                      <a-input-number v-model:value="settings.thinkTimeStdMs" :min="0" :max="60000" :step="50" addon-before="标准差" addon-after="ms" />
+                    </div>
+                    <div class="hint">模拟真实用户停顿；固定间隔沿用毫秒值</div>
                   </div>
                   <div class="field">
                     <div class="label">目标 QPS 限速</div>
@@ -1899,6 +2458,103 @@ function backToRequest() {
           </div>
         </div>
       </template>
+    </a-modal>
+
+    <!-- 参数池 / Token 池管理：建池、导入条目、查看脱敏值 -->
+    <a-modal
+      v-model:open="poolManagerOpen"
+      title="参数池 / Token 池管理"
+      :width="920"
+      :footer="null"
+      class="pool-manager-modal"
+    >
+      <div class="pool-manager">
+        <div class="pool-side">
+          <div class="pool-create">
+            <a-input
+              v-model:value="newPoolName"
+              size="small"
+              placeholder="新池名称"
+              @press-enter="createPool"
+            />
+            <a-select v-model:value="newPoolKind" size="small" class="pool-kind">
+              <a-select-option value="token">Token 池</a-select-option>
+              <a-select-option value="parameter">参数池</a-select-option>
+            </a-select>
+            <a-checkbox v-model:checked="newPoolSensitive">敏感</a-checkbox>
+            <a-button
+              size="small"
+              type="primary"
+              :loading="poolManagerBusy"
+              @click="createPool"
+            >
+              新建
+            </a-button>
+          </div>
+          <div class="pool-list">
+            <div
+              v-for="pool in pools"
+              :key="pool.id"
+              class="pool-list-item"
+              :class="{ active: pool.id === activePoolId }"
+              @click="openPoolItems(pool.id)"
+            >
+              <div class="pool-list-main">
+                <span class="pool-list-name">{{ pool.name }}</span>
+                <span class="pool-list-tag">{{ pool.kind === 'token' ? 'Token' : '参数' }}</span>
+                <span v-if="pool.sensitive" class="pool-list-tag sensitive">敏感</span>
+              </div>
+              <div class="pool-list-meta">
+                <span>{{ pool.itemCount }} 条</span>
+                <a-button size="small" type="link" danger @click.stop="deletePool(pool.id)">
+                  删除
+                </a-button>
+              </div>
+            </div>
+            <div v-if="!pools.length" class="pool-empty">还没有池，先在上方新建一个</div>
+          </div>
+        </div>
+
+        <div class="pool-detail">
+          <template v-if="activePoolId">
+            <div class="pool-detail-head">
+              <span>条目（{{ activePoolItems.length }}）</span>
+              <span class="hint">敏感池按脱敏值展示，执行时才取明文</span>
+            </div>
+            <div class="pool-item-list">
+              <div v-for="item in activePoolItems" :key="item.id" class="pool-item">
+                <span class="mono pool-item-value">{{ item.masked || item.value || '—' }}</span>
+                <span v-if="item.account" class="pool-item-account">{{ item.account }}</span>
+                <span class="pool-item-weight">权重 {{ item.weight }}</span>
+                <a-button size="small" type="text" danger @click="removePoolItem(item.id)">
+                  删除
+                </a-button>
+              </div>
+              <div v-if="!activePoolItems.length" class="pool-empty">暂无条目，可在下方导入</div>
+            </div>
+            <div class="pool-import">
+              <a-textarea
+                v-model:value="poolImportText"
+                :rows="5"
+                :disabled="poolManagerBusy"
+                placeholder="每行一条，逗号分隔「值,账号,权重」；也可粘贴 JSON 数组，如 [{&quot;token&quot;:&quot;t1&quot;,&quot;account&quot;:&quot;a&quot;}]"
+              />
+              <div class="pool-import-foot">
+                <span class="hint"># 开头的行会被忽略，权重留空按 1 处理</span>
+                <a-button
+                  size="small"
+                  type="primary"
+                  :loading="poolManagerBusy"
+                  @click="importPoolItems"
+                >
+                  导入
+                </a-button>
+              </div>
+            </div>
+          </template>
+          <div v-else class="pool-empty">选择左侧的池查看条目</div>
+        </div>
+      </div>
     </a-modal>
   </div>
 </template>
@@ -2023,10 +2679,244 @@ function backToRequest() {
   font-size: 10px;
   line-height: 1.6;
   color: var(--fm-muted);
+  overflow-wrap: anywhere;
 }
 
 .hint.warn {
   color: var(--fm-warning);
+}
+
+.pool-label {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+}
+
+.pool-row {
+  display: flex;
+  /* 配置卡片较窄时让控件按最小宽度换行，避免百分比宽度互相挤压 */
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.pool-row > :deep(.ant-select) {
+  flex: 1 1 120px;
+  min-width: 0;
+}
+
+.pool-row > :deep(.ant-btn) {
+  flex: none;
+  margin-left: auto;
+}
+
+/* 行内提示默认带 margin-top，会让「列名即变量名」与控件错位 */
+.pool-row > .column-hint {
+  flex: 1 1 auto;
+  margin-top: 0;
+  white-space: nowrap;
+}
+
+.pool-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 6px;
+}
+
+.pool-preview {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--fm-border);
+  border-radius: 8px;
+  background: var(--fm-surface-2);
+}
+
+.pool-problems {
+  color: var(--fm-warning);
+  font-size: 12px;
+}
+
+.pool-sample {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.pool-sample-item {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 12px;
+}
+
+/* ---------- 池管理弹窗 ---------- */
+.pool-manager {
+  display: grid;
+  grid-template-columns: 300px minmax(0, 1fr);
+  gap: 16px;
+  min-height: 360px;
+}
+
+.pool-side {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border-right: 1px solid var(--fm-border);
+  padding-right: 16px;
+}
+
+.pool-create {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.pool-create .pool-kind {
+  width: 100px;
+  flex: none;
+}
+
+.pool-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  overflow-y: auto;
+  max-height: 420px;
+}
+
+.pool-list-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 9px;
+  border: 1px solid var(--fm-border);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.pool-list-item:hover {
+  border-color: var(--fm-primary);
+}
+
+.pool-list-item.active {
+  border-color: var(--fm-primary);
+  background: var(--fm-surface-2);
+}
+
+.pool-list-main {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.pool-list-name {
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pool-list-tag {
+  flex: none;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: var(--fm-surface-2);
+  border: 1px solid var(--fm-border);
+  font-size: 10px;
+  color: var(--fm-muted);
+}
+
+.pool-list-tag.sensitive {
+  color: var(--fm-warning);
+  border-color: var(--fm-warning);
+}
+
+.pool-list-meta {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+  font-size: 11px;
+  color: var(--fm-muted);
+}
+
+.pool-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.pool-detail-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.pool-item-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  overflow-y: auto;
+  max-height: 240px;
+}
+
+.pool-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 8px;
+  border: 1px solid var(--fm-border);
+  border-radius: 6px;
+  font-size: 12px;
+}
+
+.pool-item-value {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pool-item-account,
+.pool-item-weight {
+  flex: none;
+  font-size: 11px;
+  color: var(--fm-muted);
+}
+
+.pool-import {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.pool-import-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.pool-empty {
+  padding: 18px 10px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--fm-muted);
 }
 
 .config-foot {
@@ -2697,6 +3587,14 @@ function backToRequest() {
 .param-title {
   font-size: 12.5px;
   font-weight: 600;
+}
+
+.param-head-actions {
+  margin-left: auto;
+  align-self: center;
+  display: flex;
+  align-items: center;
+  gap: 4px;
 }
 
 .param-sub {

@@ -3,10 +3,12 @@ import type {
   ReportError,
   ReportRequestRecord,
   ReportSample,
+  PoolReportStat,
   StatusCount,
 } from '@/types/models'
+import type { ClusterReportMeta } from '@/types/cluster'
 import type { CellValue, XlsxSheet } from './xlsx'
-import { detectKnee, downsample, qpsOverview, scoreReport, selfCheck, type QpsOverview } from './reportAnalytics'
+import { detectKnee, downsample, qpsOverview, reportPeaks, scoreReport, selfCheck, type QpsOverview } from './reportAnalytics'
 import { buildAdvice, buildFindings, cdfPoints, gradeReport, type FindingLevel } from './reportNarrative'
 
 /* ---------- 通用格式化 ---------- */
@@ -1131,7 +1133,11 @@ function capacityBlock(detail: ReportDetail): string {
 <div class="note">${usageNote}回环检测值，非目标系统容量，实际受网络 RTT 与目标侧影响。</div>`
 }
 
-function renderHtml(detail: ReportDetail, requests: ReportRequestRecord[] = []): string {
+function renderHtml(
+  detail: ReportDetail,
+  requests: ReportRequestRecord[] = [],
+  options: { includePools?: boolean } = {},
+): string {
   const report = detail.report
   const config = detail.config
   const metrics = config?.metrics
@@ -1414,6 +1420,16 @@ ${tableHtml(
 
   const scene = (detail.scenarioText ?? '').trim()
   const summary = (detail.summaryText ?? '').trim()
+  const peaks = reportPeaks(detail)
+  const peaksBlock = peaks
+    ? `<div class="sub">峰值专题<span class="hint">出现时刻与平台期按每秒采样统计</span></div>
+<div class="strip">
+  <div><span>峰值 QPS</span><b>${fmtNum(peaks.qps.value, 0)}</b><em>第 ${peaks.qps.second} 秒 · 持续 ${peaks.qps.heldSec} 秒</em></div>
+  <div><span>峰值并发</span><b>${fmtNum(peaks.concurrent.value, 0)}</b><em>第 ${peaks.concurrent.second} 秒 · 持续 ${peaks.concurrent.heldSec} 秒</em></div>
+  <div><span>最差 P95 / P99</span><b>${fmtNum(peaks.p95.value, 0)} / ${fmtNum(peaks.p99.value, 0)} ms</b><em>峰值时刻延迟</em></div>
+  <div><span>峰值带宽 / 错误率</span><b>${fmtBytes(peaks.bandwidth.value)}/s</b><em>最高错误率 ${peaks.errorRate.value.toFixed(2)}%</em></div>
+</div>`
+    : ''
 
   const sec1 = section(
     's1',
@@ -1434,6 +1450,7 @@ ${kpiBlock(detail, qps)}
   <div><span>明细模式</span><b>${escapeHtml(recordModeLabel(recordMode))}</b></div>
   <div><span>施压端</span><b>${escapeHtml(agent?.host ?? '未记录')}</b></div>
 </div>
+${peaksBlock}
 ${slaSection}
 ${capacityBlock(detail)}
 <div class="sub">关键发现<span class="hint">按严重程度排序</span></div>
@@ -1489,6 +1506,24 @@ ${findingsBlock(detail)}`,
     ['压测期峰值内存', metrics?.memPeakMb ? `${fmtInt(metrics.memPeakMb)} MB` : '未采集'],
   ])
 
+  const poolStats = options.includePools === false ? [] : (config?.pools ?? [])
+  const poolBlock = poolStats.length
+    ? `<div class="sub">参数 / Token 池<span class="hint">只统计条目与使用次数，不含明文</span></div>
+${tableHtml(
+  ['池名', '条目', '已用', '注入请求', '401 刷新', '失效', '统计范围'],
+  poolStats.map((pool) => [
+    escapeHtml(pool.name),
+    fmtInt(pool.items),
+    fmtInt(pool.used),
+    fmtInt(pool.requests),
+    fmtInt(pool.refreshed),
+    fmtInt(pool.invalid),
+    poolScopeLabel(pool),
+  ]),
+  [1, 2, 3, 4, 5],
+)}`
+    : ''
+
   const sec2 = section(
     's2',
     '02',
@@ -1517,7 +1552,7 @@ ${
           )} 并发。</div>`
         : ''
     }</div>
-</div>`,
+</div>${poolBlock}`,
   )
 
   const sec3 = section(
@@ -1776,8 +1811,54 @@ document.addEventListener('click', function (event) {
 export function buildReportHtml(
   detail: ReportDetail,
   requests: ReportRequestRecord[] = [],
+  options: { includePools?: boolean } = {},
 ): string {
-  return renderHtml(detail, requests)
+  return renderHtml(detail, requests, options)
+}
+
+/** 池统计范围文案：集群汇总 / 仅主节点 / 单机本机 */
+function poolScopeLabel(pool: PoolReportStat): string {
+  if (pool.nodeScope === 'cluster') {
+    return pool.nodes?.length ? `全部节点（${pool.nodes.length}）` : '全部节点'
+  }
+  return pool.nodeScope === 'master' ? '仅主节点' : '本机'
+}
+
+/** Excel「池统计」工作表：只含计数与序号，不含任何明文 */
+function poolSheet(detail: ReportDetail): CellValue[][] {
+  const pools = detail.config?.pools ?? []
+  if (!pools.length) return [['说明', '该报告未记录参数 / Token 池统计']]
+  const rows: CellValue[][] = [
+    ['池名', '条目', '已用', '注入请求', '401 刷新', '失效', '范围'],
+    ...pools.map((pool) => [
+      pool.name,
+      pool.items,
+      pool.used,
+      pool.requests,
+      pool.refreshed,
+      pool.invalid,
+      poolScopeLabel(pool),
+    ]),
+  ]
+  const perNodePools = pools.filter((pool) => pool.byNode?.length)
+  if (perNodePools.length) {
+    rows.push([], ['节点用量明细', '', '', '', '', '', ''])
+    rows.push(['池名', '节点', '已用', '注入请求', '401 刷新'])
+    perNodePools.forEach((pool) => {
+      pool.byNode?.forEach((node) =>
+        rows.push([pool.name, node.name, node.used, node.requests, node.refreshed]),
+      )
+    })
+  }
+  const perItemPools = pools.filter((pool) => pool.perItem?.length)
+  if (perItemPools.length) {
+    rows.push([], ['条目使用明细', '', '', '', '', '', ''])
+    rows.push(['池名', '条目序号', '请求次数'])
+    perItemPools.forEach((pool) => {
+      pool.perItem?.forEach((item) => rows.push([pool.name, item.index, item.requests]))
+    })
+  }
+  return rows
 }
 
 /* ---------- Excel 工作簿 ---------- */
@@ -1805,6 +1886,7 @@ function percentileSheet(detail: ReportDetail): CellValue[][] {
 export function buildReportSheets(
   detail: ReportDetail,
   requests: ReportRequestRecord[] = [],
+  options: { includePools?: boolean } = {},
 ): XlsxSheet[] {
   const report = detail.report
   const sla = slaRows(detail)
@@ -1844,6 +1926,21 @@ export function buildReportSheets(
     ['流量总量(B)', report.bytesTotal],
     [],
   ]
+
+  // 峰值专题：与报告页、AI 共用 reportPeaks，集群取 cluster.peaks，单机取 metricsPeaks
+  const peaks = reportPeaks(detail)
+  if (peaks) {
+    overview.push(
+      ['峰值专题', '数值', '出现秒', '平台期(秒)'],
+      ['秒级峰值 QPS', peaks.qps.value, peaks.qps.second, peaks.qps.heldSec],
+      ['峰值并发', peaks.concurrent.value, peaks.concurrent.second, peaks.concurrent.heldSec],
+      ['峰值带宽(B/s)', peaks.bandwidth.value, peaks.bandwidth.second, peaks.bandwidth.heldSec],
+      ['最差 P95(ms)', peaks.p95.value, peaks.p95.second, peaks.p95.heldSec],
+      ['最差 P99(ms)', peaks.p99.value, peaks.p99.second, peaks.p99.heldSec],
+      ['最高错误率(%)', peaks.errorRate.value, peaks.errorRate.second, peaks.errorRate.heldSec],
+      [],
+    )
+  }
 
   if (sla.length) {
     overview.push(['SLA 验收', '目标', '实测', '结论'])
@@ -1997,8 +2094,99 @@ export function buildReportSheets(
     ...buildAdvice(detail).map((item) => [item.priority, item.title, item.detail]),
   ]
 
-  return [
+  const clusterMeta = (config as unknown as { cluster?: ClusterReportMeta } | null)?.cluster
+  // 集群概览放在峰值页顶部，避免与「概览」工作表重复
+  const clusterHead: CellValue[][] = clusterMeta
+    ? [
+        ['分布式压测', ''],
+        ['协议版本', `v${clusterMeta.protocolVersion}`],
+        ['主节点', clusterMeta.masterNode || '—'],
+        ['总并发', clusterMeta.totalConcurrent],
+        ['起跑时间', fmtTime(clusterMeta.startedAt)],
+        ['结束时间', fmtTime(clusterMeta.finishedAt)],
+        ['丢弃采样', clusterMeta.droppedSamples],
+        ['结果完整', clusterMeta.incomplete ? '不完整' : '完整'],
+        [],
+      ]
+    : []
+
+  // 峰值专题单独一张表
+  const clusterPeakSheet: CellValue[][] = clusterMeta
+    ? [
+        ...clusterHead,
+        ...(clusterMeta.peaks
+          ? [
+              ['峰值专题', '数值', '出现秒', '持续秒', '节点'],
+              ['峰值 QPS', clusterMeta.peaks.qps.value, clusterMeta.peaks.qps.second, clusterMeta.peaks.qps.heldSec, clusterMeta.peaks.qps.topNode || '—'],
+              ['峰值并发', clusterMeta.peaks.concurrent.value, clusterMeta.peaks.concurrent.second, clusterMeta.peaks.concurrent.heldSec, '—'],
+              ['最差 P95(ms)', clusterMeta.peaks.p95.value, clusterMeta.peaks.p95.second, clusterMeta.peaks.p95.heldSec, '—'],
+              ['最差 P99(ms)', clusterMeta.peaks.p99.value, clusterMeta.peaks.p99.second, clusterMeta.peaks.p99.heldSec, '—'],
+              ['峰值带宽(B/s)', clusterMeta.peaks.bandwidth.value, clusterMeta.peaks.bandwidth.second, clusterMeta.peaks.bandwidth.heldSec, '—'],
+              ['最高错误率(%)', clusterMeta.peaks.errorRate.value, clusterMeta.peaks.errorRate.second, clusterMeta.peaks.errorRate.heldSec, '—'],
+            ]
+          : [['峰值专题', '本次报告未记录峰值']]),
+      ]
+    : []
+
+  // 节点贡献单独一张表
+  const clusterNodeSheet: CellValue[][] = clusterMeta
+    ? [
+        [
+          '节点',
+          '角色',
+          '地址',
+          '状态',
+          '分配并发',
+          '平均 QPS',
+          '峰值 QPS',
+          '峰值并发',
+          '贡献占比(%)',
+          '采集健康',
+        ],
+        ...clusterMeta.nodes.map((node) => [
+          node.name,
+          node.role === 'master' ? '主节点' : '从节点',
+          node.addr,
+          node.status,
+          node.concurrent,
+          node.qpsAvg,
+          node.peakQps,
+          node.peakConcurrent,
+          Number(((node.share ?? 0) * 100).toFixed(2)),
+          node.health?.state === 'ok' || node.health?.state === 'done'
+            ? '正常'
+            : node.health?.message || node.health?.state || '—',
+        ]),
+      ]
+    : []
+
+  // 节点秒级曲线单独一张表：按秒对齐，缺采样留空，避免把 0 当成真实低吞吐
+  const clusterSeriesSheet: CellValue[][] = []
+  if (clusterMeta?.nodeSeries?.length) {
+    const series = clusterMeta.nodeSeries.filter((item) => item.points.length)
+    if (series.length) {
+      clusterSeriesSheet.push(
+        ['节点秒级采样', ...series.map((item) => item.node)],
+        [
+          '秒',
+          ...series.map((item) => `${item.node} QPS`),
+          ...series.map((item) => `${item.node} 并发`),
+        ],
+      )
+      const maxPoints = Math.max(...series.map((item) => item.points.length))
+      for (let index = 0; index < maxPoints; index += 1) {
+        clusterSeriesSheet.push([
+          index + 1,
+          ...series.map((item) => item.points[index]?.qps ?? null),
+          ...series.map((item) => item.points[index]?.concurrent ?? null),
+        ])
+      }
+    }
+  }
+
+  const sheets: XlsxSheet[] = [
     { name: '概览', rows: overview },
+    { name: '配置快照', rows: snapshot },
     { name: '优化建议', rows: advice },
     { name: '延迟分位', rows: percentileSheet(detail) },
     { name: '采样明细', rows: samples },
@@ -2008,6 +2196,18 @@ export function buildReportSheets(
     { name: '错误类型', rows: errorTypes },
     { name: '错误明细', rows: errors },
     { name: '分阶段汇总', rows: stages },
-    { name: '配置快照', rows: snapshot },
   ]
+  if (clusterPeakSheet.length) {
+    sheets.push({ name: '集群峰值', rows: clusterPeakSheet })
+  }
+  if (clusterNodeSheet.length) {
+    sheets.push({ name: '集群节点', rows: clusterNodeSheet })
+  }
+  if (clusterSeriesSheet.length) {
+    sheets.push({ name: '节点采样', rows: clusterSeriesSheet })
+  }
+  if (options.includePools !== false && (detail.config?.pools?.length ?? 0) > 0) {
+    sheets.push({ name: '池统计', rows: poolSheet(detail) })
+  }
+  return sheets
 }

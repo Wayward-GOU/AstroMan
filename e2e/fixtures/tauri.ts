@@ -710,6 +710,11 @@ function installBridge() {
     test_run_get: () => clone(runDetail()),
     test_run_list: () => [state.run],
 
+    /* ---------- 数据池 ---------- */
+    // 自动化测试页挂载时会拉池列表；未提供时返回 null 会让页面渲染报错
+    pool_list: () => [],
+    pool_items: () => [],
+
     /* ---------- 分布式压测 ---------- */
     cluster_protocol_info: () => ({
       version: 2,

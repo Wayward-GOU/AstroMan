@@ -165,7 +165,7 @@ const PRESETS = [
 .rx-flag.active {
   background: var(--fm-primary);
   border-color: var(--fm-primary);
-  color: #fff;
+  color: var(--fm-on-accent);
 }
 
 .rx-presets {

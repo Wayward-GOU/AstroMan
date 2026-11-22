@@ -32,6 +32,10 @@ jobs:
       - name: 版本号一致性
         run: npm run version:check
       - run: npm run test
+      # 样式门禁：硬编码 hex / rgba / 字面圆角 / 字面投影只许下降，另跑 23 套主题对比度。
+      # 脚本口径见 skill astroman-testing「样式门禁」一节，改口径必须同步那里。
+      - name: 样式门禁（硬编码 + 对比度）
+        run: npm run ui:check
       - run: npm run build
       # W4 / A-21：release 包不得开启 DevTools，CSP 基础指令必须完整
       - name: release 安全断言

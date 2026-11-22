@@ -423,7 +423,7 @@ onMounted(loadTargets)
 
 <style scoped>
 .remote-panel {
-  border-top: 1px dashed var(--fm-border, #e5e7eb);
+  border-top: 1px dashed var(--fm-border);
   padding-top: 16px;
   margin-top: 16px;
 }
@@ -437,12 +437,12 @@ onMounted(loadTargets)
 .title {
   font-size: 14px;
   font-weight: 600;
-  color: var(--fm-text, #111827);
+  color: var(--fm-text);
 }
 .desc {
   margin-top: 4px;
   font-size: 12px;
-  color: var(--fm-text-secondary, #6b7280);
+  color: var(--fm-text-secondary);
   line-height: 1.6;
 }
 .actions {
@@ -461,7 +461,7 @@ onMounted(loadTargets)
   justify-content: space-between;
   gap: 12px;
   padding: 10px 12px;
-  border: 1px solid var(--fm-border, #e5e7eb);
+  border: 1px solid var(--fm-border);
   border-radius: 2px;
   background: #fff;
 }
@@ -470,7 +470,7 @@ onMounted(loadTargets)
 }
 .name {
   font-weight: 600;
-  color: var(--fm-text, #111827);
+  color: var(--fm-text);
   display: flex;
   align-items: center;
   gap: 8px;
@@ -493,7 +493,7 @@ onMounted(loadTargets)
   gap: 10px;
   margin-top: 4px;
   font-size: 12px;
-  color: var(--fm-text-secondary, #6b7280);
+  color: var(--fm-text-secondary);
 }
 .status {
   margin-top: 4px;
@@ -515,8 +515,8 @@ onMounted(loadTargets)
   padding: 18px 12px;
   text-align: center;
   font-size: 12px;
-  color: var(--fm-text-secondary, #6b7280);
-  border: 1px dashed var(--fm-border, #e5e7eb);
+  color: var(--fm-text-secondary);
+  border: 1px dashed var(--fm-border);
   border-radius: 2px;
 }
 .mono {
@@ -544,7 +544,7 @@ onMounted(loadTargets)
 }
 .muted {
   font-size: 12px;
-  color: var(--fm-text-secondary, #6b7280);
+  color: var(--fm-text-secondary);
 }
 .remote-list {
   display: flex;
@@ -559,7 +559,7 @@ onMounted(loadTargets)
   justify-content: space-between;
   gap: 12px;
   padding: 8px 10px;
-  border: 1px solid var(--fm-border, #e5e7eb);
+  border: 1px solid var(--fm-border);
   border-radius: 2px;
 }
 .remote-main {

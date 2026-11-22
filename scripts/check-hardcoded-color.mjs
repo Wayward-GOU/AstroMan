@@ -1,9 +1,24 @@
 #!/usr/bin/env node
 /**
- * 硬编码样式门禁：统计 hex / rgba / 字面圆角 / 投影 / :deep(.ant-*)
+ * 硬编码样式门禁：统计 hex / rgba / 字面圆角 / 字面投影 / :deep(.ant-*)
  * 超出基线即失败，防止改造期间「边改边加」。
  *
  * 用法：node scripts/check-hardcoded-color.mjs [--write-baseline]
+ *
+ * 口径（2026-11-22 修正；旧口径把「已令牌化」的声明也计入，基线因此失真）：
+ *   - hex     ：颜色字面量。排除 HTML 实体——`&#123;` 这类 `{` 的转义会被误判成 3 位 hex，
+ *               旧口径由此虚增了 20 余处
+ *   - rgba    ：`rgb(` / `rgba(` 函数式色值
+ *   - radius  ：`border-radius` 的字面值；`var(--fm-radius*)` 不计（已令牌化）
+ *   - shadow  ：含字面颜色的 `box-shadow`；纯 `var(--fm-shadow*)`、`none`、
+ *               颜色走 token 或 color-mix 的不计（已令牌化）
+ *   - deep    ：`:deep(.ant-*)` 仅作参考项，不进失败判定。
+ *               覆盖 Ant Design 内部样式只能靠它，没有令牌化的替代路径；
+ *               计入「硬编码债务」只会逼后来人为了过门禁去写选择器 hack。
+ *
+ * 口径要点：src/styles/tokens.css 是令牌定义处（自带 59 个 hex），必须排除。
+ * 否则 C0 一新增这个文件，hex 就变成 484，门禁当场自锁。
+ * src/styles/components.css 是共用组件层，同样豁免。
  */
 import fs from 'node:fs'
 import path from 'node:path'
@@ -12,22 +27,20 @@ const ROOT = process.cwd()
 const TARGET_DIRS = ['src/views', 'src/components', 'src/App.vue']
 
 /**
- * 基线（2026-11-10 C3 收尾实测，统计范围含 src/views + src/components + src/App.vue + src/styles）
- * hex 234 / rgba 19 / radius 447 / shadow 51 / deep 110
- * C1 落地表格首末单元格圆角归零（一条声明管四个选择器），radius 净 +1 → 454；
- * C3 结束后按实测值下调（原 425/89/454/73/110），此后只允许更低。
- * 收尾清理 History 回退色与剩余字面圆角，hex 239→234、rgba 20→19。
- *
- * 口径要点：src/styles/tokens.css 是令牌定义处（自带 59 个 hex），必须排除。
- * 否则 C0 一新增这个文件，hex 就变成 484，门禁当场自锁。
+ * 基线（2026-11-22 按修正口径实测后收紧，此后只允许更低）。
+ * 旧值（错口径）：hex 234 / rgba 19 / radius 447 / shadow 51 / deep 110。
+ * 本轮：修正口径（排除实体、排除已令牌化声明）+ 清理 114 处 `var(--fm-x, #hex)` 兜底
+ *      + 浮层投影收进 `--fm-shadow-*` + 深色底白字收进 `--fm-on-accent`。
  */
 const BASELINE = {
-  hex: 234,
-  rgba: 19,
-  radius: 447,
-  shadow: 51,
-  deep: 110,
+  hex: 129,
+  rgba: 12,
+  radius: 175,
+  shadow: 0,
 }
+
+/** 仅展示、不判定 */
+const REFERENCE = ['deep']
 
 const EXT = new Set(['.vue', '.ts', '.css'])
 
@@ -58,26 +71,32 @@ walk(path.join(ROOT, 'src/styles'), files)
 const counts = { hex: 0, rgba: 0, radius: 0, shadow: 0, deep: 0 }
 const perFile = {}
 
-/* 令牌/组件定义处不计入：
-   - tokens.css 是色值集中地（59 个 hex）
-   - components.css 是共用组件层，只允许 var(--fm-*)，圆角声明本身是设计规格
-   两者都是「集中定义」，计入会让门禁在新增文件时自锁。 */
 const EXEMPT_FILES = new Set([
   path.join(ROOT, 'src/styles/tokens.css'),
   path.join(ROOT, 'src/styles/components.css'),
 ])
 
+/** 去掉 HTML 实体：`&#123;` 会被 `#[0-9a-f]{3}` 误判成 hex */
+const stripEntities = (text) => text.replace(/&#\d+;/g, '')
+
+function measure(text) {
+  const body = stripEntities(text)
+  return {
+    hex: (body.match(/#[0-9a-fA-F]{3,8}\b/g) || []).length,
+    rgba: (body.match(/rgba?\(/g) || []).length,
+    // 字面圆角：border-radius 后不是 var（用 (?!\s*var\() 而非消费空白，
+    // 否则 \s* 的回溯会让否定断言失效，把所有 token 写法也计进来）
+    radius: (body.match(/border-radius\s*:(?!\s*var\()/g) || []).length,
+    // 字面投影：同一条声明内出现函数式色值才算硬编码颜色
+    shadow: (body.match(/box-shadow\s*:[^;}\n]*rgba?\(/g) || []).length,
+    deep: (body.match(/:deep\(\s*\.ant-/g) || []).length,
+  }
+}
+
 for (const file of files) {
   if (EXEMPT_FILES.has(file)) continue
-  const text = fs.readFileSync(file, 'utf8')
-  const c = {
-    hex: (text.match(/#[0-9a-fA-F]{3,8}\b/g) || []).length,
-    rgba: (text.match(/rgba?\(/g) || []).length,
-    radius: (text.match(/border-radius\s*:/g) || []).length,
-    shadow: (text.match(/box-shadow\s*:/g) || []).length,
-    deep: (text.match(/:deep\(\s*\.ant-/g) || []).length,
-  }
-  Object.keys(c).forEach((k) => (counts[k] += c[k]))
+  const c = measure(fs.readFileSync(file, 'utf8'))
+  Object.keys(counts).forEach((k) => (counts[k] += c[k]))
   if (c.hex + c.rgba + c.radius + c.shadow + c.deep > 0) {
     perFile[path.relative(ROOT, file)] = c
   }
@@ -95,13 +114,25 @@ rows.forEach(([f, c]) => {
   )
 })
 
-console.log('\n合计：')
+if (process.argv.includes('--write-baseline')) {
+  console.log('\n实测：', JSON.stringify(counts))
+  console.log('请把 BASELINE 改为：', JSON.stringify(counts))
+  process.exit(0)
+}
+
+console.log('\n硬编码合计：')
 let failed = false
 Object.entries(BASELINE).forEach(([k, base]) => {
   const now = counts[k]
   const ok = now <= base
   if (!ok) failed = true
   console.log(`  ${k.padEnd(8)} ${String(now).padStart(4)} / 基线 ${base}  ${ok ? '✅' : '❌ 超出'}`)
+})
+
+REFERENCE.forEach((k) => {
+  console.log(
+    `  ${k.padEnd(8)} ${String(counts[k]).padStart(4)}（参考项，不判定：覆盖 antd 内部样式无令牌化替代）`,
+  )
 })
 
 if (failed) {

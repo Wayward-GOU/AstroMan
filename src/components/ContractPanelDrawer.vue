@@ -277,7 +277,7 @@ function opText(change: ContractChange) {
 .contract-hint {
   font-size: 12px;
   line-height: 1.6;
-  color: var(--fm-text-3, #8a8f99);
+  color: var(--fm-text-3);
   margin-bottom: 10px;
 }
 .contract-create {
@@ -291,10 +291,10 @@ function opText(change: ContractChange) {
   padding: 24px 0;
   text-align: center;
   font-size: 12px;
-  color: var(--fm-text-3, #8a8f99);
+  color: var(--fm-text-3);
 }
 .snapshot-list {
-  border: 1px solid var(--fm-border, #e5e7eb);
+  border: 1px solid var(--fm-border);
   border-radius: 6px;
   overflow: hidden;
 }
@@ -304,13 +304,13 @@ function opText(change: ContractChange) {
   gap: 12px;
   padding: 8px 12px;
   font-size: 12px;
-  border-bottom: 1px solid var(--fm-border, #eef0f3);
+  border-bottom: 1px solid var(--fm-border);
 }
 .snapshot-row:last-child {
   border-bottom: none;
 }
 .snapshot-row.active {
-  background: var(--fm-fill-1, #f5f6f8);
+  background: var(--fm-fill-1);
 }
 .latest-tag {
   margin-left: 4px;
@@ -328,15 +328,15 @@ function opText(change: ContractChange) {
 }
 .snapshot-count {
   width: 70px;
-  color: var(--fm-text-3, #8a8f99);
+  color: var(--fm-text-3);
 }
 .snapshot-time {
   width: 150px;
-  color: var(--fm-text-3, #8a8f99);
+  color: var(--fm-text-3);
 }
 .snapshot-digest {
   width: 70px;
-  color: var(--fm-text-4, #c0c4cc);
+  color: var(--fm-text-4);
 }
 .snapshot-ops {
   display: flex;
@@ -363,7 +363,7 @@ function opText(change: ContractChange) {
   padding: 1px 8px;
   font-size: 12px;
   border-radius: 10px;
-  background: var(--fm-fill-1, #f5f6f8);
+  background: var(--fm-fill-1);
 }
 .pill.breaking {
   color: #cf1322;
@@ -391,8 +391,8 @@ function opText(change: ContractChange) {
   gap: 10px;
   padding: 6px 10px;
   font-size: 12px;
-  border-left: 3px solid var(--fm-border, #e5e7eb);
-  background: var(--fm-fill-1, #fafafb);
+  border-left: 3px solid var(--fm-border);
+  background: var(--fm-fill-1);
   margin-bottom: 4px;
 }
 .change-row.breaking {
@@ -417,7 +417,7 @@ function opText(change: ContractChange) {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--fm-text-3, #8a8f99);
+  color: var(--fm-text-3);
 }
 .change-msg {
   flex: 1;
@@ -435,6 +435,6 @@ function opText(change: ContractChange) {
   margin-bottom: 4px;
 }
 .schema-item {
-  color: var(--fm-text-3, #8a8f99);
+  color: var(--fm-text-3);
 }
 </style>

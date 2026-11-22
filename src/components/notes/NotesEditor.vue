@@ -717,7 +717,7 @@ function onKeydown(event: KeyboardEvent) {
   line-height: 13px;
   border-radius: 50%;
   background: rgba(0, 0, 0, 0.55);
-  color: #fff;
+  color: var(--fm-on-accent);
   font-size: 11px;
   opacity: 0;
 }

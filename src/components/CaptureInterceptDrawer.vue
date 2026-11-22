@@ -758,7 +758,7 @@ onMounted(() => {
   padding: 8px 10px;
   font-size: 12px;
   color: var(--fm-muted);
-  background: var(--fm-bg-soft, #f6f7f9);
+  background: var(--fm-bg-soft);
   border-radius: 6px;
 }
 
@@ -792,7 +792,7 @@ onMounted(() => {
   font-size: 12px;
   line-height: 1.6;
   color: var(--fm-muted);
-  background: var(--fm-bg-soft, #f6f7f9);
+  background: var(--fm-bg-soft);
   border-radius: 6px;
 }
 
@@ -809,8 +809,8 @@ onMounted(() => {
   font-size: 13px;
   color: var(--fm-muted);
   text-align: center;
-  background: var(--fm-bg-soft, #f6f7f9);
-  border: 1px dashed var(--fm-border, #e5e7eb);
+  background: var(--fm-bg-soft);
+  border: 1px dashed var(--fm-border);
   border-radius: 8px;
 }
 
@@ -823,7 +823,7 @@ onMounted(() => {
 .rule-card {
   padding: 10px 12px;
   background: #fff;
-  border: 1px solid var(--fm-border, #e5e7eb);
+  border: 1px solid var(--fm-border);
   border-radius: 8px;
 }
 
@@ -894,14 +894,14 @@ onMounted(() => {
   font-size: 12px;
   line-height: 1.7;
   color: var(--fm-muted);
-  border: 1px solid var(--fm-border, #e5e7eb);
+  border: 1px solid var(--fm-border);
   border-radius: 8px;
 }
 
 .rule-note h4 {
   margin: 0 0 4px;
   font-size: 12px;
-  color: var(--fm-text, #1f2329);
+  color: var(--fm-text);
 }
 
 .rule-note ol {
@@ -934,7 +934,7 @@ onMounted(() => {
   gap: 8px;
   padding-top: 10px;
   margin-top: auto;
-  border-top: 1px solid var(--fm-border, #e5e7eb);
+  border-top: 1px solid var(--fm-border);
 }
 
 .foot-hint {

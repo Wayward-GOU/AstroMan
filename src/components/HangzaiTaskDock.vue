@@ -71,8 +71,8 @@ const elapsed = computed(() => {
   padding: 10px 12px;
   border-radius: 10px;
   border: 1px solid var(--fm-border, rgba(0, 0, 0, 0.1));
-  background: var(--fm-surface, #fff);
-  box-shadow: 0 10px 28px rgba(15, 23, 42, 0.16);
+  background: var(--fm-surface);
+  box-shadow: var(--fm-shadow-panel);
 }
 
 .task-dot {
@@ -80,7 +80,7 @@ const elapsed = computed(() => {
   height: 8px;
   flex-shrink: 0;
   border-radius: 50%;
-  background: var(--fm-primary, #009688);
+  background: var(--fm-primary);
   animation: task-pulse 1.4s ease-in-out infinite;
 }
 
@@ -99,7 +99,7 @@ const elapsed = computed(() => {
   gap: 6px;
   font-size: 12px;
   font-weight: 600;
-  color: var(--fm-text, #1f2937);
+  color: var(--fm-text);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -108,13 +108,13 @@ const elapsed = computed(() => {
 .task-round {
   font-size: 11px;
   font-weight: 500;
-  color: var(--fm-text-2, #6b7280);
+  color: var(--fm-text-2);
 }
 
 .task-sub {
   margin-top: 2px;
   font-size: 11px;
-  color: var(--fm-text-2, #6b7280);
+  color: var(--fm-text-2);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;

@@ -424,16 +424,16 @@ function restore(item: RevisionBrief, after?: () => void) {
   flex: 1;
   font-size: 12px;
   line-height: 1.6;
-  color: var(--fm-text-3, #8a8f99);
+  color: var(--fm-text-3);
 }
 .history-empty {
   padding: 24px 0;
   text-align: center;
   font-size: 12px;
-  color: var(--fm-text-3, #8a8f99);
+  color: var(--fm-text-3);
 }
 .history-list {
-  border: 1px solid var(--fm-border, #e5e7eb);
+  border: 1px solid var(--fm-border);
   border-radius: 6px;
   overflow: hidden;
 }
@@ -444,14 +444,14 @@ function restore(item: RevisionBrief, after?: () => void) {
   padding: 8px 12px;
   font-size: 12px;
   cursor: pointer;
-  border-bottom: 1px solid var(--fm-border, #eef0f3);
+  border-bottom: 1px solid var(--fm-border);
 }
 .history-row:last-child {
   border-bottom: none;
 }
 .history-row:hover,
 .history-row.active {
-  background: var(--fm-fill-1, #f5f6f8);
+  background: var(--fm-fill-1);
 }
 .history-rev {
   width: 56px;
@@ -459,14 +459,14 @@ function restore(item: RevisionBrief, after?: () => void) {
 }
 .history-time {
   flex: 1;
-  color: var(--fm-text-3, #8a8f99);
+  color: var(--fm-text-3);
 }
 .history-ops {
   display: flex;
   gap: 12px;
 }
 .history-ops a.disabled {
-  color: var(--fm-text-4, #c0c4cc);
+  color: var(--fm-text-4);
   pointer-events: none;
 }
 .diff-block {
@@ -484,8 +484,8 @@ function restore(item: RevisionBrief, after?: () => void) {
   gap: 10px;
   padding: 6px 10px;
   font-size: 12px;
-  border-left: 3px solid var(--fm-border, #e5e7eb);
-  background: var(--fm-fill-1, #fafafb);
+  border-left: 3px solid var(--fm-border);
+  background: var(--fm-fill-1);
   margin-bottom: 4px;
 }
 .diff-row.warning {
@@ -500,7 +500,7 @@ function restore(item: RevisionBrief, after?: () => void) {
 .diff-kind {
   width: 72px;
   flex-shrink: 0;
-  color: var(--fm-text-3, #8a8f99);
+  color: var(--fm-text-3);
 }
 .diff-values {
   flex: 1;
@@ -517,11 +517,11 @@ function restore(item: RevisionBrief, after?: () => void) {
   white-space: nowrap;
 }
 .diff-before {
-  color: var(--fm-text-3, #8a8f99);
+  color: var(--fm-text-3);
   text-decoration: line-through;
 }
 .diff-arrow {
-  color: var(--fm-text-4, #c0c4cc);
+  color: var(--fm-text-4);
 }
 
 .detail-meta {
@@ -535,7 +535,7 @@ function restore(item: RevisionBrief, after?: () => void) {
   font-weight: 600;
 }
 .detail-time {
-  color: var(--fm-text-3, #8a8f99);
+  color: var(--fm-text-3);
 }
 .detail-spacer {
   flex: 1;
@@ -547,7 +547,7 @@ function restore(item: RevisionBrief, after?: () => void) {
 }
 .detail-sub {
   font-size: 12px;
-  color: var(--fm-text-3, #8a8f99);
+  color: var(--fm-text-3);
   margin-bottom: 12px;
 }
 .detail-section {
@@ -567,8 +567,8 @@ function restore(item: RevisionBrief, after?: () => void) {
   line-height: 1.6;
   white-space: pre-wrap;
   word-break: break-all;
-  background: var(--fm-fill-1, #fafafb);
-  border: 1px solid var(--fm-border, #eef0f3);
+  background: var(--fm-fill-1);
+  border: 1px solid var(--fm-border);
   border-radius: 4px;
 }
 .detail-code + .detail-code {
@@ -579,6 +579,6 @@ function restore(item: RevisionBrief, after?: () => void) {
 }
 .detail-empty {
   font-size: 12px;
-  color: var(--fm-text-3, #8a8f99);
+  color: var(--fm-text-3);
 }
 </style>

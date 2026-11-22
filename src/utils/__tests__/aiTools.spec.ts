@@ -416,4 +416,33 @@ describe('单一定义源（AI-11）', () => {
     expect(toolArgsSignature('send_request')).toContain('timeoutMs?')
     expect(toolArgsSignature('project_list')).toBe('无')
   })
+
+  it('集群历史与变量来源工具已注册、有 Schema 且可被检索', async () => {
+    const { toolArgsSignature, validateToolArgs, TOOL_CATALOG, toolNames } =
+      await import('@/utils/aiTools')
+    const names = toolNames()
+    for (const name of [
+      'cluster_jobs_list',
+      'cluster_job_detail',
+      'cluster_slave_history',
+      'stress_var_sources',
+    ]) {
+      expect(names).toContain(name)
+      // 长尾工具不进核心目录，只列名字；列不出名字模型就永远发现不了它
+      expect(TOOL_CATALOG).toContain(name)
+    }
+
+    expect(toolArgsSignature('cluster_jobs_list')).toBe(
+      '{ page?, pageSize?, status?, keyword? }',
+    )
+    expect(toolArgsSignature('cluster_job_detail')).toBe('{ jobId }')
+    expect(toolArgsSignature('stress_var_sources')).toBe('{ config }')
+
+    expect(validateToolArgs('cluster_job_detail', {})).toBe('缺少必填参数 jobId')
+    expect(validateToolArgs('stress_var_sources', {})).toBe('缺少必填参数 config')
+    expect(validateToolArgs('cluster_jobs_list', { pageSize: 500 })).toBe(
+      '参数 pageSize 不能大于 100',
+    )
+    expect(validateToolArgs('cluster_slave_history', { limit: 20, offset: 0 })).toBeNull()
+  })
 })

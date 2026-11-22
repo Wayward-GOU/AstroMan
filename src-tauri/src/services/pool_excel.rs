@@ -201,7 +201,9 @@ pub fn import_excel(
         }
         processed += 1;
         if processed > MAX_EXCEL_ROWS {
-            return Err(format!("单次最多导入 {MAX_EXCEL_ROWS} 行，请拆分文件后重试"));
+            return Err(format!(
+                "单次最多导入 {MAX_EXCEL_ROWS} 行，请拆分文件后重试"
+            ));
         }
         let first_index = *header_map.get(&first_column).unwrap_or(&0);
         let first_value = range

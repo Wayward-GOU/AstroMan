@@ -14,6 +14,10 @@ use crate::services::cluster::protocol::PoolItem;
 /// 结构化池错误码（第三批 11）：前端按前缀识别并给出针对性引导
 pub const E_POOL_EMPTY: &str = "POOL_EMPTY";
 pub const E_POOL_BINDING_INVALID: &str = "POOL_BINDING_INVALID";
+/// 同一个变量被多个池绑定：运行期后写入者会静默覆盖先写入者，按配置错误拦下
+///
+/// 命名与技术方案 `docs/v1.1.2-tech-plan.md` 的池问题码表保持一致。
+pub const E_POOL_VAR_CONFLICT: &str = "POOL_VAR_CONFLICT";
 pub const E_POOL_SHARD_EMPTY: &str = "POOL_SHARD_EMPTY";
 pub const E_POOL_SLICE_GAP: &str = "POOL_SLICE_GAP";
 pub const E_POOL_SLICE_TOO_LARGE: &str = "POOL_SLICE_TOO_LARGE";
@@ -52,9 +56,7 @@ pub fn normalize_columns(input: &[String]) -> Result<Vec<String>, String> {
             return Err(format!("第 {} 列名称为空", index + 1));
         }
         if name.chars().count() > MAX_POOL_COLUMN_LEN {
-            return Err(format!(
-                "列「{name}」超过 {MAX_POOL_COLUMN_LEN} 个字符"
-            ));
+            return Err(format!("列「{name}」超过 {MAX_POOL_COLUMN_LEN} 个字符"));
         }
         if !is_valid_column_name(name) {
             return Err(format!(
@@ -102,8 +104,7 @@ pub fn pool_columns(conn: &Connection, name: &str) -> Result<Vec<String>, String
         )
         .optional()
         .map_err(|error| format!("读取池列失败：{error}"))?;
-    let (kind, raw) =
-        row.ok_or_else(|| format!("{E_POOL_BINDING_INVALID}: 池「{name}」不存在"))?;
+    let (kind, raw) = row.ok_or_else(|| format!("{E_POOL_BINDING_INVALID}: 池「{name}」不存在"))?;
     Ok(parse_columns_json(&raw, &kind))
 }
 
@@ -452,8 +453,8 @@ pub fn save_refresh_config(
     config: &PoolRefreshConfig,
 ) -> Result<(), String> {
     let mode = if config.is_http() { "http" } else { "none" };
-    let raw = serde_json::to_string(config)
-        .map_err(|error| format!("序列化刷新配置失败：{error}"))?;
+    let raw =
+        serde_json::to_string(config).map_err(|error| format!("序列化刷新配置失败：{error}"))?;
     let changed = conn
         .execute(
             "UPDATE data_pools SET refresh_mode = ?1, refresh_json = ?2, updated_at = ?3
@@ -545,9 +546,7 @@ pub fn pool_sensitive(conn: &Connection, pool_id: i64) -> Result<bool, String> {
 /// 统计池健康度
 fn health_for_pool(conn: &Connection, pool_id: i64) -> Result<PoolHealth, String> {
     let now = now_ms();
-    let sql = format!(
-        "SELECT status, COUNT(*) FROM ({ITEM_STATUS_SOURCE}) GROUP BY status"
-    );
+    let sql = format!("SELECT status, COUNT(*) FROM ({ITEM_STATUS_SOURCE}) GROUP BY status");
     let mut stmt = conn
         .prepare(&sql)
         .map_err(|error| format!("读取池健康度失败：{error}"))?;
@@ -759,7 +758,9 @@ pub fn parse_import(text: &str) -> Result<Vec<(String, Option<String>, f64)>, St
     if trimmed.starts_with('[') {
         let value: serde_json::Value =
             serde_json::from_str(trimmed).map_err(|error| format!("JSON 解析失败：{error}"))?;
-        let array = value.as_array().ok_or_else(|| "JSON 顶层必须是数组".to_string())?;
+        let array = value
+            .as_array()
+            .ok_or_else(|| "JSON 顶层必须是数组".to_string())?;
         let mut items = Vec::new();
         for entry in array {
             match entry {
@@ -800,7 +801,10 @@ pub fn parse_import(text: &str) -> Result<Vec<(String, Option<String>, f64)>, St
         if value.is_empty() {
             continue;
         }
-        let account = parts.get(1).filter(|item| !item.is_empty()).map(|item| item.to_string());
+        let account = parts
+            .get(1)
+            .filter(|item| !item.is_empty())
+            .map(|item| item.to_string());
         let weight = parts
             .get(2)
             .and_then(|item| item.parse::<f64>().ok())
@@ -951,11 +955,7 @@ pub fn import_items(conn: &Connection, pool_id: i64, text: &str) -> Result<usize
                         .map(|item| item.trim().is_empty())
                         .unwrap_or(true)
                     {
-                        return Err(format!(
-                            "第 {} 个对象缺少首列「{}」的值",
-                            index + 1,
-                            first
-                        ));
+                        return Err(format!("第 {} 个对象缺少首列「{}」的值", index + 1, first));
                     }
                     let weight = map
                         .get("weight")
@@ -1058,9 +1058,7 @@ pub fn save_columns(
 
     let items = {
         let mut stmt = conn
-            .prepare(
-                "SELECT id, value, account, data_json FROM data_pool_items WHERE pool_id = ?1",
-            )
+            .prepare("SELECT id, value, account, data_json FROM data_pool_items WHERE pool_id = ?1")
             .map_err(|error| format!("读取池条目失败：{error}"))?;
         let rows = stmt
             .query_map(params![pool_id], |row| {
@@ -1082,7 +1080,9 @@ pub fn save_columns(
         .map_err(|error| format!("开启列迁移事务失败：{error}"))?;
     {
         let mut update = tx
-            .prepare("UPDATE data_pool_items SET data_json = ?1, value = ?2, account = ?3 WHERE id = ?4")
+            .prepare(
+                "UPDATE data_pool_items SET data_json = ?1, value = ?2, account = ?3 WHERE id = ?4",
+            )
             .map_err(|error| format!("准备更新池条目失败：{error}"))?;
         for (id, value, account, raw_data) in items {
             let mut old_data = parse_data_json(&raw_data);
@@ -1101,11 +1101,7 @@ pub fn save_columns(
                             .is_some()
                 });
                 let next_value = if let Some(change) = renamed {
-                    let from = change
-                        .from
-                        .as_deref()
-                        .map(str::trim)
-                        .unwrap_or_default();
+                    let from = change.from.as_deref().map(str::trim).unwrap_or_default();
                     old_data.get(from).cloned().unwrap_or_default()
                 } else {
                     old_data.get(column).cloned().unwrap_or_default()
@@ -1129,8 +1125,8 @@ pub fn save_columns(
                 .map_err(|error| format!("更新池条目失败：{error}"))?;
         }
     }
-    let raw_columns = serde_json::to_string(&new_columns)
-        .map_err(|error| format!("序列化池列失败：{error}"))?;
+    let raw_columns =
+        serde_json::to_string(&new_columns).map_err(|error| format!("序列化池列失败：{error}"))?;
     tx.execute(
         "UPDATE data_pools SET columns_json = ?1, updated_at = ?2 WHERE id = ?3",
         params![raw_columns, now_ms(), pool_id],
@@ -1252,7 +1248,10 @@ mod tests {
         assert_eq!(all.health.disabled, 1);
         // 敏感池：列表接口不下发明文
         assert!(all.items.iter().all(|item| item.masked));
-        assert!(all.items.iter().all(|item| !item.value.contains("token-active")));
+        assert!(all
+            .items
+            .iter()
+            .all(|item| !item.value.contains("token-active")));
 
         let cooling = pool_items_page(&conn, 1, 1, 50, "", "cooling", true).unwrap();
         assert_eq!(cooling.total, 1);
@@ -1295,8 +1294,12 @@ mod tests {
         assert_eq!(default_columns("token"), vec!["token", "account"]);
         assert_eq!(default_columns("parameter"), vec!["value"]);
         assert_eq!(
-            normalize_columns(&[" token ".to_string(), "account".to_string(), "token".to_string()])
-                .unwrap(),
+            normalize_columns(&[
+                " token ".to_string(),
+                "account".to_string(),
+                "token".to_string()
+            ])
+            .unwrap(),
             vec!["token", "account"]
         );
         assert!(normalize_columns(&[]).is_err());
@@ -1308,11 +1311,11 @@ mod tests {
         assert!(normalize_columns(&too_many).is_err());
         // 旧池（空列定义）按 v20 之前的固定列兼容
         assert_eq!(parse_columns_json("", "token"), vec!["value", "account"]);
+        assert_eq!(parse_columns_json("not-json", "parameter"), vec!["value"]);
         assert_eq!(
-            parse_columns_json("not-json", "parameter"),
-            vec!["value"]
+            parse_columns_json("[]", "parameter"),
+            vec!["value", "account"]
         );
-        assert_eq!(parse_columns_json("[]", "parameter"), vec!["value", "account"]);
     }
 
     #[test]
@@ -1544,8 +1547,7 @@ mod perf_tests {
                 )
                 .unwrap();
             for index in 0..count {
-                stmt.execute(params![format!("token-{index:06}")])
-                    .unwrap();
+                stmt.execute(params![format!("token-{index:06}")]).unwrap();
             }
         }
         conn.execute_batch("COMMIT").unwrap();
@@ -1575,7 +1577,10 @@ mod perf_tests {
         };
         let elapsed = started.elapsed();
         println!("perf_pool_reveal_one: {} bytes in {elapsed:?}", value.len());
-        assert!(elapsed < std::time::Duration::from_millis(50), "单条 reveal 耗时 {elapsed:?}");
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "单条 reveal 耗时 {elapsed:?}"
+        );
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1596,7 +1601,10 @@ mod perf_tests {
         );
         assert_eq!(items.len(), 10_000);
         if before > 0 {
-            assert!(delta_mb < 128.0, "10,000 token 占用 {delta_mb:.1} MB，超过 128MB 目标");
+            assert!(
+                delta_mb < 128.0,
+                "10,000 token 占用 {delta_mb:.1} MB，超过 128MB 目标"
+            );
         }
         drop(items);
         drop(conn);
@@ -1610,10 +1618,8 @@ mod perf_tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|value| value.as_nanos())
             .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!(
-            "astroman-perf-pool-{}-{stamp}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("astroman-perf-pool-{}-{stamp}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let conn = Connection::open(dir.join("pool.db")).unwrap();
         conn.execute_batch(

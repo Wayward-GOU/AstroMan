@@ -12,6 +12,8 @@ import {
   clusterDiscoveryList,
   clusterJoinDiscovered,
   clusterMasterAbort,
+  clusterJobDetail,
+  clusterJobsList,
   clusterMasterApprove,
   clusterMasterAutoAccept,
   clusterMasterClose,
@@ -23,6 +25,7 @@ import {
   clusterMasterSnapshot,
   clusterNodeSamples,
   clusterSlaveConnect,
+  clusterSlaveHistoryList,
   clusterVarAudit,
   dashboardMetrics,
   envActivate,
@@ -71,6 +74,7 @@ import {
   stressStop,
   stressBudgetGet,
   stressJobs,
+  stressVarSources,
   testArtifactExport,
   testArtifactList,
   testCaseDelete,
@@ -130,10 +134,14 @@ import type {
   TestCase,
   TestCasePayload,
   TestDatasetPayload,
+  VarSourceItem,
 } from '@/types/models'
 import type {
+  ClusterJobSummary,
   ClusterMasterSnapshot,
   ClusterNodeInfo,
+  ClusterSlaveHistoryItem,
+  ClusterWorkerRow,
   ReportPeaks,
   SampleHealth,
 } from '@/types/cluster'
@@ -797,6 +805,19 @@ const SCHEMAS: Record<string, Record<string, ArgRule>> = {
     collectionId: { kind: 'number', required: true },
     requests: { kind: 'array', required: true, min: 1, max: 50 },
   },
+  /* ---------------- 集群历史与变量来源（只读） ---------------- */
+  cluster_jobs_list: {
+    page: { kind: 'number', min: 1 },
+    pageSize: { kind: 'number', min: 1, max: 100 },
+    status: { kind: 'string' },
+    keyword: { kind: 'string' },
+  },
+  cluster_job_detail: { jobId: { kind: 'number', required: true } },
+  cluster_slave_history: {
+    limit: { kind: 'number', min: 1, max: 200 },
+    offset: { kind: 'number', min: 0 },
+  },
+  stress_var_sources: { config: { kind: 'object', required: true } },
 }
 
 function checkRule(key: string, value: unknown, rule: ArgRule): string | null {
@@ -1714,6 +1735,65 @@ function clusterDigest(snapshot: ClusterMasterSnapshot) {
     节点数: snapshot.nodes.length,
     节点: snapshot.nodes.map(clusterNodeDigest),
     消息: snapshot.message || '',
+  }
+}
+
+/** 历史任务摘要：主节点「历史」tab 与从节点「本机参与过的任务」共用 */
+function clusterJobDigest(job: ClusterJobSummary) {
+  return {
+    任务编号: job.id,
+    计划: job.planName || '未命名计划',
+    状态: cnLabel(CLUSTER_STATUS_LABELS, job.status, job.status),
+    开始时间: fmtTime(job.createdAt),
+    结束时间: job.finishedAt ? fmtTime(job.finishedAt) : '未结束',
+    主节点: job.masterNode || '—',
+    节点数: job.nodeCount,
+    总并发: job.totalConcurrent,
+    '平均QPS': job.avgQps != null ? Number(job.avgQps.toFixed(1)) : '未采集',
+    报告编号: job.reportId ?? '无报告',
+    完整性: job.incomplete ? '不完整（有节点失联或采样缺失）' : '完整',
+    说明: job.message || '',
+  }
+}
+
+/** 历史任务里的节点行：含整机资源峰值与时钟误差 */
+function clusterWorkerDigest(node: ClusterWorkerRow) {
+  return {
+    节点: node.nodeName || '未命名节点',
+    地址: node.addr,
+    角色: node.role === 'master' ? '主节点' : '从节点',
+    状态: cnLabel(NODE_STATUS_LABELS, node.status, node.status),
+    分配并发: node.concurrent,
+    权重: node.weight,
+    QPS: Number((node.qps ?? 0).toFixed(1)),
+    引擎CPU: node.cpu != null ? `${node.cpu.toFixed(1)}%` : '未采集',
+    引擎内存: node.memMb != null ? `${Math.round(node.memMb)} MB` : '未采集',
+    时钟偏差: `${Math.round(node.clockOffsetMs)} 毫秒`,
+    时钟不确定度: `${Math.round(node.clockUncertaintyMs)} 毫秒`,
+    丢失采样: node.droppedSamples,
+    加入时间: fmtTime(node.joinedAt),
+    最后心跳: node.lastSeenAt ? fmtTime(node.lastSeenAt) : '—',
+    错误: node.error || '无',
+  }
+}
+
+/** 从节点本地参与记录：本机跑了多少、峰值多少 */
+function clusterSlaveHistoryDigest(item: ClusterSlaveHistoryItem) {
+  return {
+    记录编号: item.id,
+    主节点: item.masterNode || item.masterAddr,
+    主节点任务: item.masterJobId ?? '未上报',
+    计划: item.planName || '未命名计划',
+    加入方式: item.joinMode === 'code' ? '配对码' : '审批',
+    本机节点名: item.nodeName,
+    分配并发: item.concurrent,
+    集群总并发: item.totalConcurrent,
+    状态: cnLabel(CLUSTER_STATUS_LABELS, item.status, item.status),
+    '平均QPS': Number((item.qpsAvg ?? 0).toFixed(1)),
+    '整机CPU峰值': `${(item.hostCpuPeak ?? 0).toFixed(1)}%`,
+    '内存峰值': `${Math.round(item.memPeakMb ?? 0)} MB`,
+    '网卡峰值': `${Math.round(item.netPeakKbps ?? 0)} KB/s`,
+    参与时间: fmtTime(item.createdAt),
   }
 }
 
@@ -3112,9 +3192,44 @@ const SPECS: ToolSpec[] = [
     },
   },
   {
+    name: 'stress_var_sources',
+    desc: '压测配置的变量来源清单（只读）：列出配置里每个 {{占位符}} 属于普通变量 / 密钥 / 系统变量，来自环境、运行期、数据池还是缺失，并标出当前是否可用；不返回变量值',
+    handler: async (args) => {
+      const config = args.config
+      if (typeof config !== 'object' || config === null || Array.isArray(config)) {
+        throw new Error('config 必须是压测配置对象')
+      }
+      const items = await stressVarSources(config as Partial<StressConfig>)
+      const kindText: Record<VarSourceItem['kind'], string> = {
+        user: '普通变量',
+        secret: '密钥',
+        os: '系统变量',
+      }
+      const sourceText: Record<VarSourceItem['source'], string> = {
+        env: '环境变量',
+        runtime: '运行期变量',
+        pool: '数据池',
+        os: '本机系统变量',
+        missing: '缺失',
+      }
+      return {
+        变量数: items.length,
+        待处理: items.filter((item) => !item.ok).length,
+        全部可用: items.length > 0 && items.every((item) => item.ok),
+        变量: items.map((item) => ({
+          写法: `{{${item.kind === 'user' ? '' : `${item.kind}:`}${item.name}}}`,
+          名称: item.name,
+          类型: kindText[item.kind] ?? item.kind,
+          来源: sourceText[item.source] ?? item.source,
+          状态: item.ok ? '可用' : '待处理',
+          说明: item.detail || '',
+        })),
+      }
+    },
+  },
+  {
     name: 'stress_budget_get',
-    desc: '本机并发预算：自动/手动模式、机器上限、单任务上限、运行任务数与来源（只读）',
-    handler: async () => {
+    desc: '本机并发预算：自动/手动模式、机器上限、单任务上限、运行任务数与来源（只读）',    handler: async () => {
       const budget = await stressBudgetGet()
       return {
         模式: budget.mode === 'auto' ? '自动（按机器能力）' : '手动',
@@ -3451,6 +3566,48 @@ const SPECS: ToolSpec[] = [
         主节点: snapshot.masterAddr,
         节点名: snapshot.nodeName,
         说明: snapshot.error || '',
+      }
+    },
+  },
+  {
+    name: 'cluster_jobs_list',
+    desc: '集群任务历史（主节点视角，只读）：分页列出本机发起过的分布式压测任务，可按状态（finished / failed / running / preparing）或计划名关键字过滤',
+    handler: async (args) => {
+      const page = Math.max(1, optionalNum(args.page) ?? 1)
+      const pageSize = Math.min(100, Math.max(1, optionalNum(args.pageSize) ?? 20))
+      const status = str(args.status).trim()
+      const keyword = str(args.keyword).trim()
+      const data = await clusterJobsList(page, pageSize, status, keyword)
+      return {
+        总数: data.total,
+        页码: page,
+        每页: pageSize,
+        任务: data.items.map(clusterJobDigest),
+      }
+    },
+  },
+  {
+    name: 'cluster_job_detail',
+    desc: '集群历史任务详情（只读）：任务本身 + 各节点分配并发、引擎 CPU / 内存、时钟偏差与丢失采样；用于复盘「哪台机器拖慢 / 失联」',
+    handler: async (args) => {
+      const detail = await clusterJobDetail(needNum(args.jobId, 'jobId'))
+      return {
+        任务: clusterJobDigest(detail.job),
+        节点数: detail.nodes.length,
+        节点: detail.nodes.map(clusterWorkerDigest),
+      }
+    },
+  },
+  {
+    name: 'cluster_slave_history',
+    desc: '本机作为从节点的参与记录（只读）：连过哪些主节点、跑了什么计划、本机整机 CPU / 内存 / 网卡峰值；主节点侧看不到这些数据',
+    handler: async (args) => {
+      const limit = Math.min(200, Math.max(1, optionalNum(args.limit) ?? 20))
+      const offset = Math.max(0, optionalNum(args.offset) ?? 0)
+      const items = await clusterSlaveHistoryList(limit, offset)
+      return {
+        条数: items.length,
+        记录: items.map(clusterSlaveHistoryDigest),
       }
     },
   },
@@ -5003,7 +5160,9 @@ const SPECS: ToolSpec[] = [
 const TOOL_KEYWORDS: Array<{ words: string[]; tools: string[] }> = [
   { words: ['环境', '变量', 'env'], tools: ['env_', 'environment'] },
   { words: ['报告', '压测结果', 'report'], tools: ['report_'] },
-  { words: ['历史', '记录', 'history'], tools: ['history_', 'run_'] },
+  { words: ['历史', '记录', 'history'], tools: ['history_', 'run_', 'cluster_jobs_list', 'cluster_job_detail', 'cluster_slave_history'] },
+  { words: ['集群', '分布式', '主节点', '从节点', '配对', 'cluster'], tools: ['cluster_'] },
+  { words: ['变量来源', '变量类型', '系统变量', '占位符来源', 'os:'], tools: ['stress_var_sources'] },
   { words: ['运行详情', '响应头', '响应体', '请求体', 'run'], tools: ['run_get', 'run_list'] },
   { words: ['电脑', '系统', 'CPU', '内存', '磁盘', '进程', '卡顿', 'system'], tools: ['system_'] },
   { words: ['版本', '数据目录', '数据库', 'app', 'info'], tools: ['app_info'] },

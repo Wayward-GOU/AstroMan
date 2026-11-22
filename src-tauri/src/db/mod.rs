@@ -25,7 +25,8 @@ mod seed;
 /// 18 = 池健康度（data_pool_items 过期 / 冷却 / 失败次数 / 最近使用）
 /// 19 = Token 刷新配置（data_pools.refresh_mode / refresh_json）与集群节点级采样表
 /// 20 = 池自定义列（data_pools.columns_json / data_pool_items.data_json）
-pub const DB_VERSION: i64 = 20;
+/// 21 = 集群配对 / 执行历史（cluster_slave_history）+ 报告样本资源列
+pub const DB_VERSION: i64 = 21;
 
 /// 每条连接都要应用的 SQLite 参数（P-06）。
 ///
@@ -303,26 +304,31 @@ const COLUMN_MIGRATIONS: &[(&str, &str, &str)] = &[
         "INTEGER NOT NULL DEFAULT 0",
     ),
     // v19：Token 刷新配置（none / http），配置体为 JSON
-    (
-        "data_pools",
-        "refresh_mode",
-        "TEXT NOT NULL DEFAULT 'none'",
-    ),
-    (
-        "data_pools",
-        "refresh_json",
-        "TEXT NOT NULL DEFAULT '{}'",
-    ),
+    ("data_pools", "refresh_mode", "TEXT NOT NULL DEFAULT 'none'"),
+    ("data_pools", "refresh_json", "TEXT NOT NULL DEFAULT '{}'"),
     // v20：池自定义列定义与整行数据（Excel 模板导入）
+    ("data_pools", "columns_json", "TEXT NOT NULL DEFAULT '[]'"),
+    ("data_pool_items", "data_json", "TEXT NOT NULL DEFAULT '{}'"),
+    // v21：集群报告样本补资源维度（旧报告为 0，界面显示「未采集」）
+    ("cluster_report_samples", "cpu", "REAL DEFAULT 0"),
     (
-        "data_pools",
-        "columns_json",
-        "TEXT NOT NULL DEFAULT '[]'",
+        "cluster_report_samples",
+        "host_cpu_percent",
+        "REAL DEFAULT 0",
+    ),
+    ("cluster_report_samples", "mem_mb", "INTEGER DEFAULT 0"),
+    ("cluster_report_samples", "net_rx_kbps", "REAL DEFAULT 0"),
+    ("cluster_report_samples", "net_tx_kbps", "REAL DEFAULT 0"),
+    // v21：从节点历史记录本机资源峰值，不必等报告回传
+    (
+        "cluster_slave_history",
+        "host_cpu_peak",
+        "REAL NOT NULL DEFAULT 0",
     ),
     (
-        "data_pool_items",
-        "data_json",
-        "TEXT NOT NULL DEFAULT '{}'",
+        "cluster_slave_history",
+        "net_peak_kbps",
+        "REAL NOT NULL DEFAULT 0",
     ),
 ];
 
@@ -779,7 +785,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(requests, 3, "数据池示例集合应包含 3 个请求（含 Excel 导入示例）");
+        assert_eq!(
+            requests, 3,
+            "数据池示例集合应包含 3 个请求（含 Excel 导入示例）"
+        );
 
         let import_columns: String = conn
             .query_row(

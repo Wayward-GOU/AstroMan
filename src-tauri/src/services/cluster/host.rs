@@ -7,8 +7,8 @@
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 use super::client::EVENT_SLAVE;
-use super::protocol::{ClusterMasterSnapshot, ClusterSlaveSnapshot};
-use super::server::{ClusterSampleEvent, EVENT_MASTER, EVENT_SAMPLE};
+use super::protocol::{ClusterMasterSnapshot, ClusterSampleFrame, ClusterSlaveSnapshot};
+use super::server::{EVENT_MASTER, EVENT_SAMPLE_FRAME};
 use crate::state::AppState;
 
 /// 会话宿主：发事件 + 读取本机状态
@@ -16,7 +16,8 @@ use crate::state::AppState;
 /// 方法保持非泛型，才能作为 `dyn` 对象跨线程共享。
 pub trait ClusterApp: Send + Sync + 'static {
     fn emit_master(&self, snapshot: ClusterMasterSnapshot);
-    fn emit_sample(&self, event: ClusterSampleEvent);
+    /// 采样帧：每秒一帧，替代逐条推送
+    fn emit_sample_frame(&self, frame: ClusterSampleFrame);
     fn emit_slave(&self, snapshot: ClusterSlaveSnapshot);
     fn try_state(&self) -> Option<tauri::State<'_, AppState>>;
 }
@@ -26,8 +27,8 @@ impl<R: Runtime> ClusterApp for AppHandle<R> {
         let _ = self.emit(EVENT_MASTER, snapshot);
     }
 
-    fn emit_sample(&self, event: ClusterSampleEvent) {
-        let _ = self.emit(EVENT_SAMPLE, event);
+    fn emit_sample_frame(&self, frame: ClusterSampleFrame) {
+        let _ = self.emit(EVENT_SAMPLE_FRAME, frame);
     }
 
     fn emit_slave(&self, snapshot: ClusterSlaveSnapshot) {

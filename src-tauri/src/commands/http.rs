@@ -999,7 +999,7 @@ fn charset_from_meta(head: &[u8]) -> Option<&'static Encoding> {
     for (index, _) in text.match_indices("charset=") {
         let rest = &text[index + "charset=".len()..];
         let label = rest
-            .trim_start_matches(|c: char| c == '"' || c == '\'')
+            .trim_start_matches(['"', '\''])
             .split(|c: char| c == '"' || c == '\'' || c == ';' || c == '>' || c.is_whitespace())
             .next()
             .unwrap_or("");
@@ -1260,6 +1260,9 @@ fn decode_text(buffer: &[u8], charset: Option<&'static Encoding>) -> String {
     }
 }
 
+// 响应体收尾参数较多：头缓冲、结束标记、落盘目录、类型、已读字节、上限与编码各自独立，
+// 拆结构体反而要在两处调用点重复组装，这里保留长参数列表。
+#[allow(clippy::too_many_arguments)]
 async fn collect_text(
     response: &mut reqwest::Response,
     head: Vec<u8>,
@@ -1624,6 +1627,6 @@ mod tests {
         let client = reqwest::Client::new();
         let result = send_with_cancel(client.get("http://127.0.0.1:9"), Some(&flag)).await;
         assert!(matches!(result, Err(error) if error.cancelled));
-        assert_eq!(flag.load(Ordering::SeqCst), true);
+        assert!(flag.load(Ordering::SeqCst));
     }
 }

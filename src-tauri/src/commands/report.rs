@@ -258,9 +258,8 @@ pub fn report_list(
 ) -> Result<Vec<StressReport>, String> {
     let limit = limit.unwrap_or(100).clamp(1, 500) as i64;
     let conn = state.pool.get().map_err(err)?;
-    let sql = format!(
-        "SELECT {REPORT_COLUMNS}, config_json FROM test_reports ORDER BY id DESC LIMIT ?1"
-    );
+    let sql =
+        format!("SELECT {REPORT_COLUMNS}, config_json FROM test_reports ORDER BY id DESC LIMIT ?1");
     let mut stmt = conn.prepare(&sql).map_err(err)?;
     let rows = stmt
         .query_map(params![limit], |row| {
@@ -321,9 +320,7 @@ pub fn report_node_series(
     );
     let mut args: Vec<rusqlite::types::Value> = Vec::new();
     if ids.is_empty() {
-        sql.push_str(
-            " AND report_id IN (SELECT id FROM test_reports ORDER BY id DESC LIMIT 20)",
-        );
+        sql.push_str(" AND report_id IN (SELECT id FROM test_reports ORDER BY id DESC LIMIT 20)");
     } else {
         let marks = vec!["?"; ids.len()].join(",");
         sql.push_str(&format!(" AND report_id IN ({marks})"));

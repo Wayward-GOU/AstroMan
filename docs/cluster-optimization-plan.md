@@ -1,6 +1,6 @@
 # 分布式压测优化清单与功能设计
 
-> 适用版本：v1.1.2（`develop-master-v1.1.2`）
+> 适用版本：v1.1.3（`develop-master-v1.1.2` 分支，随 v1.1.3 发布）
 > 范围：`src-tauri/src/services/cluster/*`、`src-tauri/src/commands/cluster.rs`、`src/views/Cluster.vue`、报告页
 > 本文分两部分：第一部分的优化项可直接开工；第二部分是三个新功能的落地方案。
 

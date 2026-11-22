@@ -11,7 +11,7 @@ description: AstroMan 内置 AI 助手「航仔」的开发与维护规范。接
 
 | 能力 | 落点 |
 |---|---|
-| **126 个工具**（113 业务 + 12 工具箱 + `tool_search`），其中 22 个自动化测试域、7 个抓包域、17 个集群域、7 个池工具 | `aiTools.ts` 的 `SPECS` / `SCHEMAS` / `WRITE_TOOLS` / `CORE_TOOL_NAMES` / `TOOL_KEYWORDS` |
+| **130 个工具**（117 业务 + 12 工具箱 + `tool_search`），其中 22 个自动化测试域、7 个抓包域、20 个集群域、7 个池工具 | `aiTools.ts` 的 `SPECS` / `SCHEMAS` / `WRITE_TOOLS` / `CORE_TOOL_NAMES` / `TOOL_KEYWORDS` |
 | 自动化测试：套件 / 用例 / 运行 / 报告 | 22 个 `test_*` 工具 → `commands/test_suite.rs`、`test_case.rs`、`test_run.rs`、`test_report.rs`、`test_preflight.rs`；流程见 §自动化测试域 |
 | 停止生成 / 自动重试 / 工具硬超时 | `ai.rs` 的 `ai_chat_cancel` + `request_id` 注册表、`retry` 事件；`aiTools.ts` 的 `toolTimeoutOf` / `withTimeout` / `ToolTimeoutError` |
 | 上下文预算与异步摘要 | `contextBudget.ts` / `modelMeta.ts`；`ai_sessions.summary / summary_until`；对话页预算条 |
@@ -43,7 +43,7 @@ description: AstroMan 内置 AI 助手「航仔」的开发与维护规范。接
 | `src-tauri/src/models.rs` | `AiProvider`（`api_key_masked` / `has_key` / `max_tokens` / `timeout_secs`）、`AiMessage`、`AiChatPayload`、`AiStreamEvent`、`AiSession`（`pinned` / `summary`）、`AiStoredMessage`、`AiToolLog`（`round` / `trace_id` / `timeout`）、`AiUsageLog` / `AiUsagePage` / `AiUsageDay` |
 | `src-tauri/src/db/schema.sql` | `ai_providers`、`ai_sessions`、`ai_messages`、`ai_tool_logs`、`ai_usage_logs` 五张在用表（另有遗留的 `ai_conversations`，代码已不读写，见 §数据表） |
 | `src-tauri/src/commands/test_suite.rs` / `test_case.rs` / `test_run.rs` / `test_report.rs` / `test_preflight.rs` | 测试域工具的后端命令：`test_suite_*` / `test_case_*` / `test_run_*` / `test_report_generate` / `test_preflight`（工具侧只做参数归一、字段裁剪与中文键，业务逻辑在后端） |
-| `src/utils/aiTools.ts` | **工具注册表**：**126 个工具**（113 业务 + 12 工具箱 + `tool_search`，含 22 个测试域、7 个抓包域、17 个集群域与 7 个池工具）的声明、参数解析、执行、中文名、`danger` 标记、`isWriteTool()` 写操作判定（`WRITE_TOOLS` 48 项）、`SCHEMAS` 入参校验、`TOOL_KEYWORDS` 检索别名、`toolTimeoutOf()` 超时档位、`ToolResult` 输出信封、目录分层 |
+| `src/utils/aiTools.ts` | **工具注册表**：**130 个工具**（117 业务 + 12 工具箱 + `tool_search`，含 22 个测试域、7 个抓包域、20 个集群域与 7 个池工具）的声明、参数解析、执行、中文名、`danger` 标记、`isWriteTool()` 写操作判定（`WRITE_TOOLS` 48 项）、`SCHEMAS` 入参校验、`TOOL_KEYWORDS` 检索别名、`toolTimeoutOf()` 超时档位、`ToolResult` 输出信封、目录分层 |
 | `src/utils/aiProtocol.ts` | fenced 块解析：`parseSegments` / `normalizePseudoFence` / `liftNativeCalls` / `stripNativeTags` / `sanitizeAssistant` / `callKey` |
 | `src/utils/contextBudget.ts` | token 估算 `estimateTokens` / `estimateMessages`、预算裁剪 `buildContext`、摘要前缀 `SUMMARY_PREFIX` |
 | `src/utils/modelMeta.ts` | 模型 → 上下文窗口映射 `contextWindowOf`、预算比例 `contextBudgetOf`（窗口 60%，下限 2000） |
@@ -284,14 +284,14 @@ Rust 侧 `ai_chat(payload, on_event: Channel<AiStreamEvent>)`，逐块 `on_event
 | 13. 上下文预算与摘要 | `buildContext()` 按窗口 60% 组装，超预算硬裁剪并注明「较早的 N 条已省略」；`ai_sessions.summary / summary_until` 异步摘要，最近 6 条永不压缩，连续失败 3 次暂停 |
 | 14. 不可信数据隔离 | 工具结果 / 附件 / 页面快照统一 `wrapUntrusted()`；疑似注入行打 `[已过滤]` |
 | 15. 导出覆盖确认 | `project_export` / `report_export` / `history_export` / `openapi_export` 先 `fileExists()`；已存在时标题改「文件已存在，确认覆盖？」 |
-| 16. 工具目录分层 | 系统提示词只展开 **27 个核心工具**（`CORE_TOOL_NAMES`，含 `test_suite_list` / `test_run_start` / `test_run_get` / `tool_search`），其余列名；长尾工具必须先 `tool_search({ keyword })`，禁止编造工具名 |
+| 16. 工具目录分层 | 系统提示词只展开 **28 个核心工具**（`CORE_TOOL_NAMES`，含 `test_suite_list` / `test_run_start` / `test_run_get` / `tool_search`），其余列名；长尾工具必须先 `tool_search({ keyword })`，禁止编造工具名 |
 | 17. 结果信封与计数 | 工具返回 `summary / total / truncated`；模型引用 `total`，禁止逐条数，也禁止把截断当成完整结果 |
 
 规则编号与 `agent_hard_rules.md` 一一对应（1–17），改 md 时本表同步改编号，不要新增「7.1」这类小数点编号——历史表里就因此漏掉了 10–15 六条。
 
 改规则时的顺序：`agent_hard_rules.md`（需求） → `SCHEMAS` / `MAX_TOOL_ROUNDS` / `danger` / `WRITE_TOOLS` → 前端提示文案 → 本表。
 
-### 工具清单（113 业务 + 12 工具箱 + `tool_search` = 126）
+### 工具清单（117 业务 + 12 工具箱 + `tool_search` = 130）
 
 | 分类 | 工具 |
 |---|---|
@@ -299,8 +299,8 @@ Rust 侧 `ai_chat(payload, on_event: Channel<AiStreamEvent>)`，逐块 `on_event
 | 集合 | `collection_tree` `collection_create` `collection_rename` `collection_delete` |
 | 请求 | `request_list` `request_get` `request_search` `request_options` `request_create` `request_batch_create` `request_update` `request_script_save` `request_delete` `curl_import` `send_request` `run_batch` |
 | 环境 | `env_list` `env_create` `env_var_save` `env_activate` `env_delete` `env_script_save` |
-| 压测 | `plan_list` `plan_get` `plan_save` `plan_delete` `stress_start` `stress_stop` `stress_budget_get` `report_list` `report_get` `report_export` `report_requests` `report_delete` `run_list` |
-| 分布式压测 | `cluster_status` `cluster_session_get` `cluster_nodes` `cluster_samples` `cluster_diagnostics` `cluster_discovered_masters` `cluster_pending_joins` `cluster_start` `cluster_prepare` `cluster_launch` `cluster_var_audit` `cluster_stop` `cluster_close` `cluster_approve_join` `cluster_reject_join` `cluster_auto_accept` `cluster_join_master` |
+| 压测 | `plan_list` `plan_get` `plan_save` `plan_delete` `stress_start` `stress_stop` `stress_budget_get` `stress_var_sources` `report_list` `report_get` `report_export` `report_requests` `report_delete` `run_list` |
+| 分布式压测 | `cluster_status` `cluster_session_get` `cluster_nodes` `cluster_samples` `cluster_diagnostics` `cluster_discovered_masters` `cluster_pending_joins` `cluster_start` `cluster_prepare` `cluster_launch` `cluster_var_audit` `cluster_stop` `cluster_close` `cluster_jobs_list` `cluster_job_detail` `cluster_slave_history` `cluster_approve_join` `cluster_reject_join` `cluster_auto_accept` `cluster_join_master` |
 | 数据池 | `pool_list` `pool_get` `pool_preview` `pool_create` `pool_import` `pool_delete` `pool_bind_plan` |
 | 自动化测试 | `test_suite_list` `test_suite_get` `test_suite_create` `test_suite_update` `test_suite_delete` `test_case_create` `test_case_update` `test_case_delete` `test_run_start` `test_run_stop` `test_run_get` `test_report_export` `test_dataset_list` `test_dataset_get` `test_dataset_save` `test_dataset_delete` `test_suite_import` `test_suite_export` `test_run_list` `test_artifact_list` `test_artifact_export` `test_preflight` |
 | 抓包 | `capture_status` `capture_flow_list` `capture_flow_get` `capture_start` `capture_stop` `capture_repeat` `capture_export` |
@@ -309,22 +309,22 @@ Rust 侧 `ai_chat(payload, on_event: Channel<AiStreamEvent>)`，逐块 `on_event
 | 工具箱 | `toolbox_json_format` `toolbox_json_to_entity` `toolbox_json_to_sql` `toolbox_convert` `toolbox_timestamp` `toolbox_base64` `toolbox_hash` `toolbox_url` `toolbox_regex` `toolbox_jwt` `toolbox_diff` `toolbox_uuid` |
 | 元工具 | `tool_search`（按中英文关键词检索长尾工具用法） |
 
-数一遍是 113 个业务工具 + 12 个工具箱 + `tool_search` = **126**。这个数字被算错过好几次（历史文档写过 61 / 62 / 74 / 75 / 92），原因是拿 `grep -o "name: '[a-z_0-9]*'"` 统计时会多出一个空匹配，直接多数一个。可靠算法：
+数一遍是 117 个业务工具 + 12 个工具箱 + `tool_search` = **130**。这个数字被算错过好几次（历史文档写过 61 / 62 / 74 / 75 / 92），原因是拿 `grep -o "name: '[a-z_0-9]*'"` 统计时会多出一个空匹配，直接多数一个。可靠算法：
 
 ```bash
 node -e "const s=require('fs').readFileSync('src/utils/aiTools.ts','utf8');const n=[...s.slice(s.indexOf('const SPECS')).matchAll(/name: '([a-z][a-z0-9_]*)'/g)].map(m=>m[1]);console.log(n.length, new Set(n).size)"
 ```
 
-输出两个数都是 `126` 才算对。新增或删除工具后跑 `npx vitest run src/utils/__tests__/aiTools.spec.ts`，并同步本节标题、§现状速览、§工具目录分层里的核心数。
+输出两个数都是 `130` 才算对。新增或删除工具后跑 `npx vitest run src/utils/__tests__/aiTools.spec.ts`，并同步本节标题、§现状速览、§工具目录分层里的核心数。
 
 ### 工具目录分层（T-12）
 
-- `CORE_TOOL_NAMES`（**27 个**）保留完整说明，其余工具只列名字，合起来组成系统提示词里的 `TOOL_CATALOG`
+- `CORE_TOOL_NAMES`（**28 个**）保留完整说明，其余工具只列名字，合起来组成系统提示词里的 `TOOL_CATALOG`
 - 模型遇到没见过的工具先调 `tool_search({ keyword })`，别名表 `TOOL_KEYWORDS` 覆盖中文与英文（环境 / 报告 / 历史 / 转换 / 编码 / 时间 / 正则 / 差异 / 实体 / SQL / JWT / UUID / URL / Cookie / 脚本 / 导入 / 导出 / 计划压测 / 测试套件与用例 / 运行报告…）
 - 测试域只有 `test_suite_list` / `test_run_start` / `test_run_get` 进核心（够覆盖「列套件 → 跑 → 看结果」主线），建 / 改 / 删 / 数据集 / 导入导出 / 附件 / 预检全部走 `tool_search` 检索；`TOOL_KEYWORDS` 里用 `{ words: ['测试','套件','用例','回归'], tools: ['test_'] }` 等前缀规则覆盖全族
 - 抓包 7 个工具全部是长尾（不进核心），靠 `{ words: ['抓包','录制','流量','har'], tools: ['capture_'] }` 检索；提示词里只写「抓包 / 流量」的使用规则，不占核心目录字符
 - 新增工具时：核心工具补进 `CORE_TOOL_NAMES` 并写清参数；长尾工具只写一行 `desc` + `args`，同时补 `TOOL_KEYWORDS`
-- `toolCatalogStats()` 返回 `{ core, full, ratio }`，单测约束 `ratio ≤ 0.7`、目录长度 < 4200，防止提示词重新膨胀；126 个工具时 core/full 约 0.3，还有余量但要克制
+- `toolCatalogStats()` 返回 `{ core, full, ratio }`，单测约束 `ratio ≤ 0.7`、目录长度 < 4200，防止提示词重新膨胀；130 个工具时 core/full 约 0.3，还有余量但要克制
 
 ### 工具输出信封（T-11）
 
@@ -408,6 +408,26 @@ node -e "const s=require('fs').readFileSync('src/utils/aiTools.ts','utf8');const
 | `TEST_TRIGGER_LABELS` | `ui` / `ai` / `cli` / `schedule` → 界面手动 / 航仔发起 / 命令行 / 定时计划 | `test_run_get` 的 `trigger` |
 
 `kind` 是**唯一保留原值**的字段：它是 `test_case_create` / `test_case_update` 的入参，`SCHEMAS` 里有 `enum: ['request','python','stress']`，翻成中文再回填会被校验拦下。所以返回里同时给 `kind`（机器值）和 `kindLabel`（中文）。`testCaseKindLabel()` 也导出了，确认卡与工具返回共用一张表；认不出的值返回空串，由调用方 `|| 原值` 兜底。
+
+### 集群历史与变量来源域（4 个只读工具，v1.1.2 新增）
+
+配套功能见 `astroman-backend` 的「集群历史」与 `astroman-frontend` 的「历史 tab / 本次变量面板」。工具层直接复用 `src/api/index.ts` 已有的封装，**没有新增 Rust 命令**（`cluster_jobs_list` / `cluster_job_detail` / `cluster_slave_history_list` / `stress_var_sources` 都是上一轮就注册好的命令）。
+
+| 能力 | 工具 | 数据来源 | 关键约束 |
+|---|---|---|---|
+| 主节点任务历史 | `cluster_jobs_list` | `clusterJobsList(page, pageSize, status, keyword)` | 状态过滤值只有 `finished` / `failed` / `running` / `preparing`；`pageSize` 上限 100；`incomplete` 为真表示当时有节点失联或采样缺失 |
+| 任务详情 | `cluster_job_detail` | `clusterJobDetail(jobId)` | 节点行含引擎 CPU / 内存、时钟偏差与不确定度、丢失采样；**不含整机 CPU** |
+| 从机参与记录 | `cluster_slave_history` | `clusterSlaveHistoryList(limit, offset)` | 只有本机作为从节点才有数据，含整机 CPU / 内存 / 网卡峰值；主节点侧查不到这些值 |
+| 变量来源清单 | `stress_var_sources` | `stressVarSources(config)` | 入参 `config` 是压测配置对象（`StressConfig` 除 `url` 外都有 serde default，可传子集）；只返回名字 / 类型 / 来源 / 是否可用，**不返回变量值** |
+
+四条口径必须和代码一致，回答用户时不能混：
+
+- **引擎 CPU ≠ 整机 CPU**：节点行里 `cpu` 是压测进程自身占用，`hostCpuPeak` 才是整机使用率峰值；报告「资源峰值」列用的是后者。
+- **峰值是逐指标取峰**，不是「峰值时刻那一帧」的全部值，所以 CPU 峰值和网卡峰值可能不在同一秒。
+- **时钟偏差与不确定度是两回事**：`clockOffsetMs` 是校准后的偏移（用来对齐采样），`clockUncertaintyMs` 是测量误差，超过 50 毫秒会提示；开跑后每 60 秒复测一次，复测**只更新偏差显示，不改已校准的偏移**。
+- `stress_var_sources` 的三类来源与提示词「变量来源」段一一对应：普通变量可能来自环境 / 运行期 / 数据池，密钥只来自当前环境，`os:` 只来自本机白名单。
+
+四个工具都不进 `CORE_TOOL_NAMES`，靠 `TOOL_KEYWORDS` 检索：`['历史','记录','history']` 命中三个历史工具、`['集群','分布式','主节点','从节点','配对','cluster']` 命中 `cluster_` 全族、`['变量来源','变量类型','系统变量','占位符来源','os:']` 命中 `stress_var_sources`。
 
 ### 需要确认的操作
 

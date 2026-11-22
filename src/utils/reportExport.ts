@@ -2142,6 +2142,12 @@ export function buildReportSheets(
           '峰值并发',
           '贡献占比(%)',
           '采集健康',
+          '进程核数',
+          '整机 CPU 峰值(%)',
+          '进程内存峰值(MB)',
+          '网络峰值(KB/s)',
+          '时钟偏移(ms)',
+          '时钟漂移(ms)',
         ],
         ...clusterMeta.nodes.map((node) => [
           node.name,
@@ -2156,6 +2162,12 @@ export function buildReportSheets(
           node.health?.state === 'ok' || node.health?.state === 'done'
             ? '正常'
             : node.health?.message || node.health?.state || '—',
+          node.cpuPeak ? Number(node.cpuPeak.toFixed(2)) : null,
+          node.hostCpuPeak ? Number(node.hostCpuPeak.toFixed(1)) : null,
+          node.memPeakMb || null,
+          node.netPeakKbps ? Number(node.netPeakKbps.toFixed(1)) : null,
+          Number((node.clockOffsetMs ?? 0).toFixed(1)),
+          node.clockDriftMs ? Number(node.clockDriftMs.toFixed(1)) : null,
         ]),
       ]
     : []
@@ -2171,6 +2183,8 @@ export function buildReportSheets(
           '秒',
           ...series.map((item) => `${item.node} QPS`),
           ...series.map((item) => `${item.node} 并发`),
+          ...series.map((item) => `${item.node} 整机CPU%`),
+          ...series.map((item) => `${item.node} 网络KB/s`),
         ],
       )
       const maxPoints = Math.max(...series.map((item) => item.points.length))
@@ -2179,6 +2193,12 @@ export function buildReportSheets(
           index + 1,
           ...series.map((item) => item.points[index]?.qps ?? null),
           ...series.map((item) => item.points[index]?.concurrent ?? null),
+          ...series.map((item) => item.points[index]?.hostCpuPercent ?? null),
+          ...series.map((item) =>
+            item.points[index]
+              ? Number(((item.points[index].netRxKbps ?? 0) + (item.points[index].netTxKbps ?? 0)).toFixed(1))
+              : null,
+          ),
         ])
       }
     }

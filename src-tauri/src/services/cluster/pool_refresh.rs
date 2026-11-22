@@ -103,10 +103,7 @@ pub(crate) struct PoolRefreshCore {
 }
 
 impl PoolRefreshCore {
-    pub(crate) fn new(
-        source: Box<dyn RefreshSource>,
-        vars: HashMap<String, String>,
-    ) -> Self {
+    pub(crate) fn new(source: Box<dyn RefreshSource>, vars: HashMap<String, String>) -> Self {
         Self {
             source,
             vars,
@@ -141,10 +138,7 @@ impl PoolRefreshCore {
         // 锁内二次检查：等待期间可能已被其它节点刷新
         let cached = self.entries.lock().get(&key).cloned().unwrap_or_default();
         let now = now_ms();
-        if !cached.invalid
-            && cached.expires_at != 0
-            && cached.expires_at - now > REFRESH_AHEAD_MS
-        {
+        if !cached.invalid && cached.expires_at != 0 && cached.expires_at - now > REFRESH_AHEAD_MS {
             return Ok((cached.value, cached.expires_at, Some(column)));
         }
 
@@ -320,11 +314,8 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let mut buf = vec![0u8; 4096];
-                let _ = tokio::time::timeout(
-                    Duration::from_millis(500),
-                    stream.read(&mut buf),
-                )
-                .await;
+                let _ =
+                    tokio::time::timeout(Duration::from_millis(500), stream.read(&mut buf)).await;
                 let response = format!(
                     "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
@@ -364,10 +355,7 @@ mod tests {
         )
         .await;
         let core = Arc::new(core_with(format!("http://127.0.0.1:{port}/refresh")));
-        let (a, b) = tokio::join!(
-            core.refresh("pool", 7, 0),
-            core.refresh("pool", 7, 0),
-        );
+        let (a, b) = tokio::join!(core.refresh("pool", 7, 0), core.refresh("pool", 7, 0),);
         assert_eq!(a.unwrap().0, "new-token");
         assert_eq!(b.unwrap().0, "new-token");
         // 服务端只收到一次刷新请求

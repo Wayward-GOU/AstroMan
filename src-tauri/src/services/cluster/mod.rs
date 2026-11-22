@@ -11,6 +11,7 @@ use std::net::{IpAddr, UdpSocket};
 pub mod client;
 pub mod discovery;
 pub mod env_bundle;
+pub mod history;
 pub mod host;
 pub mod merge;
 pub mod pool_refresh;
@@ -52,6 +53,41 @@ pub fn is_private(ip: IpAddr) -> bool {
     }
 }
 
+/// 池绑定会在运行期注入的变量名
+///
+/// `column == "*"` 展开为该池的全部列名，否则取 `binding.target`。
+/// `columns_of` 由调用方提供：主节点查本机库，从节点读下发的池切片列定义。
+/// 这些名字由池在运行期填充，不能算作「需要环境提供」的缺失变量——
+/// 否则从节点准备阶段会误报 `本机环境缺少变量：keyword、pageSize…`。
+pub(crate) fn pool_injected_names(
+    bindings: &[crate::models::PoolBinding],
+    columns_of: impl Fn(&str) -> Vec<String>,
+) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for binding in bindings {
+        let pool = binding.pool.trim();
+        if pool.is_empty() {
+            continue;
+        }
+        if binding.column.trim() == "*" {
+            for column in columns_of(pool) {
+                push_unique_name(&mut names, &column);
+            }
+        } else {
+            push_unique_name(&mut names, &binding.target);
+        }
+    }
+    names
+}
+
+fn push_unique_name(names: &mut Vec<String>, name: &str) {
+    let name = name.trim();
+    if name.is_empty() || names.iter().any(|item| item == name) {
+        return;
+    }
+    names.push(name.to_string());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,5 +108,55 @@ mod tests {
         let items = local_addresses();
         assert!(items.iter().any(|item| item == "127.0.0.1"));
         assert!(!items.is_empty());
+    }
+
+    #[test]
+    fn pool_injected_names_expand_star_and_targets() {
+        use crate::models::PoolBinding;
+        let bindings = vec![
+            PoolBinding {
+                pool: "accounts".to_string(),
+                column: "*".to_string(),
+                ..Default::default()
+            },
+            PoolBinding {
+                pool: "tokens".to_string(),
+                column: "token".to_string(),
+                target: "TOKEN".to_string(),
+                ..Default::default()
+            },
+            PoolBinding {
+                pool: "tokens".to_string(),
+                column: "token".to_string(),
+                target: "TOKEN".to_string(),
+                ..Default::default()
+            },
+        ];
+        let names = pool_injected_names(&bindings, |name| {
+            if name == "accounts" {
+                vec!["keyword".to_string(), "pageSize".to_string()]
+            } else {
+                Vec::new()
+            }
+        });
+        assert_eq!(names, vec!["keyword", "pageSize", "TOKEN"]);
+    }
+
+    #[test]
+    fn pool_injected_names_skip_unknown_pool_and_empty_target() {
+        use crate::models::PoolBinding;
+        let bindings = vec![PoolBinding {
+            pool: "missing".to_string(),
+            column: "*".to_string(),
+            ..Default::default()
+        }];
+        assert!(pool_injected_names(&bindings, |_| Vec::new()).is_empty());
+        let bindings = vec![PoolBinding {
+            pool: "p".to_string(),
+            column: "value".to_string(),
+            target: "  ".to_string(),
+            ..Default::default()
+        }];
+        assert!(pool_injected_names(&bindings, |_| vec!["value".to_string()]).is_empty());
     }
 }

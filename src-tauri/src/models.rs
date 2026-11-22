@@ -783,6 +783,9 @@ pub struct PoolBinding {
     /// 池名
     pub pool: String,
     /// 占位符变量名（不含花括号），例如 TOKEN
+    ///
+    /// 同一个变量只允许由一个池注入：多个池绑到同名变量会在开跑前报
+    /// `POOL_VAR_CONFLICT`，避免运行期后写入者静默覆盖先写入者。
     pub target: String,
     /// per_vu（每 VU 固定）/ per_request（逐请求轮换）/ random（随机）
     #[serde(default)]

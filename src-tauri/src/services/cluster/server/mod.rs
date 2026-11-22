@@ -538,7 +538,15 @@ impl ClusterMaster {
     ) -> Result<ClusterMasterSnapshot, String> {
         // v1.1.2：不再限制同时保留的集群任务数；终态会释放监听，完成快照仍可查看
         self.prune_finished();
-        let (config, required_vars) = shared_config(&payload.config)?;
+        let (config, mut required_vars) = shared_config(&payload.config)?;
+        // 池绑定在运行期注入的变量不算「需要环境提供」：主从必须同一口径，
+        // 否则从节点会把池列名（keyword / pageSize …）当成缺失的环境变量
+        if let Ok(conn) = pool.get() {
+            let provided = super::pool_injected_names(&payload.config.pool_bindings, |name| {
+                crate::services::pool::pool_columns(&conn, name).unwrap_or_default()
+            });
+            required_vars.retain(|name| !provided.iter().any(|item| item == name));
+        }
         let total_concurrent = payload.config.concurrent;
         let plan_name = payload
             .plan_name
@@ -2309,7 +2317,7 @@ impl MasterSession {
     fn var_audit(&self) -> super::protocol::VarAuditReport {
         use super::protocol::{VarAuditItem, VarAuditNode};
 
-        let texts = config_texts(&self.local_config);
+        let texts = crate::util::config_texts(&self.local_config);
         let classified = crate::util::required_vars_in_texts(texts.iter().map(String::as_str));
         let master_env = self.master_env();
         let os_allow = self
@@ -2361,7 +2369,7 @@ impl MasterSession {
                 } else {
                     Some("主节点环境里没有这个变量；从节点会按缺失拦截".to_string())
                 },
-                node_states: probe_state(&[name.clone()]),
+                node_states: probe_state(std::slice::from_ref(name)),
             });
         }
 
@@ -2384,7 +2392,7 @@ impl MasterSession {
                 } else {
                     "主节点环境里没有这个 secret；从节点会按缺失拦截".to_string()
                 }),
-                node_states: probe_state(&[name.clone()]),
+                node_states: probe_state(std::slice::from_ref(name)),
             });
         }
 
@@ -2433,7 +2441,7 @@ impl MasterSession {
                 master_has_value: binding.is_some(),
                 source: if binding.is_some() { "pool" } else { "none" }.to_string(),
                 message,
-                node_states: probe_state(&[name.clone()]),
+                node_states: probe_state(std::slice::from_ref(name)),
             });
         }
 
@@ -3190,7 +3198,7 @@ async fn heartbeat_loop(
             break;
         }
         ticks += 1;
-        if ticks % recheck_every == 0 {
+        if ticks.is_multiple_of(recheck_every) {
             session.probe_clock_drift(&node_id);
         }
         ticker.tick().await;
@@ -3331,7 +3339,7 @@ fn var_node_state(node: &NodeState, names: &[String]) -> super::protocol::VarAud
 /// `{{pool:x}}` 由池注入——这些都不再误判为「用户变量缺失」。
 /// `{{secret:TOKEN}}` 归一化为 `TOKEN`，仍需主节点提供（值通过 EnvBundle 下发）。
 fn collect_required_vars(config: &StressConfig) -> Vec<String> {
-    let texts = config_texts(config);
+    let texts = crate::util::config_texts(config);
     let classified = crate::util::required_vars_in_texts(texts.iter().map(String::as_str));
     let mut names = classified.user;
     for name in classified.secret {
@@ -3340,37 +3348,6 @@ fn collect_required_vars(config: &StressConfig) -> Vec<String> {
         }
     }
     names
-}
-
-/// 配置中所有可能出现占位符的文本字段
-fn config_texts(config: &StressConfig) -> Vec<String> {
-    let mut texts = vec![config.url.trim().to_string()];
-    for item in config.params.iter().chain(config.headers.iter()) {
-        if !item.enabled {
-            continue;
-        }
-        texts.push(item.key.trim().to_string());
-        texts.push(item.value.clone());
-    }
-    if let Some(body) = &config.body {
-        texts.push(body.clone());
-    }
-    if let Some(auth) = &config.auth {
-        for value in [
-            &auth.token,
-            &auth.username,
-            &auth.password,
-            &auth.key,
-            &auth.value,
-            &auth.token_url,
-            &auth.client_id,
-            &auth.client_secret,
-            &auth.scope,
-        ] {
-            texts.push(value.clone());
-        }
-    }
-    texts
 }
 
 /// 归一化分配模式：auto / even / custom；未传时按是否携带权重推断

@@ -1070,6 +1070,8 @@ pub fn ensure_sample_pool_flow_examples(conn: &Connection) -> Result<(), String>
 }
 
 /// 写入一个自定义列示例池；同名池已存在时跳过，避免覆盖用户数据
+// 参数按「池定义 + 列 + 行」顺序排列，调用点就是示例数据的字面量，拆结构体反而更难读
+#[allow(clippy::too_many_arguments)]
 fn insert_sample_pool(
     conn: &Connection,
     name: &str,

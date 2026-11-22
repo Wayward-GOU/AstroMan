@@ -834,7 +834,11 @@ impl AppState {
     }
 
     /// 更新预算模式并落盘；返回更新后的预算
-    pub fn set_budget(&self, mode: &str, manual_limit: Option<i64>) -> Result<ConcurrencyBudget, String> {
+    pub fn set_budget(
+        &self,
+        mode: &str,
+        manual_limit: Option<i64>,
+    ) -> Result<ConcurrencyBudget, String> {
         let mut next = self.settings();
         next.stress_budget_mode = BudgetMode::normalize(mode).as_str().to_string();
         if let Some(limit) = manual_limit {
@@ -898,7 +902,9 @@ impl AppState {
         }
         next.summary_provider_id = next.summary_provider_id.max(0);
         // 并发预算：模式归一化，手动值允许 1..=100000，不再有 2000 硬上限
-        next.stress_budget_mode = BudgetMode::normalize(&next.stress_budget_mode).as_str().to_string();
+        next.stress_budget_mode = BudgetMode::normalize(&next.stress_budget_mode)
+            .as_str()
+            .to_string();
         if next.stress_max_concurrent <= 0 {
             next.stress_max_concurrent = 1000;
         }

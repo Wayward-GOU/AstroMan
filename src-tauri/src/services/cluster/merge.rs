@@ -17,8 +17,9 @@ use std::collections::BTreeMap;
 use serde_json::json;
 
 use super::protocol::{
-    ClusterReportMeta, ClusterReportNode, DonePayload, NodeSeries, PeakMetric, ReportPeaks,
-    SampleHealth, SamplePayload, SeriesPoint, CLOCK_DROP_UNCERTAINTY_MS, PROTOCOL_VERSION,
+    ClusterReportMeta, ClusterReportNode, DonePayload, HostSample, NodeSeries, PeakMetric,
+    ReportPeaks, SampleHealth, SamplePayload, SeriesPoint, CLOCK_DROP_UNCERTAINTY_MS,
+    PROTOCOL_VERSION,
 };
 use crate::commands::stress::EngineOutcome;
 use crate::models::{ErrorTypeCount, HistogramBucket, ReportSample, StatusCount, StressReport};
@@ -36,6 +37,8 @@ pub(crate) struct MergeNode {
     pub status: String,
     pub clock_offset_ms: f64,
     pub clock_uncertainty_ms: f64,
+    /// 运行期复测的漂移（毫秒），0 表示没测过或没漂
+    pub clock_drift_ms: f64,
     /// 每秒采样：丢失节点只有这部分数据
     pub samples: Vec<SamplePayload>,
     /// 正常结束 / 被停止的节点才有
@@ -215,8 +218,12 @@ pub(crate) fn merge(request: MergeRequest) -> MergedReport {
             qps_avg: node_qps(node),
             cpu_peak: node.done.as_ref().map(|done| done.cpu_peak).unwrap_or(0.0),
             mem_peak_mb: node.done.as_ref().map(|done| done.mem_peak_mb).unwrap_or(0),
+            host_cpu_peak: host_peak(node, |host| host.host_cpu_percent),
+            host_mem_peak_percent: host_peak(node, |host| host.host_mem_percent),
+            net_peak_kbps: host_peak(node, |host| host.net_rx_kbps + host.net_tx_kbps),
             clock_offset_ms: node.clock_offset_ms,
             clock_uncertainty_ms: node.clock_uncertainty_ms,
+            clock_drift_ms: node.clock_drift_ms,
             dropped_samples: if trusted {
                 node.done
                     .as_ref()
@@ -232,7 +239,11 @@ pub(crate) fn merge(request: MergeRequest) -> MergedReport {
             },
             start_ms: node_start.unwrap_or(request.started_at),
             end_ms: node_end.unwrap_or(request.finished_at),
-            peak_qps: node.samples.iter().map(|sample| sample.qps).fold(0.0, f64::max),
+            peak_qps: node
+                .samples
+                .iter()
+                .map(|sample| sample.qps)
+                .fold(0.0, f64::max),
             peak_concurrent: node
                 .samples
                 .iter()
@@ -536,7 +547,10 @@ pub(crate) fn done_from_outcome(outcome: &EngineOutcome) -> DonePayload {
     let start_ms = report.start_time.unwrap_or(end_ms);
     let snapshot = serde_json::from_str::<serde_json::Value>(&outcome.config_snapshot)
         .unwrap_or_else(|_| json!({}));
-    let runtime = snapshot.get("metrics").cloned().unwrap_or_else(|| json!({}));
+    let runtime = snapshot
+        .get("metrics")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     DonePayload {
         start_ms,
         end_ms,
@@ -593,6 +607,15 @@ fn node_qps(node: &MergeNode) -> f64 {
         .map(|sample| sample.success_count + sample.error_count)
         .sum();
     requests as f64 / span
+}
+
+/// 节点资源峰值：从每秒采样的 `host` 快照里取最大值；旧节点没有 host 记 0
+fn host_peak(node: &MergeNode, pick: impl Fn(&HostSample) -> f64) -> f64 {
+    node.samples
+        .iter()
+        .filter_map(|sample| sample.host.as_ref())
+        .map(pick)
+        .fold(0.0, f64::max)
 }
 
 /// 采集健康度快照：报告只关心「是否完整」，实时态由主节点会话维护
@@ -656,7 +679,10 @@ fn sample_p95(sample: &SamplePayload) -> f64 {
 ///
 /// 单机压测也复用该函数，保证「报告页 / 导出 / AI」与集群同一口径。
 pub(crate) fn build_peaks(samples: &[ReportSample], start_ms: i64) -> ReportPeaks {
-    fn metric(start_ms: i64, values: impl Iterator<Item = (usize, u64, f64)>) -> (usize, PeakMetric) {
+    fn metric(
+        start_ms: i64,
+        values: impl Iterator<Item = (usize, u64, f64)>,
+    ) -> (usize, PeakMetric) {
         let mut best = (0usize, 0u64, 0.0f64);
         for (index, second, value) in values {
             if value > best.2 {
@@ -709,18 +735,21 @@ pub(crate) fn build_peaks(samples: &[ReportSample], start_ms: i64) -> ReportPeak
             .enumerate()
             .map(|(index, sample)| (index, sample.elapsed_sec, sample.p99_rt)),
     );
-    let error_rate = metric(start_ms, samples.iter().enumerate().map(|(index, sample)| {
-        let total = sample.success_count + sample.error_count;
-        (
-            index,
-            sample.elapsed_sec,
-            if total > 0 {
-                sample.error_count as f64 / total as f64
-            } else {
-                0.0
-            },
-        )
-    }));
+    let error_rate = metric(
+        start_ms,
+        samples.iter().enumerate().map(|(index, sample)| {
+            let total = sample.success_count + sample.error_count;
+            (
+                index,
+                sample.elapsed_sec,
+                if total > 0 {
+                    sample.error_count as f64 / total as f64
+                } else {
+                    0.0
+                },
+            )
+        }),
+    );
 
     // 平台期：从峰值点向两侧扩展，统计 ≥ 峰值 98% 的连续秒数
     fn hold(
@@ -798,6 +827,23 @@ fn build_node_series(nodes: &[MergeNode]) -> Vec<NodeSeries> {
                     concurrent: sample.concurrent,
                     p95: sample_p95(sample),
                     errors: sample.error_count,
+                    cpu: sample.host.as_ref().map(|host| host.cpu).unwrap_or(0.0),
+                    host_cpu_percent: sample
+                        .host
+                        .as_ref()
+                        .map(|host| host.host_cpu_percent)
+                        .unwrap_or(0.0),
+                    mem_mb: sample.host.as_ref().map(|host| host.mem_mb).unwrap_or(0),
+                    net_rx_kbps: sample
+                        .host
+                        .as_ref()
+                        .map(|host| host.net_rx_kbps)
+                        .unwrap_or(0.0),
+                    net_tx_kbps: sample
+                        .host
+                        .as_ref()
+                        .map(|host| host.net_tx_kbps)
+                        .unwrap_or(0.0),
                 })
                 .collect();
             NodeSeries {
@@ -909,6 +955,7 @@ mod tests {
             sum_rt_ms: count * 20,
             sum_ttfb_ms: count * 10,
             latency_buckets: latency,
+            host: None,
         }
     }
 
@@ -950,6 +997,7 @@ mod tests {
             status: if done.is_some() { "done" } else { "lost" }.to_string(),
             clock_offset_ms: 0.0,
             clock_uncertainty_ms: 5.0,
+            clock_drift_ms: 0.0,
             samples,
             done,
         }
@@ -1290,13 +1338,18 @@ mod perf_tests {
         let nodes = (0..16u32)
             .map(|index| MergeNode {
                 name: format!("node-{index:02}"),
-                role: if index == 0 { "master".into() } else { "slave".into() },
+                role: if index == 0 {
+                    "master".into()
+                } else {
+                    "slave".into()
+                },
                 addr: format!("192.168.1.{}:17801", index + 10),
                 weight: 1.0,
                 concurrent: 100,
                 status: "done".into(),
                 clock_offset_ms: 0.0,
                 clock_uncertainty_ms: 0.0,
+                clock_drift_ms: 0.0,
                 samples: (0..86_400u64)
                     .map(|sec| SamplePayload {
                         elapsed_sec: sec,
@@ -1311,6 +1364,7 @@ mod perf_tests {
                         sum_rt_ms: 2_000,
                         sum_ttfb_ms: 1_000,
                         latency_buckets: Vec::new(),
+                        host: None,
                     })
                     .collect(),
                 done: None,

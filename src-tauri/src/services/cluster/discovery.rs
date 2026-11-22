@@ -95,7 +95,8 @@ fn listener() -> &'static Mutex<ListenerState> {
 }
 
 fn stop_flag() -> Arc<AtomicBool> {
-    STOP.get_or_init(|| Arc::new(AtomicBool::new(false))).clone()
+    STOP.get_or_init(|| Arc::new(AtomicBool::new(false)))
+        .clone()
 }
 
 /// 开始监听发现端口：幂等，重复调用只保证监听线程存活
@@ -120,9 +121,7 @@ pub fn start_listener() -> Result<(), String> {
         while !stop.load(Ordering::SeqCst) {
             match socket.recv_from(&mut buffer) {
                 Ok((size, peer)) => {
-                    let Ok(beacon) =
-                        serde_json::from_slice::<MasterBeacon>(&buffer[..size])
-                    else {
+                    let Ok(beacon) = serde_json::from_slice::<MasterBeacon>(&buffer[..size]) else {
                         continue;
                     };
                     if beacon.app != "AstroMan" || beacon.v != DISCOVERY_VERSION {
@@ -188,7 +187,10 @@ pub fn broadcast_master(snapshot: &ClusterMasterSnapshot) {
         v: DISCOVERY_VERSION,
         kind: "master".to_string(),
         app: "AstroMan".to_string(),
-        instance_id: format!("job-{}-{}-{}", snapshot.job_id, snapshot.port, snapshot.created_at),
+        instance_id: format!(
+            "job-{}-{}-{}",
+            snapshot.job_id, snapshot.port, snapshot.created_at
+        ),
         name: snapshot.name.clone(),
         host: host.clone(),
         port: snapshot.port,
@@ -261,7 +263,9 @@ fn prune() {
     let now = crate::util::now_ms();
     let ttl = (DISCOVERY_TTL_SEC * 1000) as i64;
     let mut state = listener().lock();
-    state.discovered.retain(|_, item| now - item.last_seen_ms <= ttl);
+    state
+        .discovered
+        .retain(|_, item| now - item.last_seen_ms <= ttl);
 }
 
 /// 只接受私网 IPv4 与回环；公网 / 跨网段地址丢弃

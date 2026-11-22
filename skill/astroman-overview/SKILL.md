@@ -31,7 +31,7 @@ AstroMan/
 │  │                  # 报告：reportExport（HTML/Excel/JSON）、reportAnalytics（QPS/拐点/体检/自洽）、reportNarrative
 │  │                  # 压测 / 池：clusterAllocation（分配算法）、poolGate（开跑前预览）、formatJson（支持 {{变量}} 模板）
 │  │                  # 记事本：notesGrouping（分组/排序）、notesImage（压缩/哈希）、notesQuickParse（自然语言解析）、notesTags（标签配色）
-│  │                  # AI：aiTools（126 个工具：113 业务 + 12 工具箱 + tool_search）、aiProtocol（围栏协议）、contextBudget（token 预算）、modelMeta（窗口）、untrusted（注入隔离）、aiPricing（费用）、promptText（压缩）
+│  │                  # AI：aiTools（130 个工具：117 业务 + 12 工具箱 + tool_search）、aiProtocol（围栏协议）、contextBudget（token 预算）、modelMeta（窗口）、untrusted（注入隔离）、aiPricing（费用）、promptText（压缩）
 │  └─ views/          # Dashboard / Projects / Project / RequestEditor / StressTest / Runner / Automation / Reports / History
 │                     # Tools / SystemMonitor / Settings / Environment / ReportDetail / AiAssistant / AiUsage / AiToolLogs
 │                     # Plans（压测计划中心）、Cluster（分布式压测）、DataPools（参数池 / Token 池）
@@ -43,7 +43,7 @@ AstroMan/
 │  │                  # capture.rs：抓包启停、清单、CA、系统代理、HAR / ZIP、改参重发、断点 / 映射 / 弱网
 │  │                  # notes.rs：待办 CRUD、计数、标签、设置、附件、截图识别
 │  ├─ src/services/   # pool.rs（池 CRUD / 列迁移 / 导入 / 预览）、pool_excel.rs（Excel 模板与导入，calamine + rust_xlsxwriter）
-│  │                  # cluster/：server（主节点）/ client（从节点）/ protocol（v2）/ env_bundle（X25519 + AES-GCM）/ pool_refresh / merge
+│  │                  # cluster/：server/（主节点，mod 会话 / persist 落库 / pairing 配对 / tests）、client（从节点）、protocol（v2）、env_bundle（X25519 + AES-GCM）、pool_refresh、merge、history（任务与从机历史）
 │  ├─ src/capture/    # 抓包内核：mod（生命周期）/ proxy / handler / store / ca / sysproxy / har / archive / intercept（断点 / 映射 / 弱网）
 │  ├─ src/notes/      # 待办领域：mod（CRUD / 设置 / 静默时段）/ quick（迷你窗口 + 全局快捷键）/ reminder（30 秒调度）/ attachment（哈希去重）/ vision（截图识别）
 │  ├─ src/db/         # schema.sql + mod.rs（init → migrate → seed）+ seed.rs
@@ -61,6 +61,9 @@ AstroMan/
 │  ├─ capabilities/default.json # 已授权 core:default / core:webview:allow-set-webview-zoom / dialog:default
 │  └─ icons/          # 打包与托盘图标（唯一保留的一套）
 ├─ scripts/           # install-macos.sh、prepare-cli.mjs、sync-version.mjs、gen-sample-report.mts（重新生成示例报告）
+│                    # check-hardcoded-color.mjs（样式门禁）、check-contrast.ts（23 套主题对比度）
+├─ docs/              # 现行文档，README 末尾有索引；cluster-optimization-plan.md 是集群优化清单与落地进度
+├─ docx/              # 历史技术方案档案（v1.0.8–v1.1.1 的设计输入，已实现，仅作追溯，勿当现状文档看）
 ├─ skill/             # 项目内开发规范（本目录）
 └─ .github/workflows/ # ci.yml（四道门禁）、release.yml
 ```
@@ -152,6 +155,6 @@ Windows 下 `cargo check` 在受限沙箱里会命中 `D:\Software\Rust\cargo\.g
 | `astroman-notes` | 记事本与待办：四种类型、标签与 50% 抽屉、提醒 / 重复 / 稍后 / 暂停 / 免打扰、快速记录、截图识别、附件去重、数据表 |
 | `astroman-automation` | 自动化测试子系统：套件 / 用例 / 断言 / 数据集 / Python 钩子 / 运行产物 / CLI 退出码 / 压测门禁 |
 | `astroman-toolbox` | 离线工具箱：92 个工具的注册契约、两种接入方式、新增流程、搜索别名与工具清单同步 |
-| `astroman-ai` | AI 助手「航仔」：双模式、三协议、流式渲染、上下文预算与摘要、停止/重试/工具超时、注入隔离、126 个工具与目录分层、写操作确认卡、消息操作、复盘时间线、会话管理 |
+| `astroman-ai` | AI 助手「航仔」：双模式、三协议、流式渲染、上下文预算与摘要、停止/重试/工具超时、注入隔离、130 个工具与目录分层、写操作确认卡、消息操作、复盘时间线、会话管理 |
 | `astroman-testing` | vitest / cargo test / tarpaulin 覆盖率 / CI 四道门禁 / 版本号同步与沙箱坑 |
 | `astroman-build-release` | 构建、打包与发布 |

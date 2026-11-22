@@ -28,17 +28,16 @@ pub fn test_preflight(
     state: State<'_, AppState>,
     suite_id: i64,
     env_id: Option<i64>,
+    // 运行时额外变量（如参数池取到的值），预检时同样视为已提供
+    extra_vars: Option<HashMap<String, String>>,
 ) -> Result<PreflightReport, String> {
-    run_preflight(state.inner(), suite_id, env_id)
-}
-
-/// 预检实现：命令与 CLI 共用
-pub fn run_preflight(
-    state: &AppState,
-    suite_id: i64,
-    env_id: Option<i64>,
-) -> Result<PreflightReport, String> {
-    run_preflight_with(state, suite_id, env_id, &HashMap::new(), &HashSet::new())
+    run_preflight_with(
+        state.inner(),
+        suite_id,
+        env_id,
+        &extra_vars.unwrap_or_default(),
+        &HashSet::new(),
+    )
 }
 
 /// 预检实现（带 CLI `--env-file` 注入的变量 / 密钥）

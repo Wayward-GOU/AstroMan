@@ -51,6 +51,7 @@ import type {
   StorageInfo,
   UpdateInfo,
 } from '@/types/models'
+import type { StressBudget } from '@/types/cluster'
 
 const router = useRouter()
 
@@ -110,6 +111,10 @@ const network = reactive<AppSettings>({
   aiPermissionMode: 'confirm_write',
   aiFallbackIds: '',
   stressMaxConcurrent: 1000,
+  stressBudgetMode: 'auto',
+  stressMaxJobs: 0,
+  stressOsEnvAllow: '',
+  clusterDiscoveryEnabled: true,
 })
 const networkLoading = ref(false)
 
@@ -228,6 +233,7 @@ onMounted(async () => {
   void loadSecrets()
   void loadPolicy()
   void loadCapacity()
+  void loadBudget()
   try {
     unlistenCapacity = await listen<CapacityProgress>('capacity:progress', (event) => {
       capacityProgress.value = event.payload
@@ -241,6 +247,36 @@ onBeforeUnmount(() => {
   unlistenCapacity?.()
   unlistenCapacity = null
 })
+
+/* ---------- 并发预算（v1.1.2） ---------- */
+const budget = ref<StressBudget | null>(null)
+const budgetLoading = ref(false)
+
+async function loadBudget() {
+  try {
+    budget.value = await api.stressBudgetGet()
+  } catch {
+    budget.value = null
+  }
+}
+
+async function saveBudget() {
+  budgetLoading.value = true
+  try {
+    const manual = network.stressBudgetMode === 'manual' ? network.stressMaxConcurrent : null
+    budget.value = await api.stressBudgetSet(
+      network.stressBudgetMode === 'manual' ? 'manual' : 'auto',
+      manual,
+    )
+    network.stressBudgetMode = budget.value.mode
+    network.stressMaxConcurrent = budget.value.perJobLimit
+    message.success('并发预算已更新')
+  } catch (e) {
+    message.error(String(e))
+  } finally {
+    budgetLoading.value = false
+  }
+}
 
 /* ---------- 本机施压能力检测（1.7） ---------- */
 const capacity = ref<CapacityResult | null>(null)
@@ -1525,20 +1561,92 @@ async function openReleasePage() {
 
             <div class="row">
               <div class="row-label">
-                <div class="row-title">跨任务并发上限</div>
+                <div class="row-title">并发预算</div>
                 <div class="row-desc">
-                  多窗口 / 多计划并行时所有任务并发之和的上限，硬上限 2000；单任务仍可到 5000
+                  自动：按 CPU 核数、句柄上限与内存计算本机上限（v1.1.2 起不再固定 2000）；手动：直接指定单任务上限
                 </div>
               </div>
               <div class="row-control wide">
+                <a-select v-model:value="network.stressBudgetMode" size="small" style="width: 160px">
+                  <a-select-option value="auto">自动（按机器能力）</a-select-option>
+                  <a-select-option value="manual">手动</a-select-option>
+                </a-select>
                 <a-input-number
+                  v-if="network.stressBudgetMode === 'manual'"
                   v-model:value="network.stressMaxConcurrent"
                   :min="1"
-                  :max="2000"
+                  :max="100000"
                   :step="100"
                   size="small"
-                  style="width: 200px"
+                  style="width: 160px; margin-left: 8px"
                 />
+                <a-button size="small" type="primary" :loading="budgetLoading" @click="saveBudget">
+                  应用预算
+                </a-button>
+              </div>
+            </div>
+
+            <div v-if="budget" class="row">
+              <div class="row-label">
+                <div class="row-title">当前预算</div>
+                <div class="row-desc">
+                  机器上限 {{ budget.machineLimit }} · 单任务 {{ budget.perJobLimit }} · 运行中
+                  {{ budget.activeJobs }}<template v-if="budget.maxJobs > 0"> / {{ budget.maxJobs }}</template>
+                </div>
+              </div>
+              <div class="row-control wide">
+                <span class="mono">
+                  {{ budget.sources.cores }} 核 · {{ budget.sources.memGb }} GB · 句柄
+                  {{ budget.sources.fdLimit }} · 受限项 {{ budget.sources.limitedBy }}
+                  <template v-if="budget.sources.probeSaturation">
+                    · 探测饱和 {{ budget.sources.probeSaturation }}
+                  </template>
+                </span>
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="row-label">
+                <div class="row-title">同时运行任务上限</div>
+                <div class="row-desc">0 表示不限；每个任务仍受上面的单任务上限约束</div>
+              </div>
+              <div class="row-control wide">
+                <a-input-number
+                  v-model:value="network.stressMaxJobs"
+                  :min="0"
+                  :max="64"
+                  size="small"
+                  style="width: 160px"
+                />
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="row-label">
+                <div class="row-title">系统环境变量白名单</div>
+                <div class="row-desc">
+                  允许 <code v-pre>{{os:NAME}}</code> 读取本机环境变量，逗号分隔，支持 <code>PREFIX*</code>；留空表示全部禁止
+                </div>
+              </div>
+              <div class="row-control wide">
+                <a-input
+                  v-model:value="network.stressOsEnvAllow"
+                  size="small"
+                  style="width: 320px"
+                  placeholder="例如：HOME,USER,PATH,APP_*"
+                />
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="row-label">
+                <div class="row-title">局域网发现</div>
+                <div class="row-desc">
+                  开启后主节点在配对阶段通过 UDP 17802 广播，从节点可自动发现并申请加入（仍需在主机接受）
+                </div>
+              </div>
+              <div class="row-control wide">
+                <a-switch v-model:checked="network.clusterDiscoveryEnabled" size="small" />
               </div>
             </div>
           </div>

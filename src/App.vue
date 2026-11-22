@@ -24,6 +24,7 @@ import {
   ArrowLeftOutlined,
   CloseOutlined,
   ScheduleOutlined,
+  DatabaseOutlined,
 } from '@ant-design/icons-vue'
 import AppLogo from '@/components/AppLogo.vue'
 import AstroBuddy from '@/components/AstroBuddy.vue'
@@ -144,6 +145,7 @@ const navs: NavItem[] = [
   { key: 'projects', label: '项目管理', hint: '项目 · 集合 · 环境', to: '/projects', icon: FolderOpenOutlined, group: '调试' },
   { key: 'stress', label: '压测', hint: '选择接口发起压测', to: '/stress', icon: ThunderboltOutlined, group: '测试' },
   { key: 'cluster', label: '分布式压测', hint: '多机施压 · 配对码 · 合并报告', to: '/cluster', icon: ClusterOutlined, group: '测试' },
+  { key: 'pools', label: '数据池', hint: '参数 / Token 池 · 健康度 · 启停', to: '/pools', icon: DatabaseOutlined, group: '测试' },
   { key: 'capture', label: '抓包', hint: 'HTTP/HTTPS 录制 · 改包 · 重发', to: '/capture', icon: ApiOutlined, group: '测试' },
   { key: 'runner', label: '批量运行', hint: '集合 Runner · 数据驱动', to: '/runner', icon: PlayCircleOutlined, group: '测试' },
   { key: 'automation', label: '自动化测试', hint: '套件 · 断言 · Python · 报告', to: '/automation', icon: ExperimentOutlined, group: '测试' },
@@ -458,6 +460,7 @@ const activeKey = computed(() => {
   if (path.startsWith('/stress')) return 'stress'
   if (path.startsWith('/cluster')) return 'cluster'
   if (path.startsWith('/plans')) return 'stress'
+  if (path.startsWith('/pools')) return 'pools'
   if (path.startsWith('/reports')) return 'stress'
   if (path.startsWith('/capture')) return 'capture'
   if (path.startsWith('/runner')) return 'runner'

@@ -9,6 +9,21 @@ import {
   collectionTree,
   cookieList,
   curlParse,
+  clusterDiscoveryList,
+  clusterJoinDiscovered,
+  clusterMasterAbort,
+  clusterMasterApprove,
+  clusterMasterAutoAccept,
+  clusterMasterClose,
+  clusterMasterCreate,
+  clusterMasterLaunch,
+  clusterMasterPrepare,
+  clusterMasterReject,
+  clusterMasterSessions,
+  clusterMasterSnapshot,
+  clusterNodeSamples,
+  clusterSlaveConnect,
+  clusterVarAudit,
   dashboardMetrics,
   envActivate,
   envCreate,
@@ -26,6 +41,12 @@ import {
   planGet,
   planDelete,
   planSave,
+  poolCreate,
+  poolDelete,
+  poolGet,
+  poolImport,
+  poolList,
+  poolPreview,
   projectCreate,
   projectDelete,
   projectExport,
@@ -48,6 +69,8 @@ import {
   runList,
   stressStart,
   stressStop,
+  stressBudgetGet,
+  stressJobs,
   testArtifactExport,
   testArtifactList,
   testCaseDelete,
@@ -94,6 +117,7 @@ import type {
   HttpRequestDetail,
   HttpResult,
   KeyValueItem,
+  PoolBinding,
   ReportDetail,
   ReportRequestRecord,
   ReportRequestsPage,
@@ -108,6 +132,12 @@ import type {
   TestDatasetPayload,
 } from '@/types/models'
 import type {
+  ClusterMasterSnapshot,
+  ClusterNodeInfo,
+  ReportPeaks,
+  SampleHealth,
+} from '@/types/cluster'
+import type {
   CaptureBody,
   CaptureFlow,
   CaptureHeader,
@@ -116,6 +146,7 @@ import type {
   CaptureStatus,
 } from '@/types/capture'
 import { runScriptJob } from '@/utils/scriptHost'
+import { reportPeaks } from '@/utils/reportAnalytics'
 import {
   clearRuntimeVars,
   listRuntimeVars,
@@ -334,6 +365,94 @@ const SCHEMAS: Record<string, Record<string, ArgRule>> = {
     offset: { kind: 'number', min: 0, max: 1999 },
   },
   report_get: { id: { kind: 'number', required: true } },
+  // v1.1.2 分布式压测只读工具
+  cluster_status: {},
+  cluster_session_get: { jobId: { kind: 'number', required: true } },
+  cluster_nodes: { jobId: { kind: 'number', required: true } },
+  cluster_samples: {
+    jobId: { kind: 'number', required: true },
+    nodeId: { kind: 'string', required: true },
+    limit: { kind: 'number', min: 1, max: 300 },
+  },
+  cluster_diagnostics: { jobId: { kind: 'number', required: true } },
+  cluster_discovered_masters: {},
+  cluster_pending_joins: {},
+  // 压测任务与预算
+  stress_jobs: {},
+  stress_job_get: { jobId: { kind: 'number', required: true } },
+  stress_budget_get: {},
+  // 参数池 / Token 池（默认脱敏，不提供明文接口）
+  pool_list: {},
+  pool_get: {
+    pool: { kind: 'string', required: true },
+    limit: { kind: 'number', min: 1, max: 200 },
+  },
+  pool_preview: {
+    pool: { kind: 'string', required: true },
+    target: { kind: 'string' },
+    /** '' 取首列 / '*' 全部列自动注入 / 具体列名 */
+    column: { kind: 'string' },
+    mode: { kind: 'string', enum: ['per_vu', 'per_request', 'random'] },
+    vuCount: { kind: 'number', min: 0, max: 100000 },
+  },
+  // 写操作：必须经用户确认
+  cluster_start: {
+    planId: { kind: 'number', required: true },
+    port: { kind: 'number', min: 1024, max: 65535 },
+    pairCodeTtlSec: { kind: 'number', min: 60, max: 3600 },
+    masterName: { kind: 'string' },
+    longRunAck: { kind: 'boolean' },
+    poolBindings: { kind: 'array' },
+    /** 集群变量策略：主节点优先或本机优先 */
+    varPolicy: { kind: 'string', enum: ['master_wins', 'local_wins'] },
+  },
+  cluster_prepare: {
+    jobId: { kind: 'number', required: true },
+    allocationMode: { kind: 'string', enum: ['auto', 'even', 'custom'] },
+    weights: { kind: 'array' },
+  },
+  cluster_launch: { jobId: { kind: 'number', required: true } },
+  cluster_var_audit: { jobId: { kind: 'number', required: true } },
+  cluster_stop: {
+    jobId: { kind: 'number', required: true },
+    reason: { kind: 'string' },
+  },
+  cluster_close: { jobId: { kind: 'number', required: true } },
+  cluster_approve_join: {
+    jobId: { kind: 'number', required: true },
+    nodeId: { kind: 'string', required: true },
+  },
+  cluster_reject_join: {
+    jobId: { kind: 'number', required: true },
+    nodeId: { kind: 'string', required: true },
+    reason: { kind: 'string' },
+  },
+  cluster_auto_accept: {
+    jobId: { kind: 'number', required: true },
+    enabled: { kind: 'boolean', required: true },
+  },
+  cluster_join_master: {
+    masterAddr: { kind: 'string', required: true },
+    pairCode: { kind: 'string' },
+    nodeName: { kind: 'string' },
+  },
+  pool_create: {
+    name: { kind: 'string', required: true },
+    kind: { kind: 'string', enum: ['parameter', 'token'] },
+    sensitive: { kind: 'boolean' },
+    description: { kind: 'string' },
+    /** 自定义列名，如 phone / password；首列必填 */
+    columns: { kind: 'array', item: 'string' },
+  },
+  pool_import: {
+    pool: { kind: 'string', required: true },
+    text: { kind: 'string', required: true },
+  },
+  pool_delete: { pool: { kind: 'string', required: true } },
+  pool_bind_plan: {
+    planId: { kind: 'number', required: true },
+    bindings: { kind: 'array', required: true },
+  },
   env_create: {
     projectId: { kind: 'number', required: true },
     name: { kind: 'string', required: true },
@@ -371,6 +490,7 @@ const SCHEMAS: Record<string, Record<string, ArgRule>> = {
     topN: { kind: 'number', min: 0, max: 5000 },
     slowThresholdMs: { kind: 'number', min: 0 },
     baselineReportId: { kind: 'number' },
+    poolBindings: { kind: 'array' },
   },
   stress_start: {
     requestId: { kind: 'number' },
@@ -398,6 +518,7 @@ const SCHEMAS: Record<string, Record<string, ArgRule>> = {
     baselineReportId: { kind: 'number' },
     runGroupId: { kind: 'number' },
     longRunAck: { kind: 'boolean' },
+    poolBindings: { kind: 'array' },
   },
   stress_stop: {},
   run_batch: {
@@ -1323,6 +1444,52 @@ async function reportDigest(detail: ReportDetail) {
   const report = detail.report
   const config = detail.config
   const target = await describeReportTarget(report.requestId, config?.envId ?? null)
+  const clusterMeta = (config as (StressConfig & { cluster?: unknown }) | null)?.cluster as
+    | {
+        mode?: string
+        totalConcurrent?: number
+        mergedQps?: number
+        peaks?: ReportPeaks | null
+        nodes?: Array<{
+          name?: string
+          role?: string
+          qpsAvg?: number
+          peakQps?: number
+          share?: number
+          health?: SampleHealth
+          status?: string
+        }>
+        nodeSeries?: Array<{ node?: string; points?: unknown[] }>
+      }
+    | undefined
+
+  // 峰值专题：单机与集群统一从 reportPeaks 读取，避免口径分叉
+  const peakData = reportPeaks(detail)
+  const peaksDigest = peakData
+    ? {
+        '最高QPS': {
+          值: Number(peakData.qps.value.toFixed(1)),
+          出现秒: peakData.qps.second,
+          持续秒: peakData.qps.heldSec,
+          峰值节点: peakData.qps.topNode || '未记录',
+        },
+        最高并发: {
+          值: peakData.concurrent.value,
+          出现秒: peakData.concurrent.second,
+          持续秒: peakData.concurrent.heldSec,
+        },
+        'P95 最差': {
+          值: `${Math.round(peakData.p95.value)} 毫秒`,
+          出现秒: peakData.p95.second,
+        },
+        'P99 最差': {
+          值: `${Math.round(peakData.p99.value)} 毫秒`,
+          出现秒: peakData.p99.second,
+        },
+        峰值带宽: `${fmtBytes(peakData.bandwidth.value)}/s`,
+        最高错误率: `${peakData.errorRate.value.toFixed(2)}%`,
+      }
+    : '未记录'
 
   const statusCodes = detail.statusCodes.map((item) => ({
     状态码: item.code,
@@ -1427,9 +1594,234 @@ async function reportDigest(detail: ReportDetail) {
     错误样本: recentErrors.length ? recentErrors : '无错误',
     采样点总数: detail.samples.length,
     最近采样: samples,
+    峰值专题: peaksDigest,
+    集群: clusterMeta
+      ? {
+          模式: clusterMeta.mode || '集群压测',
+          总并发: clusterMeta.totalConcurrent ?? report.concurrency,
+          节点: (clusterMeta.nodes ?? []).map((node) => ({
+            名称: node.name || '未命名节点',
+            角色: node.role === 'master' ? '主节点' : '从节点',
+            状态: cnLabel(NODE_STATUS_LABELS, node.status, node.status || '未知'),
+            平均QPS: Number((node.qpsAvg ?? 0).toFixed(1)),
+            峰值QPS: Number((node.peakQps ?? 0).toFixed(1)),
+            贡献占比: `${((node.share ?? 0) * 100).toFixed(1)}%`,
+            采集健康: healthDigest(node.health),
+          })),
+          峰值: peaksDigest,
+        }
+      : '单机压测',
   }
 }
 
+
+/** 集群任务状态中文 */
+const CLUSTER_STATUS_LABELS: Record<string, string> = {
+  pairing: '待配对',
+  preparing: '分发配置',
+  running: '压测中',
+  finished: '已完成',
+  failed: '失败',
+}
+
+/** 节点状态中文 */
+const NODE_STATUS_LABELS: Record<string, string> = {
+  pending: '待审批',
+  pairing: '配对中',
+  pairReady: '配对完成',
+  preparing: '准备中',
+  preflight: '预检中',
+  ready: '就绪',
+  running: '压测中',
+  done: '完成',
+  lost: '失联',
+  left: '已退出',
+  rejected: '被拒绝',
+}
+
+/** 采集健康度中文 */
+const HEALTH_LABELS: Record<string, string> = {
+  ok: '正常',
+  waiting: '等待首样',
+  gap: '采样缺口',
+  lost: '无数据',
+  done: '正常结束',
+}
+
+function healthDigest(health?: SampleHealth | null): string {
+  if (!health) return '未知'
+  const label = cnLabel(HEALTH_LABELS, health.state, health.state)
+  return health.message ? `${label}（${health.message}）` : label
+}
+
+/** 单个节点摘要：AI 读取集群状态/诊断共用 */
+function clusterNodeDigest(node: ClusterNodeInfo) {
+  return {
+    节点: node.name,
+    角色: node.role === 'master' ? '主节点' : '从节点',
+    状态: cnLabel(NODE_STATUS_LABELS, node.status, node.status),
+    地址: node.addr,
+    实时QPS: Number(node.qps.toFixed(1)),
+    '峰值QPS': Number(node.peakQps.toFixed(1)),
+    并发: node.concurrent,
+    分配并发: node.quota,
+    'VU区间': `${node.vuStart}–${node.vuStart + node.vuCount}`,
+    采集健康: healthDigest(node.health),
+    首样时间: node.health?.firstSampleMs ? fmtTime(node.health.firstSampleMs) : '未收到',
+    丢失采样: node.health?.lost ?? 0,
+    能力: node.capacity
+      ? `${node.capacity.cores} 核 / ${node.capacity.memGb} GB / 预算 ${node.capacity.machineLimit}`
+      : '未上报',
+    池兼容: node.poolColumns ? '支持自定义列 / 自动注入' : '旧版：不支持自定义列与自动注入',
+    变量下发: node.envBundle ? '加密下发（主节点优先）' : '旧版：只读本机同名环境',
+    池切片: node.poolSliceBytes != null ? fmtBytes(node.poolSliceBytes) : '未下发',
+    时钟误差: node.clockUncertaintyMs != null ? `±${Math.round(node.clockUncertaintyMs)} 毫秒` : '未测量',
+    错误: node.error || '无',
+  }
+}
+
+/** 集群任务摘要：AI 只读工具共用 */
+function clusterDigest(snapshot: ClusterMasterSnapshot) {
+  const pending = snapshot.pending ?? []
+  return {
+    任务编号: snapshot.jobId,
+    名称: snapshot.name,
+    状态: cnLabel(CLUSTER_STATUS_LABELS, snapshot.status, snapshot.status),
+    目标: `${snapshot.method} ${snapshot.target}`,
+    端口: snapshot.port,
+    本地地址: snapshot.localAddresses,
+    '配对码剩余': snapshot.pairCodeExpiresAt
+      ? `${Math.max(0, Math.round((snapshot.pairCodeExpiresAt - Date.now()) / 1000))} 秒`
+      : '无',
+    总并发: snapshot.totalConcurrent,
+    分配模式: snapshot.allocationMode,
+    本机预算: snapshot.budget,
+    完整性: snapshot.incomplete ? '不完整（有节点失联或采样缺失）' : '完整',
+    待接受节点: pending.length
+      ? pending.map((item) => ({
+          名称: item.name,
+          申请编号: item.requestId,
+          节点编号: item.nodeId,
+          地址: item.addr,
+          申请时间: fmtTime(item.requestedAt),
+        }))
+      : '无',
+    自动接受: snapshot.autoAccept ? '开启' : '关闭',
+    局域网发现: snapshot.discovery ? '开启' : '关闭',
+    数据池体量: snapshot.poolEstimate
+      ? `${fmtBytes(snapshot.poolEstimate.bytes)}（${snapshot.poolEstimate.items} 条 / ${snapshot.poolEstimate.pools} 个池，单节点切片上限 ${fmtBytes(snapshot.poolSliceLimitBytes)}）`
+      : '无池绑定',
+    节点数: snapshot.nodes.length,
+    节点: snapshot.nodes.map(clusterNodeDigest),
+    消息: snapshot.message || '',
+  }
+}
+
+/** 按名称找池 ID；找不到直接报错，避免 AI 猜 ID */
+async function poolIdByName(name: string): Promise<number> {
+  const target = name.trim()
+  const pools = await poolList()
+  const hit = pools.find((item) => item.name === target)
+  if (!hit) {
+    throw new Error(`池「${target}」不存在；可用池：${pools.map((item) => item.name).join('、') || '无'}`)
+  }
+  return hit.id
+}
+
+/** 从已保存的计划还原集群压测配置：集群只跑单场景，阶梯折算为峰值并发 + 累计时长 */
+async function clusterConfigFromPlan(
+  planId: number,
+  poolBindings?: PoolBinding[],
+): Promise<{ config: StressConfig; planName: string; projectId: number; envId: number | null }> {
+  const plan = await planGet(planId)
+  if (!plan.requestId) throw new Error('该计划没有绑定接口，无法启动集群压测')
+  const detail = await requestGet(plan.requestId)
+  const raw = (plan.config ?? {}) as {
+    settings?: Record<string, unknown>
+    stages?: StressStage[]
+    envId?: number | null
+  }
+  const settings = raw.settings ?? {}
+  const stages = Array.isArray(raw.stages) ? raw.stages : []
+  const positive = (value: unknown, fallback: number) => {
+    const parsed = Number(value)
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
+  }
+  const concurrent = stages.length
+    ? Math.max(1, ...stages.map((item) => Math.max(1, Number(item.concurrent) || 1)))
+    : Math.max(1, positive(settings.concurrent, 20))
+  const durationSec = stages.length
+    ? stages.reduce((sum, item) => sum + Math.max(1, Number(item.durationSec) || 1), 0)
+    : positive(settings.durationSec, 60)
+  const slaEnabled = settings.slaEnabled === true
+  const config: StressConfig = {
+    requestId: detail.id,
+    projectId: plan.projectId,
+    planId: plan.id,
+    name: plan.name,
+    method: detail.method,
+    url: detail.url,
+    headers: detail.headers,
+    params: detail.params,
+    bodyType: detail.bodyType,
+    body: detail.body,
+    envId: raw.envId ?? null,
+    insecure: settings.insecure === true,
+    timeoutMs: positive(settings.timeoutMs, 30_000),
+    connectTimeoutMs: positive(settings.connectTimeoutMs, 10_000),
+    followRedirects: settings.followRedirects !== false,
+    stopErrorRate: settings.stopOnErrorRate === true ? positive(settings.stopErrorRate, 5) : null,
+    stopMinRequests: settings.stopOnErrorRate === true ? positive(settings.stopMinRequests, 100) : null,
+    concurrent,
+    durationSec,
+    rampUpSec: stages.length ? 0 : Math.max(0, Number(settings.rampUpSec) || 0),
+    thinkTimeMs: Math.max(0, Number(settings.thinkTimeMs) || 0),
+    stages: [],
+    targetRps: positive(settings.targetRps, 0) || null,
+    recordDetail: settings.recordDetail as StressConfig['recordDetail'],
+    captureMode: settings.captureMode as StressConfig['captureMode'],
+    topN: settings.captureMode === 'locate' ? positive(settings.topN, 200) : null,
+    slowThresholdMs:
+      settings.captureMode === 'locate' ? Math.max(0, Number(settings.slowThresholdMs) || 0) : null,
+    ignoreOverlap: false,
+    baselineReportId: optionalNum(settings.baselineReportId) ?? null,
+    longRunAck: settings.longRunAck === true,
+    sla: slaEnabled
+      ? {
+          p95Ms: optionalNum(settings.slaP95) ?? null,
+          p99Ms: optionalNum(settings.slaP99) ?? null,
+          errorRate: optionalNum(settings.slaErrorRate) ?? null,
+          minRps: optionalNum(settings.slaMinRps) ?? null,
+        }
+      : null,
+    poolBindings,
+  }
+  return { config, planName: plan.name, projectId: plan.projectId, envId: raw.envId ?? null }
+}
+
+/** 数据池自定义列：绑定可指定列 */
+function parsePoolBindings(value: unknown): PoolBinding[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const rows: PoolBinding[] = []
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object') continue
+    const obj = entry as ToolArgs
+    const pool = str(obj.pool).trim()
+    const target = str(obj.target).trim()
+    // column：'' 取首列 / '*' 全部列自动注入 / 具体列名；其它类型按旧行为处理
+    const column = typeof obj.column === 'string' ? obj.column.trim() : ''
+    if (!pool || (!target && column !== '*')) continue
+    const mode = str(obj.mode, 'per_vu')
+    rows.push({
+      pool,
+      target,
+      mode: (['per_vu', 'per_request', 'random'].includes(mode) ? mode : 'per_vu') as PoolBinding['mode'],
+      refreshOn401: obj.refreshOn401 === true,
+      column,
+    })
+  }
+  return rows.length ? rows : undefined
+}
 
 function optionalNum(value: unknown): number | undefined {
   if (value === null || value === undefined || value === '') return undefined
@@ -2546,6 +2938,604 @@ const SPECS: ToolSpec[] = [
     handler: async (args) => reportDigest(await reportGet(needNum(args.id, 'id'))),
   },
   {
+    name: 'cluster_status',
+    desc: '集群主节点会话总览：状态、端口、总并发、分配模式、本机预算、节点与采集健康（只读）',
+    handler: async () => {
+      const sessions = await clusterMasterSessions()
+      return {
+        会话数: sessions.length,
+        会话: sessions.map((snapshot) => clusterDigest(snapshot)),
+      }
+    },
+  },
+  {
+    name: 'cluster_session_get',
+    desc: '按任务编号读取集群会话详情（只读）',
+    handler: async (args) =>
+      clusterDigest(await clusterMasterSnapshot(needNum(args.jobId, 'jobId'))),
+  },
+  {
+    name: 'cluster_nodes',
+    desc: '集群各节点：状态、分配并发、能力核验、采集健康、峰值与时钟误差（只读）',
+    handler: async (args) => {
+      const snapshot = await clusterMasterSnapshot(needNum(args.jobId, 'jobId'))
+      return {
+        任务编号: snapshot.jobId,
+        状态: cnLabel(CLUSTER_STATUS_LABELS, snapshot.status, snapshot.status),
+        节点数: snapshot.nodes.length,
+        节点: snapshot.nodes.map(clusterNodeDigest),
+      }
+    },
+  },
+  {
+    name: 'cluster_samples',
+    desc: '节点最近 N 个每秒采样：QPS、并发、耗时与错误数（只读，最多 300 个）',
+    handler: async (args) => {
+      const jobId = needNum(args.jobId, 'jobId')
+      const nodeId = str(args.nodeId).trim()
+      if (!nodeId) throw new Error('nodeId 不能为空')
+      const limit = Math.min(300, Math.max(1, optionalNum(args.limit) ?? 30))
+      const samples = await clusterNodeSamples(jobId, nodeId, limit)
+      return {
+        节点: nodeId,
+        条数: samples.length,
+        采样: samples.map((sample) => ({
+          秒: sample.elapsedSec,
+          QPS: Number(sample.qps.toFixed(1)),
+          并发: sample.concurrent,
+          成功: sample.successCount,
+          失败: sample.errorCount,
+          平均耗时: sample.successCount + sample.errorCount
+            ? Math.round(sample.sumRtMs / (sample.successCount + sample.errorCount))
+            : 0,
+        })),
+      }
+    },
+  },
+  {
+    name: 'cluster_diagnostics',
+    desc: '集群诊断：首样超时、采样缺口、失联节点、时钟误差与从节点引擎计数（只读）',
+    handler: async (args) => {
+      const jobId = needNum(args.jobId, 'jobId')
+      const snapshot = await clusterMasterSnapshot(jobId)
+      const problems: string[] = []
+      const nodes = snapshot.nodes.map((node) => {
+        const health = node.health?.state
+        if (health === 'lost') problems.push(`${node.name} 无采样数据`)
+        else if (health === 'gap') problems.push(`${node.name} 采样缺口 ${node.health.lost} 个`)
+        else if (health === 'waiting') problems.push(`${node.name} 尚未收到首样`)
+        if ((node.clockUncertaintyMs ?? 0) > 200) {
+          problems.push(`${node.name} 时钟误差 ±${Math.round(node.clockUncertaintyMs ?? 0)} 毫秒，曲线已丢弃`)
+        }
+        return {
+          ...clusterNodeDigest(node),
+          引擎计数: node.engineStats
+            ? {
+                总请求: node.engineStats.total,
+                成功: node.engineStats.success,
+                失败: node.engineStats.errors,
+                QPS: Number(node.engineStats.qps.toFixed(1)),
+                并发: node.engineStats.concurrent,
+              }
+            : '未回传',
+        }
+      })
+      return {
+        任务编号: jobId,
+        状态: cnLabel(CLUSTER_STATUS_LABELS, snapshot.status, snapshot.status),
+        完整性: snapshot.incomplete ? '不完整' : '完整',
+        问题: problems.length ? problems : '未发现异常',
+        节点: nodes,
+      }
+    },
+  },
+  {
+    name: 'cluster_discovered_masters',
+    desc: '局域网内发现的主节点（6 秒内有 Beacon，只读）；找不到时提示用户手动输入 IP:端口',
+    handler: async () => {
+      const masters = await clusterDiscoveryList()
+      return {
+        数量: masters.length,
+        主节点: masters.map((item) => ({
+          名称: item.name,
+          地址: item.addr,
+          任务编号: item.jobId,
+          状态: cnLabel(CLUSTER_STATUS_LABELS, item.status, item.status),
+          节点数: `${item.nodeCount}/${item.maxNodes}`,
+          能力: item.capacity
+            ? `${item.capacity.cores} 核 / ${Math.round(item.capacity.memMb / 1024)} GB / 预算 ${item.capacity.budget}`
+            : '未上报',
+          发现延迟: `${item.latencyMs} 毫秒`,
+        })),
+      }
+    },
+  },
+  {
+    name: 'cluster_pending_joins',
+    desc: '所有集群会话中的待审批加入申请（只读）；确认后可调用 cluster_approve_join',
+    handler: async () => {
+      const sessions = await clusterMasterSessions()
+      const rows = sessions.flatMap((snapshot) =>
+        snapshot.pending.map((item) => ({
+          任务编号: snapshot.jobId,
+          任务名称: snapshot.name,
+          节点编号: item.nodeId,
+          申请编号: item.requestId,
+          名称: item.name,
+          地址: item.addr,
+          设备: item.deviceId || '未上报',
+          申请时间: fmtTime(item.requestedAt),
+        })),
+      )
+      return { 数量: rows.length, 待接受: rows }
+    },
+  },
+  {
+    name: 'stress_jobs',
+    desc: '当前运行中的压测任务列表（含集群任务与实时 QPS，只读）',
+    handler: async () => {
+      const jobs = await stressJobs()
+      return {
+        数量: jobs.length,
+        任务: jobs.map((job) => ({
+          编号: job.id,
+          名称: job.name,
+          目标: job.target,
+          并发: job.concurrent,
+          实时QPS: job.qps ?? 0,
+          已运行秒: job.elapsedSec,
+          开始时间: fmtTime(job.startedAt),
+          状态: job.status,
+        })),
+      }
+    },
+  },
+  {
+    name: 'stress_job_get',
+    desc: '按任务编号读取压测任务详情（只读）',
+    handler: async (args) => {
+      const jobId = needNum(args.jobId, 'jobId')
+      const job = (await stressJobs()).find((item) => item.id === jobId)
+      if (!job) throw new Error(`任务 #${jobId} 不在运行中`)
+      return {
+        编号: job.id,
+        名称: job.name,
+        目标: job.target,
+        并发: job.concurrent,
+        实时QPS: job.qps ?? 0,
+        已运行秒: job.elapsedSec,
+        开始时间: fmtTime(job.startedAt),
+        状态: job.status,
+        计划编号: job.planId ?? '无',
+        请求编号: job.requestId ?? '无',
+      }
+    },
+  },
+  {
+    name: 'stress_budget_get',
+    desc: '本机并发预算：自动/手动模式、机器上限、单任务上限、运行任务数与来源（只读）',
+    handler: async () => {
+      const budget = await stressBudgetGet()
+      return {
+        模式: budget.mode === 'auto' ? '自动（按机器能力）' : '手动',
+        机器上限: budget.machineLimit,
+        单任务上限: budget.perJobLimit,
+        运行中任务: budget.activeJobs,
+        任务上限: budget.maxJobs === 0 ? '不限' : budget.maxJobs,
+        来源: {
+          核数: budget.sources.cores,
+          内存GB: budget.sources.memGb,
+          句柄上限: budget.sources.fdLimit,
+          探测饱和并发: budget.sources.probeSaturation ?? '未探测',
+          按CPU: budget.sources.byCpu,
+          按句柄: budget.sources.byFd,
+          按内存: budget.sources.byMem,
+          受限项: budget.sources.limitedBy,
+          计算时间: fmtTime(budget.sources.computedAt),
+        },
+      }
+    },
+  },
+  {
+    name: 'pool_list',
+    desc: '参数池 / Token 池列表：名称、类型、条目数、列定义、是否敏感（只读）',
+    handler: async () => {
+      const pools = await poolList()
+      return {
+        数量: pools.length,
+        池: pools.map((item) => ({
+          名称: item.name,
+          类型: item.kind === 'secret' ? 'Token/密钥' : item.kind,
+          条目数: item.itemCount,
+          列: item.columns ?? [],
+          敏感: item.sensitive ? '是（默认脱敏）' : '否',
+          说明: item.description || '',
+          更新时间: fmtTime(item.updatedAt),
+        })),
+      }
+    },
+  },
+  {
+    name: 'pool_get',
+    desc: '读取池内条目（默认脱敏，不返回明文；需要明文请让用户在参数池页查看）',
+    handler: async (args) => {
+      const name = str(args.pool).trim()
+      if (!name) throw new Error('pool 不能为空')
+      const poolId = await poolIdByName(name)
+      const limit = Math.min(200, Math.max(1, optionalNum(args.limit) ?? 20))
+      const detail = await poolGet(poolId, limit)
+      const columns = detail.pool.columns ?? []
+      return {
+        池: name,
+        类型: detail.pool.kind === 'token' ? 'Token/密钥' : detail.pool.kind,
+        条目数: detail.pool.itemCount,
+        启用: detail.pool.enabledCount,
+        列: columns,
+        健康: {
+          可用: detail.items.health.active,
+          失效: detail.items.health.invalid,
+          过期: detail.items.health.expired,
+          冷却: detail.items.health.cooling,
+          停用: detail.items.health.disabled,
+        },
+        展示: detail.items.items.map((item) => {
+          const data = item.data ?? {}
+          return {
+            序号: item.index,
+            值: item.masked ? '***' : item.value,
+            数据: Object.fromEntries(
+              Object.entries(data).map(([key, value]) => [key, item.masked ? '***' : value]),
+            ),
+            账号: item.account || '无',
+            权重: item.weight,
+            状态: item.status,
+            启用: item.enabled ? '是' : '否',
+          }
+        }),
+        说明: '值已脱敏；如需明文请在「参数池」页面查看',
+      }
+    },
+  },
+  {
+    name: 'pool_preview',
+    desc: '开跑前预览池分配：抽样条目、每个 VU 取值与问题（默认脱敏；column 可指定列或 * 全部列）',
+    handler: async (args) => {
+      const pool = str(args.pool).trim()
+      if (!pool) throw new Error('pool 不能为空')
+      const target = str(args.target, 'token').trim() || 'token'
+      // column：'' 取首列 / '*' 全部列自动注入 / 具体列名
+      const column = str(args.column).trim()
+      const mode = str(args.mode, 'per_vu')
+      const vuCount = Math.max(0, optionalNum(args.vuCount) ?? 0)
+      const bindings: PoolBinding[] = [
+        {
+          pool,
+          target,
+          mode: (['per_vu', 'per_request', 'random'].includes(mode) ? mode : 'per_vu') as PoolBinding['mode'],
+          refreshOn401: true,
+          column,
+        },
+      ]
+      const preview = await poolPreview(bindings, vuCount, false)
+      const poolInfo = (await poolList()).find((item) => item.name === pool)
+      const columns = poolInfo?.columns ?? []
+      const firstBinding = preview.bindings[0]
+      return {
+        池: pool,
+        列: columns,
+        目标: column === '*' ? '自动注入' : column || target,
+        自动注入: column === '*' ? firstBinding?.targets ?? columns : undefined,
+        模式: mode,
+        问题: preview.problems.length ? preview.problems : '未发现问题',
+        抽样: preview.bindings.flatMap((binding) =>
+          binding.sample.map((item) => {
+            const data = item.data ?? {}
+            const value = column === '*' ? undefined : column ? data[column] ?? item.value : item.value
+            return {
+              标签: `#${item.id}`,
+              值: value ?? '整行',
+              数据: data,
+              账号: item.account || '无',
+              权重: item.weight,
+            }
+          }),
+        ),
+        'VU分配': preview.bindings.flatMap((binding) =>
+          binding.assignments.map((item) => ({
+            VU: item.vu,
+            值: item.value,
+            账号: item.account || '无',
+          })),
+        ),
+      }
+    },
+  },
+  {
+    name: 'cluster_start',
+    desc: '用已保存的压测计划创建集群主节点会话（危险操作，需用户确认；创建后把配对码发给从节点）',
+    danger: true,
+    handler: async (args) => {
+      const planId = needNum(args.planId, 'planId')
+      const bindings = parsePoolBindings(args.poolBindings)
+      const { config, planName, projectId, envId } = await clusterConfigFromPlan(planId, bindings)
+      if (config.durationSec > 7200 && args.longRunAck !== true) {
+        throw new Error('集群时长超过 2 小时，需要用户知悉同机施压风险后再传 longRunAck=true')
+      }
+      config.longRunAck = args.longRunAck === true
+      if (args.varPolicy === 'local_wins') config.varPolicy = 'local_wins'
+      else if (args.varPolicy === 'master_wins') config.varPolicy = 'master_wins'
+      let envName: string | null = null
+      if (envId) {
+        try {
+          const envs = await envList(projectId)
+          envName = envs.find((item) => item.id === envId)?.name ?? null
+        } catch {
+          envName = null
+        }
+      }
+      const snapshot = await clusterMasterCreate({
+        planId,
+        planName,
+        config,
+        envName,
+        port: optionalNum(args.port) ?? null,
+        pairCodeTtlSec: optionalNum(args.pairCodeTtlSec) ?? null,
+        masterName: str(args.masterName).trim() || null,
+      })
+      return {
+        ...clusterDigest(snapshot),
+        提示: '把配对码发给从节点；从节点在集群页输入地址和配对码加入，全部到齐后再下发配置',
+      }
+    },
+  },
+  {
+    name: 'cluster_prepare',
+    desc: '按分配模式向已配对节点下发配置（危险操作，需用户确认）：auto 按能力、even 平均、custom 自定义权重与范围',
+    danger: true,
+    handler: async (args) => {
+      const jobId = needNum(args.jobId, 'jobId')
+      const mode =
+        args.allocationMode === 'even' || args.allocationMode === 'custom'
+          ? args.allocationMode
+          : 'auto'
+      const weights = Array.isArray(args.weights)
+        ? args.weights
+            .map((item) => {
+              const row = item as Record<string, unknown>
+              return {
+                nodeId: str(row.nodeId).trim(),
+                weight: optionalNum(row.weight) ?? 1,
+                minConcurrent: optionalNum(row.minConcurrent),
+                maxConcurrent: optionalNum(row.maxConcurrent),
+              }
+            })
+            .filter((item) => item.nodeId)
+        : []
+      const snapshot = await clusterMasterPrepare(jobId, mode, weights)
+      return {
+        ...clusterDigest(snapshot),
+        提示: '配置已下发，等待从节点预检；全部就绪后用 cluster_launch 同步开跑',
+      }
+    },
+  },
+  {
+    name: 'cluster_launch',
+    desc: '全部从节点预检就绪后统一开跑（危险操作，需用户确认）',
+    danger: true,
+    handler: async (args) => {
+      const snapshot = await clusterMasterLaunch(needNum(args.jobId, 'jobId'))
+      return {
+        ...clusterDigest(snapshot),
+        提示: '所有节点已按统一起跑时刻开始；运行中可用 cluster_nodes / cluster_samples 观察，结束后看报告',
+      }
+    },
+  },
+  {
+    name: 'cluster_var_audit',
+    desc: '集群变量体检（只读）：检查每个变量/密钥在主节点是否有值、来源（环境/OS/池）与各从节点状态，不返回变量值',
+    handler: async (args) => {
+      const report = await clusterVarAudit(needNum(args.jobId, 'jobId'))
+      return {
+        任务编号: report.jobId,
+        环境: report.envName || '未指定',
+        变量策略:
+          report.varPolicy === 'local_wins' ? '本机优先（仅补主节点缺失项）' : '主节点优先',
+        环境变量数: report.envVarCount,
+        密钥变量数: report.secretCount,
+        节点: report.nodes.map((node) => `${node.name}（${node.status}）`),
+        变量: report.items.map((item) => {
+          const states: Record<string, string> = {}
+          for (const node of report.nodes) {
+            states[node.name] = item.nodeStates[node.id]?.state ?? 'unknown'
+          }
+          return {
+            变量: item.name,
+            类型: item.kind,
+            来源: item.source,
+            主节点有值: item.masterHasValue ? '是' : '否',
+            节点状态: states,
+            说明: item.message || '',
+          }
+        }),
+        全部就绪:
+          report.items.length > 0 &&
+          report.items.every((item) =>
+            report.nodes.every((node) => item.nodeStates[node.id]?.state === 'ok'),
+          ),
+      }
+    },
+  },
+  {
+    name: 'cluster_stop',
+    desc: '停止集群任务（危险操作，需用户确认）',
+    danger: true,
+    handler: async (args) => {
+      const jobId = needNum(args.jobId, 'jobId')
+      const reason = str(args.reason, 'AI 按用户要求停止').trim()
+      await clusterMasterAbort(jobId, reason || null)
+      return { 已停止: jobId }
+    },
+  },
+  {
+    name: 'cluster_close',
+    desc: '关闭并移除集群会话（危险操作，需用户确认）',
+    danger: true,
+    handler: async (args) => {
+      const jobId = needNum(args.jobId, 'jobId')
+      await clusterMasterClose(jobId)
+      return { 已关闭: jobId }
+    },
+  },
+  {
+    name: 'cluster_approve_join',
+    desc: '接受一个待审批的从节点（危险操作，需用户确认）',
+    danger: true,
+    handler: async (args) => {
+      const snapshot = await clusterMasterApprove(
+        needNum(args.jobId, 'jobId'),
+        str(args.nodeId).trim(),
+      )
+      return { 已接受: args.nodeId, 节点数: snapshot.nodes.length }
+    },
+  },
+  {
+    name: 'cluster_reject_join',
+    desc: '拒绝一个待审批的从节点（危险操作，需用户确认）',
+    danger: true,
+    handler: async (args) => {
+      await clusterMasterReject(
+        needNum(args.jobId, 'jobId'),
+        str(args.nodeId).trim(),
+        str(args.reason).trim() || null,
+      )
+      return { 已拒绝: args.nodeId }
+    },
+  },
+  {
+    name: 'cluster_auto_accept',
+    desc: '开关本次集群任务的「自动接受加入」：开启后新从节点申请直接入列（危险操作，需用户确认；仅对当前任务生效，关闭会话后失效）',
+    danger: true,
+    handler: async (args) => {
+      const enabled = args.enabled
+      if (typeof enabled !== 'boolean') throw new Error('enabled 需为 true 或 false')
+      const snapshot = await clusterMasterAutoAccept(
+        needNum(args.jobId, 'jobId'),
+        enabled,
+      )
+      return {
+        自动接受: snapshot.autoAccept ? '已开启' : '已关闭',
+        节点数: snapshot.nodes.length,
+        待接受: snapshot.pending?.length ?? 0,
+      }
+    },
+  },
+  {
+    name: 'cluster_join_master',
+    desc: '本机作为从节点加入主节点：有配对码时用配对码直连，否则走审批申请（需用户在主机接受；危险操作，需确认）',
+    danger: true,
+    handler: async (args) => {
+      const addr = str(args.masterAddr).trim()
+      if (!addr) throw new Error('masterAddr 不能为空')
+      const pairCode = str(args.pairCode).trim()
+      const nodeName = str(args.nodeName).trim() || null
+      const snapshot = pairCode
+        ? await clusterSlaveConnect({
+            masterAddr: addr,
+            pairCode,
+            joinMode: 'code',
+            nodeName,
+          })
+        : await clusterJoinDiscovered(addr, nodeName)
+      return {
+        状态: snapshot.status === 'pending' ? '已申请，等待主机接受' : snapshot.status,
+        主节点: snapshot.masterAddr,
+        节点名: snapshot.nodeName,
+        说明: snapshot.error || '',
+      }
+    },
+  },
+  {
+    name: 'pool_create',
+    desc: '新建参数池 / Token 池（需用户确认）',
+    danger: true,
+    handler: async (args) => {
+      const name = str(args.name).trim()
+      if (!name) throw new Error('name 不能为空')
+      const kind = str(args.kind, 'parameter')
+      const columns = Array.isArray(args.columns)
+        ? args.columns.map((item) => str(item).trim()).filter(Boolean)
+        : []
+      const payload = {
+        name,
+        kind: ['parameter', 'token'].includes(kind) ? kind : 'parameter',
+        sensitive: args.sensitive !== false,
+        description: str(args.description).trim(),
+        columns: columns.length ? columns : undefined,
+      }
+      const created = await poolCreate(payload)
+      return { 已创建: name, 编号: created.id, 列: payload.columns ?? [] }
+    },
+  },
+  {
+    name: 'pool_import',
+    desc: '向池导入条目（需用户确认）：JSON 数组按列名写入、文本首行与列名一致时按表头、否则按列顺序；未知列忽略',
+    danger: true,
+    handler: async (args) => {
+      const name = str(args.pool).trim()
+      const text = str(args.text)
+      if (!name) throw new Error('pool 不能为空')
+      if (!text.trim()) throw new Error('text 不能为空')
+      const poolId = await poolIdByName(name)
+      const count = await poolImport(poolId, text)
+      return { 池: name, 已导入: count }
+    },
+  },
+  {
+    name: 'pool_delete',
+    desc: '删除指定池及其全部条目（危险操作，需用户确认）',
+    danger: true,
+    handler: async (args) => {
+      const name = str(args.pool).trim()
+      if (!name) throw new Error('pool 不能为空')
+      const poolId = await poolIdByName(name)
+      await poolDelete(poolId)
+      return { 已删除: name }
+    },
+  },
+  {
+    name: 'pool_bind_plan',
+    desc: '把池绑定写入已保存的压测计划（危险操作，需用户确认；只改计划配置，不启动任务；column 可为空取首列、* 全部列自动注入或具体列名）',
+    danger: true,
+    handler: async (args) => {
+      const planId = needNum(args.planId, 'planId')
+      const bindings = parsePoolBindings(args.bindings)
+      if (!bindings) {
+        throw new Error('bindings 不能为空；每项需要 pool，target 仅在 column 不是 "*" 时必填')
+      }
+      const plan = await planGet(planId)
+      const config = (plan.config && typeof plan.config === 'object' ? plan.config : {}) as Record<
+        string,
+        unknown
+      >
+      const saved = await planSave({
+        id: plan.id,
+        projectId: plan.projectId,
+        requestId: plan.requestId,
+        name: plan.name,
+        config: { ...config, poolBindings: bindings },
+      })
+      return {
+        计划: saved.name,
+        计划编号: saved.id,
+        绑定: bindings.map((item) => {
+          const column = item.column === '*' ? '全部列（同名注入）' : item.column || '首列'
+          const target = item.target || '自动注入'
+          return `${item.pool} → ${column} → ${target}（${item.mode}）`
+        }),
+      }
+    },
+  },
+  {
     name: 'env_create',
     desc: '在项目下新建环境（如 dev / test / prod）',
     handler: async (args) => {
@@ -2659,7 +3649,7 @@ const SPECS: ToolSpec[] = [
   },
   {
     name: 'plan_save',
-    desc: '保存压测计划到项目（固定并发或梯度阶段，可带 SLA），保存后可在「压测」页直接载入执行',
+    desc: '保存压测计划到项目（固定并发或梯度阶段，可带 SLA），保存后可在「压测」页直接载入执行；poolBindings 每项支持 column：\'*\' 为全部列按列名自动注入，具体列名则把该列注入 target',
     handler: async (args) => {
       const projectId = needNum(args.projectId, 'projectId')
       const name = str(args.name).trim()
@@ -2669,9 +3659,10 @@ const SPECS: ToolSpec[] = [
       const stages = toStages(args.stages)
       if (mode === 'stages' && !stages.length) throw new Error('梯度模式需要提供 stages 数组')
 
-      const concurrent = Math.min(5000, Math.max(1, Math.round(optionalNum(args.concurrent) ?? 10)))
+      const concurrent = Math.min(100000, Math.max(1, Math.round(optionalNum(args.concurrent) ?? 10)))
       const durationSec = Math.min(86400, Math.max(1, Math.round(optionalNum(args.durationSec) ?? 30)))
       const sla = slaOf(args)
+      const poolBindings = parsePoolBindings(args.poolBindings)
       const captureMode =
         args.captureMode === 'capacity' || args.captureMode === 'locate' ? args.captureMode : 'auto'
       const config = {
@@ -2693,6 +3684,7 @@ const SPECS: ToolSpec[] = [
           topN: Math.max(0, Math.round(optionalNum(args.topN) ?? 200)),
           slowThresholdMs: Math.max(0, Math.round(optionalNum(args.slowThresholdMs) ?? 0)),
           baselineReportId: optionalNum(args.baselineReportId) ?? null,
+          poolBindings: poolBindings ?? [],
           slaEnabled: sla !== null,
           slaP95: sla?.p95Ms ?? 500,
           slaP99: sla?.p99Ms ?? 1000,
@@ -2716,7 +3708,7 @@ const SPECS: ToolSpec[] = [
   },
   {
     name: 'stress_start',
-    desc: '启动压测：按已保存请求（requestId）或直接给 URL；默认 10 并发 × 30 秒，支持梯度阶段与 SLA',
+    desc: '启动压测：按已保存请求（requestId）或直接给 URL；默认 10 并发 × 30 秒，支持梯度阶段与 SLA；poolBindings 每项支持 column：\'*\' 为全部列按列名自动注入，具体列名则把该列注入 target',
     danger: true,
     handler: async (args) => {
       const requestId = optionalNum(args.requestId)
@@ -2752,9 +3744,10 @@ const SPECS: ToolSpec[] = [
       }
 
       const stages = toStages(args.stages)
+      const poolBindings = parsePoolBindings(args.poolBindings)
       const concurrent = stages.length
         ? Math.max(...stages.map((item) => item.concurrent))
-        : Math.min(5000, Math.max(1, Math.round(optionalNum(args.concurrent) ?? 10)))
+        : Math.min(100000, Math.max(1, Math.round(optionalNum(args.concurrent) ?? 10)))
       const durationSec = stages.length
         ? stages.reduce((sum, item) => sum + item.durationSec, 0)
         : Math.min(86400, Math.max(1, Math.round(optionalNum(args.durationSec) ?? 30)))
@@ -2785,6 +3778,7 @@ const SPECS: ToolSpec[] = [
         baselineReportId: optionalNum(args.baselineReportId) ?? null,
         runGroupId: optionalNum(args.runGroupId) ?? null,
         longRunAck: args.longRunAck === true,
+        poolBindings: poolBindings ?? [],
       })
       const shape = stages.length
         ? `${stages.length} 个阶段（峰值 ${concurrent} 并发，累计 ${durationSec}s）`

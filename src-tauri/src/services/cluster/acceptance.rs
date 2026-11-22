@@ -202,6 +202,7 @@ async fn pair_cluster(
     let connect = ClusterSlaveConnectPayload {
         master_addr: format!("127.0.0.1:{}", snapshot.port),
         pair_code,
+        join_mode: Some("code".to_string()),
         node_name: Some("从-验收".to_string()),
     };
     slave
@@ -304,10 +305,21 @@ async fn smoke_round(target: &TestTarget) -> (f64, f64, f64) {
         .cluster
         .prepare(
             job_id,
-            vec![ClusterNodeWeight {
-                node_id: slave_id.clone(),
-                weight: 1.0,
-            }],
+            None,
+            vec![
+                ClusterNodeWeight {
+                    node_id: "master".to_string(),
+                    weight: 1.0,
+                    min_concurrent: None,
+                    max_concurrent: None,
+                },
+                ClusterNodeWeight {
+                    node_id: slave_id.clone(),
+                    weight: 1.0,
+                    min_concurrent: None,
+                    max_concurrent: None,
+                },
+            ],
         )
         .await
         .expect("下发配置并预检");
@@ -434,9 +446,12 @@ async fn unreachable_target_is_blocked_at_preflight() {
         .cluster
         .prepare(
             job_id,
+            None,
             vec![ClusterNodeWeight {
                 node_id: slave_id,
                 weight: 1.0,
+                min_concurrent: None,
+                max_concurrent: None,
             }],
         )
         .await
@@ -474,9 +489,12 @@ async fn lost_slave_marks_report_incomplete() {
         .cluster
         .prepare(
             job_id,
+            None,
             vec![ClusterNodeWeight {
                 node_id: slave_id,
                 weight: 1.0,
+                min_concurrent: None,
+                max_concurrent: None,
             }],
         )
         .await
@@ -571,12 +589,13 @@ async fn lost_slave_marks_report_incomplete() {
 }
 
 #[tokio::test]
-async fn missing_env_var_is_reported_by_name() {
+async fn env_bundle_fills_slave_missing_vars() {
     let target = TestTarget::start(5);
     let master = MockNode::new("env-master");
     let slave = MockNode::new("env-slave");
 
-    // 主节点环境齐全；从节点同名环境缺少 token
+    // 主节点环境齐全；从节点同名环境缺少 token：
+    // v1.1.2 起主节点会把环境加密下发（EnvBundle），从节点不再因此失败
     let master_env = create_env(&master, "prod", &[("token", "abc")]);
     create_env(&slave, "prod", &[]);
 
@@ -594,20 +613,29 @@ async fn missing_env_var_is_reported_by_name() {
 
     let (job_id, slave_id) = pair_cluster(&master, &slave, config, Some("prod".to_string())).await;
 
-    let error = master
+    master
         .state()
         .cluster
         .prepare(
             job_id,
-            vec![ClusterNodeWeight {
-                node_id: slave_id,
-                weight: 1.0,
-            }],
+            None,
+            vec![
+                ClusterNodeWeight {
+                    node_id: "master".to_string(),
+                    weight: 1.0,
+                    min_concurrent: None,
+                    max_concurrent: None,
+                },
+                ClusterNodeWeight {
+                    node_id: slave_id,
+                    weight: 1.0,
+                    min_concurrent: None,
+                    max_concurrent: None,
+                },
+            ],
         )
         .await
-        .expect_err("从节点缺少变量时准备必须失败");
-    assert!(error.contains("从-验收"), "错误信息应带从节点名：{error}");
-    assert!(error.contains("token"), "错误信息应带缺失变量名：{error}");
+        .expect("主节点环境可通过 EnvBundle 下发给从节点");
 
     master
         .state()

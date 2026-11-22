@@ -136,13 +136,36 @@ note_file_links(note_id, file_id, created_at)   -- 联合主键 + ON DELETE CASC
 
 ## 压测引擎要点（`commands/stress.rs`）
 
-- 全局互斥：`AppState.stress_running`（`AtomicBool`），同一时刻只允许一个压测任务
-- 停止信号：`AppState.stress_cancel`，任务内定期检查
+- 任务注册表：`AppState.stress_jobs` 支持多任务并行，停止按 `jobId`；不要退回单一全局 `stress_running`
+- 并发预算：`ConcurrencyBudget` / `try_reserve` 统一约束单任务与跨任务并发，设置页可切自动 / 手动（上限 100000）
+- 停止信号：按任务的取消标志，任务内定期检查；窗口关闭不中断任务
 - 并发模型：`tokio::task::JoinSet` + `mpsc` 汇总指标，指标用 `AtomicU64` 累加
 - 进度推送：`app.emit("stress:progress", &progress)`，结构体 `StressProgress` 需实现 `Clone + Serialize`
 - 结束后写 `test_reports` / `report_samples` / `report_requests`，分位、状态码分布、错误类型、直方图以 JSON 列存储
 - 压测请求自身也会写历史，注意不要绕过 `MAX_HISTORY` 裁剪
 - 请求体与手动发送走同一套规则：`body_type == "json"` 时先 `strip_json_comments` 再渲染变量，保证「请求编辑器能发、压测也能发」
+
+## 数据池（`services/pool.rs` / `services/pool_excel.rs` / `commands/pool.rs`）
+
+- 表结构：`data_pools.columns_json`（列名数组）与 `data_pool_items.data_json`（整行对象）为 v20 新增；旧池 `columns_json` 为空时按 `["value","account"]` 解释，不要按类型自动改成 `token,account`
+- 列规则：`MAX_POOL_COLUMNS = 24`、`MAX_POOL_COLUMN_LEN = 32`、列名 `[A-Za-z_][A-Za-z0-9_]*`；`normalize_columns` / `parse_columns_json` 是唯一入口
+- 改列：`save_columns` 在单事务里迁移 `data_json` 并同步 `value/account`；列数不等直接报错，`from` 必须存在且不可重复；删除列会丢该列数据
+- 导入：`insert_rows` 是文本 / JSON / Excel 共用写入口；`pool_excel.rs` 只由 Rust 读写 xlsx（`calamine` + `rust_xlsxwriter`），只读第一个 Sheet、首列必填、单次 5 万行、超 15 位数字给 `numericWarnings`
+- 绑定语义：`PoolBinding.column` 为 `""` 取 `value`、`"*"` 按列名全部注入、其它值取 `data[column]` 映射到 `target`；同池多绑定共用条目，同池 mode 必须一致
+- 预览：`pool_preview` 是开跑前唯一校验入口，列不存在 / 变量名为空 / 条目不足都应在预览阶段报错，运行期不回退
+- 敏感池：查询、预览、AI 工具结果一律脱敏，明文只走 `pool_item_reveal`
+- 改完跑 `cargo test --lib pool`（列迁移、导入、预览、Excel 往返都有用例）
+
+## 分布式压测（`services/cluster/` + `commands/cluster.rs`）
+
+- 协议 `PROTOCOL_VERSION = 2`；主节点 `server.rs`、从节点 `client.rs`、载荷 `protocol.rs`，改动要三处同步并更新 `src/types/cluster.ts`
+- 环境变量：`EnvBundle` 用 X25519 + HKDF-SHA256 + AES-256-GCM；从节点先读本机同名环境再 `merge_bundle_vars`，`master_wins` 主节点覆盖、`local_wins` 本机优先；`{{os:NAME}}` 只注入白名单
+- 池切片：prepare 时主节点 `pool_slices_for` 读池并按全局 VU 切片，从节点只用 `config.pool_slices`；`per_vu` 不足时下发全量 + `startIndex`，`per_request` / `random` 按节点分片；单节点序列化上限 `MAX_POOL_SLICE_BYTES = 64 MB`
+- 下发前校验：`ensure_pool_slice_size` 返回字节数（写入 `NodeState.pool_slice_bytes` 供前端展示），超限报 `E_POOL_SLICE_TOO_LARGE` 并指出最大来源池；`estimate_pool_bytes` 只做 COUNT / LENGTH 估算，不下发条目
+- 版本兼容：`NodeState.pool_columns` 来自 Hello；计划含非空 `column`（含 `*`）时必须让不支持的旧节点失败并列出节点名；`env_bundle` 能力位取决于是否收到公钥
+- Token 刷新：从节点 401 走 `PoolRefreshRequest / PoolRefreshResult`，主节点 `PoolRefreshCore` 按 `(pool, item_id)` 单飞；主节点本地引擎复用同一核心
+- 新增快照字段后同步 `ClusterNodeInfo` / `ClusterMasterSnapshot` 与前端 digest（航仔 `clusterNodeDigest` 已输出池兼容 / 变量下发 / 池切片 / 数据池体量）
+- 改完跑 `cargo test --lib cluster`（分配、合并、池切片、失联、双机 smoke）
 
 ## 抓包后端（`capture/` + `commands/capture.rs`）
 

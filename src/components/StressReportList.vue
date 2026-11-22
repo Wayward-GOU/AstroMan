@@ -15,6 +15,12 @@ import type { StressReport } from '@/types/models'
 const router = useRouter()
 const reports = ref<StressReport[]>([])
 const loading = ref(true)
+/** 仅看集群报告（v1.1.2 第二批） */
+const clusterOnly = ref(false)
+
+const visibleReports = computed(() =>
+  clusterOnly.value ? reports.value.filter((item) => item.isCluster) : reports.value,
+)
 
 async function load() {
   loading.value = true
@@ -131,6 +137,10 @@ function compareMetricRows() {
     { label: 'P99', values: list.map((item) => ms(item.p99Rt)) },
     { label: '平均 QPS', values: list.map((item) => fmtNum(item.avgQps)) },
     { label: '最大 QPS', values: list.map((item) => fmtNum(item.maxQps)) },
+    {
+      label: '峰值 QPS',
+      values: list.map((item) => (item.peakQps ? fmtNum(item.peakQps) : '—')),
+    },
     { label: 'APDEX', values: list.map((item) => item.apdex.toFixed(3)) },
     { label: '并发', values: list.map((item) => String(item.concurrency)) },
     { label: '状态', values: list.map((item) => (item.status === 'stopped' ? '已停止' : '已完成')) },
@@ -147,14 +157,17 @@ function compareMetricRows() {
         <span>累计请求 <b>{{ stats.requests.toLocaleString() }}</b></span>
         <span>整体成功率 <b>{{ stats.rate.toFixed(1) }}%</b></span>
       </div>
-      <a-button size="small" :disabled="selectedIds.length < 2" @click="compareOpen = true">
-        <SwapOutlined /> 对比{{ selectedIds.length ? `（${selectedIds.length}）` : '' }}
-      </a-button>
+      <div class="history-actions">
+        <a-checkbox v-model:checked="clusterOnly">仅集群</a-checkbox>
+        <a-button size="small" :disabled="selectedIds.length < 2" @click="compareOpen = true">
+          <SwapOutlined /> 对比{{ selectedIds.length ? `（${selectedIds.length}）` : '' }}
+        </a-button>
+      </div>
     </div>
 
     <a-spin :spinning="loading">
-      <div v-if="reports.length" class="report-list">
-        <div v-for="report in reports" :key="report.id" class="fm-card report-card">
+      <div v-if="visibleReports.length" class="report-list">
+        <div v-for="report in visibleReports" :key="report.id" class="fm-card report-card">
           <div class="report-head">
             <div class="report-title">
               <a-checkbox
@@ -166,6 +179,7 @@ function compareMetricRows() {
               <span class="status-pill" :class="{ stopped: report.status === 'stopped' }">
                 {{ report.status === 'stopped' ? '已停止' : '已完成' }}
               </span>
+              <span v-if="report.isCluster" class="cluster-pill">集群</span>
               <span
                 v-for="tag in riskTags(report)"
                 :key="tag.label"
@@ -199,6 +213,12 @@ function compareMetricRows() {
               <span class="m-value mono">{{ fmtNum(report.avgQps) }}</span>
             </div>
             <div class="metric">
+              <span class="m-label">峰值 QPS</span>
+              <span class="m-value mono">
+                {{ report.peakQps ? fmtNum(report.peakQps) : '—' }}
+              </span>
+            </div>
+            <div class="metric">
               <span class="m-label">APDEX</span>
               <span class="m-value mono">{{ report.apdex.toFixed(3) }}</span>
             </div>
@@ -228,8 +248,14 @@ function compareMetricRows() {
 
       <div v-else-if="!loading" class="fm-card empty">
         <div class="empty-icon"><FundProjectionScreenOutlined /></div>
-        <div class="empty-title">还没有压测报告</div>
-        <div class="empty-desc">完成一次压测后，吞吐、延迟分位与错误明细会自动出现在这里。</div>
+        <div class="empty-title">{{ clusterOnly ? '还没有集群压测报告' : '还没有压测报告' }}</div>
+        <div class="empty-desc">
+          {{
+            clusterOnly
+              ? '取消「仅集群」筛选可查看单机压测报告。'
+              : '完成一次压测后，吞吐、延迟分位与错误明细会自动出现在这里。'
+          }}
+        </div>
       </div>
     </a-spin>
 
@@ -274,6 +300,11 @@ function compareMetricRows() {
 .history-stats b {
   color: var(--fm-text);
   font-weight: 600;
+}
+.history-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
 }
 .report-list {
   display: flex;
@@ -328,6 +359,14 @@ function compareMetricRows() {
   background: var(--fm-warning-soft);
   color: var(--fm-warning);
 }
+.cluster-pill {
+  font-size: 10px;
+  padding: 1px 7px;
+  border-radius: 3px;
+  border: 1px solid var(--fm-primary);
+  color: var(--fm-primary);
+  flex-shrink: 0;
+}
 .risk-tag {
   font-size: 10px;
   padding: 1px 7px;
@@ -353,7 +392,7 @@ function compareMetricRows() {
 }
 .report-metrics {
   display: grid;
-  grid-template-columns: repeat(7, minmax(0, 1fr));
+  grid-template-columns: repeat(8, minmax(0, 1fr));
   gap: 8px;
   margin-top: 14px;
 }

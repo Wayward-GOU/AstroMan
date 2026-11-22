@@ -79,7 +79,7 @@ npm.cmd run dev
 ### 前端
 
 ```powershell
-npm.cmd run test        # vitest run：14 个 spec / 160 条
+npm.cmd run test        # vitest run：35 个 spec / 322 条
 npm.cmd run build       # vue-tsc --noEmit + vite build（类型错误在这里拦）
 ```
 
@@ -91,7 +91,7 @@ npm.cmd run build       # vue-tsc --noEmit + vite build（类型错误在这里�
 cd src-tauri
 cargo fmt --check --all                            # 格式门禁
 cargo clippy --lib --all-targets -- -D warnings    # 静态检查，注意 -- 只能在 --all-targets 之后
-cargo test --lib                                   # 140 条用例
+cargo test --lib                                   # 426 条用例（6 ignored）
 ```
 
 > `cargo test` 会在临时目录建库。环境不允许写 SQLite（受限沙箱、只读盘）时会集中报 `attempt to write a readonly database`，属于环境问题，单独重跑或换可写目录即可。

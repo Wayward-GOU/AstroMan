@@ -30,17 +30,21 @@ use uuid::Uuid;
 
 use super::host::ClusterApp;
 use super::merge::{self, MergeNode, MergeRequest};
+use super::pool_refresh::{DbRefreshSource, LocalPoolRefreshRelay, PoolRefreshCore};
 use super::protocol::{
-    AbortPayload, ClusterMasterSnapshot, ClusterMessage, ClusterNodeInfo, DonePayload,
-    ErrorPayload, HelloAckPayload, HelloPayload, PingPayload, PongPayload, PreflightPayload,
-    PrepareAckPayload, PreparePayload, SamplePayload, StartPayload, TimeAckPayload,
-    TimeProbePayload, CLOCK_SAMPLE_ROUNDS, DEFAULT_PORT, HEARTBEAT_MISSES, HEARTBEAT_SEC,
-    MAX_MESSAGE_BYTES, MAX_NODES, MAX_PAIR_CODE_TTL_SEC, MIN_PAIR_CODE_TTL_SEC, PAIR_CODE_DIGITS,
-    PAIR_CODE_TTL_SEC, PROTOCOL_VERSION,
+    AbortPayload, ClusterMasterSnapshot, ClusterMessage, ClusterNodeInfo, DonePayload, EngineStats,
+    ErrorPayload, HelloAckPayload, HelloPayload, HelloPendingPayload, HelloRejectedPayload,
+    NodeCapacity, PendingNodeInfo, PingPayload, PongPayload,
+    PoolRefreshRequestPayload, PoolRefreshResultPayload,
+    PreflightPayload, PrepareAckPayload, PreparePayload, PoolSizeEstimate, SamplePayload, StartPayload,
+    TimeAckPayload, TimeProbePayload, PoolSlice, CLOCK_SAMPLE_ROUNDS, DEFAULT_PORT, HEARTBEAT_MISSES,
+    HEARTBEAT_SEC, MAX_MESSAGE_BYTES, MAX_NODES, MAX_PAIR_CODE_TTL_SEC, MAX_POOL_SLICE_BYTES,
+    MIN_PAIR_CODE_TTL_SEC,
+    PAIR_CODE_DIGITS, PAIR_CODE_TTL_SEC, PROTOCOL_VERSION,
 };
 use crate::commands::stress::{
-    prepare_stress, run_engine, save_report, EngineOptions, EngineOutcome, EngineSampleSink,
-    PreparedStress, ReportPayload,
+    prepare_stress_with_relay, run_engine, save_report, EngineOptions, EngineOutcome,
+    EngineSampleSink, PoolRefreshRelay, PreparedStress, ReportPayload,
 };
 use crate::models::{ReportError, ReportRequestRecord, SlowRequest, StressConfig};
 use crate::state::{DbPool, StressJobDraft};
@@ -50,8 +54,14 @@ use crate::util::{err, now_ms};
 pub const START_LEAD_MS: i64 = 2_000;
 /// 准备阶段等待从节点回执的上限
 pub const SETUP_TIMEOUT: Duration = Duration::from_secs(15);
-/// 同时存在的集群任务上限（主窗口列表用）
-pub const MAX_MASTER_SESSIONS: usize = 3;
+/// 审批模式：从节点等待主机接受的最长时间（秒）
+pub const JOIN_WAIT_SEC: u64 = 120;
+/// 审批模式：同一 IP 两次申请的最小间隔（毫秒）
+const JOIN_RATE_MS: i64 = 5_000;
+/// 审批模式：待接受申请上限
+const MAX_PENDING_JOINS: usize = 3;
+/// 发现广播间隔（秒）
+const BEACON_SEC: u64 = 2;
 
 pub const EVENT_MASTER: &str = "cluster:master";
 pub const EVENT_SAMPLE: &str = "cluster:sample";
@@ -93,12 +103,18 @@ fn resolve_pair_code_ttl(value: Option<i64>) -> Result<i64, String> {
     Ok(ttl)
 }
 
-/// 单节点权重：缺省为 1，主节点与从节点一视同仁
+/// 单节点权重与并发边界：缺省权重 1，主节点与从节点一视同仁
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClusterNodeWeight {
     pub node_id: String,
     pub weight: f64,
+    /// 该节点至少分配的并发；缺省 1
+    #[serde(default)]
+    pub min_concurrent: Option<u32>,
+    /// 该节点最多分配的并发；缺省取本机预算
+    #[serde(default)]
+    pub max_concurrent: Option<u32>,
 }
 
 /// 每秒采样事件：前端画各节点实时曲线
@@ -143,6 +159,33 @@ struct NodeState {
     preflight_ok: Option<bool>,
     samples: Vec<SamplePayload>,
     done: Option<DonePayload>,
+    /// 节点能力：核数/内存/本机预算
+    capacity: Option<NodeCapacity>,
+    /// 本次分配并发上限（预算与 min/max 共同决定）
+    quota: u32,
+    /// 全局 VU 区间
+    vu_start: u32,
+    vu_count: u32,
+    /// 运行期峰值
+    peak_qps: f64,
+    peak_concurrent: u32,
+    /// 采集健康度
+    first_sample_ms: Option<i64>,
+    last_sample_ms: Option<i64>,
+    received_samples: u64,
+    last_stats: Option<EngineStats>,
+    /// X25519 对端公钥（主节点侧保存从节点公钥）
+    peer_public_key: Option<[u8; 32]>,
+    /// 审批模式的申请 ID（接受后清空）
+    request_id: Option<String>,
+    /// 设备指纹：审批展示与白名单
+    device_id: Option<String>,
+    /// 最近一次 PrepareAck 报告的缺失变量（含 `os:NAME`）
+    missing_vars: Vec<String>,
+    /// 从节点是否支持数据池自定义列（v20）；旧节点缺省 false
+    pool_columns: bool,
+    /// 本次下发的池切片字节数（prepare 时写入）
+    pool_slice_bytes: Option<u64>,
 }
 
 impl NodeState {
@@ -172,10 +215,26 @@ impl NodeState {
             preflight_ok: None,
             samples: Vec::new(),
             done: None,
+            capacity: None,
+            quota: 0,
+            vu_start: 0,
+            vu_count: 0,
+            peak_qps: 0.0,
+            peak_concurrent: 0,
+            first_sample_ms: None,
+            last_sample_ms: None,
+            received_samples: 0,
+            last_stats: None,
+            peer_public_key: None,
+            request_id: None,
+            device_id: None,
+            missing_vars: Vec::new(),
+            pool_columns: true,
+            pool_slice_bytes: None,
         }
     }
 
-    fn info(&self) -> ClusterNodeInfo {
+    fn info(&self, start_at_ms: Option<i64>, now: i64) -> ClusterNodeInfo {
         ClusterNodeInfo {
             id: self.id.clone(),
             name: self.name.clone(),
@@ -193,6 +252,78 @@ impl NodeState {
             joined_at: self.joined_at,
             last_seen_at: self.last_seen_at,
             error: self.error.clone(),
+            capacity: self.capacity.clone(),
+            quota: self.quota,
+            health: self.health(start_at_ms, now),
+            peak_qps: self.peak_qps,
+            peak_concurrent: self.peak_concurrent,
+            vu_start: self.vu_start,
+            vu_count: self.vu_count,
+            engine_stats: self.last_stats.clone(),
+            missing_vars: self.missing_vars.clone(),
+            pool_columns: self.pool_columns,
+            env_bundle: self.role == "master" || self.peer_public_key.is_some(),
+            pool_slice_bytes: self.pool_slice_bytes,
+        }
+    }
+
+    /// 采集健康度：区分「还没开始」「首样超时」「中途缺口」「已结束」「失联」
+    fn health(&self, start_at_ms: Option<i64>, now: i64) -> crate::services::cluster::protocol::SampleHealth {
+        use crate::services::cluster::protocol::{
+            SampleHealth, FIRST_SAMPLE_BAD_SEC, FIRST_SAMPLE_WARN_SEC,
+        };
+        let elapsed = start_at_ms
+            .map(|start| (now - start).max(0) as u64 / 1000)
+            .unwrap_or(0);
+        let expected = if self.status == "running" || self.status == "done" {
+            elapsed
+        } else {
+            0
+        };
+        let received = self.samples.len() as u64;
+        let lost = expected.saturating_sub(received);
+        let gap_sec = self
+            .last_sample_ms
+            .map(|last| (now - last).max(0) as u64 / 1000)
+            .unwrap_or(elapsed);
+        let (state, message) = match self.status.as_str() {
+            "running" => {
+                if received == 0 {
+                    if elapsed >= FIRST_SAMPLE_BAD_SEC {
+                        ("lost", Some(format!("首样超时 {elapsed}s，检查从节点引擎是否启动")))
+                    } else if elapsed >= FIRST_SAMPLE_WARN_SEC {
+                        ("waiting", Some(format!("等待首样（{elapsed}s）")))
+                    } else {
+                        ("waiting", None)
+                    }
+                } else if gap_sec > 2 {
+                    ("gap", Some(format!("已 {gap_sec}s 没有新采样")))
+                } else if lost > 0 {
+                    ("gap", Some(format!("丢失 {lost} 个采样点")))
+                } else {
+                    ("ok", None)
+                }
+            }
+            "done" => {
+                if lost > 0 {
+                    ("gap", Some(format!("丢失 {lost} 个采样点")))
+                } else {
+                    ("done", None)
+                }
+            }
+            "lost" => ("lost", self.error.clone()),
+            "left" | "rejected" => ("lost", self.error.clone()),
+            _ => ("waiting", None),
+        };
+        SampleHealth {
+            state: state.to_string(),
+            first_sample_ms: self.first_sample_ms,
+            last_sample_ms: self.last_sample_ms,
+            expected,
+            received,
+            lost,
+            gap_sec,
+            message,
         }
     }
 
@@ -210,6 +341,8 @@ struct SessionState {
     pair_code: Option<PairCode>,
     nodes: Vec<NodeState>,
     next_node: u32,
+    /// 加入申请限流：IP → 最近一次申请时刻
+    join_requests: HashMap<String, i64>,
 }
 
 /// 主节点本地引擎的逐请求明细：集群报告只收主节点的明细，需在报告里标注
@@ -254,11 +387,30 @@ struct MasterSession {
     aborting: AtomicBool,
     /// 合并落库只允许执行一次
     finalizing: AtomicBool,
+    /// 本机并发预算（主节点）
+    budget: u32,
+    /// 分配模式：auto / even / custom
+    allocation_mode: Mutex<String>,
+    /// 创建任务时按池条目估算的体量，供下发前提示；无池绑定为 None
+    pool_estimate: Option<PoolSizeEstimate>,
+    /// 本会话 X25519 私钥（EnvBundle 加密）
+    x25519_secret: x25519_dalek::StaticSecret,
+    /// 本会话 X25519 公钥（base64）
+    x25519_public: String,
+    /// Token 刷新单飞核心：从节点与本地引擎共用（8.10.5）
+    pool_refresh: Arc<PoolRefreshCore>,
+    /// accept 任务句柄：终态时中止并释放端口
+    accept: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    /// 进入终态的时间（毫秒）：用于完成后快照的保留清理
+    terminal_at: Mutex<Option<i64>>,
+    /// 本次任务是否自动接受加入申请
+    auto_accept: AtomicBool,
+    /// 是否广播局域网发现
+    discovery: bool,
 }
 
 struct RunningMaster {
     session: Arc<MasterSession>,
-    accept: tauri::async_runtime::JoinHandle<()>,
 }
 
 /// 主节点会话管理器：随 AppState 存活
@@ -285,11 +437,8 @@ impl ClusterMaster {
         app: Arc<dyn ClusterApp>,
         payload: ClusterMasterStartPayload,
     ) -> Result<ClusterMasterSnapshot, String> {
-        if self.sessions.lock().len() >= MAX_MASTER_SESSIONS {
-            return Err(format!(
-                "最多同时保留 {MAX_MASTER_SESSIONS} 个分布式压测任务，请先结束已有任务"
-            ));
-        }
+        // v1.1.2：不再限制同时保留的集群任务数；终态会释放监听，完成快照仍可查看
+        self.prune_finished();
         let (config, required_vars) = shared_config(&payload.config)?;
         let total_concurrent = payload.config.concurrent;
         let plan_name = payload
@@ -308,12 +457,20 @@ impl ClusterMaster {
                     .map(str::to_string)
             })
             .unwrap_or_else(|| payload.config.url.trim().to_string());
-        let port = payload.port.unwrap_or(DEFAULT_PORT);
-        let pair_code_ttl = resolve_pair_code_ttl(payload.pair_code_ttl_sec)?;
-        let listener = TcpListener::bind(("0.0.0.0", port))
-            .await
-            .map_err(|error| format!("集群端口 {port} 监听失败：{error}"))?;
+        let listener = bind_cluster_listener(payload.port).await?;
         let port = listener.local_addr().map_err(err)?.port();
+        let budget = app
+            .try_state()
+            .map(|state| state.budget().machine_limit)
+            .unwrap_or(1000);
+        let discovery = app
+            .try_state()
+            .map(|state| state.settings().cluster_discovery_enabled)
+            .unwrap_or(true);
+        let x25519_secret = x25519_dalek::StaticSecret::random();
+        let x25519_public =
+            crate::commands::http::base64_encode(x25519_dalek::PublicKey::from(&x25519_secret).as_bytes());
+        let pair_code_ttl = resolve_pair_code_ttl(payload.pair_code_ttl_sec)?;
         let created_at = now_ms();
         let pair_code = PairCode {
             code: new_pair_code(),
@@ -347,6 +504,17 @@ impl ClusterMaster {
         )?;
         let master_node = NodeState::master(master_name, master_addr, created_at);
         upsert_worker(&pool, job_id, &master_node)?;
+        let pool_estimate = estimate_pool_bytes(&pool, &payload.config.pool_bindings);
+        // 刷新用的环境变量：与主节点本地引擎同源，供刷新地址/请求体渲染
+        let refresh_vars = master_refresh_vars(
+            &pool,
+            &payload.config,
+            payload.env_name.as_deref(),
+        );
+        let pool_refresh = Arc::new(PoolRefreshCore::new(
+            Box::new(DbRefreshSource::new(pool.clone())),
+            refresh_vars,
+        ));
         let session = Arc::new(MasterSession {
             job_id,
             plan_id: payload.plan_id.unwrap_or(0),
@@ -374,6 +542,7 @@ impl ClusterMaster {
                 pair_code: Some(pair_code),
                 nodes: vec![master_node],
                 next_node: 1,
+                join_requests: HashMap::new(),
             }),
             local_prepared: Mutex::new(None),
             local_job: Mutex::new(None),
@@ -381,15 +550,28 @@ impl ClusterMaster {
             local_details: Mutex::new(None),
             aborting: AtomicBool::new(false),
             finalizing: AtomicBool::new(false),
+            budget,
+            allocation_mode: Mutex::new("auto".to_string()),
+            pool_estimate,
+            x25519_secret,
+            x25519_public,
+            pool_refresh,
+            accept: Mutex::new(None),
+            terminal_at: Mutex::new(None),
+            auto_accept: AtomicBool::new(false),
+            discovery,
         });
         let accept = tauri::async_runtime::spawn(accept_loop(session.clone(), listener));
+        *session.accept.lock() = Some(accept);
         tauri::async_runtime::spawn(watchdog_loop(session.clone()));
+        if discovery {
+            MasterSession::spawn_beacon(session.clone());
+        }
         let snapshot = session.snapshot();
         self.sessions.lock().insert(
             job_id,
             RunningMaster {
                 session: session.clone(),
-                accept,
             },
         );
         session.emit_snapshot();
@@ -401,6 +583,7 @@ impl ClusterMaster {
     }
 
     pub fn snapshots(&self) -> Vec<ClusterMasterSnapshot> {
+        self.prune_finished();
         let sessions: Vec<Arc<MasterSession>> = self
             .sessions
             .lock()
@@ -408,6 +591,40 @@ impl ClusterMaster {
             .map(|running| running.session.clone())
             .collect();
         sessions.iter().map(|session| session.snapshot()).collect()
+    }
+
+    /// 清理已完成的集群快照：超时（30 分钟）或超出数量上限（20 个）时移除
+    ///
+    /// 运行中的任务不受影响；终态会话在进入终态时已释放监听端口，
+    /// 这里只回收内存里的快照，任务与报告仍在数据库里。
+    fn prune_finished(&self) {
+        let now = now_ms();
+        let mut sessions = self.sessions.lock();
+        let mut finished: Vec<(i64, i64)> = sessions
+            .iter()
+            .filter_map(|(id, running)| {
+                let session = &running.session;
+                let terminal = matches!(
+                    session.state.lock().status.as_str(),
+                    "finished" | "failed"
+                );
+                if !terminal {
+                    return None;
+                }
+                let at = session.terminal_at.lock().unwrap_or(session.created_at);
+                Some((*id, at))
+            })
+            .collect();
+        finished.sort_by_key(|(_, at)| *at);
+        let mut remaining = finished.len();
+        for (id, at) in finished {
+            let expired = now - at > crate::services::cluster::protocol::RETENTION_SEC * 1000;
+            let overflow = remaining > crate::services::cluster::protocol::RETENTION_MAX_TASKS;
+            if expired || overflow {
+                sessions.remove(&id);
+                remaining = remaining.saturating_sub(1);
+            }
+        }
     }
 
     fn session(&self, job_id: i64) -> Result<Arc<MasterSession>, String> {
@@ -418,14 +635,15 @@ impl ClusterMaster {
             .ok_or_else(|| format!("分布式压测任务 {job_id} 不存在或已关闭"))
     }
 
-    /// 按权重下发配置并等待从节点回执
+    /// 按分配模式下发配置并等待从节点回执
     pub async fn prepare(
         &self,
         job_id: i64,
+        mode: Option<String>,
         weights: Vec<ClusterNodeWeight>,
     ) -> Result<ClusterMasterSnapshot, String> {
         let session = self.session(job_id)?;
-        session.prepare(weights).await?;
+        session.prepare(mode, weights).await?;
         Ok(session.snapshot())
     }
 
@@ -445,6 +663,59 @@ impl ClusterMaster {
         Ok(session.snapshot())
     }
 
+    /// 接受一个待审批的加入申请
+    pub fn approve(&self, job_id: i64, node_id: &str) -> Result<ClusterMasterSnapshot, String> {
+        let session = self.session(job_id)?;
+        session.approve_join(node_id)?;
+        Ok(session.snapshot())
+    }
+
+    /// 拒绝一个待审批的加入申请
+    pub fn reject(
+        &self,
+        job_id: i64,
+        node_id: &str,
+        reason: Option<String>,
+    ) -> Result<ClusterMasterSnapshot, String> {
+        let session = self.session(job_id)?;
+        session.reject_join(node_id, reason)?;
+        Ok(session.snapshot())
+    }
+
+    /// 本次任务自动接受加入申请
+    pub fn set_auto_accept(
+        &self,
+        job_id: i64,
+        enabled: bool,
+    ) -> Result<ClusterMasterSnapshot, String> {
+        let session = self.session(job_id)?;
+        session.set_auto_accept(enabled);
+        Ok(session.snapshot())
+    }
+
+    /// 节点最近 N 个每秒采样（默认 30，最多 300），用于 AI 诊断
+    pub fn node_samples(
+        &self,
+        job_id: i64,
+        node_id: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<SamplePayload>, String> {
+        let session = self.session(job_id)?;
+        let limit = limit.unwrap_or(30).clamp(1, 300);
+        let state = session.state.lock();
+        let Some(node) = state.nodes.iter().find(|node| node.id == node_id) else {
+            return Err("节点不存在".to_string());
+        };
+        let start = node.samples.len().saturating_sub(limit);
+        Ok(node.samples[start..].to_vec())
+    }
+
+    /// 变量体检：只读检查下发前的变量来源与各节点状态（不含变量值）
+    pub fn var_audit(&self, job_id: i64) -> Result<super::protocol::VarAuditReport, String> {
+        let session = self.session(job_id)?;
+        Ok(session.var_audit())
+    }
+
     /// 关闭并移除会话（运行中会先中止）
     pub fn close(&self, job_id: i64) -> Result<(), String> {
         let running = self
@@ -453,7 +724,7 @@ impl ClusterMaster {
             .remove(&job_id)
             .ok_or_else(|| format!("分布式压测任务 {job_id} 不存在或已关闭"))?;
         running.session.shutdown.store(true, Ordering::SeqCst);
-        running.accept.abort();
+        running.session.release_transport();
         if matches!(
             running.session.state.lock().status.as_str(),
             "pairing" | "preparing" | "ready" | "running"
@@ -465,6 +736,42 @@ impl ClusterMaster {
 }
 
 impl MasterSession {
+    /// 配对阶段每 2 秒广播一次发现 Beacon；离开配对阶段或进程关闭即自动结束
+    fn spawn_beacon(session: Arc<MasterSession>) {
+        tauri::async_runtime::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(BEACON_SEC));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                if session.shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                let snapshot = session.snapshot();
+                if snapshot.status != "pairing" {
+                    break;
+                }
+                super::discovery::broadcast_master(&snapshot);
+            }
+        });
+    }
+
+    /// 释放监听端口并停止 accept / 心跳 / 看门狗：
+    /// 任务进入终态时调用，已完成快照仍保留在会话表里可查看
+    fn release_transport(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.accept.lock().take() {
+            handle.abort();
+        }
+    }
+
+    /// 记录终态时间：完成后快照按「30 分钟 / 20 个任务」保留
+    fn mark_terminal(&self) {
+        let mut at = self.terminal_at.lock();
+        if at.is_none() {
+            *at = Some(now_ms());
+        }
+    }
+
     fn snapshot(&self) -> ClusterMasterSnapshot {
         let now = now_ms();
         let state = self.state.lock();
@@ -489,12 +796,38 @@ impl MasterSession {
             pair_code_ttl_sec: self.pair_code_ttl_sec,
             local_addresses: self.local_addresses.clone(),
             total_concurrent: self.total_concurrent,
+            allocation_mode: self.allocation_mode.lock().clone(),
+            budget: self.budget,
             start_at_ms: state.start_at_ms,
             elapsed_sec,
             report_id: state.report_id,
             incomplete: state.incomplete,
             message: state.message.clone(),
-            nodes: state.nodes.iter().map(NodeState::info).collect(),
+            nodes: state
+                .nodes
+                .iter()
+                .map(|node| node.info(state.start_at_ms, now))
+                .collect(),
+            pending: state
+                .nodes
+                .iter()
+                .filter(|node| node.status == "pending")
+                .filter_map(|node| {
+                    Some(PendingNodeInfo {
+                        request_id: node.request_id.clone()?,
+                        node_id: node.id.clone(),
+                        name: node.name.clone(),
+                        addr: node.addr.clone(),
+                        device_id: node.device_id.clone(),
+                        capacity: node.capacity.clone(),
+                        requested_at: node.joined_at,
+                    })
+                })
+                .collect(),
+            auto_accept: self.auto_accept.load(Ordering::SeqCst),
+            discovery: self.discovery,
+            pool_estimate: self.pool_estimate.clone(),
+            pool_slice_limit_bytes: MAX_POOL_SLICE_BYTES as u64,
             created_at: self.created_at,
         }
     }
@@ -520,6 +853,11 @@ impl MasterSession {
             finished_at,
         ) {
             log::warn!("更新集群任务状态失败：{error}");
+        }
+        // 终态即释放监听：用户不必点「关闭」，同端口可立即重建下一个任务
+        if matches!(status, "finished" | "failed") {
+            self.mark_terminal();
+            self.release_transport();
         }
     }
 
@@ -577,8 +915,22 @@ impl MasterSession {
         hello: HelloPayload,
         tx: mpsc::UnboundedSender<ClusterMessage>,
     ) -> Result<String, String> {
+        if hello.version != PROTOCOL_VERSION {
+            return Err(format!(
+                "协议版本不一致：主节点 v{}，从节点 v{}，请升级后重试",
+                PROTOCOL_VERSION, hello.version
+            ));
+        }
+        if hello.join_mode.as_deref() == Some("request") {
+            return self.register_request(peer, hello, tx);
+        }
         let now = now_ms();
         let ttl_sec = self.pair_code_ttl_sec;
+        let peer_public_key = match hello.public_key.as_deref() {
+            Some(raw) => Some(super::env_bundle::decode_public(raw)?),
+            None => None,
+        };
+        let capacity = hello.node_capacity.clone();
         let (node_id, token, probes, pair_expires) = {
             let mut state = self.state.lock();
             if state.status != "pairing" {
@@ -668,6 +1020,22 @@ impl MasterSession {
                 preflight_ok: None,
                 samples: Vec::new(),
                 done: None,
+                capacity,
+                quota: 0,
+                vu_start: 0,
+                vu_count: 0,
+                peak_qps: 0.0,
+                peak_concurrent: 0,
+                first_sample_ms: None,
+                last_sample_ms: None,
+                received_samples: 0,
+                last_stats: None,
+                peer_public_key,
+                request_id: None,
+                device_id: hello.device_id.clone(),
+                missing_vars: Vec::new(),
+                pool_columns: hello.pool_columns,
+                pool_slice_bytes: None,
             });
             (
                 id,
@@ -682,6 +1050,9 @@ impl MasterSession {
             token,
             node_id: node_id.clone(),
             job_id: self.job_id,
+            public_key: Some(self.x25519_public.clone()),
+            pool_refresh_relay: true,
+            pool_columns: true,
         });
         if tx.send(ack).is_err() {
             return Err("连接已断开".to_string());
@@ -699,6 +1070,224 @@ impl MasterSession {
         Ok(node_id)
     }
 
+    /// 审批模式加入：登记待接受申请，接受后仍走同一套时钟对齐
+    fn register_request(
+        &self,
+        peer: SocketAddr,
+        hello: HelloPayload,
+        tx: mpsc::UnboundedSender<ClusterMessage>,
+    ) -> Result<String, String> {
+        let now = now_ms();
+        let peer_public_key = match hello.public_key.as_deref() {
+            Some(raw) => Some(super::env_bundle::decode_public(raw)?),
+            None => None,
+        };
+        let capacity = hello.node_capacity.clone();
+        let name = hello.node_name.trim();
+        if name.is_empty() {
+            return Err("节点名不能为空".to_string());
+        }
+        if name.chars().count() > 64 {
+            return Err("节点名不能超过 64 个字符".to_string());
+        }
+        let device_id = hello
+            .device_id
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| peer.ip().to_string());
+        let auto = self.auto_accept.load(Ordering::SeqCst);
+        let (node_id, request_id) = {
+            let mut state = self.state.lock();
+            if state.status != "pairing" {
+                return Err("任务已开始或已结束，不能再加入节点".to_string());
+            }
+            let ip = peer.ip().to_string();
+            if let Some(last) = state.join_requests.get(&ip) {
+                if now - *last < JOIN_RATE_MS {
+                    return Err("加入申请过于频繁，请 5 秒后重试".to_string());
+                }
+            }
+            state.join_requests.insert(ip.clone(), now);
+            // 限流表只保留最近 1 分钟，避免长期任务无限增长
+            state.join_requests.retain(|_, at| now - *at <= 60_000);
+            let pending = state
+                .nodes
+                .iter()
+                .filter(|node| node.role == "slave" && node.status == "pending")
+                .count();
+            if pending >= MAX_PENDING_JOINS {
+                return Err("待接受申请过多，请先在主节点处理".to_string());
+            }
+            let live = state
+                .nodes
+                .iter()
+                .filter(|node| {
+                    node.role == "slave" && node.is_active() && node.status != "pending"
+                })
+                .count();
+            if live + pending >= MAX_NODES {
+                return Err(format!("单任务最多 {MAX_NODES} 个从节点"));
+            }
+            if let Some(index) = state.nodes.iter().position(|node| node.name == name) {
+                if state.nodes[index].is_active() {
+                    return Err(format!("节点名「{name}」已被占用，请更换节点名"));
+                }
+                state.nodes.remove(index);
+            }
+            let id = format!("node-{}", state.next_node);
+            state.next_node += 1;
+            let request_id = Uuid::new_v4().simple().to_string();
+            state.nodes.push(NodeState {
+                id: id.clone(),
+                name: name.to_string(),
+                role: "slave".to_string(),
+                addr: peer.to_string(),
+                weight: 1.0,
+                concurrent: 0,
+                status: "pending".to_string(),
+                qps: 0.0,
+                cpu: None,
+                mem_mb: None,
+                clock_offset_ms: None,
+                clock_uncertainty_ms: None,
+                clock_best_error_ms: f64::INFINITY,
+                clock_probes: HashMap::new(),
+                clock_samples: 0,
+                dropped_samples: 0,
+                joined_at: now,
+                last_seen_at: Some(now),
+                error: None,
+                tx: Some(tx.clone()),
+                prepare_ok: None,
+                preflight_ok: None,
+                samples: Vec::new(),
+                done: None,
+                capacity,
+                quota: 0,
+                vu_start: 0,
+                vu_count: 0,
+                peak_qps: 0.0,
+                peak_concurrent: 0,
+                first_sample_ms: None,
+                last_sample_ms: None,
+                received_samples: 0,
+                last_stats: None,
+                peer_public_key,
+                request_id: Some(request_id.clone()),
+                device_id: Some(device_id),
+                missing_vars: Vec::new(),
+                pool_columns: hello.pool_columns,
+                pool_slice_bytes: None,
+            });
+            (id, request_id)
+        };
+        let pending = ClusterMessage::HelloPending(HelloPendingPayload {
+            request_id,
+            message: Some("等待主机接受".to_string()),
+            timeout_sec: JOIN_WAIT_SEC,
+        });
+        if tx.send(pending).is_err() {
+            self.remove_pending(&node_id);
+            return Err("连接已断开".to_string());
+        }
+        self.emit_snapshot();
+        if auto {
+            if let Err(error) = self.approve_join(&node_id) {
+                log::warn!("自动接受节点失败：{error}");
+            }
+        }
+        Ok(node_id)
+    }
+
+    /// 接受待审批节点：发送 HelloAck 与 5 轮时钟探测
+    fn approve_join(&self, node_id: &str) -> Result<(), String> {
+        let now = now_ms();
+        let (token, probes) = {
+            let mut state = self.state.lock();
+            if state.status != "pairing" {
+                return Err("当前任务不在配对阶段".to_string());
+            }
+            let Some(index) = state.nodes.iter().position(|node| node.id == node_id) else {
+                return Err("节点不存在或连接已断开".to_string());
+            };
+            if state.nodes[index].status != "pending" {
+                return Err("该节点不在待接受状态".to_string());
+            }
+            let mut probes = Vec::with_capacity(CLOCK_SAMPLE_ROUNDS as usize);
+            for seq in 0..CLOCK_SAMPLE_ROUNDS {
+                let at = now_ms();
+                state.nodes[index].clock_probes.insert(seq, at);
+                probes.push(TimeProbePayload { seq, t0: at });
+            }
+            state.nodes[index].status = "pairing".to_string();
+            state.nodes[index].request_id = None;
+            state.nodes[index].joined_at = now;
+            state.nodes[index].last_seen_at = Some(now);
+            state.nodes[index].error = None;
+            (Uuid::new_v4().simple().to_string(), probes)
+        };
+        let ack = ClusterMessage::HelloAck(HelloAckPayload {
+            version: PROTOCOL_VERSION,
+            token,
+            node_id: node_id.to_string(),
+            job_id: self.job_id,
+            public_key: Some(self.x25519_public.clone()),
+            pool_refresh_relay: true,
+            pool_columns: true,
+        });
+        if !self.send(node_id, ack) {
+            return Err("节点连接已断开".to_string());
+        }
+        for probe in probes {
+            if !self.send(node_id, ClusterMessage::TimeProbe(probe)) {
+                return Err("节点连接已断开".to_string());
+            }
+        }
+        self.persist_node(node_id);
+        self.emit_snapshot();
+        Ok(())
+    }
+
+    /// 拒绝待审批节点：通知原因并关闭连接
+    fn reject_join(&self, node_id: &str, reason: Option<String>) -> Result<(), String> {
+        let message = reason
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or_else(|| "主机拒绝了加入申请".to_string());
+        let _ = self.send(
+            node_id,
+            ClusterMessage::HelloRejected(HelloRejectedPayload {
+                reason: message.clone(),
+            }),
+        );
+        let mut state = self.state.lock();
+        let Some(node) = state.nodes.iter_mut().find(|node| node.id == node_id) else {
+            return Err("节点不存在".to_string());
+        };
+        node.status = "rejected".to_string();
+        node.error = Some(message);
+        node.request_id = None;
+        node.tx = None;
+        drop(state);
+        self.emit_snapshot();
+        Ok(())
+    }
+
+    /// 删除未被接受的申请（连接断开时清理）
+    fn remove_pending(&self, node_id: &str) {
+        let mut state = self.state.lock();
+        state
+            .nodes
+            .retain(|node| !(node.id == node_id && node.status == "pending"));
+        drop(state);
+        self.emit_snapshot();
+    }
+
+    /// 本次任务自动接受开关
+    fn set_auto_accept(&self, enabled: bool) {
+        self.auto_accept.store(enabled, Ordering::SeqCst);
+        self.emit_snapshot();
+    }
+
     fn touch(&self, node_id: &str) {
         let mut state = self.state.lock();
         if let Some(node) = state.nodes.iter_mut().find(|node| node.id == node_id) {
@@ -706,23 +1295,43 @@ impl MasterSession {
         }
     }
 
-    fn handle_message(&self, node_id: &str, message: ClusterMessage) {
+    fn handle_message(self: &Arc<Self>, node_id: &str, message: ClusterMessage) {
         self.touch(node_id);
         match message {
             ClusterMessage::TimeAck(payload) => self.on_time_ack(node_id, payload),
             ClusterMessage::PrepareAck(payload) => self.on_prepare_ack(node_id, payload),
+            ClusterMessage::PoolRefreshRequest(payload) => {
+                self.spawn_pool_refresh(node_id.to_string(), payload)
+            }
             ClusterMessage::Preflight(payload) => self.on_preflight(node_id, payload),
             ClusterMessage::Sample(payload) => self.on_sample(node_id, payload),
             ClusterMessage::Done(payload) => self.on_done(node_id, payload),
             ClusterMessage::Ping(payload) => {
+                if let Some(stats) = payload.stats.clone() {
+                    let mut state = self.state.lock();
+                    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == node_id) {
+                        node.last_stats = Some(stats);
+                        if node.status == "running" {
+                            node.qps = node.last_stats.as_ref().map(|s| s.qps).unwrap_or(node.qps);
+                        }
+                    }
+                }
                 let _ = self.send(
                     node_id,
                     ClusterMessage::Pong(PongPayload {
                         at_ms: payload.at_ms,
+                        stats: None,
                     }),
                 );
             }
-            ClusterMessage::Pong(_) => {}
+            ClusterMessage::Pong(payload) => {
+                if let Some(stats) = payload.stats {
+                    let mut state = self.state.lock();
+                    if let Some(node) = state.nodes.iter_mut().find(|node| node.id == node_id) {
+                        node.last_stats = Some(stats);
+                    }
+                }
+            }
             ClusterMessage::Abort(payload) => self.on_remote_abort(node_id, payload.reason),
             ClusterMessage::Hello(_) => {
                 let _ = self.send(
@@ -733,6 +1342,110 @@ impl MasterSession {
                 );
             }
             _ => {}
+        }
+    }
+
+    /// 从节点请求刷新 token：后台单飞，避免阻塞连接读取循环
+    fn spawn_pool_refresh(self: &Arc<Self>, node_id: String, payload: PoolRefreshRequestPayload) {
+        let session = self.clone();
+        tauri::async_runtime::spawn(async move {
+            let result = session
+                .pool_refresh
+                .refresh(&payload.pool, payload.item_id, payload.item_index)
+                .await;
+            // 刷新结果要写明写入列：优先按池列定义解析（token 优先否则首列）
+            let column = session
+                .db
+                .get()
+                .ok()
+                .and_then(|conn| {
+                    crate::services::pool::pool_columns(&conn, &payload.pool).ok()
+                })
+                .map(|columns| crate::commands::stress::refresh_column_of(&columns))
+                .or_else(|| match &result {
+                    Ok((_, _, Some(column))) => Some(column.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| "value".to_string());
+            let (tx, peer) = {
+                let state = session.state.lock();
+                let Some(node) = state.nodes.iter().find(|node| node.id == node_id) else {
+                    return;
+                };
+                (node.tx.clone(), node.peer_public_key)
+            };
+            let Some(tx) = tx else {
+                return;
+            };
+            let message =
+                session.pool_refresh_result(payload.request_id, peer, result, &column);
+            let _ = tx.send(ClusterMessage::PoolRefreshResult(message));
+        });
+    }
+
+    /// 刷新结果：成功用会话密钥加密回传，失败只回错误文案（不含 token）
+    ///
+    /// `column` 是本次刷新写入的列名，成功与失败都带上，便于从节点对齐 `data`。
+    fn pool_refresh_result(
+        &self,
+        request_id: String,
+        peer: Option<[u8; 32]>,
+        result: Result<(String, i64, Option<String>), String>,
+        column: &str,
+    ) -> PoolRefreshResultPayload {
+        let (value, expires_at) = match result {
+            Ok((value, expires_at, _)) => (value, expires_at),
+            Err(error) => {
+                return PoolRefreshResultPayload {
+                    request_id,
+                    ok: false,
+                    error: Some(error),
+                    nonce: String::new(),
+                    payload: String::new(),
+                    digest: String::new(),
+                    column: Some(column.to_string()),
+                }
+            }
+        };
+        let Some(peer) = peer else {
+            return PoolRefreshResultPayload {
+                request_id,
+                ok: false,
+                error: Some("缺少会话密钥，无法回传刷新结果".to_string()),
+                nonce: String::new(),
+                payload: String::new(),
+                digest: String::new(),
+                column: Some(column.to_string()),
+            };
+        };
+        let plaintext = serde_json::json!({
+            "value": value,
+            "expiresAt": expires_at,
+        })
+        .to_string();
+        match super::env_bundle::encrypt_bundle(
+            &self.x25519_secret,
+            &peer,
+            plaintext.as_bytes(),
+        ) {
+            Ok((nonce, payload, digest)) => PoolRefreshResultPayload {
+                request_id,
+                ok: true,
+                error: None,
+                nonce,
+                payload,
+                digest,
+                column: Some(column.to_string()),
+            },
+            Err(error) => PoolRefreshResultPayload {
+                request_id,
+                ok: false,
+                error: Some(error),
+                nonce: String::new(),
+                payload: String::new(),
+                digest: String::new(),
+                column: Some(column.to_string()),
+            },
         }
     }
 
@@ -797,9 +1510,11 @@ impl MasterSession {
                 node.status = "rejected".to_string();
                 node.tx = None;
                 node.error = Some(message.clone());
+                node.missing_vars = payload.missing_vars.clone();
                 failure = Some(format!("节点「{node_name}」准备失败：{message}"));
             } else {
                 node.prepare_ok = Some(true);
+                node.missing_vars.clear();
                 if payload.accepted_concurrent > 0 {
                     node.concurrent = payload.accepted_concurrent;
                 }
@@ -881,6 +1596,16 @@ impl MasterSession {
             }
             node.qps = payload.qps;
             node.concurrent = payload.concurrent;
+            node.received_samples += 1;
+            let now = now_ms();
+            node.first_sample_ms.get_or_insert(now);
+            node.last_sample_ms = Some(now);
+            if payload.qps > node.peak_qps {
+                node.peak_qps = payload.qps;
+            }
+            if payload.concurrent > node.peak_concurrent {
+                node.peak_concurrent = payload.concurrent;
+            }
             node.samples.push(payload.clone());
         }
         self.persist_node(node_id);
@@ -953,9 +1678,17 @@ impl MasterSession {
             if matches!(state.status.as_str(), "finished" | "failed") {
                 return;
             }
-            let Some(node) = state.nodes.iter_mut().find(|node| node.id == node_id) else {
+            let Some(index) = state.nodes.iter().position(|node| node.id == node_id) else {
                 return;
             };
+            // 待审批节点还没配对：直接移除，避免占用待接受列表
+            if state.nodes[index].status == "pending" {
+                state.nodes.remove(index);
+                drop(state);
+                self.emit_snapshot();
+                return;
+            }
+            let node = &mut state.nodes[index];
             if !node.is_active() {
                 return;
             }
@@ -971,7 +1704,11 @@ impl MasterSession {
         self.maybe_finalize();
     }
 
-    async fn prepare(&self, weights: Vec<ClusterNodeWeight>) -> Result<(), String> {
+    async fn prepare(
+        &self,
+        mode: Option<String>,
+        weights: Vec<ClusterNodeWeight>,
+    ) -> Result<(), String> {
         let allocations = {
             let mut state = self.state.lock();
             if state.status != "pairing" {
@@ -1001,13 +1738,73 @@ impl MasterSession {
                     not_paired.join("、")
                 ));
             }
+            // 能力感知默认权重：主节点用本机预算，从节点用上报预算；
+            // 显式传入权重时以用户为准（custom）。
             let participants: Vec<(String, f64)> = state
                 .nodes
                 .iter()
-                .map(|node| (node.id.clone(), node.weight))
+                .map(|node| {
+                    let default = if node.role == "master" {
+                        self.budget as f64
+                    } else {
+                        node.capacity
+                            .as_ref()
+                            .map(|capacity| capacity.machine_limit as f64)
+                            .filter(|value| *value > 0.0)
+                            .unwrap_or(512.0)
+                    };
+                    (node.id.clone(), default)
+                })
                 .collect();
-            let weights = resolve_weights(&participants, &weights)?;
-            let allocations = allocate_concurrency(self.total_concurrent, &participants, &weights)?;
+            // 显式模式优先；旧前端未传时按是否携带权重推断
+            let requested = weights;
+            let mode = normalize_allocation_mode(mode.as_deref(), !requested.is_empty())?;
+            *self.allocation_mode.lock() = mode.to_string();
+            let weights = resolve_weights(&participants, &requested, mode)?;
+            // 每节点硬上限：主节点预算 / 从节点上报预算
+            let caps: Vec<(String, u32)> = state
+                .nodes
+                .iter()
+                .map(|node| {
+                    let cap = if node.role == "master" {
+                        self.budget
+                    } else {
+                        node.capacity
+                            .as_ref()
+                            .map(|capacity| capacity.machine_limit)
+                            .filter(|value| *value > 0)
+                            .unwrap_or(u32::MAX / 4)
+                    };
+                    (node.id.clone(), cap)
+                })
+                .collect();
+            // 每节点 min/max：custom 由用户填写，其余模式为 1..本机预算
+            let limits: Vec<(String, u32, u32)> = state
+                .nodes
+                .iter()
+                .map(|node| {
+                    let cap = caps
+                        .iter()
+                        .find(|(id, _)| id == &node.id)
+                        .map(|(_, cap)| *cap)
+                        .unwrap_or(u32::MAX);
+                    let requested = requested.iter().find(|item| item.node_id == node.id);
+                    let min = requested.and_then(|item| item.min_concurrent).unwrap_or(1).max(1);
+                    let max = requested
+                        .and_then(|item| item.max_concurrent)
+                        .unwrap_or(cap)
+                        .min(cap);
+                    (node.id.clone(), min, max)
+                })
+                .collect();
+            let allocations = allocate_concurrency_capped(
+                self.total_concurrent,
+                &participants,
+                &weights,
+                &caps,
+                &limits,
+            )?;
+            let mut vu_cursor = 0u32;
             for node in &mut state.nodes {
                 if let Some((_, weight)) = weights.iter().find(|(id, _)| id == &node.id) {
                     node.weight = *weight;
@@ -1015,9 +1812,19 @@ impl MasterSession {
                 if let Some((_, concurrent)) = allocations.iter().find(|(id, _)| id == &node.id) {
                     node.concurrent = *concurrent;
                 }
+                node.quota = caps
+                    .iter()
+                    .find(|(id, _)| id == &node.id)
+                    .map(|(_, cap)| *cap)
+                    .unwrap_or(0);
+                node.vu_start = vu_cursor;
+                node.vu_count = node.concurrent;
+                vu_cursor = vu_cursor.saturating_add(node.concurrent);
                 node.prepare_ok = None;
                 node.preflight_ok = None;
                 node.error = None;
+                node.missing_vars.clear();
+                node.pool_slice_bytes = None;
                 if node.role == "master" {
                     node.status = "ready".to_string();
                 } else {
@@ -1052,23 +1859,88 @@ impl MasterSession {
         }
         self.set_job_status("preparing", None, false, false);
 
+        // 自定义列能力校验：列出全部不支持的从节点，给出升级或降级绑定方式两种处置
+        let needs_columns = self
+            .local_config
+            .pool_bindings
+            .iter()
+            .any(|binding| !binding.column.trim().is_empty());
+        if needs_columns {
+            let legacy: Vec<String> = {
+                let state = self.state.lock();
+                state
+                    .nodes
+                    .iter()
+                    .filter(|node| node.role == "slave" && node.is_active() && !node.pool_columns)
+                    .map(|node| node.name.clone())
+                    .collect()
+            };
+            if !legacy.is_empty() {
+                let message = format!(
+                    "从节点 {} 版本较低，不支持数据池自定义列或自动注入。请升级后重新加入；\
+或把池绑定改为「取 value 列」的旧式绑定后重试",
+                    legacy.join("、")
+                );
+                self.fail(message.clone());
+                return Err(message);
+            }
+        }
+
         for (node_id, concurrent) in &allocations {
             let payload = {
-                let state = self.state.lock();
-                let Some(node) = state.nodes.iter().find(|node| node.id == *node_id) else {
+                let mut state = self.state.lock();
+                let node_count = state.nodes.len();
+                let total_vus = state
+                    .nodes
+                    .iter()
+                    .map(|node| node.concurrent)
+                    .sum::<u32>();
+                let Some((index, node)) = state
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .find(|(_, node)| node.id == *node_id)
+                else {
                     continue;
                 };
                 if node.role == "master" {
                     continue;
                 }
-                PreparePayload {
-                    job_id: self.job_id,
-                    plan_name: self.plan_name.clone(),
-                    config: self.config.clone(),
-                    env_name: self.env_name.clone(),
-                    required_vars: self.required_vars.clone(),
-                    concurrent: *concurrent,
-                    total_concurrent: self.total_concurrent,
+                let pool_check: Result<(Vec<PoolSlice>, u64), String> =
+                    if self.local_config.pool_bindings.is_empty() {
+                        Ok((Vec::new(), 0))
+                    } else {
+                        validate_vu_ranges(&state.nodes, total_vus)
+                            .and_then(|_| self.pool_slices_for(index, node, node_count, total_vus))
+                    };
+                let env_bundle = self.env_bundle_for(node);
+                let (vu_start, vu_count) = (node.vu_start, node.vu_count);
+                pool_check.map(|(pool_slices, slice_bytes)| {
+                    state.nodes[index].pool_slice_bytes = Some(slice_bytes);
+                    PreparePayload {
+                        job_id: self.job_id,
+                        plan_name: self.plan_name.clone(),
+                        config: self.config.clone(),
+                        env_name: self.env_name.clone(),
+                        var_policy: crate::util::normalize_var_policy(
+                            self.local_config.var_policy.as_deref(),
+                        )
+                        .to_string(),
+                        required_vars: self.required_vars.clone(),
+                        concurrent: *concurrent,
+                        total_concurrent: self.total_concurrent,
+                        env_bundle,
+                        vu_start,
+                        vu_count,
+                        pool_slices,
+                    }
+                })
+            };
+            let payload = match payload {
+                Ok(payload) => payload,
+                Err(message) => {
+                    self.fail(message.clone());
+                    return Err(message);
                 }
             };
             if !self.send(node_id, ClusterMessage::Prepare(payload)) {
@@ -1191,6 +2063,352 @@ impl MasterSession {
         self.on_local_done(outcome);
     }
 
+    /// 主节点环境变量（解密后的明文只用于本次下发，不落盘）
+    fn master_env(&self) -> Option<(HashMap<String, String>, std::collections::HashSet<String>)> {
+        let conn = self.db.get().ok()?;
+        let env_id = match self.local_config.env_id {
+            Some(id) => Some(id),
+            None => {
+                let name = self.env_name.as_deref()?.trim();
+                if name.is_empty() {
+                    return None;
+                }
+                conn.query_row(
+                    "SELECT id FROM environments WHERE name = ?1
+                     ORDER BY is_active DESC, id ASC LIMIT 1",
+                    params![name],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .ok()
+                .flatten()
+            }
+        }?;
+        crate::commands::http::load_vars_with_secrets(&conn, env_id).ok()
+    }
+
+    /// 变量体检：只读汇总每个变量的来源、主节点是否有值和各从节点状态。
+    /// 不返回任何变量值，也不触发下发。
+    fn var_audit(&self) -> super::protocol::VarAuditReport {
+        use super::protocol::{VarAuditItem, VarAuditNode};
+
+        let texts = config_texts(&self.local_config);
+        let classified =
+            crate::util::required_vars_in_texts(texts.iter().map(String::as_str));
+        let master_env = self.master_env();
+        let os_allow = self
+            .app
+            .try_state()
+            .map(|state| state.settings().stress_os_env_allow)
+            .unwrap_or_default();
+
+        let state = self.state.lock();
+        let nodes: Vec<VarAuditNode> = state
+            .nodes
+            .iter()
+            .filter(|node| node.role == "slave")
+            .map(|node| VarAuditNode {
+                id: node.id.clone(),
+                name: node.name.clone(),
+                addr: node.addr.clone(),
+                status: node.status.clone(),
+            })
+            .collect();
+
+        let probe_state = |names: &[String]| {
+            let mut map = HashMap::new();
+            for node in state.nodes.iter().filter(|node| node.role == "slave") {
+                map.insert(node.id.clone(), var_node_state(node, names));
+            }
+            map
+        };
+
+        let mut items: Vec<VarAuditItem> = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
+
+        for name in &classified.user {
+            if seen.contains(name) {
+                continue;
+            }
+            seen.push(name.clone());
+            let has = master_env
+                .as_ref()
+                .map(|(vars, _)| vars.contains_key(name))
+                .unwrap_or(false);
+            items.push(VarAuditItem {
+                name: name.clone(),
+                kind: "user".to_string(),
+                master_has_value: has,
+                source: if has { "env" } else { "none" }.to_string(),
+                message: if has {
+                    None
+                } else {
+                    Some("主节点环境里没有这个变量；从节点会按缺失拦截".to_string())
+                },
+                node_states: probe_state(&[name.clone()]),
+            });
+        }
+
+        for name in &classified.secret {
+            if seen.contains(name) {
+                continue;
+            }
+            seen.push(name.clone());
+            let has = master_env
+                .as_ref()
+                .map(|(vars, _)| vars.contains_key(name))
+                .unwrap_or(false);
+            items.push(VarAuditItem {
+                name: name.clone(),
+                kind: "secret".to_string(),
+                master_has_value: has,
+                source: if has { "env" } else { "none" }.to_string(),
+                message: Some(if has {
+                    "值通过加密环境包下发，报告与日志不会出现明文".to_string()
+                } else {
+                    "主节点环境里没有这个 secret；从节点会按缺失拦截".to_string()
+                }),
+                node_states: probe_state(&[name.clone()]),
+            });
+        }
+
+        for name in &classified.os {
+            let allowed = crate::util::os_var_allowed(&os_allow, name);
+            items.push(VarAuditItem {
+                name: name.clone(),
+                kind: "os".to_string(),
+                master_has_value: allowed && std::env::var(name).is_ok(),
+                source: "os".to_string(),
+                message: Some(if allowed {
+                    "由各节点读取本机环境变量".to_string()
+                } else {
+                    "未加入 OS 变量白名单（设置 → 压测 → OS 变量），各节点会按缺失拦截"
+                        .to_string()
+                }),
+                node_states: probe_state(&[format!("os:{name}")]),
+            });
+        }
+
+        for name in &classified.pools {
+            let binding = self
+                .local_config
+                .pool_bindings
+                .iter()
+                .find(|binding| binding.target == *name);
+            let message = match binding {
+                Some(binding) => {
+                    let mode = match binding.mode.as_str() {
+                        "per_vu" => "每 VU 固定",
+                        "per_request" => "逐请求轮换",
+                        "random" => "随机",
+                        _ => "默认策略",
+                    };
+                    let refresh = if binding.refresh_on_401 {
+                        "，401 时自动切换"
+                    } else {
+                        ""
+                    };
+                    Some(format!("由池「{}」按{mode}注入{refresh}", binding.pool))
+                }
+                None => Some("未绑定数据池，运行时会按缺少变量处理".to_string()),
+            };
+            items.push(VarAuditItem {
+                name: name.clone(),
+                kind: "pool".to_string(),
+                master_has_value: binding.is_some(),
+                source: if binding.is_some() { "pool" } else { "none" }.to_string(),
+                message,
+                node_states: probe_state(&[name.clone()]),
+            });
+        }
+
+        let (env_var_count, secret_count) = master_env
+            .as_ref()
+            .map(|(vars, secrets)| (vars.len() as u32, secrets.len() as u32))
+            .unwrap_or((0, 0));
+
+        super::protocol::VarAuditReport {
+            job_id: self.job_id,
+            env_name: self.env_name.clone(),
+            var_policy: crate::util::normalize_var_policy(self.local_config.var_policy.as_deref())
+                .to_string(),
+            env_var_count,
+            secret_count,
+            nodes,
+            items,
+        }
+    }
+
+    /// 报告配置快照追加环境元信息（名称、摘要、变量数、secret 数、策略），不记录变量值
+    fn decorate_env_snapshot(&self, merged: &mut merge::MergedReport) {
+        let Some((vars, secrets)) = self.master_env() else {
+            return;
+        };
+        let mut pairs: Vec<(&String, &String)> = vars.iter().collect();
+        pairs.sort_by(|left, right| left.0.cmp(right.0));
+        let mut canonical = String::new();
+        for (key, value) in pairs {
+            let kind = if secrets.contains(key) { "secret" } else { "var" };
+            canonical.push_str(kind);
+            canonical.push(':');
+            canonical.push_str(key);
+            canonical.push('=');
+            canonical.push_str(value);
+            canonical.push('\n');
+        }
+        let Ok(mut config) = serde_json::from_str::<serde_json::Value>(&merged.config_snapshot)
+        else {
+            return;
+        };
+        let Some(object) = config.as_object_mut() else {
+            return;
+        };
+        object.insert(
+            "envInfo".to_string(),
+            serde_json::json!({
+                "name": self.env_name,
+                "bundleDigest": super::env_bundle::digest_hex(canonical.as_bytes()),
+                "varCount": vars.len(),
+                "secretCount": secrets.len(),
+                "policy": crate::util::normalize_var_policy(
+                    self.local_config.var_policy.as_deref()
+                ),
+            }),
+        );
+        merged.config_snapshot = config.to_string();
+    }
+
+    /// 为指定从节点构建加密环境包；没有公钥或没有环境时返回 None（退回旧流程）
+    fn env_bundle_for(&self, node: &NodeState) -> Option<super::protocol::EnvBundle> {
+        let peer = node.peer_public_key?;
+        let (vars, secrets) = self.master_env()?;
+        let mut plain_vars = serde_json::Map::new();
+        let mut plain_secrets = serde_json::Map::new();
+        for (key, value) in &vars {
+            if secrets.contains(key) {
+                plain_secrets.insert(key.clone(), serde_json::Value::String(value.clone()));
+            } else {
+                plain_vars.insert(key.clone(), serde_json::Value::String(value.clone()));
+            }
+        }
+        let plaintext = serde_json::to_vec(&serde_json::json!({
+            "vars": plain_vars,
+            "secrets": plain_secrets,
+        }))
+        .ok()?;
+        let (nonce, payload, digest) =
+            super::env_bundle::encrypt_bundle(&self.x25519_secret, &peer, &plaintext).ok()?;
+        Some(super::protocol::EnvBundle {
+            version: super::protocol::ENV_BUNDLE_VERSION,
+            env_name: self.env_name.clone(),
+            nonce,
+            payload,
+            digest,
+            secret_names: secrets.into_iter().collect(),
+        })
+    }
+
+    /// 为指定从节点切出池数据
+    ///
+    /// 按池去重：同一池的多个绑定共用一份条目，只生成一个切片；
+    /// - `per_vu`：条目数 ≥ 总 VU 时按全局 VU 区间切连续窗口；不足时下发全量并带 `startIndex`，
+    ///   由从节点按 `(本地 VU + startIndex) % len` 取值，保证全局同一 VU 对应同一条；
+    /// - `per_request` / `random`：按节点序号做分片，避免跨机重复。
+    fn pool_slices_for(
+        &self,
+        node_index: usize,
+        node: &NodeState,
+        node_count: usize,
+        total_vus: u32,
+    ) -> Result<(Vec<PoolSlice>, u64), String> {
+        use crate::commands::stress::binding_mode;
+        use crate::services::pool::{
+            E_POOL_BINDING_INVALID, E_POOL_EMPTY, E_POOL_SHARD_EMPTY,
+        };
+        let conn = self
+            .db
+            .get()
+            .map_err(|error| format!("{E_POOL_SHARD_EMPTY}: 读取本机池失败：{error}"))?;
+        let bindings = &self.local_config.pool_bindings;
+        if bindings.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        // 按池去重：同一池的多个绑定只能有一份切片
+        let mut pools: Vec<(&str, Vec<&crate::models::PoolBinding>)> = Vec::new();
+        for binding in bindings {
+            let name = binding.pool.trim();
+            // target 为空仅在 column == "*" 时允许
+            if name.is_empty()
+                || (binding.target.trim().is_empty() && binding.column.trim() != "*")
+            {
+                return Err(format!(
+                    "{E_POOL_BINDING_INVALID}: 池绑定缺少池名或目标变量"
+                ));
+            }
+            if let Some((_, group)) = pools.iter_mut().find(|(pool, _)| *pool == name) {
+                group.push(binding);
+            } else {
+                pools.push((name, vec![binding]));
+            }
+        }
+        let mut slices = Vec::with_capacity(pools.len());
+        for (name, group) in pools {
+            // 同池多个绑定的轮换模式必须一致
+            let mode = binding_mode(group[0]);
+            if group.iter().any(|binding| binding_mode(binding) != mode) {
+                return Err(format!(
+                    "{E_POOL_BINDING_INVALID}: 池「{name}」的多条绑定轮换模式必须一致"
+                ));
+            }
+            let items = crate::services::pool::load_items(&conn, name)?;
+            if items.is_empty() {
+                return Err(format!("{E_POOL_EMPTY}: 池「{name}」没有可用条目"));
+            }
+            let kind = crate::services::pool::pool_kind(&conn, name);
+            let columns = crate::services::pool::pool_columns(&conn, name)?;
+            let refresh = crate::services::pool::pool_refresh_configs(
+                &conn,
+                &[name.to_string()],
+            )?
+            .remove(name);
+            let (items, start_index) = if mode == "per_vu" {
+                if items.len() >= total_vus as usize && (node.vu_start as usize) < items.len() {
+                    let start = node.vu_start as usize;
+                    let end = (start + node.vu_count as usize).min(items.len());
+                    (items[start..end].to_vec(), 0)
+                } else {
+                    (items, node.vu_start as usize)
+                }
+            } else if node_count > 0 {
+                (
+                    items
+                        .into_iter()
+                        .enumerate()
+                        .filter(|(index, _)| index % node_count == node_index)
+                        .map(|(_, item)| item)
+                        .collect(),
+                    0,
+                )
+            } else {
+                (items, 0)
+            };
+            if items.is_empty() {
+                return Err(format!(
+                    "{E_POOL_SHARD_EMPTY}: 池「{name}」在节点 {node_index} 上的分片为空"
+                ));
+            }
+            slices.push(PoolSlice {
+                name: name.to_string(),
+                kind,
+                items,
+                start_index,
+                columns,
+                refresh,
+            });
+        }
+        ensure_pool_slice_size(&slices, &node.name).map(|bytes| (slices, bytes))
+    }
+
     /// 准备主节点本地引擎：与从节点一样受本机任务注册表约束
     fn prepare_local_engine(&self, concurrent: u32) -> Result<(), String> {
         let app_state = self
@@ -1216,7 +2434,15 @@ impl MasterSession {
         }
         // 先用占位取消位准备，拿到注册表取消位后再替换，停止按钮才能停掉引擎
         let placeholder = Arc::new(AtomicBool::new(false));
-        let mut prepared = prepare_stress(app_state.inner(), config.clone(), placeholder)?;
+        // 本地引擎与从节点共用同一个单飞核心：进程内直接调用，不再各刷一次
+        let relay: Arc<dyn PoolRefreshRelay> =
+            Arc::new(LocalPoolRefreshRelay::new(self.pool_refresh.clone()));
+        let mut prepared = prepare_stress_with_relay(
+            app_state.inner(),
+            config.clone(),
+            placeholder,
+            Some(relay),
+        )?;
         let draft = StressJobDraft {
             name: prepared.name.clone(),
             target: prepared.url_text.clone(),
@@ -1347,6 +2573,7 @@ impl MasterSession {
             state.status = "finished".to_string();
             state.incomplete = incomplete;
             state.start_at_ms = state.start_at_ms.or(Some(finished_at));
+            self.mark_terminal();
             let nodes = state
                 .nodes
                 .iter()
@@ -1383,7 +2610,8 @@ impl MasterSession {
             }
         };
         let details = self.local_details.lock().take();
-        let merged = merge::merge(request);
+        let mut merged = merge::merge(request);
+        self.decorate_env_snapshot(&mut merged);
         let empty_errors: Vec<ReportError> = Vec::new();
         let empty_requests: Vec<ReportRequestRecord> = Vec::new();
         let empty_slow: Vec<SlowRequest> = Vec::new();
@@ -1409,6 +2637,13 @@ impl MasterSession {
             },
         );
         let incomplete = merged.meta.incomplete;
+        if let Ok(report_id) = &saved {
+            if let Err(error) =
+                save_cluster_samples(&self.db, *report_id, &merged.meta.node_series)
+            {
+                log::warn!("写入集群节点采样失败：{error}");
+            }
+        }
         let message = match &saved {
             Ok(report_id) => format!("合并报告 #{report_id} 已生成"),
             Err(error) => format!("报告保存失败：{error}"),
@@ -1527,7 +2762,7 @@ impl MasterSession {
                 return;
             }
             for node in state.nodes.iter_mut() {
-                if node.role != "slave" || !node.is_active() {
+                if node.role != "slave" || !node.is_active() || node.status == "pending" {
                     continue;
                 }
                 let last_seen = node.last_seen_at.unwrap_or(node.joined_at);
@@ -1723,7 +2958,10 @@ async fn heartbeat_loop(
             break;
         }
         if tx
-            .send(ClusterMessage::Ping(PingPayload { at_ms: now_ms() }))
+            .send(ClusterMessage::Ping(PingPayload {
+                at_ms: now_ms(),
+                stats: None,
+            }))
             .is_err()
         {
             break;
@@ -1756,6 +2994,47 @@ async fn watchdog_loop(session: Arc<MasterSession>) {
 }
 
 /* ---------- 规则与算法 ---------- */
+
+/// 主节点刷新的渲染变量：环境变量（含 secret）+ 配置里的运行期变量
+///
+/// 只在建立会话时读取一次；池刷新地址里的 `{{base_url}}` 等占位符依赖它。
+fn master_refresh_vars(
+    pool: &DbPool,
+    config: &StressConfig,
+    env_name: Option<&str>,
+) -> HashMap<String, String> {
+    let mut vars = HashMap::new();
+    if let Ok(conn) = pool.get() {
+        let env_id = config.env_id.or_else(|| {
+            let name = env_name?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            conn.query_row(
+                "SELECT id FROM environments WHERE name = ?1
+                 ORDER BY is_active DESC, id ASC LIMIT 1",
+                params![name],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+        });
+        if let Some(id) = env_id {
+            if let Ok((loaded, _secrets)) =
+                crate::commands::http::load_vars_with_secrets(&conn, id)
+            {
+                vars = loaded;
+            }
+        }
+    }
+    for (key, value) in &config.vars {
+        if !key.trim().is_empty() {
+            vars.insert(key.clone(), value.clone());
+        }
+    }
+    vars
+}
 
 /// 从配置提取变量名并校验一期边界
 pub(crate) fn shared_config(
@@ -1793,25 +3072,75 @@ pub(crate) fn shared_config(
     Ok((value, required_vars))
 }
 
+/// 变量体检中的单节点状态：优先看 PrepareAck 的缺失清单，其次看准备结果
+fn var_node_state(
+    node: &NodeState,
+    names: &[String],
+) -> super::protocol::VarAuditNodeState {
+    use super::protocol::VarAuditNodeState;
+    if node
+        .missing_vars
+        .iter()
+        .any(|missing| names.iter().any(|name| name == missing))
+    {
+        return VarAuditNodeState {
+            state: "missing".to_string(),
+            detail: Some("从节点回执缺少该变量".to_string()),
+        };
+    }
+    match node.prepare_ok {
+        Some(true) => VarAuditNodeState {
+            state: "ok".to_string(),
+            detail: None,
+        },
+        Some(false) => VarAuditNodeState {
+            state: "missing".to_string(),
+            detail: node.error.clone(),
+        },
+        None if node.status == "rejected" => VarAuditNodeState {
+            state: "unknown".to_string(),
+            detail: node
+                .error
+                .clone()
+                .or_else(|| Some("节点准备失败，原因未注明".to_string())),
+        },
+        None => VarAuditNodeState {
+            state: "pending".to_string(),
+            detail: Some("尚未下发配置".to_string()),
+        },
+    }
+}
+
+/// 收集需要从节点实际提供的变量名
+///
+/// v1.1.2 起必须走统一分类：`{{$timestamp}}`、`{{uuid}}`、`{{randomInt(...)}}`、
+/// `{{faker:...}}` 由各节点本地生成，`{{os:NAME}}` 由各节点读本机环境，
+/// `{{pool:x}}` 由池注入——这些都不再误判为「用户变量缺失」。
+/// `{{secret:TOKEN}}` 归一化为 `TOKEN`，仍需主节点提供（值通过 EnvBundle 下发）。
 fn collect_required_vars(config: &StressConfig) -> Vec<String> {
-    let mut names: Vec<String> = Vec::new();
-    let mut push = |text: &str| {
-        for name in find_placeholders(text) {
-            if !names.iter().any(|item| item == &name) {
-                names.push(name);
-            }
+    let texts = config_texts(config);
+    let classified = crate::util::required_vars_in_texts(texts.iter().map(String::as_str));
+    let mut names = classified.user;
+    for name in classified.secret {
+        if !names.contains(&name) {
+            names.push(name);
         }
-    };
-    push(config.url.trim());
+    }
+    names
+}
+
+/// 配置中所有可能出现占位符的文本字段
+fn config_texts(config: &StressConfig) -> Vec<String> {
+    let mut texts = vec![config.url.trim().to_string()];
     for item in config.params.iter().chain(config.headers.iter()) {
         if !item.enabled {
             continue;
         }
-        push(item.key.trim());
-        push(&item.value);
+        texts.push(item.key.trim().to_string());
+        texts.push(item.value.clone());
     }
     if let Some(body) = &config.body {
-        push(body);
+        texts.push(body.clone());
     }
     if let Some(auth) = &config.auth {
         for value in [
@@ -1825,33 +3154,36 @@ fn collect_required_vars(config: &StressConfig) -> Vec<String> {
             &auth.client_secret,
             &auth.scope,
         ] {
-            push(value);
+            texts.push(value.clone());
         }
     }
-    names
+    texts
 }
 
-fn find_placeholders(text: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.find("{{") {
-        let after = &rest[start + 2..];
-        let Some(end) = after.find("}}") else {
-            break;
-        };
-        let name = after[..end].trim();
-        if !name.is_empty() && !names.iter().any(|item| item == name) {
-            names.push(name.to_string());
-        }
-        rest = &after[end + 2..];
+/// 归一化分配模式：auto / even / custom；未传时按是否携带权重推断
+pub(crate) fn normalize_allocation_mode(
+    value: Option<&str>,
+    has_weights: bool,
+) -> Result<&'static str, String> {
+    let normalized = value
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+    match normalized.as_deref() {
+        None => Ok(if has_weights { "custom" } else { "auto" }),
+        Some("auto") => Ok("auto"),
+        Some("even") => Ok("even"),
+        Some("custom") => Ok("custom"),
+        Some(other) => Err(format!(
+            "分配模式「{other}」不支持，可选 auto（能力分配）/ even（平均分配）/ custom（自定义权重）"
+        )),
     }
-    names
 }
 
 /// 把前端可选权重落到所有参与节点（主节点恒参与）
 fn resolve_weights(
     participants: &[(String, f64)],
     requested: &[ClusterNodeWeight],
+    mode: &str,
 ) -> Result<Vec<(String, f64)>, String> {
     let unknown: Vec<&str> = requested
         .iter()
@@ -1860,6 +3192,16 @@ fn resolve_weights(
         .collect();
     if !unknown.is_empty() {
         return Err(format!("权重包含未知节点：{}", unknown.join("、")));
+    }
+    // even：忽略自定义权重，按节点平均；auto：按能力预算作为权重
+    if mode == "even" {
+        return Ok(participants
+            .iter()
+            .map(|(id, _)| (id.clone(), 1.0))
+            .collect());
+    }
+    if mode == "auto" {
+        return Ok(participants.to_vec());
     }
     let mut weights = Vec::with_capacity(participants.len());
     for (id, default) in participants {
@@ -1876,59 +3218,136 @@ fn resolve_weights(
     Ok(weights)
 }
 
-/// 先每个节点分 1，再按权重分配剩余并发；用最大余数法保证总和精确
-pub(crate) fn allocate_concurrency(
+/// 绑定集群端口：指定端口优先；未指定时 17801 → 17811..17860 → 临时端口
+async fn bind_cluster_listener(requested: Option<u16>) -> Result<TcpListener, String> {
+    if let Some(port) = requested.filter(|port| *port != 0) {
+        return TcpListener::bind(("0.0.0.0", port))
+            .await
+            .map_err(|error| format!("集群端口 {port} 监听失败：{error}"));
+    }
+    let mut candidates = vec![DEFAULT_PORT];
+    candidates.extend((DEFAULT_PORT + 10)..=super::protocol::AUTO_PORT_END);
+    for port in candidates {
+        if let Ok(listener) = TcpListener::bind(("0.0.0.0", port)).await {
+            return Ok(listener);
+        }
+    }
+    TcpListener::bind(("0.0.0.0", 0))
+        .await
+        .map_err(|error| format!("无法分配集群端口：{error}"))
+}
+
+/// 带每节点 min/max 的分配：
+/// 先为每个节点保留最小并发，再按权重分配剩余额度；超出上限时按权重回补给未满节点。
+/// 如果所有节点都达到上限仍有剩余，直接报错，避免静默少分配。
+fn allocate_concurrency_capped(
     total: u32,
     participants: &[(String, f64)],
     weights: &[(String, f64)],
+    caps: &[(String, u32)],
+    limits: &[(String, u32, u32)],
 ) -> Result<Vec<(String, u32)>, String> {
     if participants.is_empty() {
         return Err("没有可分配的节点".to_string());
     }
-    if (total as usize) < participants.len() {
+    let cap_of = |id: &str| {
+        caps.iter()
+            .find(|(node, _)| node == id)
+            .map(|(_, cap)| *cap)
+            .unwrap_or(u32::MAX)
+    };
+    let weight_of = |id: &str| {
+        weights
+            .iter()
+            .find(|(node, _)| node == id)
+            .map(|(_, weight)| *weight)
+            .unwrap_or(1.0)
+    };
+    let limit_of = |id: &str| {
+        limits
+            .iter()
+            .find(|(node, _, _)| node == id)
+            .map(|(_, min, max)| (*min, *max))
+            .unwrap_or((1, cap_of(id)))
+    };
+
+    let mut min_sum = 0u32;
+    for (id, _) in participants {
+        let (min, max) = limit_of(id);
+        if min < 1 {
+            return Err(format!("节点「{id}」的最小并发必须大于等于 1"));
+        }
+        if max < min {
+            return Err(format!(
+                "节点「{id}」的并发上限 {max} 小于下限 {min}，请调整范围"
+            ));
+        }
+        if min > cap_of(id) {
+            return Err(format!(
+                "节点「{id}」的并发下限 {min} 超过本机预算 {}，请下调下限",
+                cap_of(id)
+            ));
+        }
+        min_sum = min_sum.saturating_add(min);
+    }
+    if min_sum > total {
         return Err(format!(
-            "总并发 {total} 少于节点数 {}，无法保证每个节点至少有 1 并发",
-            participants.len()
+            "各节点最小并发之和 {min_sum} 超过总并发 {total}，请下调下限或提高总并发"
         ));
     }
-    let remaining = total - participants.len() as u32;
-    let sum: f64 = weights.iter().map(|(_, weight)| weight).sum();
-    if sum <= 0.0 {
-        return Err("权重之和必须大于 0".to_string());
-    }
-    let mut exact: Vec<(String, u32, f64)> = participants
+
+    let mut result: Vec<(String, u32)> = participants
         .iter()
-        .map(|(id, _)| {
-            let weight = weights
-                .iter()
-                .find(|(node, _)| node == id)
-                .map(|(_, weight)| *weight)
-                .unwrap_or(1.0);
-            let share = remaining as f64 * weight / sum;
-            let base = share.floor() as u32;
-            (id.clone(), 1 + base, share - base as f64)
-        })
+        .map(|(id, _)| (id.clone(), limit_of(id).0))
         .collect();
-    let assigned: u32 = exact.iter().map(|(_, count, _)| *count).sum();
-    let mut leftover = total.saturating_sub(assigned);
-    exact.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-    let count = exact.len();
-    let mut index = 0;
-    while leftover > 0 && count > 0 {
-        exact[index % count].1 += 1;
-        leftover -= 1;
-        index += 1;
+    let mut remaining = total - min_sum;
+    if remaining > 0 {
+        let sum: f64 = participants.iter().map(|(id, _)| weight_of(id)).sum();
+        if sum <= 0.0 {
+            return Err("权重之和必须大于 0".to_string());
+        }
+        // 先按权重向下取整分配，并限制在 max 以内
+        let pool = remaining;
+        let mut fractions: Vec<(usize, f64, u32)> = Vec::with_capacity(participants.len());
+        for (index, (id, _)) in participants.iter().enumerate() {
+            let (min, max) = limit_of(id);
+            let room = max.saturating_sub(min);
+            let share = pool as f64 * weight_of(id) / sum;
+            let add = (share.floor() as u32).min(room);
+            result[index].1 += add;
+            remaining -= add;
+            fractions.push((index, share.fract(), room - add));
+        }
+        // 余数从大到小逐轮补 1，仍然受 max 约束
+        fractions.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        while remaining > 0 {
+            let mut progressed = false;
+            for (index, _, room) in fractions.iter_mut() {
+                if remaining == 0 {
+                    break;
+                }
+                if *room > 0 {
+                    result[*index].1 += 1;
+                    *room -= 1;
+                    remaining -= 1;
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        if remaining > 0 {
+            let cap_sum: u32 = participants
+                .iter()
+                .map(|(id, _)| limit_of(id).1)
+                .fold(0u32, |acc, value| acc.saturating_add(value));
+            return Err(format!(
+                "各节点并发上限之和 {cap_sum} 小于总并发 {total}，请提高节点上限或减少总并发"
+            ));
+        }
     }
-    exact.sort_by_key(|(id, _, _)| {
-        participants
-            .iter()
-            .position(|(node, _)| node == id)
-            .unwrap_or(usize::MAX)
-    });
-    Ok(exact
-        .into_iter()
-        .map(|(id, count, _)| (id, count))
-        .collect())
+    Ok(result)
 }
 
 /// NTP 单样本：偏移 = t1 - (t0 + t2) / 2，误差取单程 RTT / 2
@@ -2199,9 +3618,202 @@ pub fn recover_stale_jobs(pool: &DbPool) -> Result<usize, String> {
     Ok(jobs)
 }
 
+/// 把合并后的节点级曲线落库（v19），供跨报告按节点查询
+fn save_cluster_samples(
+    db: &DbPool,
+    report_id: i64,
+    series: &[crate::services::cluster::protocol::NodeSeries],
+) -> Result<(), String> {
+    if series.is_empty() {
+        return Ok(());
+    }
+    let mut conn = db.get().map_err(err)?;
+    let tx = conn.transaction().map_err(err)?;
+    {
+        let mut stmt = tx
+            .prepare(
+                "INSERT INTO cluster_report_samples
+                 (report_id, node, role, elapsed_sec, concurrent, qps, p95_rt, error_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )
+            .map_err(err)?;
+        for node in series {
+            for point in &node.points {
+                stmt.execute(rusqlite::params![
+                    report_id,
+                    node.node,
+                    node.role,
+                    point.sec as i64,
+                    point.concurrent as i64,
+                    point.qps,
+                    point.p95,
+                    point.errors as i64,
+                ])
+                .map_err(err)?;
+            }
+        }
+    }
+    tx.commit().map_err(err)?;
+    Ok(())
+}
+
+/// 节点 VU 区间完整性校验：必须从 0 开始、连续、无重叠，且刚好覆盖总并发
+fn validate_vu_ranges(nodes: &[NodeState], total_vus: u32) -> Result<(), String> {
+    use crate::services::pool::E_POOL_SLICE_GAP;
+    let mut ranges: Vec<(u32, u32)> = nodes
+        .iter()
+        .filter(|node| node.concurrent > 0)
+        .map(|node| {
+            (
+                node.vu_start,
+                node.vu_start.saturating_add(node.vu_count),
+            )
+        })
+        .collect();
+    ranges.sort_unstable();
+    let mut cursor = 0u32;
+    for (start, end) in ranges {
+        if start != cursor {
+            return Err(format!(
+                "{E_POOL_SLICE_GAP}: 节点 VU 区间在 {cursor} 处不连续（下一段从 {start} 开始）"
+            ));
+        }
+        if end < start {
+            return Err(format!("{E_POOL_SLICE_GAP}: 节点 VU 区间非法"));
+        }
+        cursor = end;
+    }
+    if cursor != total_vus {
+        return Err(format!(
+            "{E_POOL_SLICE_GAP}: 节点 VU 区间只覆盖 {cursor}/{total_vus}"
+        ));
+    }
+    Ok(())
+}
+
+/// 按池条目估算下发体量：创建任务时算一次，供前端在下发前提示
+///
+/// 只读 `COUNT` 与 `LENGTH`，不加载条目；行开销按分片字段与 JSON 键名粗估。
+fn estimate_pool_bytes(
+    db: &DbPool,
+    bindings: &[crate::models::PoolBinding],
+) -> Option<PoolSizeEstimate> {
+    let mut names: Vec<String> = Vec::new();
+    for binding in bindings {
+        let name = binding.pool.trim();
+        if name.is_empty() || names.iter().any(|item| item == name) {
+            continue;
+        }
+        names.push(name.to_string());
+    }
+    if names.is_empty() {
+        return None;
+    }
+    let conn = db.get().ok()?;
+    let mut estimate = PoolSizeEstimate::default();
+    for name in names {
+        let Ok(Some(pool_id)) = crate::services::pool::pool_id_by_name(&conn, &name) else {
+            continue;
+        };
+        let columns = crate::services::pool::pool_columns(&conn, &name)
+            .map(|items| items.len() as u64)
+            .unwrap_or(0);
+        let Ok((count, raw_bytes)) = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(value) + LENGTH(COALESCE(account, '')) + LENGTH(data_json)), 0)
+             FROM data_pool_items WHERE pool_id = ?1 AND enabled = 1",
+            params![pool_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        ) else {
+            continue;
+        };
+        if count <= 0 {
+            continue;
+        }
+        let count = count as u64;
+        estimate.pools += 1;
+        estimate.items += count;
+        // 60 字节覆盖 id/权重/过期时间与 JSON 字段名，列名再按每个 16 字节估算
+        estimate.bytes += raw_bytes.max(0) as u64 + count * (60 + columns * 16);
+    }
+    (estimate.pools > 0).then_some(estimate)
+}
+
+/// 单节点池切片体积校验（12.5）：序列化后超过 64 MB 直接拒绝
+///
+/// 返回该节点的实际字节数，供前端展示占用；超过 80% 时记告警日志。
+fn ensure_pool_slice_size(slices: &[PoolSlice], node_name: &str) -> Result<u64, String> {
+    let bytes = serde_json::to_vec(slices)
+        .map_err(|error| format!("池切片序列化失败：{error}"))?
+        .len();
+    if bytes > MAX_POOL_SLICE_BYTES {
+        // 找出占比最大的池，让用户知道该缩减哪个池
+        let largest = slices
+            .iter()
+            .filter_map(|slice| {
+                serde_json::to_vec(slice)
+                    .ok()
+                    .map(|raw| (slice, raw.len()))
+            })
+            .max_by_key(|(_, size)| *size);
+        let detail = match largest {
+            Some((slice, size)) => format!(
+                "；最大来源是池「{}」（{} 条 × {} 列，约 {:.1} MB）",
+                slice.name,
+                slice.items.len(),
+                slice.columns.len().max(1),
+                size as f64 / 1024.0 / 1024.0
+            ),
+            None => String::new(),
+        };
+        let limit_mb = MAX_POOL_SLICE_BYTES / (1024 * 1024);
+        return Err(format!(
+            "{}: 节点「{}」的池切片 {:.1} MB 超过 {} MB 上限{}。请减少池条目、精简列，或增加从节点分摊后重试",
+            crate::services::pool::E_POOL_SLICE_TOO_LARGE,
+            node_name,
+            bytes as f64 / 1024.0 / 1024.0,
+            limit_mb,
+            detail
+        ));
+    }
+    if bytes * 5 > MAX_POOL_SLICE_BYTES * 4 {
+        log::warn!(
+            "节点「{}」的池切片已用 {:.1}/{:.0} MB，接近上限",
+            node_name,
+            bytes as f64 / 1024.0 / 1024.0,
+            MAX_POOL_SLICE_BYTES as f64 / 1024.0 / 1024.0
+        );
+    }
+    Ok(bytes as u64)
+}
+
+#[cfg(test)]
+fn ensure_pool_slice_bytes(bytes: usize, node_name: &str) -> Result<(), String> {
+    if bytes > MAX_POOL_SLICE_BYTES {
+        let limit_mb = MAX_POOL_SLICE_BYTES / (1024 * 1024);
+        return Err(format!(
+            "{}: 节点「{}」的池切片 {:.1} MB 超过 {} MB 上限，请缩小池条目或增加节点",
+            crate::services::pool::E_POOL_SLICE_TOO_LARGE,
+            node_name,
+            bytes as f64 / 1024.0 / 1024.0,
+            limit_mb
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pool_slice_size_limit_rejects_oversized() {
+        assert!(ensure_pool_slice_bytes(MAX_POOL_SLICE_BYTES, "从机A").is_ok());
+        let message = ensure_pool_slice_bytes(MAX_POOL_SLICE_BYTES + 1, "从机A").unwrap_err();
+        assert!(message.starts_with(crate::services::pool::E_POOL_SLICE_TOO_LARGE));
+        assert!(message.contains("从机A"));
+        assert!(message.contains("64 MB"));
+        assert!(message.contains("缩小池条目或增加节点"));
+    }
 
     #[test]
     fn pair_code_is_fixed_width_digits() {
@@ -2238,13 +3850,25 @@ mod tests {
             ("b".to_string(), 1.0),
         ];
         let weights = participants.clone();
-        let allocation = allocate_concurrency(16, &participants, &weights).unwrap();
+        let caps = participants
+            .iter()
+            .map(|(id, _)| (id.clone(), 100u32))
+            .collect::<Vec<_>>();
+        let limits = participants
+            .iter()
+            .map(|(id, _)| (id.clone(), 1u32, 100u32))
+            .collect::<Vec<_>>();
+        let allocation = allocate_concurrency_capped(16, &participants, &weights, &caps, &limits)
+            .unwrap();
         assert_eq!(allocation.iter().map(|(_, count)| count).sum::<u32>(), 16);
         assert!(allocation.iter().all(|(_, count)| *count >= 1));
         assert_eq!(allocation.len(), 3);
 
         let two = vec![("master".to_string(), 1.0), ("a".to_string(), 1.0)];
-        let allocation = allocate_concurrency(16, &two, &two).unwrap();
+        let two_caps = vec![("master".to_string(), 100u32), ("a".to_string(), 100u32)];
+        let two_limits = vec![("master".to_string(), 1u32, 100u32), ("a".to_string(), 1u32, 100u32)];
+        let allocation =
+            allocate_concurrency_capped(16, &two, &two, &two_caps, &two_limits).unwrap();
         assert_eq!(
             allocation,
             vec![("master".to_string(), 8), ("a".to_string(), 8)]
@@ -2255,7 +3879,16 @@ mod tests {
             ("a".to_string(), 1.0),
             ("b".to_string(), 1.0),
         ];
-        let allocation = allocate_concurrency(10, &skewed, &skewed).unwrap();
+        let skewed_caps = skewed
+            .iter()
+            .map(|(id, _)| (id.clone(), 100u32))
+            .collect::<Vec<_>>();
+        let skewed_limits = skewed
+            .iter()
+            .map(|(id, _)| (id.clone(), 1u32, 100u32))
+            .collect::<Vec<_>>();
+        let allocation =
+            allocate_concurrency_capped(10, &skewed, &skewed, &skewed_caps, &skewed_limits).unwrap();
         assert_eq!(allocation.iter().map(|(_, count)| count).sum::<u32>(), 10);
         assert_eq!(allocation[0].1, 4);
     }
@@ -2263,7 +3896,81 @@ mod tests {
     #[test]
     fn allocation_rejects_more_nodes_than_concurrency() {
         let participants = vec![("a".to_string(), 1.0), ("b".to_string(), 1.0)];
-        assert!(allocate_concurrency(1, &participants, &participants).is_err());
+        let caps = vec![("a".to_string(), 100u32), ("b".to_string(), 100u32)];
+        let limits = vec![("a".to_string(), 1u32, 100u32), ("b".to_string(), 1u32, 100u32)];
+        assert!(
+            allocate_concurrency_capped(1, &participants, &participants, &caps, &limits).is_err()
+        );
+    }
+
+    #[test]
+    fn even_mode_splits_with_remainder() {
+        let participants = vec![
+            ("master".to_string(), 8.0),
+            ("a".to_string(), 4.0),
+            ("b".to_string(), 2.0),
+        ];
+        let weights = resolve_weights(&participants, &[], "even").unwrap();
+        assert!(weights.iter().all(|(_, weight)| (*weight - 1.0).abs() < f64::EPSILON));
+        let caps = vec![
+            ("master".to_string(), 100),
+            ("a".to_string(), 100),
+            ("b".to_string(), 100),
+        ];
+        let limits = vec![
+            ("master".to_string(), 1, 100),
+            ("a".to_string(), 1, 100),
+            ("b".to_string(), 1, 100),
+        ];
+        let allocation =
+            allocate_concurrency_capped(10, &participants, &weights, &caps, &limits).unwrap();
+        assert_eq!(allocation.iter().map(|(_, count)| count).sum::<u32>(), 10);
+        assert_eq!(
+            allocation,
+            vec![
+                ("master".to_string(), 4),
+                ("a".to_string(), 3),
+                ("b".to_string(), 3),
+            ]
+        );
+    }
+
+    #[test]
+    fn allocation_respects_node_max_and_reports_cap_shortage() {
+        let participants = vec![("a".to_string(), 1.0), ("b".to_string(), 1.0)];
+        let weights = resolve_weights(&participants, &[], "even").unwrap();
+        let caps = vec![("a".to_string(), 8), ("b".to_string(), 8)];
+        let limits = vec![("a".to_string(), 1, 2), ("b".to_string(), 1, 8)];
+        let allocation =
+            allocate_concurrency_capped(10, &participants, &weights, &caps, &limits).unwrap();
+        assert_eq!(
+            allocation,
+            vec![("a".to_string(), 2), ("b".to_string(), 8)]
+        );
+
+        let tight = vec![("a".to_string(), 1, 2), ("b".to_string(), 1, 3)];
+        let error =
+            allocate_concurrency_capped(10, &participants, &weights, &caps, &tight).unwrap_err();
+        assert!(error.contains("上限之和"), "错误应说明上限不足：{error}");
+    }
+
+    #[test]
+    fn allocation_rejects_min_above_total() {
+        let participants = vec![("a".to_string(), 1.0), ("b".to_string(), 1.0)];
+        let weights = resolve_weights(&participants, &[], "even").unwrap();
+        let caps = vec![("a".to_string(), 32), ("b".to_string(), 32)];
+        let limits = vec![("a".to_string(), 6, 8), ("b".to_string(), 6, 8)];
+        let error =
+            allocate_concurrency_capped(8, &participants, &weights, &caps, &limits).unwrap_err();
+        assert!(error.contains("最小并发之和"), "错误应说明下限过高：{error}");
+    }
+
+    #[test]
+    fn allocation_mode_defaults_and_rejects_unknown() {
+        assert_eq!(normalize_allocation_mode(None, false).unwrap(), "auto");
+        assert_eq!(normalize_allocation_mode(None, true).unwrap(), "custom");
+        assert_eq!(normalize_allocation_mode(Some(" EVEN "), false).unwrap(), "even");
+        assert!(normalize_allocation_mode(Some("random"), false).is_err());
     }
 
     #[test]
@@ -2384,6 +4091,7 @@ mod tests {
             pair_code: None,
             nodes: vec![NodeState::master("m".to_string(), String::new(), 1)],
             next_node: 1,
+            join_requests: HashMap::new(),
         };
         assert!(!nodes_settled(&state));
         state.nodes[0].status = "done".to_string();
@@ -2403,7 +4111,10 @@ mod tests {
             &[ClusterNodeWeight {
                 node_id: "a".to_string(),
                 weight: 2.0,
+                min_concurrent: None,
+                max_concurrent: None,
             }],
+            "custom",
         )
         .unwrap();
         assert_eq!(resolved[0].1, 1.0);
@@ -2414,8 +4125,95 @@ mod tests {
             &[ClusterNodeWeight {
                 node_id: "ghost".to_string(),
                 weight: 1.0,
+                min_concurrent: None,
+                max_concurrent: None,
             }],
+            "custom",
         )
         .is_err());
+    }
+}
+
+/// 12.5 性能验收（手动执行，默认测试集跳过）
+///
+/// `cargo test --lib perf_save_cluster_samples -- --ignored --nocapture`
+#[cfg(test)]
+mod perf_tests {
+    use super::*;
+    use r2d2_sqlite::SqliteConnectionManager;
+    use std::time::Instant;
+
+    #[test]
+    #[ignore = "性能验收，需手动执行"]
+    fn perf_save_cluster_samples_24h_16_nodes() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "astroman-perf-series-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manager = SqliteConnectionManager::file(dir.join("series.db")).with_init(|conn| {
+            conn.execute_batch(
+                "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;",
+            )
+        });
+        let db: crate::state::DbPool = r2d2::Pool::builder()
+            .max_size(2)
+            .build(manager)
+            .unwrap();
+        {
+            let conn = db.get().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE test_reports (id INTEGER PRIMARY KEY);
+                 INSERT INTO test_reports (id) VALUES (1);
+                 CREATE TABLE cluster_report_samples (
+                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                     report_id   INTEGER NOT NULL REFERENCES test_reports(id) ON DELETE CASCADE,
+                     node        TEXT    NOT NULL,
+                     role        TEXT    NOT NULL DEFAULT 'slave',
+                     elapsed_sec INTEGER NOT NULL,
+                     concurrent  INTEGER DEFAULT 0,
+                     qps         REAL    DEFAULT 0,
+                     p95_rt      REAL    DEFAULT 0,
+                     error_count INTEGER DEFAULT 0
+                 );
+                 CREATE INDEX idx_cluster_samples_report
+                     ON cluster_report_samples(report_id, node, elapsed_sec);",
+            )
+            .unwrap();
+        }
+
+        // 24h 抽稀后的上限：16 节点 × 1800 点 = 28,800 行
+        let series = (0..16u32)
+            .map(|index| crate::services::cluster::protocol::NodeSeries {
+                node: format!("node-{index:02}"),
+                role: if index == 0 { "master".into() } else { "slave".into() },
+                points: (0..1_800u64)
+                    .map(|point| crate::services::cluster::protocol::SeriesPoint {
+                        sec: point * 48,
+                        qps: 100.0,
+                        concurrent: 100,
+                        p95: 20.0,
+                        errors: 0,
+                    })
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+
+        let started = Instant::now();
+        save_cluster_samples(&db, 1, &series).unwrap();
+        let elapsed = started.elapsed();
+        let rows: usize = series.iter().map(|node| node.points.len()).sum();
+        println!("perf_save_cluster_samples: {rows} rows in {elapsed:?}");
+        assert!(rows <= 50_000, "节点序列 {rows} 行超过 50k 目标");
+        assert!(
+            elapsed < std::time::Duration::from_millis(2_000),
+            "写入 {rows} 行耗时 {elapsed:?}，超过 2s 目标"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

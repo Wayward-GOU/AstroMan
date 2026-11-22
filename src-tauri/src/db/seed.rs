@@ -6,6 +6,13 @@ const SAMPLE_PROJECT: &str = "示例项目";
 const ENV_NAME: &str = "本地环境";
 const FIRST_SCENARIO: &str = "01 基础请求";
 const SAMPLE_REQUEST: &str = "示例请求";
+const POOL_EXAMPLE_COLLECTION: &str = "07 数据池示例";
+const SAMPLE_POOL_NAME: &str = "示例账号池（自定义列）";
+const SAMPLE_POOL_PLAN: &str = "示例压测：自定义列数据池";
+const SAMPLE_POOL_SEEDED_KEY: &str = "sample_pool_v20_seeded";
+const SAMPLE_IMPORT_POOL_NAME: &str = "示例参数池（Excel 模板导入）";
+const SAMPLE_IMPORT_PLAN: &str = "示例压测：Excel 导入池（逐请求轮换）";
+const SAMPLE_POOL_FLOW_KEY: &str = "sample_pool_flow_v20_seeded";
 
 struct SeedRequest {
     name: &'static str,
@@ -25,6 +32,55 @@ struct SeedCollection {
 }
 
 const ACCEPT_JSON: &[(&str, &str)] = &[("Accept", "application/json")];
+
+/// 数据池示例请求：演示「全部列同名注入」与「指定列映射」两种绑定
+const POOL_EXAMPLE_REQUESTS: &[SeedRequest] = &[
+    SeedRequest {
+        name: "POST 池账号登录（全部列注入）",
+        method: "POST",
+        url: "{{base_url}}/post",
+        headers: ACCEPT_JSON,
+        params: &[],
+        body_type: "json",
+        body: r#"{
+  "phone": "{{phone}}",
+  "password": "{{password}}",
+  "token": "{{token}}",
+  "mappedToken": "{{demo_token}}",
+  "note": "phone / password / token 来自示例账号池的同一行"
+}"#,
+        pre_script: "",
+        post_script: "",
+    },
+    SeedRequest {
+        name: "GET 指定列映射",
+        method: "GET",
+        url: "{{base_url}}/get",
+        headers: ACCEPT_JSON,
+        params: &[("mapped", "{{demo_token}}"), ("from", "pool")],
+        body_type: "none",
+        body: "",
+        pre_script: "",
+        post_script: "",
+    },
+];
+
+/// 导入流程示例请求：三列都来自「下载模板 → 填表 → 导入」得到的参数池
+const POOL_IMPORT_REQUESTS: &[SeedRequest] = &[SeedRequest {
+    name: "GET Excel 导入列（同名注入）",
+    method: "GET",
+    url: "{{base_url}}/get",
+    headers: ACCEPT_JSON,
+    params: &[
+        ("sku", "{{value}}"),
+        ("region", "{{region}}"),
+        ("level", "{{level}}"),
+    ],
+    body_type: "none",
+    body: "",
+    pre_script: "",
+    post_script: "",
+}];
 
 const SCENARIOS: &[SeedCollection] = &[
     SeedCollection {
@@ -441,6 +497,10 @@ console.log('login_token 已写入运行时变量')"#,
             },
         ],
     },
+    SeedCollection {
+        name: POOL_EXAMPLE_COLLECTION,
+        requests: POOL_EXAMPLE_REQUESTS,
+    },
 ];
 
 const ENV_VARS: &[(&str, &str)] = &[
@@ -740,34 +800,426 @@ fn insert_scenarios(conn: &Connection, project_id: i64) -> Result<(), String> {
 
         let collection_id = conn.last_insert_rowid();
         for (request_index, request) in scenario.requests.iter().enumerate() {
-            let headers =
-                serde_json::to_string(&to_items(request.headers)).map_err(|e| e.to_string())?;
-            let query =
-                serde_json::to_string(&to_items(request.params)).map_err(|e| e.to_string())?;
-
-            conn.execute(
-                "INSERT INTO requests (
-                    collection_id, name, method, url, headers, params, body_type, body,
-                    pre_script, post_script, assertions, sort_order, created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, '[]', ?11, ?12, ?12)",
-                params![
-                    collection_id,
-                    request.name,
-                    request.method,
-                    request.url,
-                    headers,
-                    query,
-                    request.body_type,
-                    request.body,
-                    request.pre_script,
-                    request.post_script,
-                    request_index as i64,
-                    now
-                ],
-            )
-            .map_err(|e| e.to_string())?;
+            insert_request(conn, collection_id, request, request_index as i64, now)?;
         }
     }
+    Ok(())
+}
+
+fn insert_request(
+    conn: &Connection,
+    collection_id: i64,
+    request: &SeedRequest,
+    sort_order: i64,
+    now: i64,
+) -> Result<(), String> {
+    let headers = serde_json::to_string(&to_items(request.headers)).map_err(|e| e.to_string())?;
+    let query = serde_json::to_string(&to_items(request.params)).map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT INTO requests (
+            collection_id, name, method, url, headers, params, body_type, body,
+            pre_script, post_script, assertions, sort_order, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, '[]', ?11, ?12, ?12)",
+        params![
+            collection_id,
+            request.name,
+            request.method,
+            request.url,
+            headers,
+            query,
+            request.body_type,
+            request.body,
+            request.pre_script,
+            request.post_script,
+            sort_order,
+            now
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 数据池示例：自定义列池 + 示例请求 + 示例压测计划。
+///
+/// 只追加一次（app_meta 标记），新库与老库升级都能看到；用户删除后不会再次复活。
+pub fn ensure_sample_pool_examples(conn: &Connection) -> Result<(), String> {
+    if crate::db::meta_get(conn, SAMPLE_POOL_SEEDED_KEY).is_some() {
+        // 已经写过基础示例：仍要检查后面追加的导入 / 轮换流程示例
+        return ensure_sample_pool_flow_examples(conn);
+    }
+
+    let project_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM projects WHERE name = ?1 ORDER BY id ASC LIMIT 1",
+            params![SAMPLE_PROJECT],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some(project_id) = project_id else {
+        mark_sample_pool_seeded(conn)?;
+        return ensure_sample_pool_flow_examples(conn);
+    };
+
+    let now = now_ms();
+    // 1) 示例集合与请求（老库可能还没有 07 集合）
+    let collection_id: i64 = match conn
+        .query_row(
+            "SELECT id FROM collections WHERE project_id = ?1 AND name = ?2 ORDER BY id ASC LIMIT 1",
+            params![project_id, POOL_EXAMPLE_COLLECTION],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+    {
+        Some(id) => id,
+        None => {
+            conn.execute(
+                "INSERT INTO collections (project_id, parent_id, name, sort_order, created_at, updated_at)
+                 VALUES (?1, NULL, ?2, ?3, ?4, ?4)",
+                params![project_id, POOL_EXAMPLE_COLLECTION, (SCENARIOS.len() - 1) as i64, now],
+            )
+            .map_err(|e| e.to_string())?;
+            conn.last_insert_rowid()
+        }
+    };
+    for (index, request) in POOL_EXAMPLE_REQUESTS.iter().enumerate() {
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM requests WHERE collection_id = ?1 AND name = ?2",
+                params![collection_id, request.name],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if exists == 0 {
+            insert_request(conn, collection_id, request, index as i64, now)?;
+        }
+    }
+
+    // 2) 自定义列示例池：phone / password / token 三列，敏感展示
+    insert_sample_pool(
+        conn,
+        SAMPLE_POOL_NAME,
+        "parameter",
+        true,
+        "内置示例：phone / password / token 三列；绑定「全部列（同名注入）」即可在请求里用 {{phone}}、{{password}}、{{token}}",
+        &["phone", "password", "token"],
+        &[
+            &[
+                ("phone", "13800000001"),
+                ("password", "demo-pass-1"),
+                ("token", "demo-token-1"),
+            ],
+            &[
+                ("phone", "13800000002"),
+                ("password", "demo-pass-2"),
+                ("token", "demo-token-2"),
+            ],
+            &[
+                ("phone", "13800000003"),
+                ("password", "demo-pass-3"),
+                ("token", "demo-token-3"),
+            ],
+        ],
+        now,
+    )?;
+
+    // 3) 示例压测计划：绑定「全部列」+ 指定列 token → demo_token
+    insert_sample_plan(
+        conn,
+        project_id,
+        collection_id,
+        SAMPLE_POOL_PLAN,
+        POOL_EXAMPLE_REQUESTS[0].name,
+        serde_json::json!([
+            {
+                "pool": SAMPLE_POOL_NAME,
+                "target": "",
+                "mode": "per_vu",
+                "refreshOn401": false,
+                "column": "*"
+            },
+            {
+                "pool": SAMPLE_POOL_NAME,
+                "target": "demo_token",
+                "mode": "per_vu",
+                "refreshOn401": false,
+                "column": "token"
+            }
+        ]),
+        5,
+        15,
+        3,
+        now,
+    )?;
+
+    mark_sample_pool_seeded(conn)?;
+    // 导入 / 逐请求轮换示例单独标记，已升到 v20 的老库也能补上
+    ensure_sample_pool_flow_examples(conn)
+}
+
+fn mark_sample_pool_seeded(conn: &Connection) -> Result<(), String> {
+    crate::db::meta_set(conn, SAMPLE_POOL_SEEDED_KEY, "1")
+}
+
+/// 导入与逐请求轮换示例：Excel 模板导入得到的参数池 + 每请求轮换的压测计划。
+///
+/// 单独用 app_meta 标记，保证已经升到 v20 的库也能补上；用户删除后不再复活。
+pub fn ensure_sample_pool_flow_examples(conn: &Connection) -> Result<(), String> {
+    if crate::db::meta_get(conn, SAMPLE_POOL_FLOW_KEY).is_some() {
+        return Ok(());
+    }
+    let project_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM projects WHERE name = ?1 ORDER BY id ASC LIMIT 1",
+            params![SAMPLE_PROJECT],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some(project_id) = project_id else {
+        return crate::db::meta_set(conn, SAMPLE_POOL_FLOW_KEY, "1");
+    };
+    let collection_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM collections WHERE project_id = ?1 AND name = ?2 ORDER BY id ASC LIMIT 1",
+            params![project_id, POOL_EXAMPLE_COLLECTION],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some(collection_id) = collection_id else {
+        return crate::db::meta_set(conn, SAMPLE_POOL_FLOW_KEY, "1");
+    };
+
+    let now = now_ms();
+    // 1) 请求：三列都来自导入池，演示「列名即变量名」
+    for (index, request) in POOL_IMPORT_REQUESTS.iter().enumerate() {
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM requests WHERE collection_id = ?1 AND name = ?2",
+                params![collection_id, request.name],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if exists == 0 {
+            insert_request(
+                conn,
+                collection_id,
+                request,
+                (POOL_EXAMPLE_REQUESTS.len() + index) as i64,
+                now,
+            )?;
+        }
+    }
+
+    // 2) 导入池：等价于下载模板后按 value / region / level 填表导入
+    insert_sample_pool(
+        conn,
+        SAMPLE_IMPORT_POOL_NAME,
+        "parameter",
+        false,
+        "内置示例：等同于「下载 Excel 模板 → 填 value / region / level 三列 → 导入」；绑定「全部列（同名注入）」后，请求里可直接用 {{value}}、{{region}}、{{level}}",
+        &["value", "region", "level"],
+        &[
+            &[
+                ("value", "sku-1001"),
+                ("region", "cn-east"),
+                ("level", "gold"),
+            ],
+            &[
+                ("value", "sku-1002"),
+                ("region", "cn-north"),
+                ("level", "silver"),
+            ],
+            &[
+                ("value", "sku-1003"),
+                ("region", "cn-south"),
+                ("level", "gold"),
+            ],
+            &[
+                ("value", "sku-1004"),
+                ("region", "cn-west"),
+                ("level", "bronze"),
+            ],
+        ],
+        now,
+    )?;
+
+    // 3) 计划：逐请求轮换，所有请求共用同一池但每条换一行
+    insert_sample_plan(
+        conn,
+        project_id,
+        collection_id,
+        SAMPLE_IMPORT_PLAN,
+        POOL_IMPORT_REQUESTS[0].name,
+        serde_json::json!([{
+            "pool": SAMPLE_IMPORT_POOL_NAME,
+            "target": "",
+            "mode": "per_request",
+            "refreshOn401": false,
+            "column": "*"
+        }]),
+        8,
+        20,
+        5,
+        now,
+    )?;
+
+    crate::db::meta_set(conn, SAMPLE_POOL_FLOW_KEY, "1")
+}
+
+/// 写入一个自定义列示例池；同名池已存在时跳过，避免覆盖用户数据
+fn insert_sample_pool(
+    conn: &Connection,
+    name: &str,
+    kind: &str,
+    sensitive: bool,
+    description: &str,
+    columns: &[&str],
+    rows: &[&[(&str, &str)]],
+    now: i64,
+) -> Result<(), String> {
+    let exists: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM data_pools WHERE name = ?1",
+            params![name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    if exists.is_some() {
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT INTO data_pools
+            (name, kind, sensitive, description, refresh_mode, refresh_json, columns_json, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, 'none', '{}', ?5, ?6, ?6)",
+        params![
+            name,
+            kind,
+            sensitive as i64,
+            description,
+            serde_json::json!(columns).to_string(),
+            now
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    let pool_id = conn.last_insert_rowid();
+    for row in rows {
+        let value = row.first().map(|(_, value)| *value).unwrap_or_default();
+        let data = row
+            .iter()
+            .map(|(key, value)| (key.to_string(), serde_json::json!(value)))
+            .collect::<serde_json::Map<String, serde_json::Value>>();
+        conn.execute(
+            "INSERT INTO data_pool_items
+                (pool_id, value, account, weight, enabled, created_at, expires_at, cooldown_until, fail_count, last_used_at, data_json)
+             VALUES (?1, ?2, NULL, 1, 1, ?3, 0, 0, 0, 0, ?4)",
+            params![
+                pool_id,
+                value,
+                now,
+                serde_json::Value::Object(data).to_string()
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// 写入一个引用示例请求的压测计划；同名计划已存在时跳过
+#[allow(clippy::too_many_arguments)]
+fn insert_sample_plan(
+    conn: &Connection,
+    project_id: i64,
+    collection_id: i64,
+    plan_name: &str,
+    request_name: &str,
+    bindings: serde_json::Value,
+    concurrent: i64,
+    duration_sec: i64,
+    ramp_up_sec: i64,
+    now: i64,
+) -> Result<(), String> {
+    let exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM test_plans WHERE project_id = ?1 AND name = ?2",
+            params![project_id, plan_name],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if exists > 0 {
+        return Ok(());
+    }
+    let target: Option<(i64, String, String)> = conn
+        .query_row(
+            "SELECT id, method, url FROM requests WHERE collection_id = ?1 AND name = ?2",
+            params![collection_id, request_name],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some((request_id, method, url)) = target else {
+        return Ok(());
+    };
+    let env: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT id, name FROM environments
+             WHERE project_id = ?1 AND is_active = 1 ORDER BY id ASC LIMIT 1",
+            params![project_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let mut config = serde_json::json!({
+        "schemaVersion": 2,
+        "settings": {
+            "mode": "fixed",
+            "recordDetail": "auto",
+            "captureMode": "auto",
+            "topN": 200,
+            "slowThresholdMs": 0,
+            "concurrent": concurrent,
+            "durationSec": duration_sec,
+            "rampUpSec": ramp_up_sec,
+            "thinkTimeMs": 0,
+            "timeoutMs": 30000,
+            "connectTimeoutMs": 10000,
+            "followRedirects": true,
+            "insecure": false,
+            "poolBindings": bindings
+        },
+        "stages": [],
+        "target": {
+            "requestId": request_id,
+            "method": method,
+            "urlTemplate": url,
+            "resolvedUrl": url.replace("{{base_url}}", "https://httpbin.org"),
+            "capturedAt": now,
+        }
+    });
+    if let Some((env_id, env_name)) = env {
+        config["envId"] = serde_json::json!(env_id);
+        config["envName"] = serde_json::json!(env_name);
+    }
+    conn.execute(
+        "INSERT INTO test_plans
+            (project_id, request_id, name, concurrent, duration_sec, ramp_up_sec,
+             think_time_ms, timeout_ms, config_json, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 30000, ?7, ?8, ?8)",
+        params![
+            project_id,
+            request_id,
+            plan_name,
+            concurrent,
+            duration_sec,
+            ramp_up_sec,
+            config.to_string(),
+            now
+        ],
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 

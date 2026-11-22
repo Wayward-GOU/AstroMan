@@ -13,6 +13,15 @@ const errorText = ref('')
 const showHint = ref(false)
 const inputRef = ref<HTMLTextAreaElement | null>(null)
 let composing = false
+let composingEndedAt = 0
+
+function isImeKey(event: KeyboardEvent) {
+  return composing
+    || event.isComposing
+    || event.keyCode === 229
+    || event.key === 'Process'
+    || Date.now() - composingEndedAt < 80
+}
 
 const parsed = computed(() => parseQuickNote(input.value, new Date()))
 const canSave = computed(() => Boolean(input.value.trim()) && Boolean(parsed.value.title.trim()))
@@ -96,7 +105,7 @@ function onKeydown(event: KeyboardEvent) {
     return
   }
   if (event.key === 'Enter' && !event.shiftKey) {
-    if (composing || event.isComposing) return
+    if (isImeKey(event)) return
     event.preventDefault()
     void save()
   }
@@ -104,10 +113,12 @@ function onKeydown(event: KeyboardEvent) {
 
 function onCompositionStart() {
   composing = true
+  composingEndedAt = 0
 }
 
 function onCompositionEnd() {
   composing = false
+  composingEndedAt = Date.now()
 }
 
 async function focusInput() {

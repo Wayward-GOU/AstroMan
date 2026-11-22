@@ -17,8 +17,8 @@ use std::collections::BTreeMap;
 use serde_json::json;
 
 use super::protocol::{
-    ClusterReportMeta, ClusterReportNode, DonePayload, SamplePayload, CLOCK_DROP_UNCERTAINTY_MS,
-    PROTOCOL_VERSION,
+    ClusterReportMeta, ClusterReportNode, DonePayload, NodeSeries, PeakMetric, ReportPeaks,
+    SampleHealth, SamplePayload, SeriesPoint, CLOCK_DROP_UNCERTAINTY_MS, PROTOCOL_VERSION,
 };
 use crate::commands::stress::EngineOutcome;
 use crate::models::{ErrorTypeCount, HistogramBucket, ReportSample, StatusCount, StressReport};
@@ -130,6 +130,7 @@ pub(crate) fn merge(request: MergeRequest) -> MergedReport {
     let mut started: Option<i64> = None;
     let mut ended: Option<i64> = None;
     let mut node_meta: Vec<ClusterReportNode> = Vec::with_capacity(request.nodes.len());
+    let mut node_requests: Vec<(String, u64)> = Vec::with_capacity(request.nodes.len());
 
     for node in &request.nodes {
         // 时钟误差过大时，每秒采样落在错误的时间轴上，只能丢弃曲线数据
@@ -231,7 +232,37 @@ pub(crate) fn merge(request: MergeRequest) -> MergedReport {
             },
             start_ms: node_start.unwrap_or(request.started_at),
             end_ms: node_end.unwrap_or(request.finished_at),
+            peak_qps: node.samples.iter().map(|sample| sample.qps).fold(0.0, f64::max),
+            peak_concurrent: node
+                .samples
+                .iter()
+                .map(|sample| sample.concurrent)
+                .max()
+                .unwrap_or(node.concurrent),
+            share: 0.0,
+            health: node_health(node, node_start, node_end),
         });
+        node_requests.push((
+            node.name.clone(),
+            node.samples
+                .iter()
+                .map(|sample| sample.success_count + sample.error_count)
+                .sum::<u64>(),
+        ));
+    }
+
+    // 贡献占比：基于各节点累计请求数
+    for node in &mut node_meta {
+        let requests = node_requests
+            .iter()
+            .find(|(name, _)| name == &node.name)
+            .map(|(_, count)| *count)
+            .unwrap_or(0);
+        node.share = if total > 0 {
+            requests as f64 / total as f64
+        } else {
+            0.0
+        };
     }
 
     let samples = seconds
@@ -278,6 +309,7 @@ pub(crate) fn merge(request: MergeRequest) -> MergedReport {
         .map(|value| *value as f64)
         .unwrap_or(0.0);
 
+    let peaks = build_peaks(&samples, start_ms);
     let report = StressReport {
         id: 0,
         plan_id: request.plan_id,
@@ -311,6 +343,8 @@ pub(crate) fn merge(request: MergeRequest) -> MergedReport {
         },
         concurrency: request.total_concurrent as i64,
         status: if stopped { "stopped" } else { "completed" }.to_string(),
+        is_cluster: true,
+        peak_qps: peaks.qps.value,
         start_time: Some(start_ms),
         end_time: Some(end_ms),
         created_at: end_ms,
@@ -329,6 +363,7 @@ pub(crate) fn merge(request: MergeRequest) -> MergedReport {
         .find(|node| node.role == "master")
         .map(|node| node.name.clone())
         .unwrap_or_else(|| "master".to_string());
+    let node_series = build_node_series(&request.nodes);
     let meta = ClusterReportMeta {
         protocol_version: PROTOCOL_VERSION,
         master_node,
@@ -338,6 +373,8 @@ pub(crate) fn merge(request: MergeRequest) -> MergedReport {
         finished_at: end_ms,
         dropped_samples,
         nodes: node_meta,
+        peaks: Some(peaks),
+        node_series,
         note: request.note.clone(),
     };
 
@@ -345,6 +382,17 @@ pub(crate) fn merge(request: MergeRequest) -> MergedReport {
         serde_json::from_str(&request.config_snapshot).unwrap_or_else(|_| json!({}));
     if let Some(map) = config.as_object_mut() {
         map.insert("mode".to_string(), json!("cluster"));
+        // 池统计：合并所有节点回传的计数；旧节点没有回传时保留主节点快照并标注范围
+        let pools = merged_pools(&request.nodes);
+        if !pools.is_empty() {
+            map.insert("pools".to_string(), json!(pools));
+        } else if let Some(pools) = map.get_mut("pools").and_then(|value| value.as_array_mut()) {
+            for pool in pools {
+                if let Some(pool) = pool.as_object_mut() {
+                    pool.insert("nodeScope".to_string(), json!("master"));
+                }
+            }
+        }
         map.insert(
             "cluster".to_string(),
             serde_json::to_value(&meta).unwrap_or_else(|_| json!({})),
@@ -371,15 +419,124 @@ pub(crate) fn merge(request: MergeRequest) -> MergedReport {
     }
 }
 
+/// 合并各节点回传的池统计：同池按键累加，条目按下标累加，并记录贡献节点
+///
+/// `items` 取各节点最大值而不是求和：`per_vu` 模式下每个节点都持有完整池，
+/// 求和会把池容量放大 N 倍。`used / requests / refreshed` 是各节点实际用量，求和。
+fn merged_pools(nodes: &[MergeNode]) -> Vec<serde_json::Value> {
+    #[derive(Default)]
+    struct Agg {
+        items: i64,
+        used: i64,
+        requests: i64,
+        refreshed: i64,
+        unauthorized: i64,
+        invalid: i64,
+        cooling: i64,
+        exhausted: bool,
+        per_item: BTreeMap<i64, i64>,
+        nodes: Vec<String>,
+        by_node: BTreeMap<String, [i64; 3]>,
+    }
+
+    let mut merged: BTreeMap<String, Agg> = BTreeMap::new();
+    for node in nodes {
+        let Some(done) = &node.done else {
+            continue;
+        };
+        for pool in &done.pools {
+            let Some(name) = pool.get("name").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            let name = name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            let agg = merged.entry(name.to_string()).or_default();
+            if !agg.nodes.iter().any(|item| item == &node.name) {
+                agg.nodes.push(node.name.clone());
+            }
+            let count = |key: &str| pool.get(key).and_then(|value| value.as_i64()).unwrap_or(0);
+            agg.items = agg.items.max(count("items"));
+            agg.used += count("used");
+            agg.requests += count("requests");
+            agg.refreshed += count("refreshed");
+            agg.unauthorized += count("unauthorized");
+            agg.invalid += count("invalid");
+            agg.cooling += count("cooling");
+            let node_stats = agg.by_node.entry(node.name.clone()).or_insert([0; 3]);
+            node_stats[0] += count("used");
+            node_stats[1] += count("requests");
+            node_stats[2] += count("refreshed");
+            if pool
+                .get("exhausted")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+            {
+                agg.exhausted = true;
+            }
+            if let Some(items) = pool.get("perItem").and_then(|value| value.as_array()) {
+                for item in items {
+                    let Some(index) = item.get("index").and_then(|value| value.as_i64()) else {
+                        continue;
+                    };
+                    let requests = item
+                        .get("requests")
+                        .and_then(|value| value.as_i64())
+                        .unwrap_or(0);
+                    *agg.per_item.entry(index).or_insert(0) += requests;
+                }
+            }
+        }
+    }
+
+    merged
+        .into_iter()
+        .map(|(name, agg)| {
+            let per_item: Vec<serde_json::Value> = agg
+                .per_item
+                .into_iter()
+                .map(|(index, requests)| json!({ "index": index, "requests": requests }))
+                .collect();
+            let by_node: Vec<serde_json::Value> = agg
+                .by_node
+                .into_iter()
+                .map(|(name, stats)| {
+                    json!({
+                        "name": name,
+                        "used": stats[0],
+                        "requests": stats[1],
+                        "refreshed": stats[2],
+                    })
+                })
+                .collect();
+            json!({
+                "name": name,
+                "items": agg.items,
+                "used": agg.used,
+                "requests": agg.requests,
+                "refreshed": agg.refreshed,
+                "unauthorized": agg.unauthorized,
+                "invalid": agg.invalid,
+                "cooling": agg.cooling,
+                "exhausted": agg.exhausted,
+                "perItem": per_item,
+                "nodeScope": "cluster",
+                "nodes": agg.nodes,
+                "byNode": by_node,
+            })
+        })
+        .collect()
+}
+
 /// 主节点本地引擎结果转 `DonePayload`：时间按本地时钟（偏移 0）直接使用
 pub(crate) fn done_from_outcome(outcome: &EngineOutcome) -> DonePayload {
     let report = &outcome.report;
     let end_ms = report.end_time.unwrap_or(report.created_at);
     let start_ms = report.start_time.unwrap_or(end_ms);
-    let runtime = serde_json::from_str::<serde_json::Value>(&outcome.config_snapshot)
-        .ok()
-        .and_then(|value| value.get("metrics").cloned())
-        .unwrap_or_else(|| json!({}));
+    let snapshot = serde_json::from_str::<serde_json::Value>(&outcome.config_snapshot)
+        .unwrap_or_else(|_| json!({}));
+    let runtime = snapshot.get("metrics").cloned().unwrap_or_else(|| json!({}));
     DonePayload {
         start_ms,
         end_ms,
@@ -409,6 +566,11 @@ pub(crate) fn done_from_outcome(outcome: &EngineOutcome) -> DonePayload {
         errors_dropped: outcome.sparse.errors_dropped,
         records_dropped: outcome.sparse.records_dropped,
         dropped_samples: 0,
+        pools: snapshot
+            .get("pools")
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default(),
     }
 }
 
@@ -431,6 +593,220 @@ fn node_qps(node: &MergeNode) -> f64 {
         .map(|sample| sample.success_count + sample.error_count)
         .sum();
     requests as f64 / span
+}
+
+/// 采集健康度快照：报告只关心「是否完整」，实时态由主节点会话维护
+fn node_health(node: &MergeNode, start_ms: Option<i64>, end_ms: Option<i64>) -> SampleHealth {
+    let received = node.samples.len() as u64;
+    let lost = node
+        .done
+        .as_ref()
+        .map(|done| done.dropped_samples)
+        .unwrap_or(0);
+    let expected = received.saturating_add(lost);
+    let state = if node.done.is_some() {
+        if lost > 0 {
+            "gap"
+        } else {
+            "done"
+        }
+    } else {
+        "lost"
+    };
+    SampleHealth {
+        state: state.to_string(),
+        first_sample_ms: start_ms,
+        last_sample_ms: end_ms,
+        expected,
+        received,
+        lost,
+        gap_sec: if node.done.is_some() { 0 } else { 1 },
+        message: if node.done.is_none() {
+            Some("节点失联，曲线只到最后一个采样".to_string())
+        } else if lost > 0 {
+            Some(format!("丢失 {lost} 个采样点"))
+        } else {
+            None
+        },
+    }
+}
+
+/// 每秒采样里的 P95（毫秒）
+fn sample_p95(sample: &SamplePayload) -> f64 {
+    let total: u64 = sample.latency_buckets.iter().map(|(_, count)| *count).sum();
+    if total == 0 {
+        return 0.0;
+    }
+    let target = ((total as f64) * 0.95).ceil() as u64;
+    let mut seen = 0u64;
+    for (ms, count) in &sample.latency_buckets {
+        seen += *count;
+        if seen >= target {
+            return *ms as f64;
+        }
+    }
+    sample
+        .latency_buckets
+        .last()
+        .map(|(ms, _)| *ms as f64)
+        .unwrap_or(sample.avg_rt)
+}
+
+/// 峰值指标专题：峰值、出现时刻、平台期
+///
+/// 单机压测也复用该函数，保证「报告页 / 导出 / AI」与集群同一口径。
+pub(crate) fn build_peaks(samples: &[ReportSample], start_ms: i64) -> ReportPeaks {
+    fn metric(start_ms: i64, values: impl Iterator<Item = (usize, u64, f64)>) -> (usize, PeakMetric) {
+        let mut best = (0usize, 0u64, 0.0f64);
+        for (index, second, value) in values {
+            if value > best.2 {
+                best = (index, second, value);
+            }
+        }
+        (
+            best.0,
+            PeakMetric {
+                value: best.2,
+                at_ms: start_ms + best.1.saturating_mul(1000) as i64,
+                second: best.1,
+                held_sec: 0,
+                top_node: None,
+            },
+        )
+    }
+    let qps = metric(
+        start_ms,
+        samples
+            .iter()
+            .enumerate()
+            .map(|(index, sample)| (index, sample.elapsed_sec, sample.qps)),
+    );
+    let concurrent = metric(
+        start_ms,
+        samples
+            .iter()
+            .enumerate()
+            .map(|(index, sample)| (index, sample.elapsed_sec, sample.concurrent as f64)),
+    );
+    let bandwidth = metric(
+        start_ms,
+        samples
+            .iter()
+            .enumerate()
+            .map(|(index, sample)| (index, sample.elapsed_sec, sample.bytes as f64)),
+    );
+    let p95 = metric(
+        start_ms,
+        samples
+            .iter()
+            .enumerate()
+            .map(|(index, sample)| (index, sample.elapsed_sec, sample.p95_rt)),
+    );
+    let p99 = metric(
+        start_ms,
+        samples
+            .iter()
+            .enumerate()
+            .map(|(index, sample)| (index, sample.elapsed_sec, sample.p99_rt)),
+    );
+    let error_rate = metric(start_ms, samples.iter().enumerate().map(|(index, sample)| {
+        let total = sample.success_count + sample.error_count;
+        (
+            index,
+            sample.elapsed_sec,
+            if total > 0 {
+                sample.error_count as f64 / total as f64
+            } else {
+                0.0
+            },
+        )
+    }));
+
+    // 平台期：从峰值点向两侧扩展，统计 ≥ 峰值 98% 的连续秒数
+    fn hold(
+        samples: &[ReportSample],
+        index: usize,
+        peak: f64,
+        pick: impl Fn(&ReportSample) -> f64,
+    ) -> u64 {
+        if peak <= 0.0 || samples.is_empty() {
+            return 0;
+        }
+        let threshold = peak * 0.98;
+        let mut count = 1u64;
+        let mut left = index;
+        while left > 0 && pick(&samples[left - 1]) >= threshold {
+            count += 1;
+            left -= 1;
+        }
+        let mut right = index;
+        while right + 1 < samples.len() && pick(&samples[right + 1]) >= threshold {
+            count += 1;
+            right += 1;
+        }
+        count
+    }
+    let mut qps_peak = qps.1;
+    qps_peak.held_sec = hold(samples, qps.0, qps_peak.value, |sample| sample.qps);
+    let mut concurrent_peak = concurrent.1;
+    concurrent_peak.held_sec = hold(samples, concurrent.0, concurrent_peak.value, |sample| {
+        sample.concurrent as f64
+    });
+    let mut bandwidth_peak = bandwidth.1;
+    bandwidth_peak.held_sec = hold(samples, bandwidth.0, bandwidth_peak.value, |sample| {
+        sample.bytes as f64
+    });
+    let mut p95_peak = p95.1;
+    p95_peak.held_sec = hold(samples, p95.0, p95_peak.value, |sample| sample.p95_rt);
+    let mut p99_peak = p99.1;
+    p99_peak.held_sec = hold(samples, p99.0, p99_peak.value, |sample| sample.p99_rt);
+    let mut error_peak = error_rate.1;
+    error_peak.held_sec = hold(samples, error_rate.0, error_peak.value, |sample| {
+        let total = sample.success_count + sample.error_count;
+        if total > 0 {
+            sample.error_count as f64 / total as f64
+        } else {
+            0.0
+        }
+    });
+
+    ReportPeaks {
+        qps: qps_peak,
+        concurrent: concurrent_peak,
+        bandwidth: bandwidth_peak,
+        p95: p95_peak,
+        p99: p99_peak,
+        error_rate: error_peak,
+    }
+}
+
+/// 节点级序列（抽稀到最多约 1800 点）
+fn build_node_series(nodes: &[MergeNode]) -> Vec<NodeSeries> {
+    const MAX_POINTS: usize = 1800;
+    nodes
+        .iter()
+        .filter(|node| !node.samples.is_empty())
+        .map(|node| {
+            let step = (node.samples.len() / MAX_POINTS).max(1);
+            let points = node
+                .samples
+                .iter()
+                .step_by(step)
+                .map(|sample| SeriesPoint {
+                    sec: sample.elapsed_sec,
+                    qps: sample.qps,
+                    concurrent: sample.concurrent,
+                    p95: sample_p95(sample),
+                    errors: sample.error_count,
+                })
+                .collect();
+            NodeSeries {
+                node: node.name.clone(),
+                role: node.role.clone(),
+                points,
+            }
+        })
+        .collect()
 }
 
 fn ratio(sum: u64, count: u64) -> f64 {
@@ -560,6 +936,7 @@ mod tests {
             errors_dropped: 0,
             records_dropped: 0,
             dropped_samples: 0,
+            pools: Vec::new(),
         }
     }
 
@@ -748,6 +1125,7 @@ mod tests {
                 run_group_id: None,
                 plan_name: "local".to_string(),
                 request_id: None,
+                peak_qps: 0.0,
                 total_requests: 10,
                 success_count: 9,
                 error_count: 1,
@@ -771,6 +1149,7 @@ mod tests {
                 error_rate: 10.0,
                 concurrency: 8,
                 status: "stopped".to_string(),
+                is_cluster: true,
                 start_time: Some(5_000),
                 end_time: Some(9_000),
                 created_at: 9_000,
@@ -813,5 +1192,137 @@ mod tests {
         assert_eq!(payload.mem_peak_mb, 256);
         assert_eq!(payload.total, 10);
         assert_eq!(payload.latency_buckets, vec![(10, 10)]);
+    }
+
+    #[test]
+    fn build_peaks_reports_peak_time_and_plateau() {
+        let sample = |sec: u64, qps: f64, concurrent: u32| ReportSample {
+            elapsed_sec: sec,
+            concurrent,
+            qps,
+            avg_rt: 20.0,
+            p50_rt: 10.0,
+            p95_rt: 50.0,
+            p99_rt: 100.0,
+            ttfb_avg: 5.0,
+            body_avg: 15.0,
+            body_p95: 40.0,
+            bytes: 1_000,
+            success_count: 10,
+            error_count: 0,
+        };
+        let samples = vec![
+            sample(1, 10.0, 10),
+            sample(2, 100.0, 20),
+            sample(3, 99.0, 20),
+            sample(4, 98.0, 20),
+            sample(5, 5.0, 10),
+        ];
+        let peaks = build_peaks(&samples, 1_000);
+        assert!((peaks.qps.value - 100.0).abs() < f64::EPSILON);
+        assert_eq!(peaks.qps.second, 2);
+        assert_eq!(peaks.qps.at_ms, 3_000);
+        // 峰值点及其两侧 ≥ 98% 的连续区间：100 / 99 / 98 共 3 秒
+        assert_eq!(peaks.qps.held_sec, 3);
+        assert_eq!(peaks.concurrent.value, 20.0);
+        assert_eq!(peaks.concurrent.held_sec, 3);
+    }
+
+    #[test]
+    fn merges_pool_stats_across_nodes() {
+        let mut master = done(10, vec![(20, 10)]);
+        master.pools = vec![json!({
+            "name": "tokens",
+            "items": 100,
+            "used": 10,
+            "requests": 40,
+            "refreshed": 1,
+            "unauthorized": 0,
+            "invalid": 0,
+            "cooling": 0,
+            "exhausted": false,
+            "perItem": [{ "index": 1, "requests": 10 }],
+        })];
+        let mut slave = done(10, vec![(20, 10)]);
+        slave.pools = vec![json!({
+            "name": "tokens",
+            "items": 100,
+            "used": 6,
+            "requests": 30,
+            "refreshed": 2,
+            "unauthorized": 1,
+            "invalid": 0,
+            "cooling": 0,
+            "exhausted": true,
+            "perItem": [{ "index": 1, "requests": 5 }],
+        })];
+        let mut master = node("master", vec![], Some(master));
+        master.role = "master".to_string();
+        let merged = merge(request(vec![master, node("slave-a", vec![], Some(slave))]));
+        let config: serde_json::Value = serde_json::from_str(&merged.config_snapshot).unwrap();
+        let pool = &config["pools"][0];
+        assert_eq!(pool["name"], "tokens");
+        // 条目取最大值（per_vu 下每节点持有完整池），用量求和
+        assert_eq!(pool["items"], 100);
+        assert_eq!(pool["used"], 16);
+        assert_eq!(pool["requests"], 70);
+        assert_eq!(pool["refreshed"], 3);
+        assert_eq!(pool["unauthorized"], 1);
+        assert_eq!(pool["exhausted"], true);
+        assert_eq!(pool["nodeScope"], "cluster");
+        assert_eq!(pool["byNode"].as_array().unwrap().len(), 2);
+        assert_eq!(pool["perItem"][0]["requests"], 15);
+    }
+}
+
+/// 12.5 性能验收（手动执行，默认测试集跳过）
+///
+/// `cargo test --lib perf_node_series_24h_16_nodes -- --ignored --nocapture`
+#[cfg(test)]
+mod perf_tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    #[ignore = "性能验收，需手动执行"]
+    fn perf_node_series_24h_16_nodes() {
+        // 24 小时 = 86,400 秒；16 个节点，每个节点每秒一条采样
+        let nodes = (0..16u32)
+            .map(|index| MergeNode {
+                name: format!("node-{index:02}"),
+                role: if index == 0 { "master".into() } else { "slave".into() },
+                addr: format!("192.168.1.{}:17801", index + 10),
+                weight: 1.0,
+                concurrent: 100,
+                status: "done".into(),
+                clock_offset_ms: 0.0,
+                clock_uncertainty_ms: 0.0,
+                samples: (0..86_400u64)
+                    .map(|sec| SamplePayload {
+                        elapsed_sec: sec,
+                        concurrent: 100,
+                        qps: 100.0,
+                        avg_rt: 20.0,
+                        ttfb_avg: 10.0,
+                        body_avg: 5.0,
+                        bytes: 10_000,
+                        success_count: 100,
+                        error_count: 0,
+                        sum_rt_ms: 2_000,
+                        sum_ttfb_ms: 1_000,
+                        latency_buckets: Vec::new(),
+                    })
+                    .collect(),
+                done: None,
+            })
+            .collect::<Vec<_>>();
+
+        let started = Instant::now();
+        let series = build_node_series(&nodes);
+        let elapsed = started.elapsed();
+        let rows: usize = series.iter().map(|node| node.points.len()).sum();
+        println!("perf_node_series_24h_16_nodes: {rows} points in {elapsed:?}");
+        assert_eq!(series.len(), 16);
+        assert!(rows <= 50_000, "节点序列 {rows} 行超过 50k 目标");
     }
 }

@@ -33,6 +33,14 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// 归一化集群变量策略：master_wins（默认）/ local_wins
+pub fn normalize_var_policy(value: Option<&str>) -> &'static str {
+    match value.map(|value| value.trim().to_ascii_lowercase()).as_deref() {
+        Some("local_wins") => "local_wins",
+        _ => "master_wins",
+    }
+}
+
 /// 统一的错误转字符串，方便直接返回给前端展示。
 ///
 /// SQLite 的写锁冲突统一收口成 `E_BUSY`：GUI 与 CLI 是独立进程，
@@ -58,6 +66,7 @@ pub fn is_db_busy(text: &str) -> bool {
 ///
 /// Windows 上 `reg`、`certutil`、`icacls` 这类控制台程序默认会闪一个黑窗；
 /// 定时轮询证书状态时会被用户看成“狂弹 CMD”，统一加上 `CREATE_NO_WINDOW`。
+#[cfg(windows)]
 pub fn hidden_command(program: &str) -> std::process::Command {
     #[allow(unused_mut)]
     let mut command = std::process::Command::new(program);
@@ -176,6 +185,16 @@ fn resolve_expr(
             return value.clone();
         }
         return format!("{{{{secret:{secret_expr}}}}}");
+    }
+
+    // {{os:NAME}}：值由调用方按白名单预先注入到 vars，不在此处直读进程环境
+    if let Some(os_expr) = expr.strip_prefix("os:") {
+        let os_expr = os_expr.trim();
+        let name = os_expr.strip_prefix('$').unwrap_or(os_expr);
+        if let Some(value) = vars.get(name) {
+            return value.clone();
+        }
+        return format!("{{{{os:{name}}}}}");
     }
 
     // {{faker:name}} / {{faker:int(1,100)}}：每次渲染重新取值（G-05）
@@ -392,6 +411,179 @@ pub fn is_builtin_placeholder(name: &str) -> bool {
                 | "randomInt"
                 | "randomString"
         )
+}
+
+/* ---------- v1.1.2 占位符分类 ---------- */
+
+/// 占位符类型：决定它是否需要用户提供、由谁生成
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaceholderKind {
+    /// `{{host}}`：需要用户/环境提供
+    User,
+    /// `{{secret:TOKEN}}`：需要 TOKEN，输出时登记脱敏
+    Secret,
+    /// `{{os:USER}}`：从本机 OS 环境读取（需白名单）
+    Os,
+    /// `{{pool:token}}`：由数据池运行期注入
+    Pool,
+    /// `{{faker:name}}`：各节点本地生成
+    Faker,
+    /// `{{randomInt(1,9)}}`：各节点本地生成
+    Function,
+    /// `{{$timestamp}}` / `{{uuid}}`：各节点本地生成
+    Builtin,
+}
+
+/// 把 `{{...}}` 中的表达式分类，并返回归一化后的变量名
+///
+/// 例：`secret:TOKEN` → (Secret, "TOKEN")；`os:USER` → (Os, "USER")；
+/// `pool:token` → (Pool, "token")；`$timestamp` → (Builtin, "timestamp")。
+pub fn classify_placeholder(expr: &str) -> (PlaceholderKind, String) {
+    let trimmed = expr.trim();
+    let bare = trimmed.strip_prefix('$').unwrap_or(trimmed);
+    if let Some(name) = bare.strip_prefix("secret:") {
+        return (PlaceholderKind::Secret, name.trim().to_string());
+    }
+    if let Some(name) = bare.strip_prefix("os:") {
+        return (PlaceholderKind::Os, name.trim().to_string());
+    }
+    if let Some(name) = bare.strip_prefix("pool:") {
+        return (PlaceholderKind::Pool, name.trim().to_string());
+    }
+    if bare.starts_with("faker:") {
+        return (PlaceholderKind::Faker, bare.to_string());
+    }
+    if bare.contains('(') {
+        return (PlaceholderKind::Function, bare.to_string());
+    }
+    if is_builtin_placeholder(bare) {
+        return (PlaceholderKind::Builtin, bare.to_string());
+    }
+    (PlaceholderKind::User, bare.to_string())
+}
+
+/// 一段模板里出现的变量分类结果
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequiredVars {
+    pub user: Vec<String>,
+    pub secret: Vec<String>,
+    pub os: Vec<String>,
+    pub pools: Vec<String>,
+}
+
+impl RequiredVars {
+    fn push_unique(target: &mut Vec<String>, value: String) {
+        if !value.is_empty() && !target.contains(&value) {
+            target.push(value);
+        }
+    }
+
+    fn merge(&mut self, other: RequiredVars) {
+        for item in other.user {
+            Self::push_unique(&mut self.user, item);
+        }
+        for item in other.secret {
+            Self::push_unique(&mut self.secret, item);
+        }
+        for item in other.os {
+            Self::push_unique(&mut self.os, item);
+        }
+        for item in other.pools {
+            Self::push_unique(&mut self.pools, item);
+        }
+    }
+}
+
+/// 扫描一段文本中的全部 `{{...}}`，按类型归类
+pub fn required_vars_in_text(input: &str) -> RequiredVars {
+    let mut result = RequiredVars::default();
+    let mut rest = input;
+    while let Some(start) = rest.find("{{") {
+        let Some(end_rel) = rest[start + 2..].find("}}") else {
+            break;
+        };
+        let expr = rest[start + 2..start + 2 + end_rel].trim();
+        let (kind, name) = classify_placeholder(expr);
+        match kind {
+            PlaceholderKind::User => RequiredVars::push_unique(&mut result.user, name),
+            PlaceholderKind::Secret => RequiredVars::push_unique(&mut result.secret, name),
+            PlaceholderKind::Os => RequiredVars::push_unique(&mut result.os, name),
+            PlaceholderKind::Pool => RequiredVars::push_unique(&mut result.pools, name),
+            _ => {}
+        }
+        rest = &rest[start + 2 + end_rel + 2..];
+    }
+    result
+}
+
+/// 合并多段模板的变量分类
+pub fn required_vars_in_texts<'a>(texts: impl IntoIterator<Item = &'a str>) -> RequiredVars {
+    let mut result = RequiredVars::default();
+    for text in texts {
+        result.merge(required_vars_in_text(text));
+    }
+    result
+}
+
+/// 递归扫描 JSON 中所有字符串值，得到变量分类
+pub fn required_vars_in_json(value: &serde_json::Value) -> RequiredVars {
+    let mut result = RequiredVars::default();
+    fn walk(value: &serde_json::Value, result: &mut RequiredVars) {
+        match value {
+            serde_json::Value::String(text) => result.merge(required_vars_in_text(text)),
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, result);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for item in map.values() {
+                    walk(item, result);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(value, &mut result);
+    result
+}
+
+/// 判断 OS 环境变量是否在允许清单内
+///
+/// 规则：逗号分隔；`*` 允许全部；`PREFIX*` 前缀匹配；其余按名称精确匹配（大小写敏感）。
+pub fn os_var_allowed(allow: &str, name: &str) -> bool {
+    allow.split(',').any(|item| {
+        let item = item.trim();
+        if item.is_empty() {
+            return false;
+        }
+        if item == "*" {
+            return true;
+        }
+        match item.strip_suffix('*') {
+            Some(prefix) => !prefix.is_empty() && name.starts_with(prefix),
+            None => item == name,
+        }
+    })
+}
+
+/// 敏感值掩码：长 token 保留前 6 后 4，短值只保留前 2
+pub fn mask_secret_value(value: &str) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    let len = chars.len();
+    if len == 0 {
+        return "***".to_string();
+    }
+    if len > 16 {
+        let head: String = chars[..6].iter().collect();
+        let tail: String = chars[len - 4..].iter().collect();
+        return format!("{head}...{tail}");
+    }
+    if len > 4 {
+        let head: String = chars[..2].iter().collect();
+        return format!("{head}***");
+    }
+    "***".to_string()
 }
 
 fn int_args(inner: &str) -> Option<Vec<i64>> {

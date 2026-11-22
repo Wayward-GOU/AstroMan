@@ -1,6 +1,16 @@
 import { describe, expect, it } from 'vitest'
 import type { ReportDetail, ReportSample, StageSummary } from '@/types/models'
-import { detectKnee, downsample, percentile, qpsOverview, qpsP10, scoreReport, selfCheck } from './reportAnalytics'
+import type { ReportPeaks } from '@/types/cluster'
+import {
+  detectKnee,
+  downsample,
+  percentile,
+  qpsOverview,
+  qpsP10,
+  reportPeaks,
+  scoreReport,
+  selfCheck,
+} from './reportAnalytics'
 
 function sample(elapsedSec: number, qps: number, p95: number): ReportSample {
   return {
@@ -185,4 +195,42 @@ describe('reportAnalytics', () => {
     expect(result[0]).toBe(0)
     expect(result[result.length - 1]).toBe(999)
   })
+
+  it('峰值专题：集群报告优先取 cluster.peaks', () => {
+    const clusterPeaks = peaks(2400, 120)
+    const singlePeaks = peaks(1800, 100)
+    const data = detail({
+      config: {
+        cluster: { peaks: clusterPeaks },
+        metricsPeaks: singlePeaks,
+      } as never,
+    })
+    expect(reportPeaks(data)).toBe(clusterPeaks)
+  })
+
+  it('峰值专题：单机报告回退 metricsPeaks，旧报告返回 null', () => {
+    const singlePeaks = peaks(1800, 100)
+    expect(reportPeaks(detail({ config: { metricsPeaks: singlePeaks } as never }))).toBe(singlePeaks)
+    expect(reportPeaks(detail({ config: {} as never }))).toBeNull()
+    expect(reportPeaks(detail({ config: null }))).toBeNull()
+  })
 })
+
+/** 构造一份完整的峰值专题，便于断言「集群优先 / 单机回退」 */
+function peaks(qps: number, concurrent: number): ReportPeaks {
+  const metric = (value: number, second: number, heldSec: number, topNode?: string) => ({
+    value,
+    atMs: second * 1000,
+    second,
+    heldSec,
+    topNode: topNode ?? null,
+  })
+  return {
+    qps: metric(qps, 30, 8, 'node-a'),
+    concurrent: metric(concurrent, 30, 8),
+    bandwidth: metric(1024 * 1024, 30, 6),
+    p95: metric(80, 30, 4),
+    p99: metric(160, 30, 3),
+    errorRate: metric(0.5, 30, 2),
+  }
+}

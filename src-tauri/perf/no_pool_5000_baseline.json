@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "fingerprint": "macos-aarch64-10-debug",
+  "medianQps": 12238.0,
+  "recordedAtUnix": 1795166392,
+  "workload": "GET /api/v1/{{tenant}}/items + 2 params + 8 headers, 64 workers, 3x1s windows"
+}

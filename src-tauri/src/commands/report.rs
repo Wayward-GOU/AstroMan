@@ -48,6 +48,8 @@ fn map_report(row: &Row<'_>) -> rusqlite::Result<StressReport> {
         error_rate: row.get(23)?,
         concurrency: row.get(24)?,
         status: row.get(25)?,
+        is_cluster: false,
+        peak_qps: 0.0,
         start_time: row.get(26)?,
         end_time: row.get(27)?,
         created_at: row.get(28)?,
@@ -64,6 +66,34 @@ fn parse_list<T: serde::de::DeserializeOwned>(raw: Option<String>) -> Vec<T> {
 fn parse_value(raw: Option<String>) -> Option<Value> {
     raw.and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .filter(|value| !value.is_null())
+}
+
+/// 从配置快照读取峰值 QPS：集群优先 config.cluster.peaks，单机读 config.metricsPeaks
+fn peak_qps_config(raw: Option<&str>) -> f64 {
+    raw.and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .and_then(|value| {
+            let peaks = value
+                .get("cluster")
+                .and_then(|cluster| cluster.get("peaks"))
+                .or_else(|| value.get("metricsPeaks"));
+            peaks
+                .and_then(|peaks| peaks.get("qps"))
+                .and_then(|qps| qps.get("value"))
+                .and_then(|value| value.as_f64())
+        })
+        .unwrap_or(0.0)
+}
+
+/// 报告配置里的 mode 为 cluster 时说明来自集群压测
+fn is_cluster_config(raw: Option<&str>) -> bool {
+    raw.and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .and_then(|value| {
+            value
+                .get("mode")
+                .and_then(|mode| mode.as_str())
+                .map(|mode| mode == "cluster")
+        })
+        .unwrap_or(false)
 }
 
 fn load_detail(conn: &rusqlite::Connection, id: i64) -> Result<ReportDetail, String> {
@@ -98,6 +128,10 @@ fn load_detail(conn: &rusqlite::Connection, id: i64) -> Result<ReportDetail, Str
             rusqlite::Error::QueryReturnedNoRows => "报告不存在".to_string(),
             other => err(other),
         })?;
+
+    let mut report = report;
+    report.is_cluster = is_cluster_config(config_text.as_deref());
+    report.peak_qps = peak_qps_config(config_text.as_deref());
 
     let mut sample_stmt = conn
         .prepare(
@@ -224,9 +258,19 @@ pub fn report_list(
 ) -> Result<Vec<StressReport>, String> {
     let limit = limit.unwrap_or(100).clamp(1, 500) as i64;
     let conn = state.pool.get().map_err(err)?;
-    let sql = format!("SELECT {REPORT_COLUMNS} FROM test_reports ORDER BY id DESC LIMIT ?1");
+    let sql = format!(
+        "SELECT {REPORT_COLUMNS}, config_json FROM test_reports ORDER BY id DESC LIMIT ?1"
+    );
     let mut stmt = conn.prepare(&sql).map_err(err)?;
-    let rows = stmt.query_map(params![limit], map_report).map_err(err)?;
+    let rows = stmt
+        .query_map(params![limit], |row| {
+            let mut report = map_report(row)?;
+            let config = row.get::<_, Option<String>>(31)?;
+            report.is_cluster = is_cluster_config(config.as_deref());
+            report.peak_qps = peak_qps_config(config.as_deref());
+            Ok(report)
+        })
+        .map_err(err)?;
     rows.collect::<rusqlite::Result<Vec<_>>>().map_err(err)
 }
 
@@ -234,6 +278,96 @@ pub fn report_list(
 pub fn report_get(state: State<'_, AppState>, id: i64) -> Result<ReportDetail, String> {
     let conn = state.pool.get().map_err(err)?;
     load_detail(&conn, id)
+}
+
+/// 节点级曲线的一个采样点
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportNodePoint {
+    pub sec: u64,
+    pub qps: f64,
+    pub concurrent: u32,
+    pub p95: f64,
+    pub errors: u64,
+}
+
+/// 一份报告内某个节点的曲线
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportNodeSeriesItem {
+    pub report_id: i64,
+    pub node: String,
+    pub role: String,
+    pub points: Vec<ReportNodePoint>,
+}
+
+/// 跨报告按节点查询曲线（v19）：不传报告时取最近 20 份
+#[tauri::command]
+pub fn report_node_series(
+    state: State<'_, AppState>,
+    report_ids: Option<Vec<i64>>,
+    node: Option<String>,
+) -> Result<Vec<ReportNodeSeriesItem>, String> {
+    let conn = state.pool.get().map_err(err)?;
+    let ids: Vec<i64> = report_ids
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|id| *id > 0)
+        .take(100)
+        .collect();
+    let mut sql = String::from(
+        "SELECT report_id, node, role, elapsed_sec, qps, concurrent, p95_rt, error_count
+         FROM cluster_report_samples WHERE 1 = 1",
+    );
+    let mut args: Vec<rusqlite::types::Value> = Vec::new();
+    if ids.is_empty() {
+        sql.push_str(
+            " AND report_id IN (SELECT id FROM test_reports ORDER BY id DESC LIMIT 20)",
+        );
+    } else {
+        let marks = vec!["?"; ids.len()].join(",");
+        sql.push_str(&format!(" AND report_id IN ({marks})"));
+        args.extend(ids.into_iter().map(rusqlite::types::Value::Integer));
+    }
+    if let Some(node) = node.filter(|value| !value.trim().is_empty()) {
+        sql.push_str(" AND node = ?");
+        args.push(rusqlite::types::Value::Text(node.trim().to_string()));
+    }
+    sql.push_str(" ORDER BY report_id DESC, node ASC, elapsed_sec ASC");
+    let mut stmt = conn.prepare(&sql).map_err(err)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(args.iter()), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                ReportNodePoint {
+                    sec: row.get::<_, i64>(3)?.max(0) as u64,
+                    qps: row.get(4)?,
+                    concurrent: row.get(5)?,
+                    p95: row.get(6)?,
+                    errors: row.get::<_, i64>(7)?.max(0) as u64,
+                },
+            ))
+        })
+        .map_err(err)?;
+    let mut result: Vec<ReportNodeSeriesItem> = Vec::new();
+    for row in rows {
+        let (report_id, node, role, point) = row.map_err(err)?;
+        match result
+            .iter_mut()
+            .find(|item| item.report_id == report_id && item.node == node)
+        {
+            Some(item) => item.points.push(point),
+            None => result.push(ReportNodeSeriesItem {
+                report_id,
+                node,
+                role,
+                points: vec![point],
+            }),
+        }
+    }
+    Ok(result)
 }
 
 #[tauri::command]

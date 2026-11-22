@@ -64,8 +64,33 @@ function formatSize(chars: number) {
   return `${(chars / 10000).toFixed(1)} 万字`
 }
 
+/**
+ * 输入法保护：回车确认候选词时部分浏览器 isComposing 已为 false，
+ * 用 composition 状态 + compositionend 时间窗兜底，避免误发送未输完的内容。
+ */
+let imeComposing = false
+let imeEndedAt = 0
+
+function onCompositionStart() {
+  imeComposing = true
+  imeEndedAt = 0
+}
+
+function onCompositionEnd() {
+  imeComposing = false
+  imeEndedAt = Date.now()
+}
+
+function isImeKey(event: KeyboardEvent) {
+  return imeComposing
+    || event.isComposing
+    || event.keyCode === 229
+    || event.key === 'Process'
+    || Date.now() - imeEndedAt < 80
+}
+
 function onEnter(event: KeyboardEvent) {
-  if (event.shiftKey || event.isComposing) return
+  if (event.shiftKey || isImeKey(event)) return
   event.preventDefault()
   void submit()
 }
@@ -208,6 +233,8 @@ function goChat() {
         "
         :disabled="store.streaming"
         @keydown.enter="onEnter"
+        @compositionstart="onCompositionStart"
+        @compositionend="onCompositionEnd"
       />
       <div class="assist-actions">
         <a-button size="small" type="text" :disabled="!store.messages.length" @click="copyLast">

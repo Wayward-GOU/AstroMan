@@ -1,6 +1,6 @@
 [package]
 name = "astroman"
-version = "1.1.1"
+version = "1.1.2"
 description = "AstroMan - 本地 API 调试与压测工具"
 edition = "2021"
 # 新增 astroman-cli 后仍让 `cargo run`（tauri dev 使用）默认启动桌面端
@@ -44,6 +44,9 @@ futures-util = "0.3"
 tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
 base64 = "0.22"
 aes-gcm = "0.10"
+# v1.1.2 EnvBundle：X25519 协商 + HKDF 派生 AES-256-GCM 会话密钥
+x25519-dalek = { version = "2", features = ["static_secrets", "getrandom"] }
+hkdf = "0.12"
 rusqlite = { version = "0.41", features = ["bundled"] }
 r2d2 = "0.8"
 r2d2_sqlite = "0.36"
@@ -73,6 +76,9 @@ bytes = "1"
 # 抓包 ZIP 导出：只启用 deflate，避免带入 bzip2 / zstd 等未用压缩器
 zip = { version = "9", default-features = false, features = ["deflate"] }
 sysinfo = { version = "0.33", default-features = false, features = ["system", "disk", "network"] }
+# 数据池 Excel 模板生成与导入（v20）：只在 Rust 侧读写 xlsx
+calamine = "0.26"
+rust_xlsxwriter = "0.77"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = [

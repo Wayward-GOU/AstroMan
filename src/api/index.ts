@@ -49,6 +49,14 @@ import type {
   PlanTemplate,
   PerformanceProfile,
   PolicySnapshot,
+  PoolBinding,
+  PoolHealth,
+  PoolItem,
+  PoolItemsPage,
+  PoolItemStatus,
+  PoolPreview,
+  PoolRefreshConfig,
+  PoolSummary,
   PostmanExportReport,
   Project,
   PythonCheckResult,
@@ -57,6 +65,7 @@ import type {
   RealtimeStatus,
   ReclaimResult,
   ReportDetail,
+  ReportNodeSeries,
   ReportRequestsPage,
   RemoteBackup,
   RequestRun,
@@ -109,8 +118,13 @@ import type {
   ClusterMasterStartPayload,
   ClusterNodeWeight,
   ClusterProtocolInfo,
+  ClusterSamplePayload,
   ClusterSlaveConnectPayload,
   ClusterSlaveSnapshot,
+  DiscoveredMaster,
+  DiscoveryStatus,
+  StressBudget,
+  VarAuditReport,
 } from '@/types/cluster'
 
 export { appInfo, projectList, projectCreate, projectUpdate, projectDelete } from './project'
@@ -415,7 +429,8 @@ export const stressStopAll = () => invoke<number>('stress_stop_all')
 /** 运行中任务快照（主窗口面板与窗口恢复） */
 export const stressJobs = () => invoke<StressJobSummary[]>('stress_jobs')
 
-/** 新窗口打开压测页；重复打开同一任务会聚焦已有窗口 */export const stressOpenWindow = (
+/** 新窗口打开压测页；重复打开同一任务会聚焦已有窗口 */
+export const stressOpenWindow = (
   planId?: number | null,
   jobId?: number | null,
   envId?: number | null,
@@ -449,8 +464,12 @@ export const clusterMasterSnapshot = (jobId: number) =>
 export const clusterMasterSessions = () =>
   invoke<ClusterMasterSnapshot[]>('cluster_master_sessions')
 
-export const clusterMasterPrepare = (jobId: number, weights: ClusterNodeWeight[] = []) =>
-  invoke<ClusterMasterSnapshot>('cluster_master_prepare', { jobId, weights })
+export const clusterMasterPrepare = (
+  jobId: number,
+  mode: 'auto' | 'even' | 'custom' = 'auto',
+  weights: ClusterNodeWeight[] = [],
+) =>
+  invoke<ClusterMasterSnapshot>('cluster_master_prepare', { jobId, mode, weights })
 
 export const clusterMasterLaunch = (jobId: number) =>
   invoke<ClusterMasterSnapshot>('cluster_master_launch', { jobId })
@@ -468,10 +487,145 @@ export const clusterSlaveSnapshot = () => invoke<ClusterSlaveSnapshot>('cluster_
 
 export const clusterSlaveDisconnect = () => invoke<void>('cluster_slave_disconnect')
 
+/** 节点最近 N 个每秒采样（默认 30，最多 300） */
+export const clusterNodeSamples = (jobId: number, nodeId: string, limit = 30) =>
+  invoke<ClusterSamplePayload[]>('cluster_node_samples', { jobId, nodeId, limit })
+
+/** 变量体检：只读检查变量来源、主节点是否有值与各从节点状态（不含变量值） */
+export const clusterVarAudit = (jobId: number) =>
+  invoke<VarAuditReport>('cluster_var_audit', { jobId })
+
+/** 接受待审批节点（审批配对） */
+export const clusterMasterApprove = (jobId: number, nodeId: string) =>
+  invoke<ClusterMasterSnapshot>('cluster_master_approve', { jobId, nodeId })
+
+/** 拒绝待审批节点 */
+export const clusterMasterReject = (jobId: number, nodeId: string, reason?: string | null) =>
+  invoke<ClusterMasterSnapshot>('cluster_master_reject', {
+    jobId,
+    nodeId,
+    reason: reason ?? null,
+  })
+
+/** 本次任务自动接受加入申请 */
+export const clusterMasterAutoAccept = (jobId: number, enabled: boolean) =>
+  invoke<ClusterMasterSnapshot>('cluster_master_auto_accept', { jobId, enabled })
+
+/** 启动 / 停止 / 查询局域网发现 */
+export const clusterDiscoveryStart = () => invoke<DiscoveryStatus>('cluster_discovery_start')
+
+export const clusterDiscoveryStop = () => invoke<DiscoveryStatus>('cluster_discovery_stop')
+
+export const clusterDiscoveryStatus = () => invoke<DiscoveryStatus>('cluster_discovery_status')
+
+export const clusterDiscoveryList = () => invoke<DiscoveredMaster[]>('cluster_discovery_list')
+
+/** 发现后申请加入：审批模式，等待主机接受 */
+export const clusterJoinDiscovered = (masterAddr: string, nodeName?: string | null) =>
+  invoke<ClusterSlaveSnapshot>('cluster_join_discovered', {
+    masterAddr,
+    nodeName: nodeName ?? null,
+  })
+
+/** 本机并发预算（自动探测 / 手动） */
+export const stressBudgetGet = () => invoke<StressBudget>('stress_budget_get')
+
+export const stressBudgetSet = (mode: 'auto' | 'manual', manualLimit?: number | null) =>
+  invoke<StressBudget>('stress_budget_set', {
+    mode,
+    manualLimit: manualLimit ?? null,
+  })
+
+// 参数池 / Token 池（v1.1.2）
+export const poolList = () => invoke<PoolSummary[]>('pool_list')
+
+/** 池详情：摘要 + 第一页脱敏条目（敏感池恒为掩码） */
+export const poolGet = (poolId: number, pageSize = 20) =>
+  invoke<{ pool: PoolSummary; items: PoolItemsPage }>('pool_get', { poolId, pageSize })
+
+export const poolCreate = (payload: {
+  name: string
+  kind?: string
+  sensitive?: boolean
+  description?: string
+  /** 自定义列定义；顺序即展示顺序，首列为 value 镜像 */
+  columns?: string[]
+}) => invoke<{ id: number }>('pool_create', payload)
+
+/** 调整列定义：from 为旧列名（新增列不传），name 为新列名；数组顺序即新列顺序 */
+export const poolColumnsSet = (
+  poolId: number,
+  columns: Array<{ from?: string | null; name: string }>,
+) => invoke<string[]>('pool_columns_set', { poolId, columns })
+
+/** 生成 Excel 导入模板到指定路径 */
+export const poolExcelTemplate = (poolId: number, path: string) =>
+  invoke<void>('pool_excel_template', { poolId, path })
+
+/** 从 Excel 导入条目：表头需与列名一致，首列必填 */
+export const poolExcelImport = (poolId: number, path: string) =>
+  invoke<{
+    inserted: number
+    skipped: number
+    ignoredColumns: string[]
+    numericWarnings: string[]
+  }>('pool_excel_import', { poolId, path })
+
+export const poolDelete = (poolId: number) => invoke<void>('pool_delete', { poolId })
+
+export const poolItems = (poolId: number, reveal = false) =>
+  invoke<PoolItem[]>('pool_items', { poolId, reveal })
+
+/** 管理页分页（列表接口始终脱敏） */
+export const poolItemsPage = (payload: {
+  poolId: number
+  page?: number
+  pageSize?: number
+  search?: string
+  status?: PoolItemStatus | ''
+}) => invoke<PoolItemsPage>('pool_items_page', payload)
+
+/** 单条明文（二次确认后调用）：value 为首列镜像，data 为各列明文 */
+export const poolItemReveal = (itemId: number) =>
+  invoke<{ id: number; value: string; data: Record<string, string> }>('pool_item_reveal', {
+    itemId,
+  })
+
+export const poolItemToggle = (itemId: number, enabled: boolean) =>
+  invoke<void>('pool_item_toggle', { itemId, enabled })
+
+export const poolClearItems = (poolId: number) =>
+  invoke<number>('pool_clear_items', { poolId })
+
+export const poolHealthRefresh = (poolId: number) =>
+  invoke<PoolHealth>('pool_health_refresh', { poolId })
+
+export const poolImport = (poolId: number, text: string) =>
+  invoke<number>('pool_import', { poolId, text })
+
+export const poolDeleteItem = (itemId: number) => invoke<void>('pool_delete_item', { itemId })
+
+export const poolPreview = (
+  bindings: PoolBinding[],
+  vuCount = 0,
+  reveal = false,
+) => invoke<PoolPreview>('pool_preview', { bindings, vuCount, reveal })
+
+/** Token 刷新配置（v19） */
+export const poolRefreshGet = (name: string) =>
+  invoke<PoolRefreshConfig>('pool_refresh_get', { name })
+
+export const poolRefreshSet = (name: string, config: PoolRefreshConfig) =>
+  invoke<void>('pool_refresh_set', { name, config })
+
 // 压测报告
 export const reportList = (limit = 100) => invoke<StressReport[]>('report_list', { limit })
 
 export const reportGet = (id: number) => invoke<ReportDetail>('report_get', { id })
+
+/** 跨报告按节点查询曲线（v19） */
+export const reportNodeSeries = (reportIds?: number[], node?: string) =>
+  invoke<ReportNodeSeries[]>('report_node_series', { reportIds, node })
 
 export const reportDelete = (id: number) => invoke<ReclaimResult>('report_delete', { id })
 
@@ -774,8 +928,8 @@ export const testDatasetSave = (payload: TestDatasetPayload) =>
 
 export const testDatasetDelete = (id: number) => invoke<void>('test_dataset_delete', { id })
 
-export const testPreflight = (suiteId: number, envId?: number) =>
-  invoke<PreflightReport>('test_preflight', { suiteId, envId: envId ?? null })
+export const testPreflight = (suiteId: number, envId?: number, extraVars?: Record<string, string>) =>
+  invoke<PreflightReport>('test_preflight', { suiteId, envId: envId ?? null, extraVars: extraVars ?? null })
 
 export const testRunStart = (
   suiteId: number,

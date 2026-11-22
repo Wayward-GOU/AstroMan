@@ -9,18 +9,31 @@ import LineChart from '@/components/LineChart.vue'
 import { useProjectStore } from '@/stores/project'
 import * as api from '@/api'
 import { copyToClipboard } from '@/utils/clipboard'
+import { ensurePoolPreview } from '@/utils/poolGate'
+import {
+  ALLOCATION_MODE_TEXT,
+  allocationItems,
+  allocationProblem as allocationProblemOf,
+  nodeBudgetCap,
+  nodeLimitRange,
+  planAllocation,
+  toAllocationNode,
+} from '@/utils/clusterAllocation'
 import type {
   ClusterMasterSnapshot,
   ClusterNodeInfo,
   ClusterProtocolInfo,
   ClusterSampleEvent,
   ClusterSlaveSnapshot,
+  DiscoveredMaster,
+  VarAuditReport,
 } from '@/types/cluster'
 import type {
   CapturePreset,
   Environment,
   HttpRequestDetail,
   PlanSummary,
+  PoolBinding,
   RecordDetailMode,
   SlaTargets,
   StressConfig,
@@ -39,8 +52,8 @@ const unlisteners: UnlistenFn[] = []
 let timer: number | undefined
 let polling = false
 
-/** 并发上限，与后端 stress.rs 的 MAX_CONCURRENT 保持一致 */
-const MAX_CONCURRENT = 5000
+/** 并发上限，与后端 stress.rs 的 MAX_CONCURRENT 保持一致（绝对安全上限） */
+const MAX_CONCURRENT = 100000
 
 /* ---------- 主节点：任务创建 ---------- */
 
@@ -84,6 +97,8 @@ interface PlanSettings {
   slaP99?: number
   slaErrorRate?: number
   slaMinRps?: number
+  /** 计划里保存的参数 / Token 池绑定（v1.1.2） */
+  poolBindings?: PoolBinding[]
 }
 
 const projectOptions = computed(() =>
@@ -180,8 +195,18 @@ const canCreate = computed(
 
 const session = ref<ClusterMasterSnapshot | null>(null)
 const busy = ref(false)
+/** 变量体检：只读，不含变量值 */
+const auditOpen = ref(false)
+const auditLoading = ref(false)
+const audit = ref<VarAuditReport | null>(null)
 const weights = ref<Record<string, number>>({})
 const weightDirty = ref<Record<string, boolean>>({})
+/** 分配模式：auto 能力分配 / even 平均分配 / custom 自定义权重与范围 */
+const allocationMode = ref<'auto' | 'even' | 'custom'>('auto')
+/** custom 模式下每节点的最小/最大并发 */
+const nodeLimits = ref<Record<string, { min: number | null; max: number | null }>>({})
+/** 集群变量策略：master_wins 主节点优先 / local_wins 本机优先 */
+const varPolicy = ref<'master_wins' | 'local_wins'>('master_wins')
 
 const ACTIVE_MASTER_STATUS = ['pairing', 'preparing', 'ready', 'running']
 
@@ -234,39 +259,84 @@ const nodeList = computed<ClusterNodeInfo[]>(() => session.value?.nodes ?? [])
 
 const hasSlave = computed(() => nodeList.value.some((node) => node.role === 'slave'))
 
-/**
- * 配对阶段的并发预览：与后端 `allocate_concurrency` 同口径，
- * 每个节点先保底 1 并发，剩余按权重分配，余数从大到小补齐。
- */
-const plannedConcurrent = computed<Record<string, number>>(() => {
-  const nodes = nodeList.value
-  if (!nodes.length) return {}
-  const total = Math.max(1, numberOr(session.value?.totalConcurrent, nodes.length))
-  const items = nodes.map((node) => ({
-    id: node.id,
-    weight: Math.max(0.1, numberOr(weights.value[node.id] ?? node.weight, 1)),
-  }))
-  const sum = items.reduce((acc, item) => acc + item.weight, 0)
-  const remaining = Math.max(0, total - items.length)
-  const exact = items.map((item) => {
-    const share = remaining * item.weight / sum
-    const base = Math.floor(share)
-    return { id: item.id, count: 1 + base, fraction: share - base }
-  })
-  let leftover = Math.max(0, total - exact.reduce((acc, item) => acc + item.count, 0))
-  const byFraction = [...exact].sort((a, b) => b.fraction - a.fraction)
-  let index = 0
-  while (leftover > 0 && byFraction.length) {
-    byFraction[index % byFraction.length].count += 1
-    leftover -= 1
-    index += 1
+/** 计划是否使用了自定义列 / 自动注入：旧从节点不支持这类绑定 */
+const hasCustomColumnBinding = computed(() =>
+  (planSettings.value.poolBindings ?? []).some((binding) => (binding.column ?? '').trim() !== ''),
+)
+
+/** 只统计仍在会话里的节点：失联/离开/完成的历史节点不再参与兼容性提示 */
+function isActiveNode(node: ClusterNodeInfo): boolean {
+  return !['lost', 'left', 'rejected', 'done'].includes(node.status)
+}
+
+/** 版本较低、不支持池自定义列的从节点 */
+const legacySlaves = computed(() =>
+  nodeList.value.filter(
+    (node) => node.role === 'slave' && isActiveNode(node) && !node.poolColumns,
+  ),
+)
+
+/** 未提供加密公钥、只能读本机同名环境的从节点 */
+const envFallbackSlaves = computed(() =>
+  nodeList.value.filter(
+    (node) => node.role === 'slave' && isActiveNode(node) && !node.envBundle,
+  ),
+)
+
+/** 当前计划会被旧节点阻断时，下发按钮直接禁用并说明原因 */
+const compatBlocked = computed(
+  () => hasCustomColumnBinding.value && legacySlaves.value.length > 0,
+)
+
+const poolSliceLimit = computed(() => session.value?.poolSliceLimitBytes || 64 * 1024 * 1024)
+
+const poolEstimate = computed(() => session.value?.poolEstimate ?? null)
+
+/** 池切片已用 80% 以上的节点：提前提示，避免下发时才失败 */
+const nearLimitNodes = computed(() =>
+  nodeList.value.filter(
+    (node) =>
+      isActiveNode(node) &&
+      node.poolSliceBytes != null &&
+      node.poolSliceBytes >= poolSliceLimit.value * 0.8,
+  ),
+)
+
+const prepareDisabledReason = computed(() => {
+  if (!hasSlave.value) return '至少加入 1 个从节点后才能下发配置'
+  if (compatBlocked.value) {
+    return `节点 ${legacySlaves.value.map((node) => node.name).join('、')} 版本较低，请升级后重新加入`
   }
-  return Object.fromEntries(exact.map((item) => [item.id, item.count]))
+  return ''
 })
 
-const tooFewConcurrent = computed(
-  () => nodeList.value.length > 0 && (session.value?.totalConcurrent ?? 0) < nodeList.value.length,
+/** 当前分配模式下的每节点权重与范围（auto / even / custom） */
+const allocationRows = computed(() =>
+  allocationItems(
+    nodeList.value.map(toAllocationNode),
+    allocationMode.value,
+    session.value?.budget,
+    weights.value,
+    nodeLimits.value,
+  ),
 )
+
+/**
+ * 配对阶段的并发预览：与后端 `allocate_concurrency_capped` 同口径。
+ * 先保留每节点最小并发，剩余按权重分配；超出上限的部分按余数依次补齐。
+ */
+const plannedConcurrent = computed<Record<string, number>>(() =>
+  planAllocation(allocationRows.value, session.value?.totalConcurrent),
+)
+
+/** 分配结果提示：下限/上限与总并发冲突时直接给出原因 */
+const allocationProblem = computed(() =>
+  allocationProblemOf(allocationRows.value, session.value?.totalConcurrent),
+)
+
+const allocationModeText = computed(() => ALLOCATION_MODE_TEXT[allocationMode.value])
+
+const tooFewConcurrent = computed(() => !!allocationProblem.value)
 
 const startCountdownSec = computed(() => {
   const at = session.value?.startAtMs ?? 0
@@ -505,7 +575,13 @@ function applySession(snapshot: ClusterMasterSnapshot) {
   const prevJob = session.value?.jobId
   const prevStatus = session.value?.status
   session.value = snapshot
-  if (prevJob !== snapshot.jobId) stageReached.value = 0
+  if (prevJob !== snapshot.jobId) {
+    stageReached.value = 0
+    // 刷新页面后恢复上次选择，避免默认 auto 覆盖已下发的 even/custom
+    if (snapshot.allocationMode === 'even' || snapshot.allocationMode === 'custom') {
+      allocationMode.value = snapshot.allocationMode
+    }
+  }
   const reached = STAGE_INDEX[snapshot.status]
   if (reached != null && snapshot.status !== 'failed' && reached > stageReached.value) {
     stageReached.value = reached
@@ -526,6 +602,19 @@ function setWeight(node: ClusterNodeInfo, value: unknown) {
   if (!Number.isFinite(num) || num <= 0) return
   weights.value = { ...weights.value, [node.id]: Math.min(10, Math.max(0.1, num)) }
   weightDirty.value = { ...weightDirty.value, [node.id]: true }
+}
+
+function setLimit(node: ClusterNodeInfo, field: 'min' | 'max', value: unknown) {
+  const num = Number(value)
+  const current = nodeLimits.value[node.id] ?? { min: 1, max: null }
+  const next = Number.isFinite(num) && num > 0 ? Math.floor(num) : null
+  nodeLimits.value = { ...nodeLimits.value, [node.id]: { ...current, [field]: next } }
+}
+
+function limitText(node: ClusterNodeInfo) {
+  const masterBudget = session.value?.budget
+  const { min, max } = nodeLimitRange(node, masterBudget, nodeLimits.value)
+  return max >= nodeBudgetCap(node, masterBudget) ? `${min} ~ 预算` : `${min} ~ ${max}`
 }
 
 function buildConfig(detail: HttpRequestDetail): StressConfig {
@@ -558,6 +647,7 @@ function buildConfig(detail: HttpRequestDetail): StressConfig {
     bodyType: detail.bodyType,
     body: detail.body,
     envId: planEnvId.value,
+    varPolicy: varPolicy.value,
     insecure: settings.insecure === true,
     timeoutMs: Math.max(1, numberOr(settings.timeoutMs, 30000)),
     connectTimeoutMs: Math.max(1, numberOr(settings.connectTimeoutMs, 10000)),
@@ -579,6 +669,7 @@ function buildConfig(detail: HttpRequestDetail): StressConfig {
     ignoreOverlap: false,
     baselineReportId: settings.baselineReportId ?? null,
     longRunAck: settings.longRunAck === true,
+    poolBindings: Array.isArray(settings.poolBindings) ? settings.poolBindings : [],
     sla,
   }
 }
@@ -603,6 +694,8 @@ async function createSession() {
     }
     weightDirty.value = {}
     weights.value = {}
+    nodeLimits.value = {}
+    allocationMode.value = 'auto'
     const snapshot = await api.clusterMasterCreate({
       planId: plan.id,
       planName: plan.name,
@@ -636,20 +729,83 @@ async function prepareSession() {
     message.warning('至少需要一个从节点完成配对后再下发配置')
     return
   }
+  if (compatBlocked.value) {
+    message.error(prepareDisabledReason.value)
+    return
+  }
+  // 下发前强制执行池预览：失败或取消都不允许下发（无池绑定直接通过）
+  if (
+    !(await ensurePoolPreview(
+      planSettings.value.poolBindings,
+      totalConcurrent.value,
+      '下发配置前确认参数 / Token 池',
+    ))
+  ) {
+    return
+  }
   busy.value = true
   try {
-    const payload = nodeList.value.map((node) => ({
-      nodeId: node.id,
-      weight: weights.value[node.id] ?? node.weight,
-    }))
-    applySession(await api.clusterMasterPrepare(session.value.jobId, payload))
-    message.success('配置已下发，等待从节点预检')
+    const payload = nodeList.value.map((node) => {
+      const limit = nodeLimits.value[node.id]
+      return {
+        nodeId: node.id,
+        weight: weights.value[node.id] ?? node.weight,
+        minConcurrent: allocationMode.value === 'custom' ? (limit?.min ?? 1) : null,
+        maxConcurrent: allocationMode.value === 'custom' ? (limit?.max ?? null) : null,
+      }
+    })
+    applySession(await api.clusterMasterPrepare(session.value.jobId, allocationMode.value, payload))
+    message.success(`配置已按「${allocationModeText.value}」下发，等待从节点预检`)
   } catch (error) {
     message.error(String(error))
     await refreshSession()
   } finally {
     busy.value = false
   }
+}
+
+/* ---------- 变量体检 ---------- */
+
+const AUDIT_KIND_TEXT: Record<string, string> = {
+  user: '普通',
+  secret: '密钥',
+  os: '系统',
+  pool: '数据池',
+}
+
+const AUDIT_SOURCE_TEXT: Record<string, string> = {
+  env: '环境变量',
+  os: '本机环境',
+  pool: '数据池',
+  none: '缺失',
+}
+
+const AUDIT_STATE_TEXT: Record<string, string> = {
+  ok: '通过',
+  missing: '缺失',
+  pending: '待确认',
+  unknown: '未知',
+}
+
+async function openVarAudit() {
+  if (!session.value) return
+  auditOpen.value = true
+  auditLoading.value = true
+  try {
+    audit.value = await api.clusterVarAudit(session.value.jobId)
+  } catch (error) {
+    message.error(String(error))
+  } finally {
+    auditLoading.value = false
+  }
+}
+
+function auditNodeState(row: VarAuditReport['items'][number], nodeId: string) {
+  return row.nodeStates[nodeId]
+}
+
+function auditPolicyText(policy: string) {
+  return policy === 'local_wins' ? '从节点优先' : '主节点优先'
 }
 
 function launchSession() {
@@ -826,6 +982,7 @@ function resourceText(node: ClusterNodeInfo): string {
 }
 
 const NODE_STATUS_TEXT: Record<string, string> = {
+  pending: '待接受',
   pairing: '等待配对',
   pairReady: '已配对',
   preparing: '下发配置',
@@ -839,6 +996,7 @@ const NODE_STATUS_TEXT: Record<string, string> = {
 }
 
 const NODE_STATUS_TONE: Record<string, Tone> = {
+  pending: 'warn' as Tone,
   pairing: 'idle',
   pairReady: 'info',
   preparing: 'info',
@@ -859,6 +1017,62 @@ function nodeStatusTone(status: string): Tone {
   return NODE_STATUS_TONE[status] ?? 'idle'
 }
 
+const HEALTH_TEXT: Record<string, string> = {
+  ok: '正常',
+  waiting: '等待首样',
+  gap: '采样缺口',
+  lost: '无数据',
+  done: '正常结束',
+}
+
+const HEALTH_TONE: Record<string, Tone> = {
+  ok: 'ok',
+  waiting: 'warn',
+  gap: 'warn',
+  lost: 'bad',
+  done: 'ok',
+}
+
+function healthText(node: ClusterNodeInfo): string {
+  return HEALTH_TEXT[node.health?.state ?? ''] ?? node.health?.state ?? '—'
+}
+
+function healthTone(node: ClusterNodeInfo): Tone {
+  return HEALTH_TONE[node.health?.state ?? ''] ?? 'idle'
+}
+
+function healthTitle(node: ClusterNodeInfo): string {
+  return node.health?.message || HEALTH_TEXT[node.health?.state ?? ''] || '—'
+}
+
+function capacityText(node: ClusterNodeInfo): string {
+  const capacity = node.capacity
+  if (!capacity) return '未上报'
+  return `${capacity.cores} 核 · ${capacity.memGb} GB · 预算 ${capacity.machineLimit}`
+}
+
+function fmtMb(bytes: number | null | undefined): string {
+  if (bytes == null) return '—'
+  const mb = Number(bytes) / 1024 / 1024
+  return mb >= 10 ? `${mb.toFixed(0)} MB` : `${mb.toFixed(1)} MB`
+}
+
+/** 节点兼容性说明：缺哪些能力，鼠标悬停可见 */
+function compatTitle(node: ClusterNodeInfo): string {
+  const lacks: string[] = []
+  if (!node.poolColumns) lacks.push('数据池自定义列 / 自动注入')
+  if (!node.envBundle) lacks.push('加密环境变量下发（将只读本机同名环境）')
+  return lacks.length ? `旧版节点：不支持${lacks.join('、')}` : '支持数据池自定义列与加密环境变量'
+}
+
+function nodeCompatText(node: ClusterNodeInfo): string {
+  return node.poolColumns && node.envBundle ? '新版' : '旧版'
+}
+
+function peakText(node: ClusterNodeInfo): string {
+  return `${fmt(node.peakQps)} / ${fmtInt(node.peakConcurrent)}`
+}
+
 function fmtTime(ms: number | null | undefined): string {
   if (!ms) return '—'
   try {
@@ -871,9 +1085,14 @@ function fmtTime(ms: number | null | undefined): string {
 const nodeColumns = [
   { title: '节点', key: 'name', width: 220 },
   { title: '角色', key: 'role', width: 76 },
+  { title: '兼容', key: 'compat', width: 88 },
   { title: '状态', key: 'status', width: 110 },
   { title: '权重', key: 'weight', width: 110 },
+  { title: '并发范围', key: 'limits', width: 150 },
   { title: '分配并发', key: 'concurrent', width: 92, align: 'right' as const },
+  { title: '能力', key: 'capacity', width: 180 },
+  { title: '采集健康', key: 'health', width: 110 },
+  { title: '峰值 QPS/并发', key: 'peak', width: 128, align: 'right' as const },
   { title: 'QPS', key: 'qps', width: 86, align: 'right' as const },
   { title: '时钟偏移', key: 'clock', width: 128, align: 'right' as const },
   {
@@ -885,6 +1104,55 @@ const nodeColumns = [
   },
   { title: '资源', key: 'resource', width: 150 },
 ]
+
+/** 集群审批：接受 / 拒绝 / 自动接受 */
+const joinBusy = ref<string | null>(null)
+const autoBusy = ref(false)
+
+async function approveJoin(nodeId: string) {
+  const current = session.value
+  if (!current) return
+  joinBusy.value = nodeId
+  try {
+    const next = await api.clusterMasterApprove(current.jobId, nodeId)
+    session.value = next
+    message.success('已接受节点，正在下发配置')
+  } catch (error) {
+    message.error(String(error))
+  } finally {
+    joinBusy.value = null
+  }
+}
+
+async function rejectJoin(nodeId: string) {
+  const current = session.value
+  if (!current) return
+  joinBusy.value = nodeId
+  try {
+    const next = await api.clusterMasterReject(current.jobId, nodeId, '主机拒绝了加入申请')
+    session.value = next
+    message.info('已拒绝该节点')
+  } catch (error) {
+    message.error(String(error))
+  } finally {
+    joinBusy.value = null
+  }
+}
+
+async function toggleAutoAccept(value: boolean) {
+  const current = session.value
+  if (!current) return
+  autoBusy.value = true
+  try {
+    session.value = await api.clusterMasterAutoAccept(current.jobId, value)
+  } catch (error) {
+    message.error(String(error))
+  } finally {
+    autoBusy.value = false
+  }
+}
+
+const pendingJoins = computed(() => session.value?.pending ?? [])
 
 async function copy(text: string) {
   try {
@@ -929,6 +1197,62 @@ async function tick() {
     }
   } finally {
     polling = false
+  }
+}
+
+/* ---------- 局域网发现（从节点） ---------- */
+const discovered = ref<DiscoveredMaster[]>([])
+const discoveryOn = ref(false)
+const discoveryBusy = ref(false)
+let discoveryTimer: number | undefined
+
+async function refreshDiscovered() {
+  try {
+    discovered.value = await api.clusterDiscoveryList()
+  } catch {
+    discovered.value = []
+  }
+}
+
+async function toggleDiscovery() {
+  discoveryBusy.value = true
+  try {
+    if (discoveryOn.value) {
+      await api.clusterDiscoveryStop()
+      discoveryOn.value = false
+      discovered.value = []
+      if (discoveryTimer) {
+        window.clearInterval(discoveryTimer)
+        discoveryTimer = undefined
+      }
+    } else {
+      await api.clusterDiscoveryStart()
+      discoveryOn.value = true
+      await refreshDiscovered()
+      discoveryTimer = window.setInterval(() => void refreshDiscovered(), 2000)
+    }
+  } catch (error) {
+    message.error(String(error))
+  } finally {
+    discoveryBusy.value = false
+  }
+}
+
+async function joinDiscovered(item: DiscoveredMaster) {
+  try {
+    const snapshot = await api.clusterJoinDiscovered(
+      item.addr,
+      slaveForm.nodeName.trim() || null,
+    )
+    applySlave(snapshot)
+    slaveForm.masterAddr = item.addr
+    if (snapshot.status === 'pending') {
+      message.info('已提交加入申请，请在主节点「加入申请」中接受')
+    } else {
+      message.success('已连接主节点')
+    }
+  } catch (error) {
+    message.error(String(error))
   }
 }
 
@@ -990,6 +1314,7 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   for (const off of unlisteners) off()
   if (timer) window.clearInterval(timer)
+  if (discoveryTimer) window.clearInterval(discoveryTimer)
   // 关闭页面不中断任务：主从会话都归后端进程，页面只是视图
 })
 </script>
@@ -1197,13 +1522,16 @@ onBeforeUnmount(() => {
                 <span v-if="session.incomplete" class="st-pill warn">结果不完整</span>
               </div>
               <a-space size="small" wrap>
+                <a-button size="small" :loading="auditLoading" @click="openVarAudit">
+                  变量体检
+                </a-button>
                 <a-button
                   v-if="session.status === 'pairing'"
                   type="primary"
                   size="small"
                   :loading="busy"
-                  :disabled="!hasSlave"
-                  :title="hasSlave ? '' : '至少加入 1 个从节点后才能下发配置'"
+                  :disabled="!hasSlave || compatBlocked"
+                  :title="prepareDisabledReason"
                   @click="prepareSession"
                 >
                   下发配置
@@ -1287,7 +1615,7 @@ onBeforeUnmount(() => {
               </div>
               <div v-else-if="session.status === 'pairing'" class="notice info">
                 <span class="nt">等待</span>
-                <span>等待从节点加入。至少加入 1 个从节点后，点「下发配置」按权重拆分并发并做目标预检。</span>
+                <span>等待从节点加入。至少加入 1 个从节点后，点「下发配置」按「{{ allocationModeText }}」拆分并发并做目标预检。</span>
               </div>
               <div v-else-if="session.status === 'ready'" class="notice ok">
                 <span class="nt">就绪</span>
@@ -1327,6 +1655,63 @@ onBeforeUnmount(() => {
             <span>配对码已过期。新从节点需要新配对码：关闭任务后重新创建即可；已配对节点仍可直接下发配置。</span>
           </div>
 
+          <section v-if="session.status === 'pairing'" class="fm-card panel">
+            <header class="panel-head">
+              <div class="panel-title">
+                <h3>加入申请</h3>
+                <span class="panel-sub">
+                  待接受 {{ pendingJoins.length }} 个 · 局域网发现
+                  {{ session.discovery ? '已开启' : '已关闭' }}
+                </span>
+              </div>
+              <div class="panel-actions">
+                <span class="hint">自动接受</span>
+                <a-switch
+                  :checked="session.autoAccept"
+                  :loading="autoBusy"
+                  size="small"
+                  @change="(value: unknown) => toggleAutoAccept(value === true)"
+                />
+              </div>
+            </header>
+            <div class="panel-body">
+              <div v-if="!pendingJoins.length" class="inline-empty">
+                暂无申请。从节点可通过局域网发现申请加入，或输入配对码连接。
+              </div>
+              <div v-for="item in pendingJoins" :key="item.requestId" class="join-row">
+                <div class="join-main">
+                  <div class="join-name">{{ item.name }}</div>
+                  <div class="join-meta mono">
+                    {{ item.addr }} · {{ item.deviceId || '未上报设备' }} · 申请于
+                    {{ fmtTime(item.requestedAt) }}
+                  </div>
+                  <div v-if="item.capacity" class="join-meta mono">
+                    {{ item.capacity.cores }} 核 · {{ item.capacity.memGb }} GB · 预算
+                    {{ item.capacity.machineLimit }}
+                  </div>
+                </div>
+                <div class="join-actions">
+                  <a-button
+                    size="small"
+                    type="primary"
+                    :loading="joinBusy === item.nodeId"
+                    @click="approveJoin(item.nodeId)"
+                  >
+                    接受
+                  </a-button>
+                  <a-button
+                    size="small"
+                    danger
+                    :disabled="joinBusy === item.nodeId"
+                    @click="rejectJoin(item.nodeId)"
+                  >
+                    拒绝
+                  </a-button>
+                </div>
+              </div>
+            </div>
+          </section>
+
           <section v-if="liveElapsed.length" class="fm-card panel chart-panel">
             <header class="panel-head">
               <div class="panel-title">
@@ -1343,7 +1728,18 @@ onBeforeUnmount(() => {
             <header class="panel-head">
               <div class="panel-title">
                 <h3>节点</h3>
-                <span class="panel-sub">准备时按权重拆分总并发</span>
+                <span class="panel-sub">准备时按「{{ allocationModeText }}」拆分总并发</span>
+              </div>
+              <div v-if="session.status === 'pairing'" class="panel-actions">
+                <a-select v-model:value="allocationMode" size="small" style="width: 150px">
+                  <a-select-option value="auto">能力分配</a-select-option>
+                  <a-select-option value="even">平均分配</a-select-option>
+                  <a-select-option value="custom">自定义权重</a-select-option>
+                </a-select>
+                <a-select v-model:value="varPolicy" size="small" style="width: 140px">
+                  <a-select-option value="master_wins">变量主节点优先</a-select-option>
+                  <a-select-option value="local_wins">变量本机优先</a-select-option>
+                </a-select>
               </div>
             </header>
             <a-table
@@ -1352,7 +1748,7 @@ onBeforeUnmount(() => {
               row-key="id"
               size="small"
               :pagination="false"
-              :scroll="{ x: 1010 }"
+              :scroll="{ x: 1250 }"
             >
               <template #bodyCell="{ column, record }">
                 <template v-if="column.key === 'name'">
@@ -1364,6 +1760,17 @@ onBeforeUnmount(() => {
                     {{ record.role === 'master' ? '主节点' : '从节点' }}
                   </span>
                 </template>
+                <template v-else-if="column.key === 'compat'">
+                  <span v-if="record.role === 'master'" class="mono">—</span>
+                  <span
+                    v-else
+                    class="st-pill"
+                    :class="record.poolColumns && record.envBundle ? 'ok' : 'warn'"
+                    :title="compatTitle(record)"
+                  >
+                    {{ nodeCompatText(record) }}
+                  </span>
+                </template>
                 <template v-else-if="column.key === 'status'">
                   <span class="st-pill" :class="nodeStatusTone(record.status)" :title="record.error || undefined">
                     <i class="pill-dot" />
@@ -1373,7 +1780,7 @@ onBeforeUnmount(() => {
                 </template>
                 <template v-else-if="column.key === 'weight'">
                   <a-input-number
-                    v-if="session.status === 'pairing'"
+                    v-if="session.status === 'pairing' && allocationMode === 'custom'"
                     :value="weights[record.id] ?? record.weight"
                     :min="0.1"
                     :max="10"
@@ -1382,10 +1789,61 @@ onBeforeUnmount(() => {
                     class="weight-input"
                     @update:value="setWeight(record, $event)"
                   />
-                  <span v-else class="mono">{{ fmt(record.weight, 2) }}</span>
+                  <span v-else class="mono">
+                    {{
+                      session.status === 'pairing'
+                        ? allocationMode === 'even'
+                          ? '1'
+                          : '按能力'
+                        : fmt(record.weight, 2)
+                    }}
+                  </span>
+                </template>
+                <template v-else-if="column.key === 'limits'">
+                  <div
+                    v-if="session.status === 'pairing' && allocationMode === 'custom'"
+                    class="limit-inputs"
+                  >
+                    <a-input-number
+                      :value="nodeLimits[record.id]?.min ?? 1"
+                      :min="1"
+                      size="small"
+                      class="limit-input"
+                      @update:value="setLimit(record, 'min', $event)"
+                    />
+                    <span class="limit-sep">~</span>
+                    <a-input-number
+                      :value="nodeLimits[record.id]?.max ?? null"
+                      :min="1"
+                      placeholder="预算"
+                      size="small"
+                      class="limit-input"
+                      @update:value="setLimit(record, 'max', $event)"
+                    />
+                  </div>
+                  <span v-else class="mono">{{ limitText(record) }}</span>
                 </template>
                 <template v-else-if="column.key === 'qps'">
                   <span class="mono">{{ fmt(record.qps) }}</span>
+                </template>
+                <template v-else-if="column.key === 'capacity'">
+                  <div class="mono">{{ capacityText(record) }}</div>
+                  <div
+                    v-if="record.poolSliceBytes != null"
+                    class="mono pool-slice"
+                    :class="{ over: record.poolSliceBytes >= poolSliceLimit * 0.8 }"
+                  >
+                    池切片 {{ fmtMb(record.poolSliceBytes) }} / {{ fmtMb(poolSliceLimit) }}
+                  </div>
+                </template>
+                <template v-else-if="column.key === 'health'">
+                  <span class="st-pill" :class="healthTone(record)" :title="healthTitle(record)">
+                    <i class="pill-dot" />
+                    {{ healthText(record) }}
+                  </span>
+                </template>
+                <template v-else-if="column.key === 'peak'">
+                  <span class="mono">{{ peakText(record) }}</span>
                 </template>
                 <template v-else-if="column.key === 'concurrent'">
                   <span v-if="session.status === 'pairing'" class="mono planned-value">
@@ -1407,13 +1865,48 @@ onBeforeUnmount(() => {
               </template>
             </a-table>
             <div class="node-foot">
-              <div v-if="tooFewConcurrent" class="notice warn">
-                <span class="nt">并发</span>
-                <span>总并发少于节点数，无法保证每个节点至少 1 并发。请提高总并发，或关闭多余节点的会话后重新创建任务。</span>
+              <div v-if="allocationProblem" class="notice warn">
+                <span class="nt">分配</span>
+                <span>{{ allocationProblem }}，请调整总并发或节点范围后再下发。</span>
+              </div>
+              <div v-if="compatBlocked" class="notice bad">
+                <span class="nt">版本</span>
+                <span>
+                  节点 {{ legacySlaves.map((node) => node.name).join('、') }}
+                  版本较低，不支持数据池自定义列或自动注入；请升级后重新加入，或把池绑定改为「取 value 列」。
+                </span>
+              </div>
+              <div v-else-if="envFallbackSlaves.length" class="notice warn">
+                <span class="nt">环境</span>
+                <span>
+                  节点 {{ envFallbackSlaves.map((node) => node.name).join('、') }}
+                  未提供加密公钥，只能读取本机同名环境；变量值可能与主节点不一致。
+                </span>
+              </div>
+              <div
+                v-if="poolEstimate"
+                class="notice"
+                :class="poolEstimate.bytes > poolSliceLimit ? 'warn' : 'info'"
+              >
+                <span class="nt">数据池</span>
+                <span>
+                  合计约 {{ fmtMb(poolEstimate.bytes) }}（{{ fmtInt(poolEstimate.items) }} 条 /
+                  {{ poolEstimate.pools }} 个池），单节点切片上限 {{ fmtMb(poolSliceLimit) }}。
+                  <template v-if="poolEstimate.bytes > poolSliceLimit">
+                    当前体量已超过单节点上限，建议增加从节点分摊或精简池条目。
+                  </template>
+                </span>
+              </div>
+              <div v-if="nearLimitNodes.length" class="notice warn">
+                <span class="nt">切片</span>
+                <span>
+                  节点 {{ nearLimitNodes.map((node) => node.name).join('、') }}
+                  的池切片已接近上限；可减少池条目或增加节点分摊。
+                </span>
               </div>
               <div v-if="!nodeList.length" class="inline-empty">还没有节点</div>
               <p v-else-if="session.status === 'pairing'" class="hint">
-                从节点加入后会出现在这里；权重可调，主节点与从节点一视同仁。「分配并发」为按权重预估，下发配置后以实际分配为准。
+                从节点加入后会出现在这里。能力分配按各机预算、平均分配无差别拆分、自定义权重可单独设置每节点最小/最大并发；「分配并发」为预估，下发配置后以实际分配为准。
               </p>
             </div>
           </section>
@@ -1431,6 +1924,34 @@ onBeforeUnmount(() => {
                 </div>
               </header>
               <div class="panel-body">
+                <div class="discover-head">
+                  <div>
+                    <div class="discover-title">附近的主节点</div>
+                    <div class="hint">监听 UDP 17802；发现后申请加入，需主机接受</div>
+                  </div>
+                  <a-button size="small" :loading="discoveryBusy" @click="toggleDiscovery">
+                    {{ discoveryOn ? '停止发现' : '开始发现' }}
+                  </a-button>
+                </div>
+                <div v-if="discoveryOn" class="discover-list">
+                  <div v-if="!discovered.length" class="inline-empty">
+                    正在搜索局域网内的主节点…
+                  </div>
+                  <div v-for="item in discovered" :key="item.instanceId" class="join-row">
+                    <div class="join-main">
+                      <div class="join-name">{{ item.name }}</div>
+                      <div class="join-meta mono">
+                        {{ item.addr }} · {{ item.status }} · {{ item.nodeCount }}/{{ item.maxNodes }}
+                        <template v-if="item.capacity">
+                          · {{ item.capacity.cores }} 核 · {{ Math.round(item.capacity.memMb / 1024) }} GB
+                        </template>
+                      </div>
+                    </div>
+                    <a-button size="small" type="primary" @click="joinDiscovered(item)">
+                      申请加入
+                    </a-button>
+                  </div>
+                </div>
                 <a-form layout="vertical" class="cluster-form">
                   <a-form-item label="主节点地址">
                     <a-input
@@ -1592,6 +2113,74 @@ onBeforeUnmount(() => {
         </section>
       </a-tab-pane>
     </a-tabs>
+
+    <a-modal
+      v-model:open="auditOpen"
+      title="变量体检"
+      width="900px"
+      :footer="null"
+      :get-container="false"
+    >
+      <a-spin :spinning="auditLoading">
+        <div v-if="audit" class="audit-body">
+          <div class="audit-summary">
+            <span>
+              环境
+              <b class="mono">{{ audit.envName || '未指定' }}</b>
+            </span>
+            <span>变量 <b>{{ audit.envVarCount }}</b></span>
+            <span>密钥 <b>{{ audit.secretCount }}</b></span>
+            <span>冲突策略 <b>{{ auditPolicyText(audit.varPolicy) }}</b></span>
+            <span>从节点 <b>{{ audit.nodes.length }}</b></span>
+          </div>
+
+          <div v-if="!audit.items.length" class="audit-empty">
+            当前配置没有引用环境变量、系统变量或数据池。
+          </div>
+          <div v-else class="audit-table-wrap">
+            <table class="audit-table">
+              <thead>
+                <tr>
+                  <th>变量</th>
+                  <th>类型</th>
+                  <th>来源</th>
+                  <th>主节点</th>
+                  <th v-for="node in audit.nodes" :key="node.id">{{ node.name }}</th>
+                  <th>说明</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="row in audit.items" :key="`${row.kind}:${row.name}`">
+                  <td class="mono audit-name">{{ row.name }}</td>
+                  <td>{{ AUDIT_KIND_TEXT[row.kind] ?? row.kind }}</td>
+                  <td>{{ AUDIT_SOURCE_TEXT[row.source] ?? row.source }}</td>
+                  <td>
+                    <span class="audit-chip" :class="row.masterHasValue ? 'ok' : 'bad'">
+                      {{ row.masterHasValue ? '有值' : '无值' }}
+                    </span>
+                  </td>
+                  <td v-for="node in audit.nodes" :key="node.id">
+                    <span
+                      class="audit-chip"
+                      :class="auditNodeState(row, node.id)?.state ?? 'pending'"
+                      :title="auditNodeState(row, node.id)?.detail ?? ''"
+                    >
+                      {{ AUDIT_STATE_TEXT[auditNodeState(row, node.id)?.state ?? 'pending'] ?? '待确认' }}
+                    </span>
+                  </td>
+                  <td class="audit-message">{{ row.message || '—' }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p class="audit-hint">
+            体检只读：不会下发配置、不会读取变量值。主节点「无值」的普通变量 / 密钥会在下发时被从节点拦截；
+            系统变量需要在「设置 → 压测 → OS 变量」加入白名单；数据池变量需要先在计划里绑定池。
+          </p>
+        </div>
+      </a-spin>
+    </a-modal>
   </div>
 </template>
 
@@ -2214,6 +2803,56 @@ onBeforeUnmount(() => {
   color: var(--fm-text);
 }
 
+.join-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--fm-border);
+}
+
+.join-row:last-child {
+  border-bottom: none;
+}
+
+.join-name {
+  color: var(--fm-text);
+  font-weight: 600;
+}
+
+.join-meta {
+  margin-top: 2px;
+  font-size: 11.5px;
+  color: var(--fm-muted);
+  word-break: break-all;
+}
+
+.join-actions {
+  display: flex;
+  gap: 8px;
+  flex: none;
+}
+
+.discover-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 10px;
+  margin-bottom: 12px;
+  border-bottom: 1px solid var(--fm-border);
+}
+
+.discover-title {
+  color: var(--fm-text);
+  font-weight: 600;
+}
+
+.discover-list {
+  margin-bottom: 14px;
+}
+
 .node-addr {
   font-size: 11px;
   color: var(--fm-muted);
@@ -2227,12 +2866,43 @@ onBeforeUnmount(() => {
   color: var(--fm-danger);
 }
 
+.pool-slice {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--fm-muted);
+}
+
+.pool-slice.over {
+  color: var(--fm-warning);
+  font-weight: 600;
+}
+
 .node-dropped {
   color: var(--fm-warning);
 }
 
 .weight-input {
   width: 78px;
+}
+
+.limit-inputs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.limit-input {
+  width: 58px;
+}
+
+.limit-sep {
+  color: var(--fm-muted);
+}
+
+.panel-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .planned-value {
@@ -2301,5 +2971,122 @@ onBeforeUnmount(() => {
   .flow-desc {
     white-space: normal;
   }
+}
+
+/* ---------- 变量体检 ---------- */
+.audit-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.audit-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+  padding: 9px 12px;
+  border: 1px solid var(--fm-border);
+  border-radius: var(--fm-radius-sm);
+  background: var(--fm-surface-sunken);
+  font-size: 12px;
+  color: var(--fm-text-2);
+}
+
+.audit-summary b {
+  color: var(--fm-text);
+  font-weight: 600;
+}
+
+.audit-table-wrap {
+  max-height: 52vh;
+  overflow: auto;
+  border: 1px solid var(--fm-border);
+  border-radius: var(--fm-radius-sm);
+}
+
+.audit-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.audit-table th,
+.audit-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--fm-border);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.audit-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--fm-surface-sunken);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--fm-muted);
+}
+
+.audit-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.audit-name {
+  font-weight: 600;
+  color: var(--fm-text);
+}
+
+.audit-message {
+  max-width: 260px;
+  white-space: normal;
+  line-height: 1.55;
+  color: var(--fm-text-2);
+}
+
+.audit-chip {
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 7px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.audit-chip.ok {
+  background: var(--fm-success-soft);
+  color: var(--fm-success);
+}
+
+.audit-chip.bad,
+.audit-chip.missing {
+  background: var(--fm-danger-soft);
+  color: var(--fm-danger);
+}
+
+.audit-chip.pending {
+  background: var(--fm-warning-soft);
+  color: var(--fm-warning);
+}
+
+.audit-chip.unknown {
+  background: var(--fm-surface-sunken);
+  color: var(--fm-muted);
+}
+
+.audit-empty {
+  padding: 28px 12px;
+  text-align: center;
+  font-size: 12.5px;
+  color: var(--fm-muted);
+}
+
+.audit-hint {
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.7;
+  color: var(--fm-muted);
 }
 </style>

@@ -31,6 +31,7 @@ fn read_backup(data_dir: &Path) -> ProxyBackup {
         .unwrap_or_default()
 }
 
+#[cfg(windows)]
 fn write_backup(data_dir: &Path, backup: &ProxyBackup) -> Result<(), String> {
     if let Some(parent) = backup_path(data_dir).parent() {
         std::fs::create_dir_all(parent)

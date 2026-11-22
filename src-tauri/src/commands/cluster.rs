@@ -6,6 +6,7 @@
 use tauri::{AppHandle, State};
 
 use crate::services::cluster::client::{parse_master_addr, ClusterSlaveConnectPayload};
+use crate::services::cluster::discovery::{self, DiscoveredMaster, DiscoveryStatus};
 use crate::services::cluster::protocol::{
     ClusterMasterSnapshot, ClusterProtocolInfo, ClusterSlaveSnapshot,
 };
@@ -55,11 +56,12 @@ pub fn cluster_master_sessions(state: State<'_, AppState>) -> Vec<ClusterMasterS
 pub async fn cluster_master_prepare(
     state: State<'_, AppState>,
     job_id: i64,
+    mode: Option<String>,
     weights: Option<Vec<ClusterNodeWeight>>,
 ) -> Result<ClusterMasterSnapshot, String> {
     state
         .cluster
-        .prepare(job_id, weights.unwrap_or_default())
+        .prepare(job_id, mode, weights.unwrap_or_default())
         .await
 }
 
@@ -86,6 +88,105 @@ pub fn cluster_master_abort(
 #[tauri::command]
 pub fn cluster_master_close(state: State<'_, AppState>, job_id: i64) -> Result<(), String> {
     state.cluster.close(job_id)
+}
+
+/// 节点最近 N 个每秒采样（AI 诊断用，默认 30，最多 300）
+#[tauri::command]
+pub fn cluster_node_samples(
+    state: State<'_, AppState>,
+    job_id: i64,
+    node_id: String,
+    limit: Option<usize>,
+) -> Result<Vec<crate::services::cluster::protocol::SamplePayload>, String> {
+    state.cluster.node_samples(job_id, &node_id, limit)
+}
+
+/// 变量体检：列出每个变量的来源、主节点是否有值与各从节点状态（不含变量值）
+#[tauri::command]
+pub fn cluster_var_audit(
+    state: State<'_, AppState>,
+    job_id: i64,
+) -> Result<crate::services::cluster::protocol::VarAuditReport, String> {
+    state.cluster.var_audit(job_id)
+}
+
+/// 接受一个待审批节点（审批配对）
+#[tauri::command]
+pub fn cluster_master_approve(
+    state: State<'_, AppState>,
+    job_id: i64,
+    node_id: String,
+) -> Result<ClusterMasterSnapshot, String> {
+    state.cluster.approve(job_id, &node_id)
+}
+
+/// 拒绝一个待审批节点
+#[tauri::command]
+pub fn cluster_master_reject(
+    state: State<'_, AppState>,
+    job_id: i64,
+    node_id: String,
+    reason: Option<String>,
+) -> Result<ClusterMasterSnapshot, String> {
+    state.cluster.reject(job_id, &node_id, reason)
+}
+
+/// 本次任务自动接受加入申请
+#[tauri::command]
+pub fn cluster_master_auto_accept(
+    state: State<'_, AppState>,
+    job_id: i64,
+    enabled: bool,
+) -> Result<ClusterMasterSnapshot, String> {
+    state.cluster.set_auto_accept(job_id, enabled)
+}
+
+/// 启动局域网发现监听（从节点侧）
+#[tauri::command]
+pub fn cluster_discovery_start() -> Result<DiscoveryStatus, String> {
+    discovery::start_listener()?;
+    Ok(discovery::status())
+}
+
+/// 停止局域网发现监听
+#[tauri::command]
+pub fn cluster_discovery_stop() -> DiscoveryStatus {
+    discovery::stop_listener();
+    discovery::status()
+}
+
+/// 发现状态：是否监听、端口与错误
+#[tauri::command]
+pub fn cluster_discovery_status() -> DiscoveryStatus {
+    discovery::status()
+}
+
+/// 附近的主节点列表（6 秒内有 Beacon）
+#[tauri::command]
+pub fn cluster_discovery_list() -> Vec<DiscoveredMaster> {
+    discovery::list_discovered()
+}
+
+/// 发现后申请加入：审批模式，等待主机接受
+#[tauri::command]
+pub fn cluster_join_discovered(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    master_addr: String,
+    node_name: Option<String>,
+) -> Result<ClusterSlaveSnapshot, String> {
+    let master = parse_master_addr(&master_addr)?;
+    state.policy().ensure_lan(Some(&master.host))?;
+    state.cluster_slave.connect(
+        state.pool.clone(),
+        app,
+        ClusterSlaveConnectPayload {
+            master_addr,
+            pair_code: String::new(),
+            join_mode: Some("request".to_string()),
+            node_name,
+        },
+    )
 }
 
 /// 从节点加入主节点：反向连接、配对码换节点身份、本地解析环境后等待下发配置

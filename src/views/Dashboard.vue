@@ -18,6 +18,8 @@ import {
   PlayCircleOutlined,
   FileTextOutlined,
   ExperimentOutlined,
+  DeploymentUnitOutlined,
+  DatabaseOutlined,
   PlusOutlined,
 } from '@ant-design/icons-vue'
 import AiSparkIcon from '@/components/AiSparkIcon.vue'
@@ -102,8 +104,30 @@ async function saveNoteQuick() {
   }
 }
 
+let noteQuickImeComposing = false
+let noteQuickImeEndedAt = 0
+
+function onNoteQuickCompositionStart() {
+  noteQuickImeComposing = true
+  noteQuickImeEndedAt = 0
+}
+
+function onNoteQuickCompositionEnd() {
+  noteQuickImeComposing = false
+  noteQuickImeEndedAt = Date.now()
+}
+
+/** 部分浏览器/输入法回车确认候选词时 isComposing 已为 false，需要额外时间窗兜底 */
+function isImeKey(event: KeyboardEvent) {
+  return noteQuickImeComposing
+    || event.isComposing
+    || event.keyCode === 229
+    || event.key === 'Process'
+    || Date.now() - noteQuickImeEndedAt < 80
+}
+
 function onNoteQuickKeydown(event: KeyboardEvent) {
-  if (event.key === 'Enter' && !event.isComposing) {
+  if (event.key === 'Enter' && !isImeKey(event)) {
     event.preventDefault()
     void saveNoteQuick()
   }
@@ -431,6 +455,48 @@ const suiteSteps = [
   },
 ]
 
+const clusterSteps = [
+  {
+    title: '主节点发起会话',
+    desc: '在「集群」页选一个已保存的压测计划创建会话，页面会显示本机 IP:端口与配对码（或进入审批加入模式）。',
+  },
+  {
+    title: '从节点加入',
+    desc: '其他电脑打开同一版本 AstroMan，局域网会自动发现主节点，也可手填 IP:端口；审批模式下由主节点点「接受」。',
+  },
+  {
+    title: '分配并发并做变量体检',
+    desc: 'auto 按 CPU / 内存 / 预算分配，even 平均，custom 自定义权重与上下限；先看变量体检再下发配置。',
+  },
+  {
+    title: '同步开跑并合并报告',
+    desc: '全部节点预检就绪后统一开跑；结束时主节点自动合并三组直方图、逐请求明细与各节点池统计。',
+  },
+]
+
+const poolSteps = [
+  {
+    title: '新建池并定义列',
+    desc: '数据池页点「新建池」：填池名、选 Token 池或参数池、按需勾「敏感」，在列编辑区增删 / 排序 / 重命名（如 phone、password、token）。列名只能用字母 / 数字 / 下划线且以字母或下划线开头，首列必填；Token 池默认 token,account，参数池默认 value。',
+  },
+  {
+    title: '下载模板并导入 Excel',
+    desc: '选中池点「下载 Excel 模板」：首行即当前列名，整列文本格式可防止手机号变成科学计数法或丢前导 0；第二个 Sheet 是填写说明。按表头填数后点「导入 Excel」，结果会显示 inserted / skipped / ignoredColumns，超过 15 位的数字会给出 numericWarnings。也支持文本 / JSON 按列粘贴导入。',
+  },
+  {
+    title: '检查动态列与条目状态',
+    desc: '列表按池的列定义逐列展示，不再固定「值 / 账号」；搜索可匹配任意列，状态、权重、失败次数、最近使用仍保留。敏感池逐列脱敏，查看整行明文需二次确认且 30 秒自动隐藏。Token 池可在这里配置 HTTP 刷新（可选）。',
+  },
+  {
+    title: '绑定池与列',
+    desc: '压测页添加绑定：选池 → 选列（「全部列（同名注入）」时列名即变量名，或指定某一列映射到自定义占位符）→ 选模式（每 VU 固定 / 逐请求轮换 / 随机）→ 按需勾「401 自动换下一条」。请求任意位置写 {{名字}} 都能取到池值；同一个池的多个绑定共用同一条目，账号与密码来自同一行。',
+  },
+  {
+    title: '预览分配后开跑',
+    desc: '点「预览分配」检查 problems（池不存在、变量名为空、列不存在、条目不足），选「全部列」会展示自动注入的列名；开跑前还会强制预览一次。集群下自动按全局 VU 切片，Token 刷新由主节点统一完成。',
+  },
+]
+
 const suiteAssertionExample = `[
   { "type": "status", "op": "eq", "value": 200 },
   { "type": "jsonPath", "path": "$.args.keyword",
@@ -492,34 +558,48 @@ const steps = computed(() => [
   },
   {
     key: '06',
+    title: '分布式压测',
+    desc: '一台压不够时：主节点选计划创建会话，其他电脑填配对码加入，统一分配并发、加密下发变量、同步开跑，报告自动合并。',
+    action: '打开集群',
+    go: () => router.push('/cluster'),
+  },
+  {
+    key: '07',
+    title: '准备参数池 / Token 池',
+    desc: '多账号、多 Token 或会过期的登录态放进数据池：建池先定自定义列，下载 Excel 模板填表导入；Token 池可配 HTTP 刷新；在压测、批量运行或自动化套件里绑定列与占位符名，预览分配后再开跑。',
+    action: '打开数据池',
+    go: () => router.push('/pools'),
+  },
+  {
+    key: '08',
     title: '沉淀回归套件',
     desc: '把常用接口保存成自动化测试套件，配好断言、变量链与失败策略后反复运行；示例项目已内置「示例回归（httpbin）」可直接试跑。',
     action: '打开自动化测试',
     go: () => router.push('/automation'),
   },
   {
-    key: '07',
+    key: '09',
     title: '签名与加密',
     desc: '脚本页「插入示例」可一键填入 MD5 / HMAC 签名、AES 加密、RSA 加密，生成的值用 {{变量}} 引用。',
     action: '打开项目',
     go: goProject,
   },
   {
-    key: '08',
+    key: '10',
     title: '导入现成接口',
     desc: '项目页可粘贴 cURL 一键解析；工作台可导入项目 JSON，用于同事共享或换机迁移。',
     action: '打开项目',
     go: goProject,
   },
   {
-    key: '09',
+    key: '11',
     title: '用航仔 提效',
     desc: '在「航仔」里说一句话就能建项目、写接口、发请求、写签名脚本、查压测报告，并能导出执行记录。',
     action: '打开航仔',
     go: () => router.push({ name: 'ai' }),
   },
   {
-    key: '10',
+    key: '12',
     title: '数据与备份',
     desc: '数据默认存在本机 SQLite；设置页可查看路径、迁移目录，项目页可导出 JSON 备份。',
     action: '打开设置',
@@ -764,6 +844,42 @@ const faqs = [
   {
     q: '批量运行（Runner）和压测有什么区别？',
     a: '批量运行按顺序发送：一次选中多个接口，配合迭代次数或 CSV 数据逐轮跑，适合回归与数据驱动场景，每条结果都能单独查看；压测是在固定并发下持续施压，关注 QPS、P95/P99 与错误率。需要按数据批量跑接口用「批量运行」，需要并发能力去「压测」。',
+  },
+  {
+    q: '分布式压测（集群）怎么用？',
+    a: '① 主节点在「集群」页选一个已保存的压测计划创建会话，页面显示本机 IP:端口与配对码；② 其他电脑打开同一版本 AstroMan 在「集群」页加入：局域网会自动发现主节点，也可手填地址，审批模式下由主节点点「接受」；③ 主节点按 auto / even / custom 分配并发并下发配置，开跑前先看变量体检；④ 全部节点预检就绪后点「开始」，所有节点同一时刻起跑，结束自动合并成一份报告。主节点本机默认也参与施压，可在分配时取消勾选。',
+  },
+  {
+    q: '集群下的参数池和 Token 刷新是怎么处理的？',
+    a: '计划里配好的参数池 / Token 池会自动按全局 VU 切片下发，从节点只拿到自己负责的条目，不会跨节点取到同一条身份。Token 池的 HTTP 刷新由主节点统一单飞：同一个 token 只刷新一次，结果用会话密钥加密回传，所以不需要、也不应该在从节点单独配置刷新。401 换条目重试仍按计划里 poolBindings 的 refreshOn401 生效。',
+  },
+  {
+    q: '数据池是什么？什么时候该用？',
+    a: '数据池用来放需要重复使用、轮换或会过期的值：多账号、多 Token、多手机号等。Token 池存 token 并可配自动刷新，参数池存其他参数。绑定目标只是占位符名：在请求的 URL / Query / Header / Body / 认证字段里写 {{名字}} 都能取到池值，不限于 token。典型用法：秒杀 / 抢购这类要维持登录态的场景选「每 VU 固定」，每个虚拟用户始终用同一条身份；接口按账号维度限流时选「逐请求轮换」，让请求分摊到不同账号；只压吞吐、不关心身份时选「随机」。压测在「参数池 / Token 池」绑定；批量运行按「每轮固定 / 每次执行轮换 / 随机」取值；自动化套件每次运行自动轮换一条。',
+  },
+  {
+    q: '数据池的自定义列和 Excel 导入怎么用？',
+    a: '① 建池时先定列：列名只能是字母 / 数字 / 下划线且以字母或下划线开头（如 phone、password、token），首列必填，Excel 表头必须与列名完全一致；② 建好后点「下载 Excel 模板」，按表头填数、首列不能为空，再点「导入 Excel」；文本粘贴仍保留。③ 绑定压测时可选「全部列（同名注入）」，列名即变量名，请求里直接写 {{phone}}、{{password}}；也可指定某一列映射到自定义占位符。④ 同一个池的多个绑定共用同一条目，账号与密码来自同一行，且同池绑定的 mode 必须一致。列可随时重命名 / 增删 / 排序，重命名会迁移数据，删除列会丢弃该列数据；已保存计划引用已删除列时，预览 / 开跑会报错。⑤ 想直接看效果：示例项目里已内置「07 数据池示例」请求集，以及两个计划：「示例压测：自定义列数据池」（每 VU 固定，全部列 + 指定列映射）和「示例压测：Excel 导入池（逐请求轮换）」（对应「示例参数池（Excel 模板导入）」，value / region / level 三列即模板表头），打开即可查看和预览。',
+  },
+  {
+    q: 'Excel 导入失败或列对不上怎么办？',
+    a: '① 报「缺少首列」：Excel 表头必须与池的列名完全一致（区分大小写，不要带空格）；② ignoredColumns 非空：这些表头没有匹配到列名，检查拼写或先在池里加列；③ numericWarnings：超过 15 位的数字（如身份证、订单号）被 Excel 存成了数字，建议把该列设为文本格式后重新导入；④ skipped 偏多：首列为空或整行为空会被跳过；⑤ 超过 5 万行：拆分文件分批导入。列顺序可以不同，导入按表头名匹配；只读取第一个 Sheet。',
+  },
+  {
+    q: 'Token 池的 401 换条目和自动刷新有什么区别？',
+    a: '是两套独立机制。①「401 自动换下一条」：绑定里勾选后，某条 token 返回 401 时本次请求改用池里下一条重试一次，不会去重新登录。②「HTTP 刷新」：在数据池点「Token 刷新」，填刷新地址、method、headers、body，body 与地址里可用 {{token}} / {{refreshToken}} / {{account}} 占位符，再用 JSONPath 指到新 token 和过期时间字段，最后设兜底有效期（0 表示不过期）。刷新结果会缓存，临近过期才提前刷新；同一个 token 只刷一次，连续失败会退避并把条目标记为失效。集群压测下由主节点统一刷新并加密回传，从节点不要重复配置。',
+  },
+  {
+    q: '敏感池为什么看不到明文？',
+    a: '敏感池的条目在列表、预览和 AI 工具返回里始终脱敏，只显示尾号或掩码；需要看某一条时点「查看明文」，要二次确认，并且 30 秒后自动隐藏。这样分享截图、导出报告或让航仔排查时都不会泄露 token 与密码。',
+  },
+  {
+    q: '请求里的 UUID、时间戳、随机数怎么生成？',
+    a: '直接用内置占位符，不用建变量：{{$uuid}}（或 {{uuid}}）、{{$timestamp}}（毫秒）、{{timestampSec}}、{{isoTime}}、{{yyyyMMddHHmmss}}、{{randomInt(1,100)}}、{{randomFloat(1,10,2)}}、{{randomString(16)}}、{{randomHex(16)}}、{{randomNumber(6)}}、{{randomPhone}}、{{randomEmail}}、{{randomIPv4}}；数据类可用 {{faker:name}}、{{faker:phone}}、{{faker:email}}、{{faker:uuid}}、{{faker:int(1,100)}}。每次出现都会重新生成；需要两处一致，或需要可复用、可轮换的一批数据时，把生成好的值导入数据池，再用自定义占位符名绑定。',
+  },
+  {
+    q: '变量体检是什么？在哪里看？',
+    a: '变量体检在「集群」页，开跑前检查每个变量与密钥在各节点的状态：主节点环境里有没有值、来源是环境变量 / 操作系统变量 / 池，以及每个从节点是正常（ok）、缺失（missing）还是尚未回传（pending）。默认主节点优先（master_wins），从节点本机同名变量只用于补主节点缺失项。体检结果只显示状态，不显示密钥明文。',
   },
   {
     q: '测试场景（自动化套件）和批量运行、压测有什么区别？',
@@ -1211,6 +1327,8 @@ function fmtBytes(value: number) {
             class="quick-input"
             placeholder="记一笔… 明天10点 交周报 #工作"
             @keydown="onNoteQuickKeydown"
+            @compositionstart="onNoteQuickCompositionStart"
+            @compositionend="onNoteQuickCompositionEnd"
           />
           <a-spin v-if="noteSaving" size="small" />
           <button
@@ -1241,7 +1359,7 @@ function fmtBytes(value: number) {
     <div class="pathband">
       <span class="pl">上手路径</span>
       <span class="pn">
-        10 节 · 已完成 <b>{{ pad2(pathDone) }}</b> 节 · 下一步「{{ pathNext.title }}」
+        {{ steps.length }} 节 · 已完成 <b>{{ pad2(pathDone) }}</b> 节 · 下一步「{{ pathNext.title }}」
       </span>
       <span class="gauge" aria-hidden="true">
         <i
@@ -1250,13 +1368,98 @@ function fmtBytes(value: number) {
           :class="{ on: index < pathDone, cur: index === pathDone }"
         />
       </span>
-      <span class="pnum">{{ pad2(pathDone) }} / 10</span>
+      <span class="pnum">{{ pad2(pathDone) }} / {{ steps.length }}</span>
       <a class="plink" @click="guideOpen ? closeGuide() : openGuide()">
         {{ guideOpen ? '收起使用说明 ↑' : '打开使用说明 →' }}
       </a>
     </div>
 
     <div v-show="guideOpen" id="guide" class="guide">
+
+    <!-- 分布式压测介绍 -->
+    <section class="runner-band cluster-band fm-card">
+      <div class="runner-copy">
+        <span class="runner-eyebrow"><DeploymentUnitOutlined /> 分布式压测 · Cluster</span>
+        <h2 class="runner-title">一台压不够，就把多台电脑编成一组</h2>
+        <p class="runner-desc">
+          主节点在「集群」页用已保存的压测计划创建会话，其他电脑打开同版本客户端按配对码或审批加入。
+          主节点按 CPU / 内存 / 预算自动分配并发，环境变量用会话密钥加密下发；结束自动合并各节点采样与报告。
+          参数池按全局 VU 切片，Token 刷新由主节点统一单飞，多节点不会互相踢掉 refreshToken。
+        </p>
+        <div class="runner-tags">
+          <span>能力感知分配</span>
+          <span>审批式加入</span>
+          <span>变量加密下发</span>
+          <span>变量体检</span>
+          <span>池切片 + Token 单飞</span>
+          <span>报告与池统计合并</span>
+        </div>
+        <div class="runner-actions">
+          <a-button type="primary" @click="router.push('/cluster')">
+            <template #icon><DeploymentUnitOutlined /></template>
+            打开集群压测
+          </a-button>
+          <a-button @click="router.push('/stress')">先在本机试跑</a-button>
+        </div>
+      </div>
+
+      <div class="runner-steps">
+        <div v-for="(s, i) in clusterSteps" :key="s.title" class="runner-step">
+          <span class="runner-step-index mono">0{{ i + 1 }}</span>
+          <div class="runner-step-body">
+            <div class="runner-step-title">{{ s.title }}</div>
+            <div class="runner-step-desc">{{ s.desc }}</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 数据池介绍 -->
+    <section class="runner-band pool-band fm-card">
+      <div class="runner-copy">
+        <span class="runner-eyebrow"><DatabaseOutlined /> 数据池 · 参数池 / Token 池</span>
+        <h2 class="runner-title">多账号、多 Token、会过期的登录态，交给池统一分配</h2>
+        <p class="runner-desc">
+          在「数据池」页建池并导入条目：先定自定义列（如 phone / password / token），可下载 Excel 模板按表头填表导入；
+          Token 池存 token（可配 HTTP 刷新），参数池存其他会轮换的值，敏感池默认脱敏。
+          完整流程：新建池定列 → 下载 Excel 模板导入 → 动态列检查 → 绑定池与列 → 预览分配开跑。
+          绑定「池 + 列」时，选「全部列（同名注入）」列名即变量名，也可指定某一列映射到占位符，
+          请求任意位置写 &#123;&#123;名字&#125;&#125; 都能取到池值。同一个池的多个绑定共用同一条目，账号与密码来自同一行。
+          选每 VU 固定、逐请求轮换或随机，开跑前先看「预览分配」有没有问题。
+          集群压测会自动按全局 VU 切片，Token 刷新由主节点统一完成，从节点不用重复配置。
+        </p>
+        <div class="runner-tags">
+          <span>Token 池 / 参数池</span>
+          <span>自定义列</span>
+          <span>Excel 模板导入</span>
+          <span>全部列自动注入</span>
+          <span>同池共用一条目</span>
+          <span>敏感默认脱敏</span>
+          <span>每 VU 固定身份</span>
+          <span>逐请求轮换</span>
+          <span>401 换下一条</span>
+          <span>HTTP 自动刷新</span>
+          <span>集群自动切片</span>
+        </div>
+        <div class="runner-actions">
+          <a-button type="primary" @click="router.push('/pools')">
+            <template #icon><DatabaseOutlined /></template>
+            打开数据池
+          </a-button>
+          <a-button @click="router.push('/stress')">去压测里绑定</a-button>
+        </div>
+      </div>
+
+      <div class="runner-steps">
+        <div v-for="(s, i) in poolSteps" :key="s.title" class="runner-step">
+          <span class="runner-step-index mono">0{{ i + 1 }}</span>
+          <div class="runner-step-body">
+            <div class="runner-step-title">{{ s.title }}</div>
+            <div class="runner-step-desc">{{ s.desc }}</div>
+          </div>
+        </div>
+      </div>
+    </section>
 
     <!-- 测试场景介绍 -->
     <section class="runner-band suite-band fm-card">
@@ -2664,6 +2867,7 @@ function fmtBytes(value: number) {
   padding: 20px 22px;
 }
 
+.pool-band,
 .suite-band,
 .capture-band {
   /* 平铺纸面，不再用径向光斑做装饰 */

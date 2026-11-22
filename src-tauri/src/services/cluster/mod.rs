@@ -9,8 +9,11 @@
 use std::net::{IpAddr, UdpSocket};
 
 pub mod client;
+pub mod discovery;
+pub mod env_bundle;
 pub mod host;
 pub mod merge;
+pub mod pool_refresh;
 pub mod protocol;
 pub mod server;
 

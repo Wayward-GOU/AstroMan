@@ -682,6 +682,9 @@ pub struct StressConfig {
     pub body: Option<String>,
     #[serde(default)]
     pub env_id: Option<i64>,
+    /// 集群变量策略：master_wins（主节点优先，默认）/ local_wins（本机优先）
+    #[serde(default)]
+    pub var_policy: Option<String>,
     /// 运行期变量：优先级高于环境变量，不落库
     #[serde(default)]
     pub vars: HashMap<String, String>,
@@ -715,6 +718,27 @@ pub struct StressConfig {
     pub ramp_up_sec: u32,
     #[serde(default)]
     pub think_time_ms: u64,
+    /// 思考时间分布（8.7）：fixed（默认，沿用 think_time_ms）/ uniform / normal / lognormal
+    #[serde(default)]
+    pub think_time_mode: String,
+    /// uniform 下限（毫秒）；0 时退回 think_time_ms
+    #[serde(default)]
+    pub think_time_min_ms: u64,
+    /// uniform 上限（毫秒）；0 时退回 think_time_ms
+    #[serde(default)]
+    pub think_time_max_ms: u64,
+    /// normal / lognormal 均值（毫秒）；0 时退回 think_time_ms
+    #[serde(default)]
+    pub think_time_mean_ms: u64,
+    /// normal / lognormal 标准差（毫秒）；0 时取均值的 30%
+    #[serde(default)]
+    pub think_time_std_ms: u64,
+    /// 预热曲线：linear（默认）/ step / spike
+    #[serde(default)]
+    pub ramp_up_mode: String,
+    /// 每个 VU 起始相位随机抖动上限（毫秒），0 = 不抖动
+    #[serde(default)]
+    pub vu_start_jitter_ms: u64,
     /// 阶梯加压阶段，非空时忽略 concurrent / duration_sec
     #[serde(default)]
     pub stages: Vec<StressStage>,
@@ -744,6 +768,31 @@ pub struct StressConfig {
     /// 超过 2 小时的长稳启动确认（未确认时拒绝启动）
     #[serde(default)]
     pub long_run_ack: bool,
+    /// 参数/Token 池绑定：把池值注入到同名占位符
+    #[serde(default)]
+    pub pool_bindings: Vec<PoolBinding>,
+    /// 集群模式由主节点切片下发；不参与序列化，避免 token 明文进入报告
+    #[serde(default, skip_serializing)]
+    pub pool_slices: Vec<crate::services::cluster::protocol::PoolSlice>,
+}
+
+/// 池绑定：`{{TOKEN}}` 这类占位符在运行期从哪个池取值、如何轮换
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PoolBinding {
+    /// 池名
+    pub pool: String,
+    /// 占位符变量名（不含花括号），例如 TOKEN
+    pub target: String,
+    /// per_vu（每 VU 固定）/ per_request（逐请求轮换）/ random（随机）
+    #[serde(default)]
+    pub mode: String,
+    /// 401 时切换到下一条并重试一次（Token 池）
+    #[serde(default)]
+    pub refresh_on_401: bool,
+    /// 列选择（v20）："" = 旧行为取 value；"*" = 自动同名注入全部列；其他 = 指定列名
+    #[serde(default)]
+    pub column: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -924,6 +973,10 @@ pub struct StressReport {
     pub error_rate: f64,
     pub concurrency: i64,
     pub status: String,
+    /// 是否来自集群压测（报告列表徽标用）
+    pub is_cluster: bool,
+    /// 峰值 QPS：集群取 config.cluster.peaks，单机取 config.metricsPeaks
+    pub peak_qps: f64,
     pub start_time: Option<i64>,
     pub end_time: Option<i64>,
     pub created_at: i64,

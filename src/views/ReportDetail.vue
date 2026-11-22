@@ -20,10 +20,15 @@ import { useAiAssistStore } from '@/stores/aiAssist'
 import { reportReviewPrompt } from '@/utils/aiScenarios'
 import { formatDateTime } from '@/utils/datetime'
 import * as api from '@/api'
-import type { ReportDetail, ReportRequestRecord, ReportRequestsPage } from '@/types/models'
-import type { ClusterReportMeta } from '@/types/cluster'
+import type {
+  PoolReportStat,
+  ReportDetail,
+  ReportRequestRecord,
+  ReportRequestsPage,
+} from '@/types/models'
+import type { ClusterReportMeta, ClusterReportNode } from '@/types/cluster'
 import { buildReportHtml, buildReportSheets } from '@/utils/reportExport'
-import { detectKnee, qpsOverview, scoreReport, selfCheck } from '@/utils/reportAnalytics'
+import { detectKnee, qpsOverview, reportPeaks, scoreReport, selfCheck } from '@/utils/reportAnalytics'
 import { buildFindings, gradeReport, latencyDrift, type Finding } from '@/utils/reportNarrative'
 import { buildXlsx } from '@/utils/xlsx'
 import { copyToClipboard } from '@/utils/clipboard'
@@ -34,6 +39,8 @@ const router = useRouter()
 const detail = ref<ReportDetail | null>(null)
 const loading = ref(true)
 const exporting = ref(false)
+/** 导出是否包含参数 / Token 池统计（只含计数，不含明文） */
+const includePoolStats = ref(true)
 
 const reportId = computed(() => Number(route.params.id))
 
@@ -206,6 +213,30 @@ const bytesSent = computed(() => metrics.value?.bytesSent ?? 0)
 /* ---------- 分布式压测元数据（v1.1.1 一期） ---------- */
 const cluster = computed<ClusterReportMeta | null>(() => config.value?.cluster ?? null)
 const clusterNodes = computed(() => cluster.value?.nodes ?? [])
+const clusterPeaks = computed(() => cluster.value?.peaks ?? null)
+/** 单机报告峰值专题（集群报告由 cluster.peaks 展示，不重复） */
+const singlePeaks = computed(() => (cluster.value ? null : detail.value ? reportPeaks(detail.value) : null))
+/** 集群总 QPS：各节点平均 QPS 相加，与合并口径一致 */
+const clusterTotalQps = computed(() =>
+  clusterNodes.value.reduce((sum, node) => sum + (node.qpsAvg ?? 0), 0),
+)
+
+const CLUSTER_SERIES_COLORS = ['#14655a', '#37628f', '#9c6414', '#a23333', '#6b4c9a', '#17774a']
+
+/** 节点 QPS 曲线：各节点采样长度可能不同，按最右侧对齐，左侧补 0 */
+const clusterNodeSeries = computed(() => {
+  const list = (cluster.value?.nodeSeries ?? []).filter((item) => item.points?.length)
+  const maxPoints = Math.max(0, ...list.map((item) => item.points.length))
+  return list.map((item, index) => {
+    const values = item.points.slice(-maxPoints).map((point) => point.qps)
+    while (values.length < maxPoints) values.unshift(0)
+    return {
+      name: item.node || `节点 ${index + 1}`,
+      color: CLUSTER_SERIES_COLORS[index % CLUSTER_SERIES_COLORS.length],
+      values,
+    }
+  })
+})
 
 const CLUSTER_NODE_STATUS: Record<string, string> = {
   pairing: '配对中',
@@ -233,6 +264,28 @@ function clusterStatusTone(status: string) {
 
 function clusterRoleText(role: string) {
   return role === 'master' ? '主节点' : '从节点'
+}
+
+const CLUSTER_HEALTH: Record<string, string> = {
+  ok: '正常',
+  waiting: '等待首样',
+  gap: '采样缺口',
+  lost: '无数据',
+  done: '正常结束',
+}
+
+function clusterHealthText(node: ClusterReportNode) {
+  const state = node.health?.state ?? ''
+  const label = CLUSTER_HEALTH[state] ?? state ?? '—'
+  return node.health?.message ? `${label}（${node.health.message}）` : label
+}
+
+function clusterHealthTone(node: ClusterReportNode) {
+  const state = node.health?.state
+  if (state === 'lost') return 'bad'
+  if (state === 'gap' || state === 'waiting') return 'warn'
+  if (state === 'ok' || state === 'done') return 'ok'
+  return ''
 }
 
 /** QPS 指标组：平均 / 峰值 / 90% 分布 / 单并发 / 目标达成率，页面与导出同一口径 */
@@ -690,6 +743,13 @@ function fmtNum(v: number | undefined | null, digits = 1) {
   return v.toFixed(digits)
 }
 
+function poolScopeLabel(pool: PoolReportStat) {
+  if (pool.nodeScope === 'cluster') {
+    return pool.nodes?.length ? `全部节点（${pool.nodes.length}）` : '全部节点'
+  }
+  return pool.nodeScope === 'master' ? '仅主节点' : '本机'
+}
+
 function fmtBytes(v: number | undefined | null) {
   if (!v) return '0 B'
   const units = ['B', 'KB', 'MB', 'GB', 'TB']
@@ -760,10 +820,14 @@ async function exportReport(format: ExportFormat) {
     } else {
       const records = await api.reportRequests(current.id, 1, 50000, null)
       if (format === 'html') {
-        const bytes = new TextEncoder().encode(buildReportHtml(data, records.items))
+        const bytes = new TextEncoder().encode(
+          buildReportHtml(data, records.items, { includePools: includePoolStats.value }),
+        )
         await api.reportWriteFile(target, Array.from(bytes))
       } else {
-        const bytes = buildXlsx(buildReportSheets(data, records.items))
+        const bytes = buildXlsx(
+          buildReportSheets(data, records.items, { includePools: includePoolStats.value }),
+        )
         await api.reportWriteFile(target, Array.from(bytes))
       }
     }
@@ -816,6 +880,13 @@ function remove() {
         <template #icon><ArrowLeftOutlined /></template>
         返回列表
       </a-button>
+      <a-checkbox
+        v-if="detail?.config?.pools?.length"
+        v-model:checked="includePoolStats"
+        class="pool-export-toggle"
+      >
+        包含池统计
+      </a-checkbox>
       <a-dropdown :trigger="['click']" placement="bottomRight">
         <a-button :loading="exporting">
           <template #icon><DownloadOutlined /></template>
@@ -1429,6 +1500,52 @@ function remove() {
           </div>
         </div>
 
+        <div v-if="config?.pools?.length" class="fm-card table-card">
+          <div class="card-head">
+            <div>
+              <div class="card-title">参数 / Token 池</div>
+              <div class="card-sub">只统计用量，不包含明文；集群报告按节点汇总</div>
+            </div>
+          </div>
+          <div class="data-table">
+            <table>
+              <thead>
+                <tr>
+                  <th>池名</th>
+                  <th>条目</th>
+                  <th>已用</th>
+                  <th>注入请求</th>
+                  <th>401 刷新</th>
+                  <th>失效</th>
+                  <th>范围</th>
+                </tr>
+              </thead>
+              <tbody>
+                <template v-for="pool in config.pools" :key="pool.name">
+                  <tr>
+                    <td class="mono">{{ pool.name }}</td>
+                    <td class="mono">{{ pool.items }}</td>
+                    <td class="mono">{{ pool.used }}</td>
+                    <td class="mono">{{ pool.requests }}</td>
+                    <td class="mono">{{ pool.refreshed }}</td>
+                    <td class="mono" :class="{ bad: pool.invalid > 0 }">{{ pool.invalid }}</td>
+                    <td>{{ poolScopeLabel(pool) }}</td>
+                  </tr>
+                  <tr v-for="node in pool.byNode ?? []" :key="`${pool.name}:${node.name}`" class="pool-node-row">
+                    <td class="mono pool-node">↳ {{ node.name }}</td>
+                    <td />
+                    <td class="mono">{{ node.used }}</td>
+                    <td class="mono">{{ node.requests }}</td>
+                    <td class="mono">{{ node.refreshed }}</td>
+                    <td />
+                    <td />
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
         <div class="fm-card table-card">
           <div class="card-head">
             <div>
@@ -1492,6 +1609,45 @@ function remove() {
           <div v-else class="inline-empty">历史报告未保存配置快照</div>
         </div>
 
+        <div v-if="singlePeaks" class="fm-card table-card cluster-card">
+          <div class="card-head">
+            <div>
+              <div class="card-title">峰值指标</div>
+              <div class="card-sub">按每秒采样统计，出现时刻相对起跑点</div>
+            </div>
+          </div>
+          <div class="cluster-hero">
+            <div class="hero-item">
+              <span class="hero-label">峰值 QPS</span>
+              <span class="hero-value">{{ fmtNum(singlePeaks.qps.value) }}</span>
+              <span class="hero-sub">
+                第 {{ singlePeaks.qps.second }} 秒 · 平台期 {{ singlePeaks.qps.heldSec }} 秒
+              </span>
+            </div>
+            <div class="hero-item">
+              <span class="hero-label">峰值并发</span>
+              <span class="hero-value">{{ fmtNum(singlePeaks.concurrent.value, 0) }}</span>
+              <span class="hero-sub">
+                第 {{ singlePeaks.concurrent.second }} 秒 · 平台期
+                {{ singlePeaks.concurrent.heldSec }} 秒
+              </span>
+            </div>
+            <div class="hero-item">
+              <span class="hero-label">最差 P95 / P99</span>
+              <span class="hero-value">
+                {{ fmtNum(singlePeaks.p95.value, 0) }} / {{ fmtNum(singlePeaks.p99.value, 0) }}
+                <small>ms</small>
+              </span>
+              <span class="hero-sub">取自峰值时刻的延迟分位</span>
+            </div>
+            <div class="hero-item">
+              <span class="hero-label">峰值带宽</span>
+              <span class="hero-value">{{ fmtBytes(singlePeaks.bandwidth.value) }}/s</span>
+              <span class="hero-sub">最高错误率 {{ singlePeaks.errorRate.value.toFixed(2) }}%</span>
+            </div>
+          </div>
+        </div>
+
         <div v-if="cluster" class="fm-card table-card cluster-card">
           <div class="card-head">
             <div>
@@ -1509,6 +1665,58 @@ function remove() {
             message="本次合并结果不完整"
             :description="cluster.note || '有节点失联或提前退出，吞吐与延迟可能偏低。'"
           />
+
+          <div class="cluster-hero">
+            <div class="hero-item">
+              <span class="hero-label">集群总 QPS</span>
+              <span class="hero-value">{{ fmtNum(clusterTotalQps) }}</span>
+              <span class="hero-sub">{{ clusterNodes.length }} 个节点合并</span>
+            </div>
+            <div class="hero-item">
+              <span class="hero-label">峰值 QPS</span>
+              <span class="hero-value">
+                {{ clusterPeaks ? fmtNum(clusterPeaks.qps.value) : '—' }}
+              </span>
+              <span class="hero-sub">
+                <template v-if="clusterPeaks">
+                  第 {{ clusterPeaks.qps.second }} 秒 · 持续 {{ clusterPeaks.qps.heldSec }} 秒
+                  <template v-if="clusterPeaks.qps.topNode">
+                    · {{ clusterPeaks.qps.topNode }}
+                  </template>
+                </template>
+                <template v-else>未记录</template>
+              </span>
+            </div>
+            <div class="hero-item">
+              <span class="hero-label">峰值并发</span>
+              <span class="hero-value">
+                {{ clusterPeaks ? fmtNum(clusterPeaks.concurrent.value, 0) : fmtNum(cluster.totalConcurrent, 0) }}
+              </span>
+              <span class="hero-sub">
+                <template v-if="clusterPeaks">
+                  第 {{ clusterPeaks.concurrent.second }} 秒 · 持续 {{ clusterPeaks.concurrent.heldSec }} 秒
+                </template>
+                <template v-else>分配总并发</template>
+              </span>
+            </div>
+            <div class="hero-item">
+              <span class="hero-label">最差 P95 / P99</span>
+              <span class="hero-value">
+                {{ clusterPeaks ? `${fmtNum(clusterPeaks.p95.value, 0)} / ${fmtNum(clusterPeaks.p99.value, 0)}` : '—' }}
+                <small>ms</small>
+              </span>
+              <span class="hero-sub">按合并直方图重算，非节点平均</span>
+            </div>
+            <div class="hero-item">
+              <span class="hero-label">峰值带宽 / 错误率</span>
+              <span class="hero-value">
+                {{ clusterPeaks ? fmtBytes(clusterPeaks.bandwidth.value) + '/s' : '—' }}
+              </span>
+              <span class="hero-sub">
+                {{ clusterPeaks ? `最高错误率 ${clusterPeaks.errorRate.value.toFixed(2)}%` : '未记录' }}
+              </span>
+            </div>
+          </div>
 
           <div class="config-grid">
             <div class="config-item">
@@ -1537,6 +1745,14 @@ function remove() {
             </div>
           </div>
 
+          <div v-if="clusterNodeSeries.length" class="cluster-series">
+            <div class="cluster-series-head">
+              <span>节点 QPS 曲线</span>
+              <span class="hint">按节点上报的秒级采样绘制，右侧对齐</span>
+            </div>
+            <LineChart :series="clusterNodeSeries" unit="QPS" :height="220" />
+          </div>
+
           <div class="data-table cluster-nodes">
             <table>
               <thead>
@@ -1548,6 +1764,10 @@ function remove() {
                   <th class="col-narrow">分配并发</th>
                   <th class="col-narrow">状态</th>
                   <th>平均 QPS</th>
+                  <th>峰值 QPS</th>
+                  <th class="col-narrow">峰值并发</th>
+                  <th class="col-narrow">贡献占比</th>
+                  <th>采集健康</th>
                   <th>CPU 峰值</th>
                   <th>内存峰值</th>
                   <th>时钟偏移</th>
@@ -1566,6 +1786,12 @@ function remove() {
                     {{ clusterStatusText(node.status) }}
                   </td>
                   <td class="mono">{{ fmtNum(node.qpsAvg) }}</td>
+                  <td class="mono">{{ fmtNum(node.peakQps) }}</td>
+                  <td class="mono">{{ fmtNum(node.peakConcurrent, 0) }}</td>
+                  <td class="mono">{{ `${((node.share ?? 0) * 100).toFixed(1)}%` }}</td>
+                  <td class="mono" :class="clusterHealthTone(node)" :title="clusterHealthText(node)">
+                    {{ clusterHealthText(node) }}
+                  </td>
                   <td class="mono">{{ node.cpuPeak ? `${node.cpuPeak.toFixed(2)} 核` : '未采集' }}</td>
                   <td class="mono">{{ node.memPeakMb ? fmtBytes(node.memPeakMb * 1024 * 1024) : '未采集' }}</td>
                   <td class="mono">
@@ -2917,6 +3143,63 @@ function remove() {
   margin-top: 12px;
 }
 
+.cluster-series {
+  margin-top: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--fm-border);
+  border-radius: 10px;
+}
+
+.cluster-series-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.cluster-hero {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+  margin: 12px 0;
+}
+
+.hero-item {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 12px 14px;
+  border: 1px solid var(--fm-border);
+  border-radius: 10px;
+  background: var(--fm-surface-2);
+}
+
+.hero-label {
+  font-size: 11.5px;
+  color: var(--fm-muted);
+}
+
+.hero-value {
+  font-family: var(--fm-mono);
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--fm-text);
+}
+
+.hero-value small {
+  font-size: 11px;
+  color: var(--fm-muted);
+  font-weight: 400;
+}
+
+.hero-sub {
+  font-size: 11.5px;
+  color: var(--fm-muted);
+}
+
 .cluster-addr {
   word-break: break-all;
 }
@@ -3444,6 +3727,17 @@ function remove() {
 .target-url.missing,
 .c-value-url.missing {
   color: var(--fm-warning);
+}
+
+/* 池统计：节点明细行弱化展示 */
+.pool-node-row td {
+  background: var(--fm-surface-sunken);
+  font-size: 11.5px;
+  color: var(--fm-muted);
+}
+
+.pool-node-row .pool-node {
+  color: var(--fm-text-2);
 }
 
 @media (max-width: 1180px) {

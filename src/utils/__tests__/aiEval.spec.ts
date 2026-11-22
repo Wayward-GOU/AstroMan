@@ -62,7 +62,8 @@ describe('AI 评测集结构', () => {
               ],
             }
           : { content: '这是直接回答，不调用工具。' }
-        res.writeHead(200, { 'Content-Type': 'application/json' })
+        // 关闭 keep-alive，否则 server.close() 要等默认 5s 空闲超时，用例会踩到 5s 上限
+        res.writeHead(200, { 'Content-Type': 'application/json', Connection: 'close' })
         res.end(
           JSON.stringify({
             choices: [{ message }],

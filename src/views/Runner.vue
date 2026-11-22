@@ -27,7 +27,7 @@ import {
   type ScriptRequest,
 } from '@/utils/scriptRunner'
 import { runScriptJob } from '@/utils/scriptHost'
-import type { HttpRequestDetail, HttpResult, RequestSearchHit } from '@/types/models'
+import type { HttpRequestDetail, HttpResult, PoolItem, PoolSummary, RequestSearchHit } from '@/types/models'
 
 const router = useRouter()
 const store = useProjectStore()
@@ -74,11 +74,87 @@ const results = ref<RunItem[]>([])
 const currentIndex = ref(0)
 const totalTasks = ref(0)
 
+/* ---------- 参数池（可选）：按轮 / 按次 / 随机取值 ---------- */
+/** 条目：v20 起带整行 data（旧池 / 旧接口可能没有） */
+type PoolItemWithData = PoolItem & { data?: Record<string, string> }
+
+const pools = ref<PoolSummary[]>([])
+const poolId = ref<number | null>(null)
+const poolTarget = ref('')
+/** 列选择：'' 取首列、'*' 注入整行、具体列名取该列 */
+const poolColumn = ref('')
+const poolMode = ref<'round' | 'request' | 'random'>('round')
+const poolItemsList = ref<PoolItemWithData[]>([])
+let poolCursor = 0
+
+const selectedPool = computed(() => pools.value.find((item) => item.id === poolId.value) ?? null)
+
+const poolColumnOptions = computed(() => {
+  const columns = selectedPool.value?.columns ?? []
+  return [
+    { label: '全部列（同名注入）', value: '*' },
+    ...columns.map((column) => ({ label: column, value: column })),
+  ]
+})
+
+/** 池值：'*' 返回整行 data，其余返回单值 */
+type PoolPick =
+  | { kind: 'row'; data: Record<string, string> }
+  | { kind: 'value'; value: string }
+
+async function loadPools() {
+  try {
+    pools.value = await api.poolList()
+  } catch {
+    pools.value = []
+  }
+}
+
+async function loadPoolItems(id: number | null) {
+  poolItemsList.value = []
+  poolCursor = 0
+  if (!id) return
+  try {
+    const items = (await api.poolItems(id, true)) as PoolItemWithData[]
+    poolItemsList.value = items.filter(
+      (item) => item.enabled !== false && ((item.value ?? '') !== '' || Object.keys(item.data ?? {}).length > 0),
+    )
+  } catch (error) {
+    message.error(String(error))
+  }
+}
+
+function pickPoolValue(round: number): PoolPick | null {
+  const items = poolItemsList.value
+  if (!poolId.value || !items.length) return null
+  if (poolColumn.value !== '*' && !poolTarget.value.trim()) return null
+  const index =
+    poolMode.value === 'round'
+      ? round - 1
+      : poolMode.value === 'random'
+        ? Math.floor(Math.random() * items.length)
+        : poolCursor++
+  const item = items[index % items.length]
+  if (!item) return null
+  if (poolColumn.value === '*') {
+    // 旧池 / 旧接口没有 data 时退回首列值，保证仍能渲染
+    const data = item.data
+    return { kind: 'row', data: data && Object.keys(data).length ? data : { value: item.value ?? '' } }
+  }
+  const value = poolColumn.value ? item.data?.[poolColumn.value] ?? item.value : item.value
+  return value != null && value !== '' ? { kind: 'value', value } : null
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
 onMounted(async () => {
   await store.loadProjects()
   if (store.projects.length) {
     projectId.value = store.projects[0].id
   }
+  await loadPools()
 })
 
 watch(projectId, async (id) => {
@@ -347,6 +423,17 @@ function parseCsv(text: string): DataRow[] {
   })
 }
 
+watch(poolId, (id) => {
+  // 切换池时列选择回到旧行为，并重新拉取条目
+  poolColumn.value = ''
+  void loadPoolItems(id)
+})
+
+watch(poolColumn, () => {
+  // 列选择变化时重新加载，确保拿到当前池最新条目
+  void loadPoolItems(poolId.value)
+})
+
 /* ---------- 执行 ---------- */
 function applyData(text: string, row: DataRow | null): string {
   if (!row) return text
@@ -383,6 +470,15 @@ async function start() {
     message.warning('单次执行超过 5000 次，请减少接口数量或迭代次数')
     return
   }
+  if (poolId.value && poolColumn.value !== '*' && !poolTarget.value.trim()) {
+    message.warning('已选择参数池，请填写占位符名（请求里用 {{名字}} 引用）')
+    return
+  }
+  if (poolId.value && !poolItemsList.value.length) {
+    message.warning('所选参数池没有可用条目，请先在数据池导入')
+    return
+  }
+  poolCursor = 0
   results.value = []
   stopFlag.value = false
   running.value = true
@@ -429,6 +525,11 @@ function stop() {
 
 async function runOne(requestId: number, round: number, row: DataRow | null) {
   const detail = await api.requestGet(requestId)
+  const poolPick = pickPoolValue(round)
+  const targetName = poolTarget.value.trim()
+  const poolPattern = targetName
+    ? new RegExp(`\\{\\{\\s*${escapeRegExp(targetName)}\\s*\\}\\}`, 'g')
+    : null
   if (!detail.auth) {
     detail.auth = { kind: 'none', token: '', username: '', password: '', key: '', value: '', addTo: 'header' }
   }
@@ -465,7 +566,28 @@ async function runOne(requestId: number, round: number, row: DataRow | null) {
     outgoing = preResult.request
   }
 
-  const render = (text: string) => applyData(renderRuntimeVars(text), row)
+  const render = (text: string) => {
+    let out = applyData(renderRuntimeVars(text), row)
+    // 池值优先级最高：整行注入时按列名替换，指定列时替换单个占位符
+    if (poolPick?.kind === 'row') {
+      for (const [key, value] of Object.entries(poolPick.data)) {
+        out = out.replace(new RegExp(`\\{\\{\\s*${escapeRegExp(key)}\\s*\\}\\}`, 'g'), value)
+      }
+    } else if (poolPick?.kind === 'value' && poolPattern) {
+      out = out.replace(poolPattern, poolPick.value)
+    }
+    return out
+  }
+  const renderAuth = detail.auth
+    ? {
+        ...detail.auth,
+        token: render(detail.auth.token ?? ''),
+        username: render(detail.auth.username ?? ''),
+        password: render(detail.auth.password ?? ''),
+        key: render(detail.auth.key ?? ''),
+        value: render(detail.auth.value ?? ''),
+      }
+    : detail.auth
   let result: HttpResult
   try {
     result = await api.sendRequest({
@@ -488,7 +610,7 @@ async function runOne(requestId: number, round: number, row: DataRow | null) {
       envId: envId.value,
       insecure: insecure.value,
       timeoutMs: 30000,
-      auth: detail.auth,
+      auth: renderAuth,
       cookieEnabled: true,
     })
   } catch (e) {
@@ -625,6 +747,47 @@ function openRequest(id: number) {
             placeholder="不使用环境"
             :options="store.environments.map((e) => ({ label: e.name, value: e.id }))"
           />
+        </div>
+        <div class="field">
+          <span class="label">参数池</span>
+          <div class="pool-body">
+            <a-select
+              v-model:value="poolId"
+              allow-clear
+              :disabled="running"
+              placeholder="可选，不使用池"
+              :options="pools.map((p) => ({ label: p.name, value: p.id }))"
+            />
+            <div v-if="poolId" class="pool-row">
+              <a-select
+                v-if="selectedPool?.columns?.length"
+                v-model:value="poolColumn"
+                :disabled="running"
+                style="width: 120px"
+                placeholder="默认（首列）"
+                :options="poolColumnOptions"
+              />
+              <a-input
+                v-if="poolColumn !== '*'"
+                v-model:value="poolTarget"
+                :disabled="running"
+                placeholder="占位符名，如 phone"
+              />
+              <span v-else class="hint">列名即变量名</span>
+              <a-select
+                v-model:value="poolMode"
+                :disabled="running"
+                :options="[
+                  { label: '每轮固定', value: 'round' },
+                  { label: '每次执行轮换', value: 'request' },
+                  { label: '随机', value: 'random' },
+                ]"
+              />
+            </div>
+            <span class="hint">
+              URL / Query / Header / Body / 认证字段里写 &#123;&#123;占位符名&#125;&#125; 即可取池值；选「全部列」时列名即变量名，批量运行只取值，不做 401 刷新
+            </span>
+          </div>
         </div>
         <div class="field">
           <span class="label">迭代次数</span>
@@ -898,6 +1061,31 @@ function openRequest(id: number) {
 
 .num {
   width: 110px;
+}
+
+.pool-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.pool-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* 覆盖模板里的百分比 / 固定宽度，窄配置栏下按最小宽度换行 */
+.pool-row > * {
+  flex: 1 1 110px;
+  min-width: 0;
+}
+
+.pool-row > .hint {
+  flex: 1 1 auto;
+  white-space: nowrap;
 }
 
 .hint {

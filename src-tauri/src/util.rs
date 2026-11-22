@@ -35,7 +35,10 @@ pub fn now_ms() -> i64 {
 
 /// 归一化集群变量策略：master_wins（默认）/ local_wins
 pub fn normalize_var_policy(value: Option<&str>) -> &'static str {
-    match value.map(|value| value.trim().to_ascii_lowercase()).as_deref() {
+    match value
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
         Some("local_wins") => "local_wins",
         _ => "master_wins",
     }
@@ -187,11 +190,12 @@ fn resolve_expr(
         return format!("{{{{secret:{secret_expr}}}}}");
     }
 
-    // {{os:NAME}}：值由调用方按白名单预先注入到 vars，不在此处直读进程环境
+    // {{os:NAME}}：只认注入时写入的专用键，环境变量或数据池里的同名变量顶不掉
+    // 系统值；专用键缺失说明该变量未进白名单或本机没有，按未解析处理。
     if let Some(os_expr) = expr.strip_prefix("os:") {
         let os_expr = os_expr.trim();
         let name = os_expr.strip_prefix('$').unwrap_or(os_expr);
-        if let Some(value) = vars.get(name) {
+        if let Some(value) = vars.get(&os_var_key(name)) {
             return value.clone();
         }
         return format!("{{{{os:{name}}}}}");
@@ -494,6 +498,40 @@ impl RequiredVars {
     }
 }
 
+/// 收集压测配置里所有可能含占位符的文本：URL、Query、Header、Body、认证字段
+///
+/// 变量体检、开跑前预检与集群下发共用这一份收集规则，避免各处漏字段导致
+/// 「界面上说有值、跑起来报缺失」。
+pub fn config_texts(config: &crate::models::StressConfig) -> Vec<String> {
+    let mut texts = vec![config.url.trim().to_string()];
+    for item in config.params.iter().chain(config.headers.iter()) {
+        if !item.enabled {
+            continue;
+        }
+        texts.push(item.key.trim().to_string());
+        texts.push(item.value.clone());
+    }
+    if let Some(body) = &config.body {
+        texts.push(body.clone());
+    }
+    if let Some(auth) = &config.auth {
+        for value in [
+            &auth.token,
+            &auth.username,
+            &auth.password,
+            &auth.key,
+            &auth.value,
+            &auth.token_url,
+            &auth.client_id,
+            &auth.client_secret,
+            &auth.scope,
+        ] {
+            texts.push(value.clone());
+        }
+    }
+    texts
+}
+
 /// 扫描一段文本中的全部 `{{...}}`，按类型归类
 pub fn required_vars_in_text(input: &str) -> RequiredVars {
     let mut result = RequiredVars::default();
@@ -546,6 +584,18 @@ pub fn required_vars_in_json(value: &serde_json::Value) -> RequiredVars {
     }
     walk(value, &mut result);
     result
+}
+
+/// 操作系统变量在运行期变量表里的专用键前缀
+///
+/// `{{os:NAME}}` 的语义是「本机系统值」，不能被环境变量或数据池里的同名变量顶掉，
+/// 因此注入时把系统值写到这个前缀下，`resolve_expr` 只认这个键。
+/// 前缀含双下划线且带冒号，不会与合法的池列名（字母 / 下划线开头，仅字母数字下划线）冲突。
+pub const OS_VAR_PREFIX: &str = "__os__:";
+
+/// 操作系统变量的专用键名
+pub fn os_var_key(name: &str) -> String {
+    format!("{OS_VAR_PREFIX}{name}")
 }
 
 /// 判断 OS 环境变量是否在允许清单内
@@ -699,6 +749,20 @@ mod tests {
         let simple = render("{{uuidNoDash}}", &map);
         assert_eq!(simple.len(), 32);
         assert!(!simple.contains('-'));
+    }
+
+    #[test]
+    fn os_placeholder_reads_dedicated_key_only() {
+        // 数据池 / 环境变量的同名变量不得顶掉系统值
+        let mut map = vars(&[("USER", "from-pool")]);
+        map.insert(os_var_key("USER"), "system-user".to_string());
+        assert_eq!(render("{{os:USER}}", &map), "system-user");
+        assert_eq!(render("{{USER}}", &map), "from-pool");
+        // 没有专用键时按未解析保留，绝不回退到普通变量
+        assert_eq!(
+            render("{{os:USER}}", &vars(&[("USER", "from-pool")])),
+            "{{os:USER}}"
+        );
     }
 
     #[test]

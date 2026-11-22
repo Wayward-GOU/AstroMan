@@ -609,12 +609,42 @@ CREATE TABLE IF NOT EXISTS cluster_report_samples (
     concurrent    INTEGER DEFAULT 0,
     qps           REAL    DEFAULT 0,
     p95_rt        REAL    DEFAULT 0,
-    error_count   INTEGER DEFAULT 0
+    error_count   INTEGER DEFAULT 0,
+    cpu           REAL    DEFAULT 0,
+    host_cpu_percent REAL DEFAULT 0,
+    mem_mb        INTEGER DEFAULT 0,
+    net_rx_kbps   REAL    DEFAULT 0,
+    net_tx_kbps   REAL    DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_cluster_samples_report
     ON cluster_report_samples(report_id, node, elapsed_sec);
 CREATE INDEX IF NOT EXISTS idx_cluster_samples_node
     ON cluster_report_samples(node, elapsed_sec);
+
+-- 从节点配对 / 执行历史（v21）：从机视角记录连过哪些主节点、跑过哪些任务
+CREATE TABLE IF NOT EXISTS cluster_slave_history (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at        INTEGER NOT NULL,
+    master_addr       TEXT NOT NULL DEFAULT '',
+    master_node       TEXT NOT NULL DEFAULT '',
+    master_job_id     INTEGER,
+    node_name         TEXT NOT NULL DEFAULT '',
+    plan_name         TEXT NOT NULL DEFAULT '',
+    join_mode         TEXT NOT NULL DEFAULT 'code',
+    concurrent        INTEGER NOT NULL DEFAULT 0,
+    total_concurrent  INTEGER NOT NULL DEFAULT 0,
+    status            TEXT NOT NULL DEFAULT 'connecting',
+    qps_avg           REAL NOT NULL DEFAULT 0,
+    cpu_peak          REAL NOT NULL DEFAULT 0,
+    mem_peak_mb       INTEGER NOT NULL DEFAULT 0,
+    host_cpu_peak     REAL NOT NULL DEFAULT 0,
+    net_peak_kbps     REAL NOT NULL DEFAULT 0,
+    started_at        INTEGER,
+    ended_at          INTEGER,
+    message           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_cluster_slave_history_created
+    ON cluster_slave_history(created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_errors_report ON report_errors(report_id);
 CREATE INDEX IF NOT EXISTS idx_history_created ON request_history(created_at DESC);

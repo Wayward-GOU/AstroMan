@@ -146,6 +146,9 @@ pub struct HelloPayload {
     /// 是否支持池自定义列 / 自动注入（v20）；旧节点缺省 false
     #[serde(default)]
     pub pool_columns: bool,
+    /// 是否支持运行期时钟复测；旧节点缺省 false，主节点不会在施压中打扰它
+    #[serde(default)]
+    pub clock_recheck: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -397,6 +400,37 @@ pub struct StartPayload {
     pub offset_ms: f64,
 }
 
+/// 从节点资源快照：跟随每秒采样上行，主节点据此展示与归档
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostSample {
+    /// 施压进程占用的核数（与单机报告口径一致）
+    pub cpu: f64,
+    /// 整机 CPU 使用率（0~100）：识别机器被其他进程拖慢
+    #[serde(default)]
+    pub host_cpu_percent: f64,
+    /// 施压进程 RSS（MB）
+    pub mem_mb: u64,
+    /// 整机内存使用率（0~100）
+    #[serde(default)]
+    pub host_mem_percent: f64,
+    /// 进程线程数
+    #[serde(default)]
+    pub threads: u32,
+    /// 网卡接收速率（KB/s）
+    #[serde(default)]
+    pub net_rx_kbps: f64,
+    /// 网卡发送速率（KB/s）
+    #[serde(default)]
+    pub net_tx_kbps: f64,
+    /// 1 分钟平均负载（Windows 为 0）
+    #[serde(default)]
+    pub load1: f64,
+    /// 文件描述符 / 句柄数，取不到为 0
+    #[serde(default)]
+    pub fd_count: u32,
+}
+
 /// 每秒采样：计数用于合并曲线，稀疏桶用于重算每秒分位
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -417,6 +451,9 @@ pub struct SamplePayload {
     #[serde(default)]
     pub sum_ttfb_ms: u64,
     pub latency_buckets: SparseBuckets,
+    /// 本机资源快照；旧节点为 None
+    #[serde(default)]
+    pub host: Option<HostSample>,
 }
 
 /// 从节点最终结果：合并报告的唯一输入
@@ -538,9 +575,33 @@ pub struct ClusterNodeInfo {
     pub qps: f64,
     pub cpu: Option<f64>,
     pub mem_mb: Option<u64>,
+    /// 整机 CPU 使用率（%），旧节点为 None
+    #[serde(default)]
+    pub host_cpu_percent: Option<f64>,
+    /// 整机内存使用率（%）
+    #[serde(default)]
+    pub host_mem_percent: Option<f64>,
+    /// 网卡接收速率（KB/s）
+    #[serde(default)]
+    pub net_rx_kbps: Option<f64>,
+    /// 网卡发送速率（KB/s）
+    #[serde(default)]
+    pub net_tx_kbps: Option<f64>,
+    /// 进程线程数
+    #[serde(default)]
+    pub threads: Option<u32>,
+    /// 1 分钟平均负载
+    #[serde(default)]
+    pub load1: Option<f64>,
     /// 从节点时钟相对主节点的偏移（毫秒，正数表示从节点更快）
     pub clock_offset_ms: Option<f64>,
     pub clock_uncertainty_ms: Option<f64>,
+    /// 运行期复测的漂移（毫秒）：相对配对时刻偏移的变化量
+    #[serde(default)]
+    pub clock_drift_ms: f64,
+    /// 最近一次复测时刻
+    #[serde(default)]
+    pub clock_recheck_at: Option<i64>,
     pub dropped_samples: u64,
     pub joined_at: i64,
     pub last_seen_at: Option<i64>,
@@ -584,6 +645,34 @@ pub struct PoolSizeEstimate {
     pub items: u64,
     /// 估算的切片字节数（含每行的 JSON 与字段开销）
     pub bytes: u64,
+}
+
+/// 单节点在某一秒的图表字段
+///
+/// 只带界面需要的值：直方图桶留在后端做合并与 AI 诊断，避免每秒把桶发给前端。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeSampleLite {
+    pub node_id: String,
+    pub qps: f64,
+    pub concurrent: u32,
+    pub avg_rt: f64,
+    pub error_count: u64,
+    #[serde(default)]
+    pub cpu: Option<f64>,
+    #[serde(default)]
+    pub mem_mb: Option<u64>,
+}
+
+/// 采样帧：每秒一帧，把该秒所有节点的图表字段一起下发
+///
+/// 16 个节点时 IPC 从每秒 16 次降到 1 次，主节点不用为每条采样做一次序列化。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClusterSampleFrame {
+    pub job_id: i64,
+    pub sec: u64,
+    pub nodes: Vec<NodeSampleLite>,
 }
 
 /// 主节点任务快照：前端每秒拉取 / 订阅事件
@@ -776,6 +865,20 @@ pub struct SeriesPoint {
     pub concurrent: u32,
     pub p95: f64,
     pub errors: u64,
+    /// 施压进程占用核数（旧报告为 0）
+    #[serde(default)]
+    pub cpu: f64,
+    /// 整机 CPU 使用率（%）
+    #[serde(default)]
+    pub host_cpu_percent: f64,
+    /// 进程 RSS（MB）
+    #[serde(default)]
+    pub mem_mb: u64,
+    /// 网卡接收 / 发送速率（KB/s）
+    #[serde(default)]
+    pub net_rx_kbps: f64,
+    #[serde(default)]
+    pub net_tx_kbps: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -790,8 +893,20 @@ pub struct ClusterReportNode {
     pub qps_avg: f64,
     pub cpu_peak: f64,
     pub mem_peak_mb: u64,
+    /// 整机 CPU 使用率峰值（%）
+    #[serde(default)]
+    pub host_cpu_peak: f64,
+    /// 整机内存使用率峰值（%）
+    #[serde(default)]
+    pub host_mem_peak_percent: f64,
+    /// 网卡收发合计峰值（KB/s）
+    #[serde(default)]
+    pub net_peak_kbps: f64,
     pub clock_offset_ms: f64,
     pub clock_uncertainty_ms: f64,
+    /// 运行期时钟复测得到的漂移（毫秒）
+    #[serde(default)]
+    pub clock_drift_ms: f64,
     pub dropped_samples: u64,
     pub start_ms: i64,
     pub end_ms: i64,

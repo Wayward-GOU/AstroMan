@@ -376,7 +376,7 @@ async function releaseAll() {
   height: 8px;
   background: #fa8c16;
   border-radius: 50%;
-  box-shadow: 0 0 0 3px rgba(250, 140, 22, 0.18);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--fm-warning) 18%, transparent);
 }
 
 .bp-sub {
@@ -406,7 +406,7 @@ async function releaseAll() {
   max-width: 100%;
   padding: 3px 8px;
   font-size: 12px;
-  background: var(--fm-bg-soft, #f6f7f9);
+  background: var(--fm-bg-soft);
   border: 1px solid transparent;
   border-radius: 6px;
   cursor: pointer;
@@ -419,7 +419,7 @@ async function releaseAll() {
 
 .chip-phase {
   padding: 0 5px;
-  color: #fff;
+  color: var(--fm-on-accent);
   background: #1677ff;
   border-radius: 3px;
 }
@@ -450,7 +450,7 @@ async function releaseAll() {
 }
 
 .bp-rule {
-  color: var(--fm-text, #1f2329);
+  color: var(--fm-text);
 }
 
 .bp-clock {
@@ -492,7 +492,7 @@ async function releaseAll() {
 
 .bp-sect-head em {
   font-style: normal;
-  color: var(--fm-text, #1f2329);
+  color: var(--fm-text);
 }
 
 .spacer {
@@ -527,7 +527,7 @@ async function releaseAll() {
 
 .bp-hint {
   color: var(--fm-muted);
-  background: var(--fm-bg-soft, #f6f7f9);
+  background: var(--fm-bg-soft);
 }
 
 .bp-locked {
@@ -541,7 +541,7 @@ async function releaseAll() {
   gap: 8px;
   padding-top: 10px;
   margin-top: 4px;
-  border-top: 1px solid var(--fm-border, #e5e7eb);
+  border-top: 1px solid var(--fm-border);
 }
 
 .bp-foot-hint {

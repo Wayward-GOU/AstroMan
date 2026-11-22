@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
@@ -20,10 +20,13 @@ import {
   toAllocationNode,
 } from '@/utils/clusterAllocation'
 import type {
+  ClusterJobDetail,
+  ClusterJobSummary,
   ClusterMasterSnapshot,
   ClusterNodeInfo,
   ClusterProtocolInfo,
-  ClusterSampleEvent,
+  ClusterSampleFrame,
+  ClusterSlaveHistoryItem,
   ClusterSlaveSnapshot,
   DiscoveredMaster,
   VarAuditReport,
@@ -345,21 +348,75 @@ const startCountdownSec = computed(() => {
 
 const totalQps = computed(() => nodeList.value.reduce((sum, node) => sum + node.qps, 0))
 
-/* ---------- 实时曲线：每秒采样按秒归集，避免各节点上报时刻不同导致错位 ---------- */
+/* ---------- 实时曲线：采样先进非响应式缓冲，按节拍提交 ---------- */
 
 const LIVE_WINDOW = 120
+/** 单条曲线最多保留的点数：超出后按步长抽稀，减少 SVG path 重算成本 */
+const LIVE_MAX_POINTS = 60
+const LIVE_REFRESH_KEY = 'astroman:cluster-live-refresh'
+
+/** 提交节拍（秒）：主节点自己也在施压，图表不必每秒重绘 */
+const liveRefreshSec = ref(loadLiveRefreshSec())
 const liveSamplesBySec = ref<Record<number, Record<string, number>>>({})
+/** 采样缓冲：普通 Map，写入不触发任何响应式更新 */
+const liveBuffer = new Map<number, Record<string, number>>()
+
+function loadLiveRefreshSec(): number {
+  const saved = Number(localStorage.getItem(LIVE_REFRESH_KEY))
+  return [1, 2, 5].includes(saved) ? saved : 2
+}
+
+function pushLiveSample(sec: number, nodeId: string, qps: number) {
+  const bucket = liveBuffer.get(sec)
+  if (bucket) bucket[nodeId] = qps
+  else liveBuffer.set(sec, { [nodeId]: qps })
+}
+
+/** 把缓冲提交到响应式状态；页面隐藏时跳过，恢复可见后补一次 */
+function commitLiveSamples() {
+  if (typeof document !== 'undefined' && document.hidden) return
+  const keys = [...liveBuffer.keys()].sort((a, b) => a - b).slice(-LIVE_WINDOW)
+  if (!keys.length) return
+  const keep = new Set(keys)
+  for (const key of liveBuffer.keys()) {
+    if (!keep.has(key)) liveBuffer.delete(key)
+  }
+  const next: Record<number, Record<string, number>> = {}
+  for (const key of keys) next[key] = liveBuffer.get(key) ?? {}
+  liveSamplesBySec.value = next
+}
 
 function resetLiveSamples() {
+  liveBuffer.clear()
   liveSamplesBySec.value = {}
 }
 
-const liveElapsed = computed(() =>
-  Object.keys(liveSamplesBySec.value)
+/** 图表里的节点集合：只在节点增删或改名时更新，避免每秒快照触发曲线重算 */
+const chartNodes = shallowRef<{ id: string; name: string }[]>([])
+
+function syncChartNodes(list: ClusterNodeInfo[]) {
+  const next = list.map((node) => ({ id: node.id, name: node.name || node.id }))
+  const same =
+    next.length === chartNodes.value.length &&
+    next.every(
+      (node, index) =>
+        node.id === chartNodes.value[index].id && node.name === chartNodes.value[index].name,
+    )
+  if (!same) chartNodes.value = next
+}
+
+const liveElapsed = computed(() => {
+  const all = Object.keys(liveSamplesBySec.value)
     .map(Number)
     .sort((a, b) => a - b)
-    .slice(-LIVE_WINDOW),
-)
+    .slice(-LIVE_WINDOW)
+  if (all.length <= LIVE_MAX_POINTS) return all
+  const step = Math.ceil(all.length / LIVE_MAX_POINTS)
+  const picked = all.filter((_, index) => index % step === 0)
+  const last = all[all.length - 1]
+  if (picked[picked.length - 1] !== last) picked.push(last)
+  return picked
+})
 
 const liveLabels = computed(() => liveElapsed.value.map((sec) => `${sec}s`))
 
@@ -373,8 +430,8 @@ const NODE_COLORS = [
 
 const liveSeries = computed(() => {
   if (!liveElapsed.value.length) return []
-  return nodeList.value.map((node, index) => ({
-    name: node.name || node.id,
+  return chartNodes.value.map((node, index) => ({
+    name: node.name,
     color: NODE_COLORS[index % NODE_COLORS.length],
     values: liveElapsed.value.map((sec) => liveSamplesBySec.value[sec]?.[node.id] ?? 0),
   }))
@@ -595,6 +652,7 @@ function applySession(snapshot: ClusterMasterSnapshot) {
     if (!weightDirty.value[node.id]) next[node.id] = node.weight
   }
   weights.value = next
+  syncChartNodes(snapshot.nodes)
 }
 
 function setWeight(node: ClusterNodeInfo, value: unknown) {
@@ -974,11 +1032,31 @@ function clockText(node: ClusterNodeInfo): string {
   return `${offset}${uncertainty} ms`
 }
 
+/** 运行期漂移：每秒复测一次偏移，超过 50ms 说明两台机器的时钟在跑偏 */
+function driftText(node: ClusterNodeInfo): string {
+  if (!node.clockRecheckAt || node.clockDriftMs == null) return ''
+  const drift = node.clockDriftMs
+  if (Math.abs(drift) < 1) return '漂移 <1 ms'
+  return `漂移 ${drift > 0 ? '+' : ''}${fmt(drift)} ms`
+}
+
+function driftTone(node: ClusterNodeInfo): string {
+  if (node.clockDriftMs == null || !node.clockRecheckAt) return ''
+  return Math.abs(node.clockDriftMs) >= 50 ? 'bad' : ''
+}
+
 function resourceText(node: ClusterNodeInfo): string {
-  if (node.cpu == null && node.memMb == null) return '—'
-  const cpu = node.cpu == null ? '—' : `${fmt(node.cpu, 2)} 核`
-  const mem = node.memMb == null ? '—' : `${fmtInt(node.memMb)} MB`
-  return `${cpu} · ${mem}`
+  if (node.cpu == null && node.memMb == null && node.hostCpuPercent == null) return '—'
+  const parts: string[] = []
+  if (node.cpu != null) parts.push(`引擎 ${fmt(node.cpu, 2)} 核`)
+  if (node.hostCpuPercent != null) parts.push(`整机 ${Math.round(node.hostCpuPercent)}%`)
+  if (node.memMb != null) parts.push(`${fmtInt(node.memMb)} MB`)
+  if (node.netRxKbps != null || node.netTxKbps != null) {
+    const rx = node.netRxKbps == null ? '—' : fmt(node.netRxKbps / 1024, 1)
+    const tx = node.netTxKbps == null ? '—' : fmt(node.netTxKbps / 1024, 1)
+    parts.push(`↓${rx} ↑${tx} MB/s`)
+  }
+  return parts.length ? parts.join(' · ') : '—'
 }
 
 const NODE_STATUS_TEXT: Record<string, string> = {
@@ -1055,6 +1133,17 @@ function fmtMb(bytes: number | null | undefined): string {
   if (bytes == null) return '—'
   const mb = Number(bytes) / 1024 / 1024
   return mb >= 10 ? `${mb.toFixed(0)} MB` : `${mb.toFixed(1)} MB`
+}
+
+/** 从节点历史里的资源峰值：进程口径 + 整机口径 + 网卡 */
+function slaveResourceText(item: ClusterSlaveHistoryItem): string {
+  if (!item.cpuPeak && !item.memPeakMb && !item.hostCpuPeak) return '—'
+  const parts: string[] = []
+  if (item.cpuPeak) parts.push(`${fmt(item.cpuPeak, 2)} 核`)
+  if (item.hostCpuPeak) parts.push(`整机 ${fmt(item.hostCpuPeak, 0)}%`)
+  if (item.memPeakMb) parts.push(`${fmtInt(item.memPeakMb)} MB`)
+  if (item.netPeakKbps) parts.push(`↓↑ ${fmt(item.netPeakKbps / 1024, 1)} MB/s`)
+  return parts.join(' · ')
 }
 
 /** 节点兼容性说明：缺哪些能力，鼠标悬停可见 */
@@ -1180,7 +1269,201 @@ async function copyPairInfo() {
   }
 }
 
+/* ---------- 历史记录 ---------- */
+
+const historyLoading = ref(false)
+const historyStatus = ref('')
+const historyKeyword = ref('')
+const historyPage = ref(1)
+const historyPageSize = 20
+const historyTotal = ref(0)
+const historyItems = ref<ClusterJobSummary[]>([])
+const historyDetailOpen = ref(false)
+const historyDetailLoading = ref(false)
+const historyDetail = ref<ClusterJobDetail | null>(null)
+
+const HISTORY_STATUS_OPTIONS = [
+  { value: '', label: '全部状态' },
+  { value: 'finished', label: '已完成' },
+  { value: 'failed', label: '失败' },
+  { value: 'running', label: '运行中' },
+]
+
+const HISTORY_STATUS_TEXT: Record<string, string> = {
+  pairing: '配对中',
+  preparing: '准备中',
+  ready: '就绪',
+  running: '运行中',
+  finished: '已完成',
+  failed: '失败',
+  idle: '空闲',
+}
+
+const historyColumns = [
+  { title: '创建时间', key: 'createdAt', width: 170 },
+  { title: '计划', dataIndex: 'planName', key: 'planName', ellipsis: true },
+  { title: '节点', dataIndex: 'nodeCount', key: 'nodeCount', width: 70 },
+  { title: '总并发', dataIndex: 'totalConcurrent', key: 'totalConcurrent', width: 90 },
+  { title: '平均 QPS', key: 'avgQps', width: 110 },
+  { title: '状态', key: 'status', width: 100 },
+  { title: '操作', key: 'action', width: 140 },
+]
+
+const historyNodeColumns = [
+  { title: '节点', dataIndex: 'nodeName', key: 'nodeName', ellipsis: true },
+  { title: '角色', key: 'role', width: 70 },
+  { title: '地址', dataIndex: 'addr', key: 'addr', width: 150, ellipsis: true },
+  { title: '并发', dataIndex: 'concurrent', key: 'concurrent', width: 70 },
+  { title: 'QPS', key: 'qps', width: 90 },
+  { title: 'CPU', key: 'cpu', width: 90 },
+  { title: '状态', key: 'status', width: 90 },
+]
+
+function historyStatusText(status: string) {
+  return HISTORY_STATUS_TEXT[status] ?? status
+}
+
+function historyStatusTone(status: string): Tone {
+  if (status === 'finished') return 'ok'
+  if (status === 'failed') return 'bad'
+  if (status === 'running') return 'live'
+  if (status === 'preparing' || status === 'pairing' || status === 'ready') return 'info'
+  return 'idle'
+}
+
+async function loadHistory() {
+  historyLoading.value = true
+  try {
+    const page = await api.clusterJobsList(
+      historyPage.value,
+      historyPageSize,
+      historyStatus.value,
+      historyKeyword.value.trim(),
+    )
+    historyItems.value = page.items
+    historyTotal.value = page.total
+  } catch (error) {
+    message.error(`读取历史失败：${String(error)}`)
+  } finally {
+    historyLoading.value = false
+  }
+}
+
+function applyHistoryFilter() {
+  historyPage.value = 1
+  void loadHistory()
+}
+
+function onHistoryPageChange(pagination: { current?: number }) {
+  historyPage.value = pagination.current ?? 1
+  void loadHistory()
+}
+
+async function openHistoryDetail(record: ClusterJobSummary) {
+  historyDetailOpen.value = true
+  historyDetailLoading.value = true
+  historyDetail.value = null
+  try {
+    historyDetail.value = await api.clusterJobDetail(record.id)
+  } catch (error) {
+    message.error(String(error))
+  } finally {
+    historyDetailLoading.value = false
+  }
+}
+
+function historyRowProps(record: ClusterJobSummary) {
+  return { onClick: () => void openHistoryDetail(record) }
+}
+
+function clearHistory() {
+  Modal.confirm({    title: '清理历史任务',
+    content: '只删除已结束的任务记录，运行中的任务不受影响。',
+    okText: '清理',
+    cancelText: '取消',
+    onOk: async () => {
+      try {
+        const removed = await api.clusterJobsClear(0)
+        message.success(`已清理 ${removed} 条历史`)
+        historyPage.value = 1
+        await loadHistory()
+      } catch (error) {
+        message.error(String(error))
+      }
+    },
+  })
+}
+
+/* ---------- 从节点历史 ---------- */
+
+const slaveHistory = ref<ClusterSlaveHistoryItem[]>([])
+const slaveHistoryLoading = ref(false)
+
+const slaveHistoryColumns = [
+  { title: '时间', key: 'createdAt', width: 160 },
+  { title: '主节点', dataIndex: 'masterAddr', key: 'masterAddr', width: 160, ellipsis: true },
+  { title: '计划', dataIndex: 'planName', key: 'planName', ellipsis: true },
+  { title: '并发', dataIndex: 'concurrent', key: 'concurrent', width: 70 },
+  { title: '峰值 QPS', key: 'qpsAvg', width: 100 },
+  { title: '本机资源峰值', key: 'resources', width: 210 },
+  { title: '状态', key: 'status', width: 90 },
+]
+
+async function loadSlaveHistory() {
+  slaveHistoryLoading.value = true
+  try {
+    slaveHistory.value = await api.clusterSlaveHistoryList(50, 0)
+  } catch {
+    slaveHistory.value = []
+  } finally {
+    slaveHistoryLoading.value = false
+  }
+}
+
+function clearSlaveHistory() {
+  Modal.confirm({
+    title: '清空本机参与记录',
+    content: '只删除本机的配对/执行历史，不影响主节点上的报告。',
+    okText: '清空',
+    cancelText: '取消',
+    onOk: async () => {
+      try {
+        const removed = await api.clusterSlaveHistoryClear()
+        message.success(`已清空 ${removed} 条记录`)
+        await loadSlaveHistory()
+      } catch (error) {
+        message.error(String(error))
+      }
+    },
+  })
+}
+
+watch(activeTab, (tab) => {
+  if (tab === 'history') void loadHistory()
+  if (tab === 'slave') void loadSlaveHistory()
+})
+
 /* ---------- 生命周期 ---------- */
+
+let liveTimer: number | undefined
+
+function startLiveTimer() {
+  if (liveTimer) window.clearInterval(liveTimer)
+  liveTimer = window.setInterval(() => commitLiveSamples(), liveRefreshSec.value * 1000)
+}
+
+function onVisibilityChange() {
+  if (!document.hidden) commitLiveSamples()
+}
+
+watch(liveRefreshSec, (sec) => {
+  try {
+    localStorage.setItem(LIVE_REFRESH_KEY, String(sec))
+  } catch {
+    /* 忽略存储失败 */
+  }
+  startLiveTimer()
+})
 
 async function tick() {
   nowTick.value = Date.now()
@@ -1271,24 +1554,12 @@ onMounted(async () => {
       }),
     )
     unlisteners.push(
-      await listen<ClusterSampleEvent>('cluster:sample', (event) => {
+      await listen<ClusterSampleFrame>('cluster:sample-frame', (event) => {
         const current = session.value
         if (!current || event.payload.jobId !== current.jobId) return
-        const sec = event.payload.sample.elapsedSec
-        liveSamplesBySec.value = {
-          ...liveSamplesBySec.value,
-          [sec]: {
-            ...(liveSamplesBySec.value[sec] ?? {}),
-            [event.payload.nodeId]: event.payload.sample.qps,
-          },
-        }
-        // 长时间压测只保留最近窗口的两倍，超出即裁剪
-        const keys = Object.keys(liveSamplesBySec.value).map(Number)
-        if (keys.length > LIVE_WINDOW * 2) {
-          const keep = keys.sort((a, b) => a - b).slice(-LIVE_WINDOW)
-          liveSamplesBySec.value = Object.fromEntries(
-            keep.map((key) => [String(key), liveSamplesBySec.value[key]]),
-          )
+        // 一帧包含该秒所有节点：只写缓冲，图表按 liveRefreshSec 的节拍统一提交
+        for (const node of event.payload.nodes) {
+          pushLiveSample(event.payload.sec, node.nodeId, node.qps)
         }
       }),
     )
@@ -1296,6 +1567,8 @@ onMounted(async () => {
     console.error('集群事件监听失败', error)
   }
   timer = window.setInterval(() => void tick(), 1000)
+  startLiveTimer()
+  document.addEventListener('visibilitychange', onVisibilityChange)
   void loadProtocol()
   if (!projectStore.projects.length) {
     try {
@@ -1314,7 +1587,9 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   for (const off of unlisteners) off()
   if (timer) window.clearInterval(timer)
+  if (liveTimer) window.clearInterval(liveTimer)
   if (discoveryTimer) window.clearInterval(discoveryTimer)
+  document.removeEventListener('visibilitychange', onVisibilityChange)
   // 关闭页面不中断任务：主从会话都归后端进程，页面只是视图
 })
 </script>
@@ -1716,7 +1991,16 @@ onBeforeUnmount(() => {
             <header class="panel-head">
               <div class="panel-title">
                 <h3>各节点 QPS</h3>
-                <span class="panel-sub">最近 {{ liveElapsed.length }} 秒 · 每秒刷新</span>
+                <span class="panel-sub">
+                  {{ liveElapsed.length }} 个采样点 · 每 {{ liveRefreshSec }} 秒刷新一次
+                </span>
+              </div>
+              <div class="panel-actions">
+                <a-select v-model:value="liveRefreshSec" size="small" style="width: 120px">
+                  <a-select-option :value="1">实时 · 1 秒</a-select-option>
+                  <a-select-option :value="2">平衡 · 2 秒</a-select-option>
+                  <a-select-option :value="5">省资源 · 5 秒</a-select-option>
+                </a-select>
               </div>
             </header>
             <div class="panel-body chart-body">
@@ -1853,6 +2137,14 @@ onBeforeUnmount(() => {
                 </template>
                 <template v-else-if="column.key === 'clock'">
                   <span class="mono">{{ clockText(record) }}</span>
+                  <div
+                    v-if="driftText(record)"
+                    class="mono clock-drift"
+                    :class="driftTone(record)"
+                    :title="`运行期每 60 秒复测一次；漂移超过 50 ms 说明两台机器时钟在跑偏`"
+                  >
+                    {{ driftText(record) }}
+                  </div>
                 </template>
                 <template v-else-if="column.key === 'dropped'">
                   <span class="mono" :class="{ 'node-dropped': record.droppedSamples > 0 }">
@@ -2071,6 +2363,113 @@ onBeforeUnmount(() => {
             </section>
           </a-col>
         </a-row>
+
+        <section class="fm-card panel history-panel">
+          <header class="panel-head">
+            <div class="panel-title">
+              <h3>本机参与过的任务</h3>
+              <span class="panel-sub">配对与执行记录，保留最近 50 条</span>
+            </div>
+            <div class="panel-actions">
+              <a-button size="small" @click="loadSlaveHistory">刷新</a-button>
+              <a-button size="small" danger @click="clearSlaveHistory">清空</a-button>
+            </div>
+          </header>
+          <a-table
+            size="small"
+            :columns="slaveHistoryColumns"
+            :data-source="slaveHistory"
+            :loading="slaveHistoryLoading"
+            :pagination="false"
+            row-key="id"
+            :scroll="{ y: 320 }"
+          >
+            <template #bodyCell="{ column, record }">
+              <template v-if="column.key === 'createdAt'">
+                {{ fmtTime(record.createdAt) }}
+              </template>
+              <template v-else-if="column.key === 'qpsAvg'">
+                {{ fmt(record.qpsAvg) }}
+              </template>
+              <template v-else-if="column.key === 'resources'">
+                <span class="mono">{{ slaveResourceText(record) }}</span>
+              </template>
+              <template v-else-if="column.key === 'status'">
+                <span class="st-pill" :class="historyStatusTone(record.status)">
+                  <i class="pill-dot" />
+                  {{ historyStatusText(record.status) }}
+                </span>
+              </template>
+            </template>
+          </a-table>
+        </section>
+      </a-tab-pane>
+
+      <a-tab-pane key="history" tab="历史">
+        <section class="fm-card panel">
+          <header class="panel-head">
+            <div class="panel-title">
+              <h3>主节点任务历史</h3>
+              <span class="panel-sub">配对与执行记录，点击行查看节点明细</span>
+            </div>
+            <div class="panel-actions history-actions">
+              <a-select
+                v-model:value="historyStatus"
+                size="small"
+                style="width: 120px"
+                :options="HISTORY_STATUS_OPTIONS"
+                @change="applyHistoryFilter"
+              />
+              <a-input-search
+                v-model:value="historyKeyword"
+                size="small"
+                placeholder="计划或主节点名"
+                style="width: 200px"
+                @search="applyHistoryFilter"
+              />
+              <a-button size="small" @click="loadHistory">刷新</a-button>
+              <a-button size="small" danger @click="clearHistory">清理</a-button>
+            </div>
+          </header>
+          <a-table
+            size="small"
+            :columns="historyColumns"
+            :data-source="historyItems"
+            :loading="historyLoading"
+            :pagination="{
+              current: historyPage,
+              pageSize: historyPageSize,
+              total: historyTotal,
+              showSizeChanger: false,
+            }"
+            row-key="id"
+            :custom-row="historyRowProps"
+            @change="onHistoryPageChange"
+          >
+            <template #bodyCell="{ column, record }">
+              <template v-if="column.key === 'createdAt'">
+                {{ fmtTime(record.createdAt) }}
+              </template>
+              <template v-else-if="column.key === 'avgQps'">
+                {{ record.avgQps ? fmt(record.avgQps) : '—' }}
+              </template>
+              <template v-else-if="column.key === 'status'">
+                <span class="st-pill" :class="historyStatusTone(record.status)">
+                  <i class="pill-dot" />
+                  {{ historyStatusText(record.status) }}
+                </span>
+              </template>
+              <template v-else-if="column.key === 'action'">
+                <a-space>
+                  <a @click.stop="openHistoryDetail(record)">详情</a>
+                  <a v-if="record.reportId" @click.stop="router.push(`/reports/${record.reportId}`)">
+                    报告
+                  </a>
+                </a-space>
+              </template>
+            </template>
+          </a-table>
+        </section>
       </a-tab-pane>
 
       <a-tab-pane key="protocol" tab="协议参数">
@@ -2113,6 +2512,83 @@ onBeforeUnmount(() => {
         </section>
       </a-tab-pane>
     </a-tabs>
+
+    <a-drawer
+      v-model:open="historyDetailOpen"
+      :title="historyDetail ? `任务 #${historyDetail.job.id}` : '任务详情'"
+      placement="right"
+      :width="760"
+    >
+      <a-spin :spinning="historyDetailLoading">
+        <template v-if="historyDetail">
+          <a-descriptions bordered size="small" :column="2" class="history-desc">
+            <a-descriptions-item label="计划">
+              {{ historyDetail.job.planName || '—' }}
+            </a-descriptions-item>
+            <a-descriptions-item label="主节点">
+              {{ historyDetail.job.masterNode || '—' }}
+            </a-descriptions-item>
+            <a-descriptions-item label="创建时间">
+              {{ fmtTime(historyDetail.job.createdAt) }}
+            </a-descriptions-item>
+            <a-descriptions-item label="结束时间">
+              {{ fmtTime(historyDetail.job.finishedAt) }}
+            </a-descriptions-item>
+            <a-descriptions-item label="总并发">
+              {{ historyDetail.job.totalConcurrent }}
+            </a-descriptions-item>
+            <a-descriptions-item label="状态">
+              <span class="st-pill" :class="historyStatusTone(historyDetail.job.status)">
+                <i class="pill-dot" />
+                {{ historyStatusText(historyDetail.job.status) }}
+              </span>
+            </a-descriptions-item>
+            <a-descriptions-item label="平均 QPS">
+              {{ historyDetail.job.avgQps ? fmt(historyDetail.job.avgQps) : '—' }}
+            </a-descriptions-item>
+            <a-descriptions-item label="报告">
+              <a
+                v-if="historyDetail.job.reportId"
+                @click="router.push(`/reports/${historyDetail.job.reportId}`)"
+              >
+                #{{ historyDetail.job.reportId }}
+              </a>
+              <span v-else>—</span>
+            </a-descriptions-item>
+          </a-descriptions>
+          <a-alert
+            v-if="historyDetail.job.incomplete"
+            type="warning"
+            show-icon
+            class="history-alert"
+            :message="historyDetail.job.message || '有节点失联或提前退出，结果不完整'"
+          />
+          <a-table
+            size="small"
+            :columns="historyNodeColumns"
+            :data-source="historyDetail.nodes"
+            :pagination="false"
+            row-key="nodeName"
+          >
+            <template #bodyCell="{ column, record }">
+              <template v-if="column.key === 'role'">
+                {{ record.role === 'master' ? '主' : '从' }}
+              </template>
+              <template v-else-if="column.key === 'qps'">{{ fmt(record.qps) }}</template>
+              <template v-else-if="column.key === 'cpu'">
+                {{ record.cpu == null ? '—' : `${fmt(record.cpu, 2)} 核` }}
+              </template>
+              <template v-else-if="column.key === 'status'">
+                <span class="st-pill" :class="historyStatusTone(record.status)">
+                  <i class="pill-dot" />
+                  {{ historyStatusText(record.status) }}
+                </span>
+              </template>
+            </template>
+          </a-table>
+        </template>
+      </a-spin>
+    </a-drawer>
 
     <a-modal
       v-model:open="auditOpen"
@@ -2881,6 +3357,16 @@ onBeforeUnmount(() => {
   color: var(--fm-warning);
 }
 
+.clock-drift {
+  font-size: 11px;
+  color: var(--fm-muted);
+  margin-top: 2px;
+}
+
+.clock-drift.bad {
+  color: var(--fm-warning);
+}
+
 .weight-input {
   width: 78px;
 }
@@ -3088,5 +3574,24 @@ onBeforeUnmount(() => {
   font-size: 11.5px;
   line-height: 1.7;
   color: var(--fm-muted);
+}
+
+.history-panel {
+  margin-top: 16px;
+}
+
+.history-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.history-desc {
+  margin-bottom: 12px;
+}
+
+.history-alert {
+  margin-bottom: 12px;
 }
 </style>

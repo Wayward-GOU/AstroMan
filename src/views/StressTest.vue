@@ -46,6 +46,7 @@ import type {
   StressProgress,
   StressReport,
   StressStage,
+  VarSourceItem,
 } from '@/types/models'
 
 const route = useRoute()
@@ -220,6 +221,8 @@ async function openConfig() {
   targetProjectId.value = projectStore.projects[0]?.id ?? null
   targetRequestId.value = null
   configOpen.value = true
+  // 打开抽屉即刷新变量来源，避免沿用上次打开时的旧状态
+  void loadVarSources()
 }
 
 watch(targetProjectId, async (id) => {
@@ -465,6 +468,71 @@ function addPoolBinding() {
     column: '',
   })
 }
+
+/* ---------- 本次变量：开跑前自查普通 / 密钥 / 系统变量 ---------- */
+const VAR_KIND_TEXT: Record<string, string> = {
+  user: '普通',
+  secret: '密钥',
+  os: '系统',
+}
+
+const varSources = ref<VarSourceItem[]>([])
+const varOpen = ref(false)
+const varLoading = ref(false)
+const varProblemCount = computed(() => varSources.value.filter((item) => !item.ok).length)
+
+/** 按用户实际写法展示占位符：系统变量与密钥带前缀，一眼和普通变量区分开 */
+function varPlaceholder(item: VarSourceItem) {
+  if (item.kind === 'os') return `{{os:${item.name}}}`
+  if (item.kind === 'secret') return `{{secret:${item.name}}}`
+  return `{{${item.name}}}`
+}
+
+let varTimer: ReturnType<typeof setTimeout> | undefined
+
+/** 只读检查：不写库、不返回变量值，仅告诉用户每个占位符是什么、从哪来、能不能用 */
+async function loadVarSources() {
+  if (!request.value?.url) {
+    varSources.value = []
+    return
+  }
+  varLoading.value = true
+  try {
+    // 与启动时下发的字段保持一致，避免「清单说没问题、跑起来报缺失」
+    varSources.value = await api.stressVarSources({
+      url: request.value.url,
+      method: request.value.method,
+      headers: request.value.headers,
+      params: request.value.params,
+      bodyType: request.value.bodyType,
+      body: request.value.body,
+      envId: modalEnvId.value ?? undefined,
+      poolBindings: settings.poolBindings.map((item) => ({ ...item })),
+    })
+    // 有问题时自动展开，正常时保持收起，不打扰
+    if (varProblemCount.value > 0) varOpen.value = true
+  } catch {
+    varSources.value = []
+  } finally {
+    varLoading.value = false
+  }
+}
+
+/** 池绑定改动后延迟重算，避免目标变量逐字符输入时连续请求 */
+function scheduleVarSources() {
+  if (varTimer) clearTimeout(varTimer)
+  varTimer = setTimeout(() => void loadVarSources(), 400)
+}
+
+watch(request, () => void loadVarSources())
+watch(modalEnvId, () => scheduleVarSources())
+watch(
+  () =>
+    settings.poolBindings
+      .map((item) => `${item.pool}|${item.column}|${item.target}|${item.mode}`)
+      .join('~'),
+  () => scheduleVarSources(),
+)
 
 /** 切换池：列选择回到旧行为（'' 取首列），并清空旧预览 */
 function onPoolChange(binding: PoolBinding) {
@@ -1527,6 +1595,31 @@ function backToRequest() {
               </div>
             </div>
 
+            <div v-if="request" class="var-panel">
+              <button type="button" class="var-head" @click="varOpen = !varOpen">
+                <span class="var-title">本次变量</span>
+                <span class="hint">{{ varLoading ? '检查中…' : `${varSources.length} 个` }}</span>
+                <span v-if="varProblemCount" class="var-flag bad">{{ varProblemCount }} 个待处理</span>
+                <span v-else-if="varSources.length" class="var-flag ok">全部可用</span>
+                <span class="var-caret">{{ varOpen ? '收起' : '展开' }}</span>
+              </button>
+              <div v-if="varOpen" class="var-list">
+                <div v-if="!varSources.length" class="hint" style="padding: 6px 0">
+                  本次配置没有引用占位符。
+                </div>
+                <div
+                  v-for="item in varSources"
+                  :key="`${item.kind}:${item.name}`"
+                  class="var-row"
+                >
+                  <code class="var-name">{{ varPlaceholder(item) }}</code>
+                  <span class="var-kind">{{ VAR_KIND_TEXT[item.kind] ?? item.kind }}</span>
+                  <span class="var-detail">{{ item.detail }}</span>
+                  <i class="var-dot" :class="item.ok ? 'ok' : 'bad'" />
+                </div>
+              </div>
+            </div>
+
             <template v-if="settings.mode === 'fixed'">
               <div class="field">
                 <div class="label">并发数</div>
@@ -2478,8 +2571,12 @@ function backToRequest() {
               @press-enter="createPool"
             />
             <a-select v-model:value="newPoolKind" size="small" class="pool-kind">
-              <a-select-option value="token">Token 池</a-select-option>
-              <a-select-option value="parameter">参数池</a-select-option>
+              <a-select-option value="token" title="账号 / Token / API Key / Cookie 等凭证"
+                >Token 池</a-select-option
+              >
+              <a-select-option value="parameter" title="关键词、页码、开关等业务字段"
+                >参数池</a-select-option
+              >
             </a-select>
             <a-checkbox v-model:checked="newPoolSensitive">敏感</a-checkbox>
             <a-button
@@ -2753,6 +2850,105 @@ function backToRequest() {
   flex-wrap: wrap;
   gap: 8px;
   font-size: 12px;
+}
+
+/* ---------- 本次变量（开跑前自查） ---------- */
+.var-panel {
+  margin-top: 10px;
+  border: 1px solid var(--fm-border);
+  border-radius: var(--fm-radius);
+  background: var(--fm-surface-2);
+}
+
+.var-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 10px;
+  border: none;
+  background: transparent;
+  font-size: 12px;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.var-title {
+  font-weight: 500;
+  color: var(--fm-text);
+}
+
+.var-flag {
+  font-size: 11px;
+}
+
+.var-flag.bad {
+  color: var(--fm-danger);
+}
+
+.var-flag.ok {
+  color: var(--fm-success);
+}
+
+.var-caret {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--fm-muted);
+}
+
+.var-list {
+  display: flex;
+  flex-direction: column;
+  padding: 0 10px 8px;
+}
+
+.var-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  font-size: 12px;
+  border-top: 1px solid var(--fm-border);
+}
+
+.var-name {
+  flex: none;
+  min-width: 168px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11.5px;
+  color: var(--fm-text);
+}
+
+.var-kind {
+  flex: none;
+  width: 30px;
+  font-size: 11px;
+  color: var(--fm-muted);
+}
+
+.var-detail {
+  flex: 1;
+  min-width: 0;
+  color: var(--fm-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 方形状态点：与纸感主题的小圆角一致，也避免再引入一个字面圆角 */
+.var-dot {
+  flex: none;
+  width: 5px;
+  height: 5px;
+}
+
+.var-dot.ok {
+  background: var(--fm-success);
+}
+
+.var-dot.bad {
+  background: var(--fm-danger);
 }
 
 /* ---------- 池管理弹窗 ---------- */

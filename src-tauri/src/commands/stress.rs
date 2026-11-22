@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rusqlite::{params, OptionalExtension};
+use serde::Serialize;
 use serde_json::json;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
@@ -442,7 +443,7 @@ pub(crate) fn refresh_column_of(columns: &[String]) -> String {
     } else {
         columns
             .first()
-            .map(|column| column.clone())
+            .cloned()
             .unwrap_or_else(|| "value".to_string())
     }
 }
@@ -544,15 +545,15 @@ struct PoolOverlay {
 /// 集群 token 刷新中继：从节点把刷新请求交给主节点单飞（8.10.5）
 ///
 /// 未启用集群时为 None，走本机 HTTP 刷新；启用后实现方负责 5 秒超时与失败语义。
+/// 刷新请求的返回值：新值、条目 ID、可选的下一轮提示
+pub(crate) type RefreshOutput = Result<(String, i64, Option<String>), String>;
+
+/// 中继方返回的 future：必须 Send 且可借用到调用期，trait 里只能写成 Pin<Box<...>>
+pub(crate) type RefreshFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = RefreshOutput> + Send + 'a>>;
+
 pub(crate) trait PoolRefreshRelay: Send + Sync {
-    fn refresh<'a>(
-        &'a self,
-        pool: &'a str,
-        item_id: i64,
-        item_index: usize,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(String, i64, Option<String>), String>> + Send + 'a>,
-    >;
+    fn refresh<'a>(&'a self, pool: &'a str, item_id: i64, item_index: usize) -> RefreshFuture<'a>;
 }
 
 /// 运行期池：按 VU / 按请求从池中取值，注入到同名占位符
@@ -561,8 +562,10 @@ struct PoolRuntime {
     pools: parking_lot::Mutex<HashMap<String, PoolState>>,
     /// 每条条目一把异步锁（key = 池名，下标 = 条目位置）：单飞刷新
     refresh_locks: HashMap<String, Vec<Arc<AsyncMutex<()>>>>,
-    /// per_request / round_robin 游标（key = 池名:目标变量）
+    /// per_request / round_robin 游标（key = 池名，同一池的多条绑定共用）
     cursors: parking_lot::Mutex<HashMap<String, usize>>,
+    /// random 模式的伪随机计数器（每节点一个，splitmix64 打散，避免同纳秒撞条）
+    rng: AtomicU64,
     /// 无 HTTP 刷新时的 401 轮换手位（key = 池名）
     refresh: parking_lot::Mutex<HashMap<String, usize>>,
     /// 集群切片：本节点在全局 VU 轴上的起点（key = 池名）
@@ -620,6 +623,7 @@ impl PoolRuntime {
             pools: parking_lot::Mutex::new(pools),
             refresh_locks,
             cursors: parking_lot::Mutex::new(HashMap::new()),
+            rng: AtomicU64::new(0x243F_6A88_85A3_08D3),
             refresh: parking_lot::Mutex::new(HashMap::new()),
             offsets: HashMap::new(),
             stat_items,
@@ -627,6 +631,16 @@ impl PoolRuntime {
             stat_unauthorized: parking_lot::Mutex::new(HashMap::new()),
             relay: None,
         }
+    }
+
+    /// splitmix64：无锁递增再打散，保证高并发下不会在同一时刻撞同一条
+    fn next_random(&self) -> usize {
+        let seed = self.rng.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed);
+        let mut value = seed;
+        value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        value ^= value >> 31;
+        value as usize
     }
 
     /// 写进报告 `config_json.pools`：只含池名、条目数与计数，不含任何明文
@@ -664,7 +678,11 @@ impl PoolRuntime {
                     .unwrap_or(0);
                 let counts = self.stat_items.get(name);
                 let used = counts
-                    .map(|list| list.iter().filter(|count| count.load(Ordering::Relaxed) > 0).count())
+                    .map(|list| {
+                        list.iter()
+                            .filter(|count| count.load(Ordering::Relaxed) > 0)
+                            .count()
+                    })
                     .unwrap_or(0);
                 let requests = counts
                     .map(|list| {
@@ -753,10 +771,6 @@ impl PoolRuntime {
             return None;
         }
         let now = now_ms();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|value| value.subsec_nanos())
-            .unwrap_or(0);
         // 按池分组（保持绑定顺序）：同一池的多条绑定共用本次选中的条目
         let mut grouped: Vec<(String, Vec<&PoolBinding>)> = Vec::new();
         for binding in &self.bindings {
@@ -774,7 +788,7 @@ impl PoolRuntime {
             let pools = self.pools.lock();
             let mut cursors = self.cursors.lock();
             let refresh = self.refresh.lock();
-            for (group_index, (pool, group)) in grouped.iter().enumerate() {
+            for (pool, group) in grouped.iter() {
                 let Some(state) = pools.get(pool.as_str()) else {
                     continue;
                 };
@@ -797,25 +811,22 @@ impl PoolRuntime {
                 let mode = binding_mode(group[0]);
                 // 游标 / 集群偏移都按池计算一次：同一池的多条绑定共用同一条身份
                 let cursor_key = pool.clone();
-                let position = if let Some(position) = refresh.get(pool.as_str()) {
-                    (position + vu as usize) % len
-                } else {
-                    match mode {
-                        "per_request" | "sequence" | "round_robin" => {
-                            let entry = cursors.entry(cursor_key).or_insert(0);
-                            let value = *entry;
-                            *entry = entry.wrapping_add(1);
-                            value % len
-                        }
-                        "random" => (nanos as usize).wrapping_add(group_index) % len,
-                        // per_vu：同一 VU 在整个压测生命周期固定同一条；集群按全局 VU 偏移
-                        _ => {
-                            (vu as usize
-                                + self.offsets.get(pool.as_str()).copied().unwrap_or(0))
-                                % len
-                        }
+                let base = match mode {
+                    "per_request" | "sequence" | "round_robin" => {
+                        let entry = cursors.entry(cursor_key).or_insert(0);
+                        let value = *entry;
+                        *entry = entry.wrapping_add(1);
+                        value % len
+                    }
+                    "random" => self.next_random() % len,
+                    // per_vu：同一 VU 在整个压测生命周期固定同一条；集群按全局 VU 偏移
+                    _ => {
+                        (vu as usize + self.offsets.get(pool.as_str()).copied().unwrap_or(0)) % len
                     }
                 };
+                // 401 换条只做整体平移，不接管轮换：否则 per_request 会退化成 per_vu
+                let shift = refresh.get(pool.as_str()).copied().unwrap_or(0);
+                let position = (base + shift) % len;
                 let picked = candidates[position % len];
                 picks.push((pool.clone(), picked));
                 if let Some(config) = state.refresh.as_ref() {
@@ -927,14 +938,11 @@ impl PoolRuntime {
 
     /// 本次请求涉及的池里是否有启用 http 刷新的（用于区分刷新失败与未配置）
     fn http_refresh_enabled(&self, picks: &[(String, usize)]) -> bool {
-        if !picks
-            .iter()
-            .any(|(pool, _)| {
-                self.bindings
-                    .iter()
-                    .any(|binding| binding.pool.trim() == pool && binding.refresh_on_401)
-            })
-        {
+        if !picks.iter().any(|(pool, _)| {
+            self.bindings
+                .iter()
+                .any(|binding| binding.pool.trim() == pool && binding.refresh_on_401)
+        }) {
             return false;
         }
         let pools = self.pools.lock();
@@ -955,7 +963,11 @@ impl PoolRuntime {
         pool: &str,
         index: usize,
     ) -> bool {
-        let Some(lock) = self.refresh_locks.get(pool).and_then(|list| list.get(index)) else {
+        let Some(lock) = self
+            .refresh_locks
+            .get(pool)
+            .and_then(|list| list.get(index))
+        else {
             return false;
         };
         let _guard = lock.lock().await;
@@ -1015,7 +1027,15 @@ impl PoolRuntime {
                 }
             };
         }
-        match refresh_http(client, &config, base_vars, &current_value, account.as_deref()).await {
+        match refresh_http(
+            client,
+            &config,
+            base_vars,
+            &current_value,
+            account.as_deref(),
+        )
+        .await
+        {
             Ok((value, expires_at)) => {
                 self.apply_refreshed(pool, index, value, expires_at, Some(&refresh_column));
                 true
@@ -1054,7 +1074,11 @@ impl PoolRuntime {
                 item.invalid = false;
             }
         }
-        *self.stat_refresh.lock().entry(pool.to_string()).or_insert(0) += 1;
+        *self
+            .stat_refresh
+            .lock()
+            .entry(pool.to_string())
+            .or_insert(0) += 1;
     }
 
     /// 刷新失败：指数退避冷却，连续失败 3 次标记失效
@@ -1091,13 +1115,10 @@ pub(crate) async fn refresh_http(
         vars.insert("account".to_string(), account.to_string());
     }
     let url_text = render(&config.url, &vars);
-    let url = reqwest::Url::parse(&url_text)
-        .map_err(|_| format!("刷新地址无效：{url_text}"))?;
+    let url = reqwest::Url::parse(&url_text).map_err(|_| format!("刷新地址无效：{url_text}"))?;
     let method = reqwest::Method::from_bytes(config.method.trim().as_bytes())
         .unwrap_or(reqwest::Method::POST);
-    let mut builder = client
-        .request(method, url)
-        .timeout(Duration::from_secs(15));
+    let mut builder = client.request(method, url).timeout(Duration::from_secs(15));
     for header in &config.headers {
         if !header.enabled {
             continue;
@@ -2281,21 +2302,54 @@ fn check_unresolved(
         Some(name) => format!("环境「{name}」"),
         None => "当前未绑定环境".to_string(),
     };
+    // `os:` / `secret:` 前缀来自专用占位符，分开说明，避免用户去环境里找同名普通变量
+    let mut plain: Vec<&str> = Vec::new();
+    let mut os_names: Vec<&str> = Vec::new();
+    let mut secret_names: Vec<&str> = Vec::new();
+    for name in &missing {
+        if let Some(rest) = name.strip_prefix("os:") {
+            os_names.push(rest);
+        } else if let Some(rest) = name.strip_prefix("secret:") {
+            secret_names.push(rest);
+        } else {
+            plain.push(name.as_str());
+        }
+    }
+    let mut detail: Vec<String> = Vec::new();
+    if !plain.is_empty() {
+        detail.push(plain.join("、"));
+    }
+    if !os_names.is_empty() {
+        detail.push(format!(
+            "{}（系统变量，需在「设置 → 压测 → OS 变量」加入白名单且本机有值）",
+            os_names.join("、")
+        ));
+    }
+    if !secret_names.is_empty() {
+        detail.push(format!(
+            "{}（密钥，需在当前环境里配置该 secret 变量）",
+            secret_names.join("、")
+        ));
+    }
     Err(format!(
-        "{} 缺少变量：{}。请补充变量或切换环境后重试",
-        env_label,
-        missing.join("、")
+        "{env_label} 缺少变量：{}。请补充变量或切换环境后重试",
+        detail.join("；")
     ))
 }
 
-/// 校验池绑定：池名、列选择、同池轮换模式与注入变量重名
+/// 校验池绑定：池名、列选择、同池轮换模式、同池重复注入与跨池同名注入
 fn validate_pool_bindings(
     bindings: &[PoolBinding],
     columns: &HashMap<String, Vec<String>>,
 ) -> Result<(), String> {
-    use crate::services::pool::E_POOL_BINDING_INVALID as INVALID;
+    use crate::services::pool::{
+        E_POOL_BINDING_INVALID as INVALID, E_POOL_VAR_CONFLICT as CONFLICT,
+    };
     let mut modes: HashMap<&str, &str> = HashMap::new();
-    let mut injected: HashMap<&str, Vec<String>> = HashMap::new();
+    // 变量名 → 注入它的池：跨池同名会静默覆盖，必须拦下
+    let mut owners: HashMap<String, String> = HashMap::new();
+    // 池 → 已注入变量名：同池多条绑定重复注入同一个变量
+    let mut injected: HashMap<String, Vec<String>> = HashMap::new();
     for binding in bindings {
         let pool = binding.pool.trim();
         if pool.is_empty() {
@@ -2330,34 +2384,32 @@ fn validate_pool_bindings(
         let mode = binding_mode(binding);
         if let Some(previous) = modes.get(pool) {
             if *previous != mode {
-                return Err(format!(
-                    "{INVALID}: 池「{pool}」的多条绑定轮换模式必须一致"
-                ));
+                return Err(format!("{INVALID}: 池「{pool}」的多条绑定轮换模式必须一致"));
             }
         } else {
             modes.insert(pool, mode);
         }
-        let names = injected.entry(pool).or_default();
-        let add = |name: &str, names: &mut Vec<String>| -> Result<(), String> {
-            if name.is_empty() {
-                return Ok(());
+        let names: Vec<String> = if column == "*" {
+            pool_columns.cloned().unwrap_or_default()
+        } else {
+            vec![target.to_string()]
+        };
+        for name in names {
+            if name.trim().is_empty() {
+                continue;
             }
-            if names.iter().any(|item| item == name) {
+            let same_pool = injected.entry(pool.to_string()).or_default();
+            if same_pool.iter().any(|item| item == &name) {
                 return Err(format!(
                     "{INVALID}: 池「{pool}」的绑定重复注入变量「{name}」"
                 ));
             }
-            names.push(name.to_string());
-            Ok(())
-        };
-        if column == "*" {
-            if let Some(list) = pool_columns {
-                for name in list {
-                    add(name, names)?;
-                }
+            same_pool.push(name.clone());
+            if let Some(previous) = owners.insert(name.clone(), pool.to_string()) {
+                return Err(format!(
+                    "{CONFLICT}: 池「{previous}」和池「{pool}」都注入变量「{name}」，后绑定的会静默覆盖前者；请改名或只保留一个绑定"
+                ));
             }
-        } else {
-            add(target, names)?;
         }
     }
     Ok(())
@@ -2458,8 +2510,7 @@ fn build_pool_runtime(
         .map(|binding| binding.pool.trim().to_string())
         .collect();
     let refresh = crate::services::pool::pool_refresh_configs(&conn, &names)?;
-    let runtime =
-        PoolRuntime::new(bindings, items, columns, refresh).with_relay(relay);
+    let runtime = PoolRuntime::new(bindings, items, columns, refresh).with_relay(relay);
     Ok(Some(Arc::new(runtime)))
 }
 
@@ -2472,6 +2523,155 @@ pub(crate) fn prepare_stress(
     cancel: Arc<AtomicBool>,
 ) -> Result<PreparedStress, String> {
     prepare_stress_with_relay(state, config, cancel, None)
+}
+
+/// 变量来源清单的一条记录
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VarSourceItem {
+    /// 变量名（不含花括号）
+    pub name: String,
+    /// user / secret / os
+    pub kind: String,
+    /// env / runtime / pool / os / missing
+    pub source: String,
+    /// 具体说明：环境名、池名、白名单状态
+    pub detail: String,
+    /// 当前配置下能否取到值
+    pub ok: bool,
+}
+
+/// 变量来源清单：本次配置引用到的每个占位符，标明「是什么、从哪来、能不能用」
+///
+/// 只读命令：不写库、不下发、不返回任何变量值。对应界面上的「本次变量」面板，
+/// 让用户在开跑前就能分清普通变量、密钥与系统变量，而不是等跑不起来再猜。
+#[tauri::command]
+pub fn stress_var_sources(
+    state: State<'_, AppState>,
+    config: StressConfig,
+) -> Result<Vec<VarSourceItem>, String> {
+    let conn = state.pool.get().map_err(err)?;
+    let resolved_env = resolve_env(&conn, &config)?;
+    let (env_vars, env_secrets) = match resolved_env.id {
+        Some(env_id) => crate::commands::http::load_vars_with_secrets(&conn, env_id)?,
+        None => (HashMap::new(), std::collections::HashSet::new()),
+    };
+    // 池会注入的变量名 → 池名：`*` 按列定义展开，其余用显式 target
+    let mut pool_targets: HashMap<String, String> = HashMap::new();
+    for binding in &config.pool_bindings {
+        let pool = binding.pool.trim();
+        if pool.is_empty() {
+            continue;
+        }
+        if binding.column.trim() == "*" {
+            if let Ok(columns) = crate::services::pool::pool_columns(&conn, pool) {
+                for name in columns {
+                    pool_targets.insert(name, pool.to_string());
+                }
+            }
+        } else if !binding.target.trim().is_empty() {
+            pool_targets.insert(binding.target.trim().to_string(), pool.to_string());
+        }
+    }
+    drop(conn);
+
+    let texts = crate::util::config_texts(&config);
+    let classified = crate::util::required_vars_in_texts(texts.iter().map(String::as_str));
+    let os_allow = state.settings().stress_os_env_allow;
+    let env_label = resolved_env
+        .name
+        .clone()
+        .unwrap_or_else(|| "未指定环境".to_string());
+    let mut items: Vec<VarSourceItem> = Vec::new();
+
+    for name in classified.user {
+        let item = if let Some(pool) = pool_targets.get(&name) {
+            VarSourceItem {
+                name: name.clone(),
+                kind: "user".to_string(),
+                source: "pool".to_string(),
+                detail: format!("数据池「{pool}」"),
+                ok: true,
+            }
+        } else if config.vars.contains_key(&name) {
+            VarSourceItem {
+                name: name.clone(),
+                kind: "user".to_string(),
+                source: "runtime".to_string(),
+                detail: "运行期变量".to_string(),
+                ok: true,
+            }
+        } else if env_vars.contains_key(&name) {
+            VarSourceItem {
+                name: name.clone(),
+                kind: "user".to_string(),
+                source: "env".to_string(),
+                detail: format!("环境「{env_label}」"),
+                ok: true,
+            }
+        } else {
+            VarSourceItem {
+                name: name.clone(),
+                kind: "user".to_string(),
+                source: "missing".to_string(),
+                detail: "环境变量与数据池里都没有".to_string(),
+                ok: false,
+            }
+        };
+        items.push(item);
+    }
+
+    for name in classified.secret {
+        let item = if let Some(pool) = pool_targets.get(&name) {
+            VarSourceItem {
+                name: name.clone(),
+                kind: "secret".to_string(),
+                source: "pool".to_string(),
+                detail: format!("数据池「{pool}」"),
+                ok: true,
+            }
+        } else if env_secrets.contains(&name) {
+            VarSourceItem {
+                name: name.clone(),
+                kind: "secret".to_string(),
+                source: "env".to_string(),
+                detail: format!("环境「{env_label}」的密钥"),
+                ok: true,
+            }
+        } else {
+            VarSourceItem {
+                name: name.clone(),
+                kind: "secret".to_string(),
+                source: "missing".to_string(),
+                detail: "当前环境里没有这个密钥".to_string(),
+                ok: false,
+            }
+        };
+        items.push(item);
+    }
+
+    for name in classified.os {
+        let allowed = crate::util::os_var_allowed(&os_allow, &name);
+        let has = allowed && std::env::var(&name).is_ok();
+        let detail = if !allowed {
+            "未加入白名单（设置 → 压测 → OS 变量）"
+        } else if !has {
+            "白名单已加，但本机没有该变量"
+        } else {
+            "本机系统变量"
+        };
+        items.push(VarSourceItem {
+            name,
+            kind: "os".to_string(),
+            source: "os".to_string(),
+            detail: detail.to_string(),
+            ok: has,
+        });
+    }
+
+    // 取不到值的排前面，展开面板时第一眼就能看到要处理什么
+    items.sort_by_key(|item| item.ok);
+    Ok(items)
 }
 
 /// 与 `prepare_stress` 相同，但可注入集群刷新中继：
@@ -2501,6 +2701,7 @@ pub(crate) fn prepare_stress_with_relay(
         }
     }
     // OS 环境变量：只注入白名单内的变量（{{os:NAME}}）
+    // 双键写入：专用键供 {{os:NAME}} 取值，裸名供 {{NAME}} 沿用原优先级
     let os_allow = state.settings().stress_os_env_allow;
     if !os_allow.trim().is_empty() {
         let classified =
@@ -2510,6 +2711,7 @@ pub(crate) fn prepare_stress_with_relay(
                 continue;
             }
             if let Ok(value) = std::env::var(&name) {
+                vars.insert(crate::util::os_var_key(&name), value.clone());
                 vars.insert(name, value);
             }
         }
@@ -3050,6 +3252,8 @@ pub(crate) async fn run_engine(
                     sum_rt_ms: delta_rt,
                     sum_ttfb_ms: delta_ttfb,
                     latency_buckets: bucket_delta(&metrics.buckets, &mut prev_latency),
+                    // 本机资源由调用方（从节点 sink）补齐，单机路径与主节点引擎保持 None
+                    host: None,
                 });
             }
 
@@ -4001,8 +4205,7 @@ mod tests {
             r#"{"url":"{{base_url}}/api","headers":[{"key":"X-Token","value":"{{token}}","enabled":true}]}"#,
         )
         .unwrap();
-        let error =
-            check_unresolved(&config, &HashMap::new(), &[], Some("测试环境")).unwrap_err();
+        let error = check_unresolved(&config, &HashMap::new(), &[], Some("测试环境")).unwrap_err();
         assert!(error.contains("测试环境"));
         assert!(error.contains("base_url"));
         assert!(error.contains("token"));
@@ -4014,6 +4217,186 @@ mod tests {
         // 池自动注入的变量名进入白名单后不再判缺失
         let provided = vec!["token".to_string(), "base_url".to_string()];
         assert!(check_unresolved(&config, &HashMap::new(), &provided, Some("测试环境")).is_ok());
+    }
+
+    /// 逐请求轮换语义：1000 次请求 / 100 条 token ⇒ 每条正好命中 10 次
+    #[tokio::test]
+    async fn per_request_binding_rotates_evenly_over_requests() {
+        let bindings = vec![PoolBinding {
+            pool: "tokens".to_string(),
+            target: "token".to_string(),
+            mode: "per_request".to_string(),
+            ..Default::default()
+        }];
+        let items: Vec<PoolItem> = (0..100)
+            .map(|index| PoolItem {
+                id: index as i64 + 1,
+                value: format!("t{index}"),
+                account: None,
+                weight: 1.0,
+                expires_at: 0,
+                data: HashMap::new(),
+            })
+            .collect();
+        let runtime = PoolRuntime::new(
+            bindings,
+            HashMap::from([("tokens".to_string(), items)]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let client = reqwest::Client::new();
+        let base: HashMap<String, String> = HashMap::new();
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for _ in 0..1000 {
+            let overlay = runtime
+                .overlay(&client, &base, 1)
+                .await
+                .expect("逐请求绑定应产生覆盖层");
+            let value = overlay.vars.get("token").cloned().unwrap_or_default();
+            *counts.entry(value).or_insert(0) += 1;
+        }
+        assert_eq!(counts.len(), 100);
+        assert!(
+            counts.values().all(|count| *count == 10),
+            "逐请求轮换应当均匀覆盖每个条目：{counts:?}"
+        );
+    }
+
+    /// 跨池注入同名变量会静默覆盖，必须在启动前拦下
+    #[test]
+    fn pool_bindings_reject_cross_pool_target_conflict() {
+        let columns = HashMap::from([
+            ("tokens".to_string(), vec!["token".to_string()]),
+            ("accounts".to_string(), vec!["account".to_string()]),
+        ]);
+        let bindings = vec![
+            PoolBinding {
+                pool: "tokens".to_string(),
+                target: "credential".to_string(),
+                ..Default::default()
+            },
+            PoolBinding {
+                pool: "accounts".to_string(),
+                target: "credential".to_string(),
+                ..Default::default()
+            },
+        ];
+        let error = validate_pool_bindings(&bindings, &columns).unwrap_err();
+        assert!(
+            error.starts_with("POOL_VAR_CONFLICT"),
+            "应报同名冲突：{error}"
+        );
+        assert!(error.contains("credential"), "{error}");
+    }
+
+    /// 同一个池的多列注入不同变量是正常用法
+    #[test]
+    fn pool_bindings_allow_multiple_columns_of_same_pool() {
+        let columns = HashMap::from([(
+            "tokens".to_string(),
+            vec!["token".to_string(), "account".to_string()],
+        )]);
+        let bindings = vec![
+            PoolBinding {
+                pool: "tokens".to_string(),
+                target: "token".to_string(),
+                column: "token".to_string(),
+                ..Default::default()
+            },
+            PoolBinding {
+                pool: "tokens".to_string(),
+                target: "account".to_string(),
+                column: "account".to_string(),
+                ..Default::default()
+            },
+        ];
+        assert!(validate_pool_bindings(&bindings, &columns).is_ok());
+    }
+
+    /// 401 换条的手位只能是整体平移，不能接管轮换（否则 per_request 退化成 per_vu）
+    #[tokio::test]
+    async fn unauthorized_shift_keeps_per_request_rotation() {
+        let runtime = PoolRuntime::new(
+            vec![PoolBinding {
+                pool: "tokens".to_string(),
+                target: "token".to_string(),
+                mode: "per_request".to_string(),
+                ..Default::default()
+            }],
+            HashMap::from([(
+                "tokens".to_string(),
+                (0..10)
+                    .map(|index| PoolItem {
+                        id: index as i64 + 1,
+                        value: format!("t{index}"),
+                        account: None,
+                        weight: 1.0,
+                        expires_at: 0,
+                        data: HashMap::new(),
+                    })
+                    .collect::<Vec<_>>(),
+            )]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        // 模拟一次 401 换条：手位 +1
+        runtime.refresh.lock().insert("tokens".to_string(), 1);
+        let client = reqwest::Client::new();
+        let base: HashMap<String, String> = HashMap::new();
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for _ in 0..100 {
+            let overlay = runtime
+                .overlay(&client, &base, 3)
+                .await
+                .expect("应有覆盖层");
+            let value = overlay.vars.get("token").cloned().unwrap_or_default();
+            *counts.entry(value).or_insert(0) += 1;
+        }
+        assert_eq!(counts.len(), 10, "401 之后仍应轮询到全部条目：{counts:?}");
+        assert!(
+            counts.values().all(|count| *count == 10),
+            "逐请求轮换不应被手位打断：{counts:?}"
+        );
+    }
+
+    /// random 模式用无锁递增 + splitmix64 打散，高并发下不能集中在少数条目
+    #[tokio::test]
+    async fn random_mode_spreads_over_items() {
+        let runtime = PoolRuntime::new(
+            vec![PoolBinding {
+                pool: "tokens".to_string(),
+                target: "token".to_string(),
+                mode: "random".to_string(),
+                ..Default::default()
+            }],
+            HashMap::from([(
+                "tokens".to_string(),
+                (0..20)
+                    .map(|index| PoolItem {
+                        id: index as i64 + 1,
+                        value: format!("t{index}"),
+                        account: None,
+                        weight: 1.0,
+                        expires_at: 0,
+                        data: HashMap::new(),
+                    })
+                    .collect::<Vec<_>>(),
+            )]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let client = reqwest::Client::new();
+        let base: HashMap<String, String> = HashMap::new();
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for _ in 0..400 {
+            let overlay = runtime
+                .overlay(&client, &base, 1)
+                .await
+                .expect("应有覆盖层");
+            let value = overlay.vars.get("token").cloned().unwrap_or_default();
+            *counts.entry(value).or_insert(0) += 1;
+        }
+        assert_eq!(counts.len(), 20, "随机模式应覆盖全部条目：{counts:?}");
     }
 
     #[test]
@@ -4161,9 +4544,7 @@ mod perf_tests {
 
     /// 极简 keep-alive HTTP/1.1：读完整请求头（GET 无体），固定返回 200
     fn serve_keep_alive(mut stream: TcpStream) {
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .ok();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
         let mut buffer: Vec<u8> = Vec::with_capacity(2048);
         let mut chunk = [0u8; 4096];
         loop {
@@ -4341,8 +4722,7 @@ mod perf_tests {
         );
         match std::fs::read_to_string(&path) {
             Ok(text) => {
-                let baseline: Baseline =
-                    serde_json::from_str(&text).expect("基线文件格式错误");
+                let baseline: Baseline = serde_json::from_str(&text).expect("基线文件格式错误");
                 if baseline.fingerprint == fingerprint() {
                     let floor = baseline.median_qps * 0.95;
                     assert!(

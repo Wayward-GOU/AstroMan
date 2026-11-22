@@ -14,8 +14,8 @@
 | [`astroman-notes`](astroman-notes/SKILL.md) | 改记事本 / 待办，或排查不提醒、提醒时间不对、附件丢失 | 四种类型、标签与 50% 抽屉、提醒 / 重复 / 稍后 / 暂停 / 免打扰、快速记录、截图识别、附件去重、三张表 |
 | [`astroman-automation`](astroman-automation/SKILL.md) | 改自动化测试子系统的任何一处 | 七张表、执行内核、6 类断言、数据集、Python 钩子、压测门禁、产物与 CLI 退出码 |
 | [`astroman-toolbox`](astroman-toolbox/SKILL.md) | 新增 / 修改离线工具 | 92 个工具与 9 分类、`ToolDef` 契约、纯函数 + 组件两种接入、搜索别名、清单同步 |
-| [`astroman-ai`](astroman-ai/SKILL.md) | 改航仔（模型接入、工具、提示词、流式） | 双模式、三协议、上下文预算与摘要、126 个工具（含 22 测试域、7 抓包域、17 集群域、7 池工具）、确认卡、复盘 |
-| [`astroman-testing`](astroman-testing/SKILL.md) | 加测试、改门禁、CI 变红 | vitest、cargo test、tarpaulin 覆盖率、四道门禁、版本号同步、沙箱坑 |
+| [`astroman-ai`](astroman-ai/SKILL.md) | 改航仔（模型接入、工具、提示词、流式） | 双模式、三协议、上下文预算与摘要、130 个工具（含 22 测试域、7 抓包域、20 集群域、7 池工具）、确认卡、复盘 |
+| [`astroman-testing`](astroman-testing/SKILL.md) | 加测试、改门禁、CI 变红 | vitest、cargo test、tarpaulin 覆盖率、四道门禁、硬编码样式门禁口径、版本号同步、沙箱坑 |
 | [`astroman-build-release`](astroman-build-release/SKILL.md) | 打包、换图标、发版 | 构建命令、打包配置、图标体系、发版流程、构建排错 |
 
 维护约定：

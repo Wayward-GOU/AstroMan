@@ -13,14 +13,14 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use rusqlite::{params, OptionalExtension};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tauri::AppHandle;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -32,15 +32,14 @@ use super::host::ClusterApp;
 use super::merge::{self, MergeNode, MergeRequest};
 use super::pool_refresh::{DbRefreshSource, LocalPoolRefreshRelay, PoolRefreshCore};
 use super::protocol::{
-    AbortPayload, ClusterMasterSnapshot, ClusterMessage, ClusterNodeInfo, DonePayload, EngineStats,
-    ErrorPayload, HelloAckPayload, HelloPayload, HelloPendingPayload, HelloRejectedPayload,
-    NodeCapacity, PendingNodeInfo, PingPayload, PongPayload,
-    PoolRefreshRequestPayload, PoolRefreshResultPayload,
-    PreflightPayload, PrepareAckPayload, PreparePayload, PoolSizeEstimate, SamplePayload, StartPayload,
-    TimeAckPayload, TimeProbePayload, PoolSlice, CLOCK_SAMPLE_ROUNDS, DEFAULT_PORT, HEARTBEAT_MISSES,
+    AbortPayload, ClusterMasterSnapshot, ClusterMessage, ClusterNodeInfo, ClusterSampleFrame,
+    DonePayload, EngineStats, ErrorPayload, HelloAckPayload, HelloPayload, HelloPendingPayload,
+    HelloRejectedPayload, NodeCapacity, NodeSampleLite, PendingNodeInfo, PingPayload, PongPayload,
+    PoolRefreshRequestPayload, PoolRefreshResultPayload, PoolSizeEstimate, PoolSlice,
+    PreflightPayload, PrepareAckPayload, PreparePayload, SamplePayload, StartPayload,
+    TimeAckPayload, TimeProbePayload, CLOCK_SAMPLE_ROUNDS, DEFAULT_PORT, HEARTBEAT_MISSES,
     HEARTBEAT_SEC, MAX_MESSAGE_BYTES, MAX_NODES, MAX_PAIR_CODE_TTL_SEC, MAX_POOL_SLICE_BYTES,
-    MIN_PAIR_CODE_TTL_SEC,
-    PAIR_CODE_DIGITS, PAIR_CODE_TTL_SEC, PROTOCOL_VERSION,
+    MIN_PAIR_CODE_TTL_SEC, PAIR_CODE_DIGITS, PAIR_CODE_TTL_SEC, PROTOCOL_VERSION,
 };
 use crate::commands::stress::{
     prepare_stress_with_relay, run_engine, save_report, EngineOptions, EngineOutcome,
@@ -49,6 +48,19 @@ use crate::commands::stress::{
 use crate::models::{ReportError, ReportRequestRecord, SlowRequest, StressConfig};
 use crate::state::{DbPool, StressJobDraft};
 use crate::util::{err, now_ms};
+
+mod pairing;
+mod persist;
+#[cfg(test)]
+mod tests;
+
+pub(crate) use pairing::clock_metrics;
+use pairing::{new_pair_code, register_pair_failure};
+pub(crate) use persist::recover_stale_jobs;
+use persist::{
+    insert_job, save_cluster_samples, update_job, update_job_finished, update_job_start,
+    update_pair_expiry, update_weights, update_worker, upsert_worker, WorkerRow,
+};
 
 /// 任务开跑前的统一提前量：留出网络单程与从节点建引擎的时间
 pub const START_LEAD_MS: i64 = 2_000;
@@ -62,9 +74,23 @@ const JOIN_RATE_MS: i64 = 5_000;
 const MAX_PENDING_JOINS: usize = 3;
 /// 发现广播间隔（秒）
 const BEACON_SEC: u64 = 2;
-
+/// 单节点保留的每秒采样上限：AI 诊断最多取 300 条，超出即丢最旧的
+const SAMPLE_RETAIN: usize = 300;
+/// 运行期节点状态落库的最小间隔，避免每来一条采样就写一次库
+const PERSIST_INTERVAL_MS: i64 = 5_000;
+/// 配对码失败限速：统计窗口
+const PAIR_FAIL_WINDOW_MS: i64 = 10_000;
+/// 配对码失败限速：同一来源在窗口内允许的失败次数
+const PAIR_FAIL_PER_WINDOW: u32 = 5;
+/// 配对码失败上限：当前码累计错误达到该值即作废并换新码
+const PAIR_FAIL_TOTAL: u32 = 10;
+/// 运行期时钟复测间隔（秒）：长任务靠它发现晶振漂移
+const CLOCK_RECHECK_SEC: u64 = 60;
+/// 复测 seq 起点：与配对阶段的 0..CLOCK_SAMPLE_ROUNDS 区分
+const RECHECK_SEQ_BASE: u32 = 900_000;
 pub const EVENT_MASTER: &str = "cluster:master";
-pub const EVENT_SAMPLE: &str = "cluster:sample";
+/// 采样帧事件：每秒一帧，替代逐节点逐条推送
+pub const EVENT_SAMPLE_FRAME: &str = "cluster:sample-frame";
 
 /// 主节点启动参数
 #[derive(Debug, Clone, Deserialize)]
@@ -117,13 +143,11 @@ pub struct ClusterNodeWeight {
     pub max_concurrent: Option<u32>,
 }
 
-/// 每秒采样事件：前端画各节点实时曲线
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ClusterSampleEvent {
-    pub job_id: i64,
-    pub node_id: String,
-    pub sample: SamplePayload,
+/// 采样帧缓冲：按秒累积各节点的图表字段，由 watchdog 每秒 flush 一次
+#[derive(Default)]
+struct SampleFrameBuffer {
+    sec: u64,
+    nodes: HashMap<String, NodeSampleLite>,
 }
 
 /* ---------- 会话数据 ---------- */
@@ -144,12 +168,25 @@ struct NodeState {
     qps: f64,
     cpu: Option<f64>,
     mem_mb: Option<u64>,
+    /// 最近一帧整机资源（从节点每秒随采样上报）
+    host_cpu_percent: Option<f64>,
+    host_mem_percent: Option<f64>,
+    net_rx_kbps: Option<f64>,
+    net_tx_kbps: Option<f64>,
+    node_threads: Option<u32>,
+    load1: Option<f64>,
     clock_offset_ms: Option<f64>,
     clock_uncertainty_ms: Option<f64>,
     /// 时钟对齐时 RTT 最小的那一轮的误差（毫秒）
     clock_best_error_ms: f64,
     clock_probes: HashMap<u32, i64>,
     clock_samples: u32,
+    /// 从节点是否支持运行期时钟复测（Hello 声明；旧节点缺省 false）
+    clock_recheck: bool,
+    /// 运行期复测的漂移：相对配对时刻偏移的变化量（毫秒）
+    clock_drift_ms: f64,
+    /// 最近一次复测时刻
+    clock_recheck_at: Option<i64>,
     dropped_samples: u64,
     joined_at: i64,
     last_seen_at: Option<i64>,
@@ -158,6 +195,8 @@ struct NodeState {
     prepare_ok: Option<bool>,
     preflight_ok: Option<bool>,
     samples: Vec<SamplePayload>,
+    /// 最近一次落库时刻：运行期按 PERSIST_INTERVAL_MS 节流
+    last_persist_at: i64,
     done: Option<DonePayload>,
     /// 节点能力：核数/内存/本机预算
     capacity: Option<NodeCapacity>,
@@ -201,11 +240,20 @@ impl NodeState {
             qps: 0.0,
             cpu: None,
             mem_mb: None,
+            host_cpu_percent: None,
+            host_mem_percent: None,
+            net_rx_kbps: None,
+            net_tx_kbps: None,
+            node_threads: None,
+            load1: None,
             clock_offset_ms: None,
             clock_uncertainty_ms: None,
             clock_best_error_ms: f64::INFINITY,
             clock_probes: HashMap::new(),
             clock_samples: 0,
+            clock_recheck: false,
+            clock_drift_ms: 0.0,
+            clock_recheck_at: None,
             dropped_samples: 0,
             joined_at,
             last_seen_at: Some(joined_at),
@@ -214,6 +262,7 @@ impl NodeState {
             prepare_ok: None,
             preflight_ok: None,
             samples: Vec::new(),
+            last_persist_at: 0,
             done: None,
             capacity: None,
             quota: 0,
@@ -246,8 +295,16 @@ impl NodeState {
             qps: self.qps,
             cpu: self.cpu,
             mem_mb: self.mem_mb,
+            host_cpu_percent: self.host_cpu_percent,
+            host_mem_percent: self.host_mem_percent,
+            net_rx_kbps: self.net_rx_kbps,
+            net_tx_kbps: self.net_tx_kbps,
+            threads: self.node_threads,
+            load1: self.load1,
             clock_offset_ms: self.clock_offset_ms,
             clock_uncertainty_ms: self.clock_uncertainty_ms,
+            clock_drift_ms: self.clock_drift_ms,
+            clock_recheck_at: self.clock_recheck_at,
             dropped_samples: self.dropped_samples,
             joined_at: self.joined_at,
             last_seen_at: self.last_seen_at,
@@ -268,7 +325,11 @@ impl NodeState {
     }
 
     /// 采集健康度：区分「还没开始」「首样超时」「中途缺口」「已结束」「失联」
-    fn health(&self, start_at_ms: Option<i64>, now: i64) -> crate::services::cluster::protocol::SampleHealth {
+    fn health(
+        &self,
+        start_at_ms: Option<i64>,
+        now: i64,
+    ) -> crate::services::cluster::protocol::SampleHealth {
         use crate::services::cluster::protocol::{
             SampleHealth, FIRST_SAMPLE_BAD_SEC, FIRST_SAMPLE_WARN_SEC,
         };
@@ -290,7 +351,10 @@ impl NodeState {
             "running" => {
                 if received == 0 {
                     if elapsed >= FIRST_SAMPLE_BAD_SEC {
-                        ("lost", Some(format!("首样超时 {elapsed}s，检查从节点引擎是否启动")))
+                        (
+                            "lost",
+                            Some(format!("首样超时 {elapsed}s，检查从节点引擎是否启动")),
+                        )
                     } else if elapsed >= FIRST_SAMPLE_WARN_SEC {
                         ("waiting", Some(format!("等待首样（{elapsed}s）")))
                     } else {
@@ -332,6 +396,33 @@ impl NodeState {
     }
 }
 
+/// 心跳回传的引擎计数：顺手把节点资源用量写回状态
+///
+/// 之前只在收到 `Done` 时才赋值，导致运行期节点表的 CPU/内存一直是空的。
+fn apply_engine_stats(node: &mut NodeState, stats: EngineStats) {
+    if node.status == "running" {
+        node.qps = stats.qps;
+        if stats.cpu > 0.0 {
+            node.cpu = Some(stats.cpu);
+        }
+        if stats.mem_mb > 0 {
+            node.mem_mb = Some(stats.mem_mb);
+        }
+    }
+    node.last_stats = Some(stats);
+}
+
+/// 运行期时钟复测：只记录与配对偏移的差值，不改 offset
+///
+/// 施压中途改 offset 会让已上报的 `elapsed_sec` 和对齐的起跑时刻一起跳变，
+/// 曲线会出现垂直断层；因此这里只量化漂移，用告警提示用户时钟跑偏了。
+fn apply_clock_recheck(node: &mut NodeState, offset: f64, at: i64) {
+    if let Some(baseline) = node.clock_offset_ms {
+        node.clock_drift_ms = offset - baseline;
+    }
+    node.clock_recheck_at = Some(at);
+}
+
 struct SessionState {
     status: String,
     start_at_ms: Option<i64>,
@@ -343,6 +434,10 @@ struct SessionState {
     next_node: u32,
     /// 加入申请限流：IP → 最近一次申请时刻
     join_requests: HashMap<String, i64>,
+    /// 配对码错误限速：IP → (窗口内次数, 窗口起点)
+    pair_failures: HashMap<String, (u32, i64)>,
+    /// 当前配对码累计错误次数：达到上限即作废换码
+    pair_fail_total: u32,
 }
 
 /// 主节点本地引擎的逐请求明细：集群报告只收主节点的明细，需在报告里标注
@@ -383,6 +478,8 @@ struct MasterSession {
     local_watch: Mutex<Option<Arc<AtomicBool>>>,
     /// 本地引擎结束后的明细，等所有节点结算后一起落库
     local_details: Mutex<Option<LocalDetails>>,
+    /// 采样帧缓冲：每秒推送一次图表数据，避免逐条 IPC
+    sample_frame: Mutex<SampleFrameBuffer>,
     /// 手动中止：引擎仍会产出 stopped 结果，报告要标注不完整
     aborting: AtomicBool,
     /// 合并落库只允许执行一次
@@ -407,6 +504,8 @@ struct MasterSession {
     auto_accept: AtomicBool,
     /// 是否广播局域网发现
     discovery: bool,
+    /// 运行期时钟复测的序号：跨节点共享，回包按 seq 认领
+    recheck_seq: AtomicU64,
 }
 
 struct RunningMaster {
@@ -439,7 +538,15 @@ impl ClusterMaster {
     ) -> Result<ClusterMasterSnapshot, String> {
         // v1.1.2：不再限制同时保留的集群任务数；终态会释放监听，完成快照仍可查看
         self.prune_finished();
-        let (config, required_vars) = shared_config(&payload.config)?;
+        let (config, mut required_vars) = shared_config(&payload.config)?;
+        // 池绑定在运行期注入的变量不算「需要环境提供」：主从必须同一口径，
+        // 否则从节点会把池列名（keyword / pageSize …）当成缺失的环境变量
+        if let Ok(conn) = pool.get() {
+            let provided = super::pool_injected_names(&payload.config.pool_bindings, |name| {
+                crate::services::pool::pool_columns(&conn, name).unwrap_or_default()
+            });
+            required_vars.retain(|name| !provided.iter().any(|item| item == name));
+        }
         let total_concurrent = payload.config.concurrent;
         let plan_name = payload
             .plan_name
@@ -468,8 +575,9 @@ impl ClusterMaster {
             .map(|state| state.settings().cluster_discovery_enabled)
             .unwrap_or(true);
         let x25519_secret = x25519_dalek::StaticSecret::random();
-        let x25519_public =
-            crate::commands::http::base64_encode(x25519_dalek::PublicKey::from(&x25519_secret).as_bytes());
+        let x25519_public = crate::commands::http::base64_encode(
+            x25519_dalek::PublicKey::from(&x25519_secret).as_bytes(),
+        );
         let pair_code_ttl = resolve_pair_code_ttl(payload.pair_code_ttl_sec)?;
         let created_at = now_ms();
         let pair_code = PairCode {
@@ -506,11 +614,7 @@ impl ClusterMaster {
         upsert_worker(&pool, job_id, &master_node)?;
         let pool_estimate = estimate_pool_bytes(&pool, &payload.config.pool_bindings);
         // 刷新用的环境变量：与主节点本地引擎同源，供刷新地址/请求体渲染
-        let refresh_vars = master_refresh_vars(
-            &pool,
-            &payload.config,
-            payload.env_name.as_deref(),
-        );
+        let refresh_vars = master_refresh_vars(&pool, &payload.config, payload.env_name.as_deref());
         let pool_refresh = Arc::new(PoolRefreshCore::new(
             Box::new(DbRefreshSource::new(pool.clone())),
             refresh_vars,
@@ -543,11 +647,14 @@ impl ClusterMaster {
                 nodes: vec![master_node],
                 next_node: 1,
                 join_requests: HashMap::new(),
+                pair_failures: HashMap::new(),
+                pair_fail_total: 0,
             }),
             local_prepared: Mutex::new(None),
             local_job: Mutex::new(None),
             local_watch: Mutex::new(None),
             local_details: Mutex::new(None),
+            sample_frame: Mutex::new(SampleFrameBuffer::default()),
             aborting: AtomicBool::new(false),
             finalizing: AtomicBool::new(false),
             budget,
@@ -560,6 +667,7 @@ impl ClusterMaster {
             terminal_at: Mutex::new(None),
             auto_accept: AtomicBool::new(false),
             discovery,
+            recheck_seq: AtomicU64::new(0),
         });
         let accept = tauri::async_runtime::spawn(accept_loop(session.clone(), listener));
         *session.accept.lock() = Some(accept);
@@ -604,10 +712,8 @@ impl ClusterMaster {
             .iter()
             .filter_map(|(id, running)| {
                 let session = &running.session;
-                let terminal = matches!(
-                    session.state.lock().status.as_str(),
-                    "finished" | "failed"
-                );
+                let terminal =
+                    matches!(session.state.lock().status.as_str(), "finished" | "failed");
                 if !terminal {
                     return None;
                 }
@@ -856,6 +962,8 @@ impl MasterSession {
         }
         // 终态即释放监听：用户不必点「关闭」，同端口可立即重建下一个任务
         if matches!(status, "finished" | "failed") {
+            // 终态前把最后一秒的采样发出去，曲线不缺尾点
+            self.flush_sample_frame();
             self.mark_terminal();
             self.release_transport();
         }
@@ -890,6 +998,24 @@ impl MasterSession {
         if let Err(error) = update_worker(&self.db, self.job_id, &row) {
             log::warn!("更新集群节点失败：{error}");
         }
+    }
+
+    /// 运行期节流落库：节点 qps/并发每秒都在变，没必要每条采样都写一次库
+    ///
+    /// 状态变更（就绪、完成、失联）仍走 `persist_node` 立即写，只有采样路径用这里。
+    fn persist_node_throttled(&self, node_id: &str) {
+        let now = now_ms();
+        {
+            let mut state = self.state.lock();
+            let Some(node) = state.nodes.iter_mut().find(|node| node.id == node_id) else {
+                return;
+            };
+            if now - node.last_persist_at < PERSIST_INTERVAL_MS {
+                return;
+            }
+            node.last_persist_at = now;
+        }
+        self.persist_node(node_id);
     }
 
     fn send(&self, node_id: &str, message: ClusterMessage) -> bool {
@@ -950,8 +1076,16 @@ impl MasterSession {
                 .code
                 .clone();
             if hello.pair_code.trim() != code {
-                return Err("配对码不正确".to_string());
+                // 配对码错误：按来源限速；累计错误达到上限直接作废当前码，避免 6 位码被枚举
+                return Err(register_pair_failure(
+                    &mut state,
+                    &peer.ip().to_string(),
+                    now,
+                    ttl_sec,
+                ));
             }
+            state.pair_fail_total = 0;
+            state.pair_failures.remove(&peer.ip().to_string());
             let name = hello.node_name.trim();
             if name.is_empty() {
                 return Err("节点名不能为空".to_string());
@@ -1006,6 +1140,12 @@ impl MasterSession {
                 qps: 0.0,
                 cpu: None,
                 mem_mb: None,
+                host_cpu_percent: None,
+                host_mem_percent: None,
+                net_rx_kbps: None,
+                net_tx_kbps: None,
+                node_threads: None,
+                load1: None,
                 clock_offset_ms: None,
                 clock_uncertainty_ms: None,
                 clock_best_error_ms: f64::INFINITY,
@@ -1019,6 +1159,7 @@ impl MasterSession {
                 prepare_ok: None,
                 preflight_ok: None,
                 samples: Vec::new(),
+                last_persist_at: 0,
                 done: None,
                 capacity,
                 quota: 0,
@@ -1035,6 +1176,9 @@ impl MasterSession {
                 device_id: hello.device_id.clone(),
                 missing_vars: Vec::new(),
                 pool_columns: hello.pool_columns,
+                clock_recheck: hello.clock_recheck,
+                clock_drift_ms: 0.0,
+                clock_recheck_at: None,
                 pool_slice_bytes: None,
             });
             (
@@ -1121,9 +1265,7 @@ impl MasterSession {
             let live = state
                 .nodes
                 .iter()
-                .filter(|node| {
-                    node.role == "slave" && node.is_active() && node.status != "pending"
-                })
+                .filter(|node| node.role == "slave" && node.is_active() && node.status != "pending")
                 .count();
             if live + pending >= MAX_NODES {
                 return Err(format!("单任务最多 {MAX_NODES} 个从节点"));
@@ -1148,6 +1290,12 @@ impl MasterSession {
                 qps: 0.0,
                 cpu: None,
                 mem_mb: None,
+                host_cpu_percent: None,
+                host_mem_percent: None,
+                net_rx_kbps: None,
+                net_tx_kbps: None,
+                node_threads: None,
+                load1: None,
                 clock_offset_ms: None,
                 clock_uncertainty_ms: None,
                 clock_best_error_ms: f64::INFINITY,
@@ -1161,6 +1309,7 @@ impl MasterSession {
                 prepare_ok: None,
                 preflight_ok: None,
                 samples: Vec::new(),
+                last_persist_at: 0,
                 done: None,
                 capacity,
                 quota: 0,
@@ -1177,6 +1326,9 @@ impl MasterSession {
                 device_id: Some(device_id),
                 missing_vars: Vec::new(),
                 pool_columns: hello.pool_columns,
+                clock_recheck: hello.clock_recheck,
+                clock_drift_ms: 0.0,
+                clock_recheck_at: None,
                 pool_slice_bytes: None,
             });
             (id, request_id)
@@ -1310,10 +1462,7 @@ impl MasterSession {
                 if let Some(stats) = payload.stats.clone() {
                     let mut state = self.state.lock();
                     if let Some(node) = state.nodes.iter_mut().find(|node| node.id == node_id) {
-                        node.last_stats = Some(stats);
-                        if node.status == "running" {
-                            node.qps = node.last_stats.as_ref().map(|s| s.qps).unwrap_or(node.qps);
-                        }
+                        apply_engine_stats(node, stats);
                     }
                 }
                 let _ = self.send(
@@ -1328,7 +1477,7 @@ impl MasterSession {
                 if let Some(stats) = payload.stats {
                     let mut state = self.state.lock();
                     if let Some(node) = state.nodes.iter_mut().find(|node| node.id == node_id) {
-                        node.last_stats = Some(stats);
+                        apply_engine_stats(node, stats);
                     }
                 }
             }
@@ -1358,9 +1507,7 @@ impl MasterSession {
                 .db
                 .get()
                 .ok()
-                .and_then(|conn| {
-                    crate::services::pool::pool_columns(&conn, &payload.pool).ok()
-                })
+                .and_then(|conn| crate::services::pool::pool_columns(&conn, &payload.pool).ok())
                 .map(|columns| crate::commands::stress::refresh_column_of(&columns))
                 .or_else(|| match &result {
                     Ok((_, _, Some(column))) => Some(column.clone()),
@@ -1377,8 +1524,7 @@ impl MasterSession {
             let Some(tx) = tx else {
                 return;
             };
-            let message =
-                session.pool_refresh_result(payload.request_id, peer, result, &column);
+            let message = session.pool_refresh_result(payload.request_id, peer, result, &column);
             let _ = tx.send(ClusterMessage::PoolRefreshResult(message));
         });
     }
@@ -1423,11 +1569,7 @@ impl MasterSession {
             "expiresAt": expires_at,
         })
         .to_string();
-        match super::env_bundle::encrypt_bundle(
-            &self.x25519_secret,
-            &peer,
-            plaintext.as_bytes(),
-        ) {
+        match super::env_bundle::encrypt_bundle(&self.x25519_secret, &peer, plaintext.as_bytes()) {
             Ok((nonce, payload, digest)) => PoolRefreshResultPayload {
                 request_id,
                 ok: true,
@@ -1449,11 +1591,14 @@ impl MasterSession {
         }
     }
 
+    /// 时钟回包：配对阶段取最优样本，运行期只更新漂移（不动机器已对齐的起跑时刻）
     fn on_time_ack(&self, node_id: &str, payload: TimeAckPayload) {
         let mut paired = false;
+        let mut drift_updated = false;
         {
             let mut state = self.state.lock();
-            if state.status != "pairing" {
+            let recheck = payload.seq >= RECHECK_SEQ_BASE;
+            if state.status != "pairing" && !recheck {
                 return;
             }
             let Some(node) = state.nodes.iter_mut().find(|node| node.id == node_id) else {
@@ -1467,20 +1612,52 @@ impl MasterSession {
             }
             let t2 = now_ms();
             let (offset, uncertainty) = clock_metrics(t0, payload.t1, t2);
-            node.clock_samples += 1;
-            if uncertainty < node.clock_best_error_ms {
-                node.clock_best_error_ms = uncertainty;
-                node.clock_offset_ms = Some(offset);
-                node.clock_uncertainty_ms = Some(uncertainty);
-            }
-            if node.clock_samples >= CLOCK_SAMPLE_ROUNDS {
-                node.status = "pairReady".to_string();
-                paired = true;
+            if recheck {
+                apply_clock_recheck(node, offset, t2);
+                drift_updated = true;
+            } else {
+                node.clock_samples += 1;
+                if uncertainty < node.clock_best_error_ms {
+                    node.clock_best_error_ms = uncertainty;
+                    node.clock_offset_ms = Some(offset);
+                    node.clock_uncertainty_ms = Some(uncertainty);
+                }
+                if node.clock_samples >= CLOCK_SAMPLE_ROUNDS {
+                    node.status = "pairReady".to_string();
+                    paired = true;
+                }
             }
         }
         if paired {
             self.persist_node(node_id);
             self.emit_snapshot();
+        } else if drift_updated {
+            self.emit_snapshot();
+        }
+    }
+
+    /// 向单个节点发一拍时钟复测：只在施压中用，判定漂移是否超过告警阈值
+    fn probe_clock_drift(&self, node_id: &str) {
+        let seq = RECHECK_SEQ_BASE + self.recheck_seq.fetch_add(1, Ordering::Relaxed) as u32;
+        let at = now_ms();
+        let allowed = {
+            let mut state = self.state.lock();
+            if !matches!(state.status.as_str(), "ready" | "running" | "preparing") {
+                return;
+            }
+            match state.nodes.iter_mut().find(|node| node.id == node_id) {
+                Some(node) if node.clock_recheck => {
+                    node.clock_probes.insert(seq, at);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if allowed {
+            self.send(
+                node_id,
+                ClusterMessage::TimeProbe(TimeProbePayload { seq, t0: at }),
+            );
         }
     }
 
@@ -1606,13 +1783,62 @@ impl MasterSession {
             if payload.concurrent > node.peak_concurrent {
                 node.peak_concurrent = payload.concurrent;
             }
+            // 顺带把资源用量写回节点状态：运行期节点表才有 CPU/内存/网络可看
+            if let Some(host) = &payload.host {
+                node.cpu = Some(host.cpu);
+                node.mem_mb = Some(host.mem_mb);
+                node.host_cpu_percent = Some(host.host_cpu_percent);
+                node.host_mem_percent = Some(host.host_mem_percent);
+                node.net_rx_kbps = Some(host.net_rx_kbps);
+                node.net_tx_kbps = Some(host.net_tx_kbps);
+                if host.threads > 0 {
+                    node.node_threads = Some(host.threads);
+                }
+                node.load1 = Some(host.load1);
+            }
+            // 只保留最近 SAMPLE_RETAIN 秒：AI 诊断最多取 300 条，长任务不再无限增长
+            if node.samples.len() >= SAMPLE_RETAIN {
+                let overflow = node.samples.len() + 1 - SAMPLE_RETAIN;
+                node.samples.drain(..overflow);
+            }
             node.samples.push(payload.clone());
         }
-        self.persist_node(node_id);
-        self.app.emit_sample(ClusterSampleEvent {
+        self.persist_node_throttled(node_id);
+        // 先攒进帧缓冲：由 watchdog 每秒统一发一次，避免逐条 IPC
+        {
+            let mut frame = self.sample_frame.lock();
+            frame.sec = payload.elapsed_sec;
+            frame.nodes.insert(
+                node_id.to_string(),
+                NodeSampleLite {
+                    node_id: node_id.to_string(),
+                    qps: payload.qps,
+                    concurrent: payload.concurrent,
+                    avg_rt: payload.avg_rt,
+                    error_count: payload.error_count,
+                    cpu: payload.host.as_ref().map(|host| host.cpu),
+                    mem_mb: payload.host.as_ref().map(|host| host.mem_mb),
+                },
+            );
+        }
+    }
+
+    /// 把本秒累积的采样发成一帧；没有新采样时什么都不做
+    fn flush_sample_frame(&self) {
+        let (sec, nodes) = {
+            let mut buffer = self.sample_frame.lock();
+            if buffer.nodes.is_empty() {
+                return;
+            }
+            let mut nodes: Vec<NodeSampleLite> =
+                buffer.nodes.drain().map(|(_, node)| node).collect();
+            nodes.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+            (buffer.sec, nodes)
+        };
+        self.app.emit_sample_frame(ClusterSampleFrame {
             job_id: self.job_id,
-            node_id: node_id.to_string(),
-            sample: payload,
+            sec,
+            nodes,
         });
     }
 
@@ -1789,7 +2015,10 @@ impl MasterSession {
                         .map(|(_, cap)| *cap)
                         .unwrap_or(u32::MAX);
                     let requested = requested.iter().find(|item| item.node_id == node.id);
-                    let min = requested.and_then(|item| item.min_concurrent).unwrap_or(1).max(1);
+                    let min = requested
+                        .and_then(|item| item.min_concurrent)
+                        .unwrap_or(1)
+                        .max(1);
                     let max = requested
                         .and_then(|item| item.max_concurrent)
                         .unwrap_or(cap)
@@ -1890,11 +2119,7 @@ impl MasterSession {
             let payload = {
                 let mut state = self.state.lock();
                 let node_count = state.nodes.len();
-                let total_vus = state
-                    .nodes
-                    .iter()
-                    .map(|node| node.concurrent)
-                    .sum::<u32>();
+                let total_vus = state.nodes.iter().map(|node| node.concurrent).sum::<u32>();
                 let Some((index, node)) = state
                     .nodes
                     .iter()
@@ -2092,9 +2317,8 @@ impl MasterSession {
     fn var_audit(&self) -> super::protocol::VarAuditReport {
         use super::protocol::{VarAuditItem, VarAuditNode};
 
-        let texts = config_texts(&self.local_config);
-        let classified =
-            crate::util::required_vars_in_texts(texts.iter().map(String::as_str));
+        let texts = crate::util::config_texts(&self.local_config);
+        let classified = crate::util::required_vars_in_texts(texts.iter().map(String::as_str));
         let master_env = self.master_env();
         let os_allow = self
             .app
@@ -2145,7 +2369,7 @@ impl MasterSession {
                 } else {
                     Some("主节点环境里没有这个变量；从节点会按缺失拦截".to_string())
                 },
-                node_states: probe_state(&[name.clone()]),
+                node_states: probe_state(std::slice::from_ref(name)),
             });
         }
 
@@ -2168,7 +2392,7 @@ impl MasterSession {
                 } else {
                     "主节点环境里没有这个 secret；从节点会按缺失拦截".to_string()
                 }),
-                node_states: probe_state(&[name.clone()]),
+                node_states: probe_state(std::slice::from_ref(name)),
             });
         }
 
@@ -2182,8 +2406,7 @@ impl MasterSession {
                 message: Some(if allowed {
                     "由各节点读取本机环境变量".to_string()
                 } else {
-                    "未加入 OS 变量白名单（设置 → 压测 → OS 变量），各节点会按缺失拦截"
-                        .to_string()
+                    "未加入 OS 变量白名单（设置 → 压测 → OS 变量），各节点会按缺失拦截".to_string()
                 }),
                 node_states: probe_state(&[format!("os:{name}")]),
             });
@@ -2218,7 +2441,7 @@ impl MasterSession {
                 master_has_value: binding.is_some(),
                 source: if binding.is_some() { "pool" } else { "none" }.to_string(),
                 message,
-                node_states: probe_state(&[name.clone()]),
+                node_states: probe_state(std::slice::from_ref(name)),
             });
         }
 
@@ -2248,7 +2471,11 @@ impl MasterSession {
         pairs.sort_by(|left, right| left.0.cmp(right.0));
         let mut canonical = String::new();
         for (key, value) in pairs {
-            let kind = if secrets.contains(key) { "secret" } else { "var" };
+            let kind = if secrets.contains(key) {
+                "secret"
+            } else {
+                "var"
+            };
             canonical.push_str(kind);
             canonical.push(':');
             canonical.push_str(key);
@@ -2322,9 +2549,7 @@ impl MasterSession {
         total_vus: u32,
     ) -> Result<(Vec<PoolSlice>, u64), String> {
         use crate::commands::stress::binding_mode;
-        use crate::services::pool::{
-            E_POOL_BINDING_INVALID, E_POOL_EMPTY, E_POOL_SHARD_EMPTY,
-        };
+        use crate::services::pool::{E_POOL_BINDING_INVALID, E_POOL_EMPTY, E_POOL_SHARD_EMPTY};
         let conn = self
             .db
             .get()
@@ -2338,8 +2563,7 @@ impl MasterSession {
         for binding in bindings {
             let name = binding.pool.trim();
             // target 为空仅在 column == "*" 时允许
-            if name.is_empty()
-                || (binding.target.trim().is_empty() && binding.column.trim() != "*")
+            if name.is_empty() || (binding.target.trim().is_empty() && binding.column.trim() != "*")
             {
                 return Err(format!(
                     "{E_POOL_BINDING_INVALID}: 池绑定缺少池名或目标变量"
@@ -2366,11 +2590,8 @@ impl MasterSession {
             }
             let kind = crate::services::pool::pool_kind(&conn, name);
             let columns = crate::services::pool::pool_columns(&conn, name)?;
-            let refresh = crate::services::pool::pool_refresh_configs(
-                &conn,
-                &[name.to_string()],
-            )?
-            .remove(name);
+            let refresh = crate::services::pool::pool_refresh_configs(&conn, &[name.to_string()])?
+                .remove(name);
             let (items, start_index) = if mode == "per_vu" {
                 if items.len() >= total_vus as usize && (node.vu_start as usize) < items.len() {
                     let start = node.vu_start as usize;
@@ -2437,12 +2658,8 @@ impl MasterSession {
         // 本地引擎与从节点共用同一个单飞核心：进程内直接调用，不再各刷一次
         let relay: Arc<dyn PoolRefreshRelay> =
             Arc::new(LocalPoolRefreshRelay::new(self.pool_refresh.clone()));
-        let mut prepared = prepare_stress_with_relay(
-            app_state.inner(),
-            config.clone(),
-            placeholder,
-            Some(relay),
-        )?;
+        let mut prepared =
+            prepare_stress_with_relay(app_state.inner(), config.clone(), placeholder, Some(relay))?;
         let draft = StressJobDraft {
             name: prepared.name.clone(),
             target: prepared.url_text.clone(),
@@ -2586,6 +2803,7 @@ impl MasterSession {
                     status: node.status.clone(),
                     clock_offset_ms: node.clock_offset_ms.unwrap_or(0.0),
                     clock_uncertainty_ms: node.clock_uncertainty_ms.unwrap_or(0.0),
+                    clock_drift_ms: node.clock_drift_ms,
                     samples: node.samples.clone(),
                     done: node.done.clone(),
                 })
@@ -2638,8 +2856,7 @@ impl MasterSession {
         );
         let incomplete = merged.meta.incomplete;
         if let Ok(report_id) = &saved {
-            if let Err(error) =
-                save_cluster_samples(&self.db, *report_id, &merged.meta.node_series)
+            if let Err(error) = save_cluster_samples(&self.db, *report_id, &merged.meta.node_series)
             {
                 log::warn!("写入集群节点采样失败：{error}");
             }
@@ -2953,6 +3170,9 @@ async fn heartbeat_loop(
     let mut ticker = tokio::time::interval(Duration::from_secs(HEARTBEAT_SEC));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ticker.tick().await;
+    // 复测节拍：心跳是 2s 一次，60s 复测等于每 30 拍
+    let recheck_every = (CLOCK_RECHECK_SEC / HEARTBEAT_SEC.max(1)).max(1);
+    let mut ticks: u64 = 0;
     loop {
         if session.shutdown.load(Ordering::SeqCst) {
             break;
@@ -2977,6 +3197,10 @@ async fn heartbeat_loop(
         {
             break;
         }
+        ticks += 1;
+        if ticks.is_multiple_of(recheck_every) {
+            session.probe_clock_drift(&node_id);
+        }
         ticker.tick().await;
     }
 }
@@ -2990,6 +3214,7 @@ async fn watchdog_loop(session: Arc<MasterSession>) {
             break;
         }
         session.check_lost();
+        session.flush_sample_frame();
     }
 }
 
@@ -3021,8 +3246,7 @@ fn master_refresh_vars(
             .flatten()
         });
         if let Some(id) = env_id {
-            if let Ok((loaded, _secrets)) =
-                crate::commands::http::load_vars_with_secrets(&conn, id)
+            if let Ok((loaded, _secrets)) = crate::commands::http::load_vars_with_secrets(&conn, id)
             {
                 vars = loaded;
             }
@@ -3073,10 +3297,7 @@ pub(crate) fn shared_config(
 }
 
 /// 变量体检中的单节点状态：优先看 PrepareAck 的缺失清单，其次看准备结果
-fn var_node_state(
-    node: &NodeState,
-    names: &[String],
-) -> super::protocol::VarAuditNodeState {
+fn var_node_state(node: &NodeState, names: &[String]) -> super::protocol::VarAuditNodeState {
     use super::protocol::VarAuditNodeState;
     if node
         .missing_vars
@@ -3118,7 +3339,7 @@ fn var_node_state(
 /// `{{pool:x}}` 由池注入——这些都不再误判为「用户变量缺失」。
 /// `{{secret:TOKEN}}` 归一化为 `TOKEN`，仍需主节点提供（值通过 EnvBundle 下发）。
 fn collect_required_vars(config: &StressConfig) -> Vec<String> {
-    let texts = config_texts(config);
+    let texts = crate::util::config_texts(config);
     let classified = crate::util::required_vars_in_texts(texts.iter().map(String::as_str));
     let mut names = classified.user;
     for name in classified.secret {
@@ -3127,37 +3348,6 @@ fn collect_required_vars(config: &StressConfig) -> Vec<String> {
         }
     }
     names
-}
-
-/// 配置中所有可能出现占位符的文本字段
-fn config_texts(config: &StressConfig) -> Vec<String> {
-    let mut texts = vec![config.url.trim().to_string()];
-    for item in config.params.iter().chain(config.headers.iter()) {
-        if !item.enabled {
-            continue;
-        }
-        texts.push(item.key.trim().to_string());
-        texts.push(item.value.clone());
-    }
-    if let Some(body) = &config.body {
-        texts.push(body.clone());
-    }
-    if let Some(auth) = &config.auth {
-        for value in [
-            &auth.token,
-            &auth.username,
-            &auth.password,
-            &auth.key,
-            &auth.value,
-            &auth.token_url,
-            &auth.client_id,
-            &auth.client_secret,
-            &auth.scope,
-        ] {
-            texts.push(value.clone());
-        }
-    }
-    texts
 }
 
 /// 归一化分配模式：auto / even / custom；未传时按是否携带权重推断
@@ -3351,12 +3541,6 @@ fn allocate_concurrency_capped(
 }
 
 /// NTP 单样本：偏移 = t1 - (t0 + t2) / 2，误差取单程 RTT / 2
-pub(crate) fn clock_metrics(t0: i64, t1: i64, t2: i64) -> (f64, f64) {
-    let rtt = (t2 - t0).max(0) as f64;
-    let offset = t1 as f64 - (t0 as f64 + t2 as f64) / 2.0;
-    (offset, rtt / 2.0)
-}
-
 fn setup_ready(state: &SessionState) -> bool {
     let slaves: Vec<&NodeState> = state
         .nodes
@@ -3375,11 +3559,6 @@ fn nodes_settled(state: &SessionState) -> bool {
             .all(|node| matches!(node.status.as_str(), "done" | "lost" | "left" | "rejected"))
 }
 
-fn new_pair_code() -> String {
-    let value = Uuid::new_v4().as_u128() % 10u128.pow(PAIR_CODE_DIGITS as u32);
-    format!("{value:0width$}", width = PAIR_CODE_DIGITS)
-}
-
 /// 本机计算机名；取不到时用调用方给的兜底名（主节点 / 从节点展示不同）
 pub(crate) fn local_node_name(fallback: &str) -> String {
     std::env::var("COMPUTERNAME")
@@ -3390,285 +3569,12 @@ pub(crate) fn local_node_name(fallback: &str) -> String {
         .unwrap_or_else(|| fallback.to_string())
 }
 
-/* ---------- 持久化 ---------- */
-
-struct WorkerRow {
-    name: String,
-    addr: String,
-    role: String,
-    weight: f64,
-    concurrent: u32,
-    status: String,
-    qps: f64,
-    cpu: Option<f64>,
-    mem_mb: Option<u64>,
-    clock_offset_ms: Option<f64>,
-    clock_uncertainty_ms: Option<f64>,
-    dropped_samples: u64,
-    joined_at: i64,
-    last_seen_at: Option<i64>,
-    error: Option<String>,
-}
-
-#[allow(clippy::too_many_arguments)]
-fn insert_job(
-    pool: &DbPool,
-    created_at: i64,
-    master_node: &str,
-    plan_id: Option<i64>,
-    plan_name: &str,
-    port: u16,
-    config_json: &str,
-    pair_expires_at: i64,
-    total_concurrent: u32,
-) -> Result<i64, String> {
-    let conn = pool.get().map_err(err)?;
-    conn.execute(
-        "INSERT INTO cluster_jobs (created_at, status, master_node, plan_id, plan_name, port,
-            config_json, pair_code_expires_at, total_concurrent)
-         VALUES (?1, 'pairing', ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![
-            created_at,
-            master_node,
-            plan_id,
-            plan_name,
-            port,
-            config_json,
-            pair_expires_at,
-            total_concurrent
-        ],
-    )
-    .map_err(err)?;
-    Ok(conn.last_insert_rowid())
-}
-
-fn upsert_worker(pool: &DbPool, job_id: i64, node: &NodeState) -> Result<(), String> {
-    update_worker(
-        pool,
-        job_id,
-        &WorkerRow {
-            name: node.name.clone(),
-            addr: node.addr.clone(),
-            role: node.role.clone(),
-            weight: node.weight,
-            concurrent: node.concurrent,
-            status: node.status.clone(),
-            qps: node.qps,
-            cpu: node.cpu,
-            mem_mb: node.mem_mb,
-            clock_offset_ms: node.clock_offset_ms,
-            clock_uncertainty_ms: node.clock_uncertainty_ms,
-            dropped_samples: node.dropped_samples,
-            joined_at: node.joined_at,
-            last_seen_at: node.last_seen_at,
-            error: node.error.clone(),
-        },
-    )
-}
-
-fn update_worker(pool: &DbPool, job_id: i64, node: &WorkerRow) -> Result<(), String> {
-    let conn = pool.get().map_err(err)?;
-    conn.execute(
-        "INSERT INTO cluster_workers (job_id, node_name, addr, role, weight, concurrent, status,
-            qps, cpu, mem, clock_offset_ms, clock_uncertainty_ms, dropped_samples, joined_at,
-            last_seen_at, error)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
-         ON CONFLICT(job_id, node_name) DO UPDATE SET
-            addr = excluded.addr,
-            role = excluded.role,
-            weight = excluded.weight,
-            concurrent = excluded.concurrent,
-            status = excluded.status,
-            qps = excluded.qps,
-            cpu = excluded.cpu,
-            mem = excluded.mem,
-            clock_offset_ms = excluded.clock_offset_ms,
-            clock_uncertainty_ms = excluded.clock_uncertainty_ms,
-            dropped_samples = excluded.dropped_samples,
-            last_seen_at = excluded.last_seen_at,
-            error = excluded.error",
-        params![
-            job_id,
-            node.name,
-            node.addr,
-            node.role,
-            node.weight,
-            node.concurrent,
-            node.status,
-            node.qps,
-            // 表里这些列是 NOT NULL DEFAULT 0：未采集到就直接写 0，不写 NULL
-            node.cpu.unwrap_or(0.0),
-            node.mem_mb.map(|value| value as i64).unwrap_or(0),
-            node.clock_offset_ms.unwrap_or(0.0),
-            node.clock_uncertainty_ms.unwrap_or(0.0),
-            node.dropped_samples as i64,
-            node.joined_at,
-            node.last_seen_at,
-            node.error
-        ],
-    )
-    .map_err(err)?;
-    Ok(())
-}
-
-fn update_job(
-    pool: &DbPool,
-    job_id: i64,
-    status: &str,
-    message: Option<&str>,
-    incomplete: bool,
-    finished_at: Option<i64>,
-) -> Result<(), String> {
-    let conn = pool.get().map_err(err)?;
-    conn.execute(
-        "UPDATE cluster_jobs SET status = ?2, message = ?3, incomplete = ?4,
-            finished_at = COALESCE(?5, finished_at) WHERE id = ?1",
-        params![job_id, status, message, incomplete, finished_at],
-    )
-    .map_err(err)?;
-    Ok(())
-}
-
-fn update_job_finished(
-    pool: &DbPool,
-    job_id: i64,
-    message: &str,
-    incomplete: bool,
-    report_id: Option<i64>,
-) -> Result<(), String> {
-    let conn = pool.get().map_err(err)?;
-    conn.execute(
-        "UPDATE cluster_jobs SET status = 'finished', message = ?2, incomplete = ?3,
-            report_id = ?4, finished_at = ?5 WHERE id = ?1",
-        params![job_id, message, incomplete, report_id, now_ms()],
-    )
-    .map_err(err)?;
-    Ok(())
-}
-
-fn update_job_start(pool: &DbPool, job_id: i64, at_ms: i64) -> Result<(), String> {
-    let conn = pool.get().map_err(err)?;
-    conn.execute(
-        "UPDATE cluster_jobs SET status = 'running', start_at_ms = ?2 WHERE id = ?1",
-        params![job_id, at_ms],
-    )
-    .map_err(err)?;
-    Ok(())
-}
-
-fn update_pair_expiry(pool: &DbPool, job_id: i64, expires_at: i64) -> Result<(), String> {
-    let conn = pool.get().map_err(err)?;
-    conn.execute(
-        "UPDATE cluster_jobs SET pair_code_expires_at = ?2 WHERE id = ?1",
-        params![job_id, expires_at],
-    )
-    .map_err(err)?;
-    Ok(())
-}
-
-fn update_weights(
-    pool: &DbPool,
-    job_id: i64,
-    weights: &HashMap<String, f64>,
-) -> Result<(), String> {
-    let conn = pool.get().map_err(err)?;
-    let current: Option<String> = conn
-        .query_row(
-            "SELECT config_json FROM cluster_jobs WHERE id = ?1",
-            params![job_id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(err)?;
-    let text = match current {
-        Some(text) => text,
-        None => return Ok(()),
-    };
-    let mut value: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
-    if !value.is_object() {
-        value = serde_json::json!({});
-    }
-    value["weights"] = serde_json::to_value(weights).map_err(err)?;
-    conn.execute(
-        "UPDATE cluster_jobs SET config_json = ?2 WHERE id = ?1",
-        params![job_id, value.to_string()],
-    )
-    .map_err(err)?;
-    Ok(())
-}
-
-/// 启动时把上次异常退出遗留的任务标记为失败，避免列表长期显示运行中
-pub fn recover_stale_jobs(pool: &DbPool) -> Result<usize, String> {
-    let conn = pool.get().map_err(err)?;
-    let now = now_ms();
-    let jobs = conn
-        .execute(
-            "UPDATE cluster_jobs SET status = 'failed', message = '应用退出导致任务中断',
-                finished_at = ?1, incomplete = 1
-             WHERE status IN ('pairing', 'preparing', 'ready', 'running')",
-            params![now],
-        )
-        .map_err(err)?;
-    conn.execute(
-        "UPDATE cluster_workers SET status = 'lost', error = '应用退出导致连接中断'
-         WHERE status NOT IN ('done', 'lost', 'left', 'rejected')",
-        [],
-    )
-    .map_err(err)?;
-    Ok(jobs)
-}
-
-/// 把合并后的节点级曲线落库（v19），供跨报告按节点查询
-fn save_cluster_samples(
-    db: &DbPool,
-    report_id: i64,
-    series: &[crate::services::cluster::protocol::NodeSeries],
-) -> Result<(), String> {
-    if series.is_empty() {
-        return Ok(());
-    }
-    let mut conn = db.get().map_err(err)?;
-    let tx = conn.transaction().map_err(err)?;
-    {
-        let mut stmt = tx
-            .prepare(
-                "INSERT INTO cluster_report_samples
-                 (report_id, node, role, elapsed_sec, concurrent, qps, p95_rt, error_count)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            )
-            .map_err(err)?;
-        for node in series {
-            for point in &node.points {
-                stmt.execute(rusqlite::params![
-                    report_id,
-                    node.node,
-                    node.role,
-                    point.sec as i64,
-                    point.concurrent as i64,
-                    point.qps,
-                    point.p95,
-                    point.errors as i64,
-                ])
-                .map_err(err)?;
-            }
-        }
-    }
-    tx.commit().map_err(err)?;
-    Ok(())
-}
-
-/// 节点 VU 区间完整性校验：必须从 0 开始、连续、无重叠，且刚好覆盖总并发
 fn validate_vu_ranges(nodes: &[NodeState], total_vus: u32) -> Result<(), String> {
     use crate::services::pool::E_POOL_SLICE_GAP;
     let mut ranges: Vec<(u32, u32)> = nodes
         .iter()
         .filter(|node| node.concurrent > 0)
-        .map(|node| {
-            (
-                node.vu_start,
-                node.vu_start.saturating_add(node.vu_count),
-            )
-        })
+        .map(|node| (node.vu_start, node.vu_start.saturating_add(node.vu_count)))
         .collect();
     ranges.sort_unstable();
     let mut cursor = 0u32;
@@ -3749,11 +3655,7 @@ fn ensure_pool_slice_size(slices: &[PoolSlice], node_name: &str) -> Result<u64, 
         // 找出占比最大的池，让用户知道该缩减哪个池
         let largest = slices
             .iter()
-            .filter_map(|slice| {
-                serde_json::to_vec(slice)
-                    .ok()
-                    .map(|raw| (slice, raw.len()))
-            })
+            .filter_map(|slice| serde_json::to_vec(slice).ok().map(|raw| (slice, raw.len())))
             .max_by_key(|(_, size)| *size);
         let detail = match largest {
             Some((slice, size)) => format!(
@@ -3799,421 +3701,4 @@ fn ensure_pool_slice_bytes(bytes: usize, node_name: &str) -> Result<(), String> 
         ));
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn pool_slice_size_limit_rejects_oversized() {
-        assert!(ensure_pool_slice_bytes(MAX_POOL_SLICE_BYTES, "从机A").is_ok());
-        let message = ensure_pool_slice_bytes(MAX_POOL_SLICE_BYTES + 1, "从机A").unwrap_err();
-        assert!(message.starts_with(crate::services::pool::E_POOL_SLICE_TOO_LARGE));
-        assert!(message.contains("从机A"));
-        assert!(message.contains("64 MB"));
-        assert!(message.contains("缩小池条目或增加节点"));
-    }
-
-    #[test]
-    fn pair_code_is_fixed_width_digits() {
-        for _ in 0..20 {
-            let code = new_pair_code();
-            assert_eq!(code.len(), PAIR_CODE_DIGITS);
-            assert!(code.chars().all(|ch| ch.is_ascii_digit()));
-        }
-    }
-
-    #[test]
-    fn pair_code_ttl_defaults_and_bounds() {
-        assert_eq!(resolve_pair_code_ttl(None).unwrap(), PAIR_CODE_TTL_SEC);
-        assert_eq!(resolve_pair_code_ttl(Some(900)).unwrap(), 900);
-        assert!(resolve_pair_code_ttl(Some(30)).is_err());
-        assert!(resolve_pair_code_ttl(Some(7200)).is_err());
-        assert_eq!(resolve_pair_code_ttl(Some(60)).unwrap(), 60);
-        assert_eq!(resolve_pair_code_ttl(Some(3600)).unwrap(), 3600);
-    }
-
-    #[test]
-    fn clock_metrics_follow_ntp_single_sample() {
-        // 从节点比主节点快 5 分钟，RTT 40ms
-        let (offset, uncertainty) = clock_metrics(1_000, 301_020, 1_040);
-        assert!((offset - 300_000.0).abs() < 0.01);
-        assert!((uncertainty - 20.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn allocation_sums_to_total_and_keeps_minimum_one() {
-        let participants = vec![
-            ("master".to_string(), 1.0),
-            ("a".to_string(), 1.0),
-            ("b".to_string(), 1.0),
-        ];
-        let weights = participants.clone();
-        let caps = participants
-            .iter()
-            .map(|(id, _)| (id.clone(), 100u32))
-            .collect::<Vec<_>>();
-        let limits = participants
-            .iter()
-            .map(|(id, _)| (id.clone(), 1u32, 100u32))
-            .collect::<Vec<_>>();
-        let allocation = allocate_concurrency_capped(16, &participants, &weights, &caps, &limits)
-            .unwrap();
-        assert_eq!(allocation.iter().map(|(_, count)| count).sum::<u32>(), 16);
-        assert!(allocation.iter().all(|(_, count)| *count >= 1));
-        assert_eq!(allocation.len(), 3);
-
-        let two = vec![("master".to_string(), 1.0), ("a".to_string(), 1.0)];
-        let two_caps = vec![("master".to_string(), 100u32), ("a".to_string(), 100u32)];
-        let two_limits = vec![("master".to_string(), 1u32, 100u32), ("a".to_string(), 1u32, 100u32)];
-        let allocation =
-            allocate_concurrency_capped(16, &two, &two, &two_caps, &two_limits).unwrap();
-        assert_eq!(
-            allocation,
-            vec![("master".to_string(), 8), ("a".to_string(), 8)]
-        );
-
-        let skewed = vec![
-            ("master".to_string(), 2.0),
-            ("a".to_string(), 1.0),
-            ("b".to_string(), 1.0),
-        ];
-        let skewed_caps = skewed
-            .iter()
-            .map(|(id, _)| (id.clone(), 100u32))
-            .collect::<Vec<_>>();
-        let skewed_limits = skewed
-            .iter()
-            .map(|(id, _)| (id.clone(), 1u32, 100u32))
-            .collect::<Vec<_>>();
-        let allocation =
-            allocate_concurrency_capped(10, &skewed, &skewed, &skewed_caps, &skewed_limits).unwrap();
-        assert_eq!(allocation.iter().map(|(_, count)| count).sum::<u32>(), 10);
-        assert_eq!(allocation[0].1, 4);
-    }
-
-    #[test]
-    fn allocation_rejects_more_nodes_than_concurrency() {
-        let participants = vec![("a".to_string(), 1.0), ("b".to_string(), 1.0)];
-        let caps = vec![("a".to_string(), 100u32), ("b".to_string(), 100u32)];
-        let limits = vec![("a".to_string(), 1u32, 100u32), ("b".to_string(), 1u32, 100u32)];
-        assert!(
-            allocate_concurrency_capped(1, &participants, &participants, &caps, &limits).is_err()
-        );
-    }
-
-    #[test]
-    fn even_mode_splits_with_remainder() {
-        let participants = vec![
-            ("master".to_string(), 8.0),
-            ("a".to_string(), 4.0),
-            ("b".to_string(), 2.0),
-        ];
-        let weights = resolve_weights(&participants, &[], "even").unwrap();
-        assert!(weights.iter().all(|(_, weight)| (*weight - 1.0).abs() < f64::EPSILON));
-        let caps = vec![
-            ("master".to_string(), 100),
-            ("a".to_string(), 100),
-            ("b".to_string(), 100),
-        ];
-        let limits = vec![
-            ("master".to_string(), 1, 100),
-            ("a".to_string(), 1, 100),
-            ("b".to_string(), 1, 100),
-        ];
-        let allocation =
-            allocate_concurrency_capped(10, &participants, &weights, &caps, &limits).unwrap();
-        assert_eq!(allocation.iter().map(|(_, count)| count).sum::<u32>(), 10);
-        assert_eq!(
-            allocation,
-            vec![
-                ("master".to_string(), 4),
-                ("a".to_string(), 3),
-                ("b".to_string(), 3),
-            ]
-        );
-    }
-
-    #[test]
-    fn allocation_respects_node_max_and_reports_cap_shortage() {
-        let participants = vec![("a".to_string(), 1.0), ("b".to_string(), 1.0)];
-        let weights = resolve_weights(&participants, &[], "even").unwrap();
-        let caps = vec![("a".to_string(), 8), ("b".to_string(), 8)];
-        let limits = vec![("a".to_string(), 1, 2), ("b".to_string(), 1, 8)];
-        let allocation =
-            allocate_concurrency_capped(10, &participants, &weights, &caps, &limits).unwrap();
-        assert_eq!(
-            allocation,
-            vec![("a".to_string(), 2), ("b".to_string(), 8)]
-        );
-
-        let tight = vec![("a".to_string(), 1, 2), ("b".to_string(), 1, 3)];
-        let error =
-            allocate_concurrency_capped(10, &participants, &weights, &caps, &tight).unwrap_err();
-        assert!(error.contains("上限之和"), "错误应说明上限不足：{error}");
-    }
-
-    #[test]
-    fn allocation_rejects_min_above_total() {
-        let participants = vec![("a".to_string(), 1.0), ("b".to_string(), 1.0)];
-        let weights = resolve_weights(&participants, &[], "even").unwrap();
-        let caps = vec![("a".to_string(), 32), ("b".to_string(), 32)];
-        let limits = vec![("a".to_string(), 6, 8), ("b".to_string(), 6, 8)];
-        let error =
-            allocate_concurrency_capped(8, &participants, &weights, &caps, &limits).unwrap_err();
-        assert!(error.contains("最小并发之和"), "错误应说明下限过高：{error}");
-    }
-
-    #[test]
-    fn allocation_mode_defaults_and_rejects_unknown() {
-        assert_eq!(normalize_allocation_mode(None, false).unwrap(), "auto");
-        assert_eq!(normalize_allocation_mode(None, true).unwrap(), "custom");
-        assert_eq!(normalize_allocation_mode(Some(" EVEN "), false).unwrap(), "even");
-        assert!(normalize_allocation_mode(Some("random"), false).is_err());
-    }
-
-    #[test]
-    fn required_vars_cover_headers_body_auth_and_skip_disabled() {
-        let config: StressConfig = serde_json::from_str(
-            r#"{
-                "url":"{{base_url}}/api/{{id}}",
-                "headers":[
-                    {"key":"X-Token","value":"{{token}}","enabled":true},
-                    {"key":"X-Off","value":"{{hidden}}","enabled":false}
-                ],
-                "body":"{\"user\":\"{{user}}\"}",
-                "auth":{"kind":"bearer","token":"{{token}}"}
-            }"#,
-        )
-        .unwrap();
-        let names = collect_required_vars(&config);
-        assert!(names.contains(&"base_url".to_string()));
-        assert!(names.contains(&"id".to_string()));
-        assert!(names.contains(&"token".to_string()));
-        assert!(names.contains(&"user".to_string()));
-        assert!(!names.contains(&"hidden".to_string()));
-        assert_eq!(names.iter().filter(|name| *name == "token").count(), 1);
-    }
-
-    #[test]
-    fn shared_config_rejects_phase_one_gaps() {
-        let mut config: StressConfig =
-            serde_json::from_str(r#"{"url":"http://127.0.0.1/x"}"#).unwrap();
-        config.vars.insert("token".to_string(), "abc".to_string());
-        assert!(shared_config(&config).unwrap_err().contains("运行期变量"));
-
-        let mut config: StressConfig =
-            serde_json::from_str(r#"{"url":"http://127.0.0.1/x"}"#).unwrap();
-        config.stages = vec![serde_json::from_str(r#"{"concurrent":1,"durationSec":5}"#).unwrap()];
-        assert!(shared_config(&config).unwrap_err().contains("阶梯"));
-
-        let mut config: StressConfig = serde_json::from_str(
-            r#"{"url":"http://127.0.0.1/x","auth":{"kind":"bearer","token":"plain-secret"}}"#,
-        )
-        .unwrap();
-        assert!(shared_config(&config).unwrap_err().contains("明文"));
-
-        config.auth.as_mut().unwrap().token = "{{token}}".to_string();
-        let (value, _) = shared_config(&config).unwrap();
-        assert!(value.get("auth").is_some());
-    }
-
-    #[test]
-    fn shared_config_clears_env_and_keeps_template() {
-        let config: StressConfig = serde_json::from_str(
-            r#"{"url":"{{base_url}}/x","envId":7,"headers":[{"key":"A","value":"{{token}}","enabled":true}]}"#,
-        )
-        .unwrap();
-        let (value, names) = shared_config(&config).unwrap();
-        assert!(value.get("envId").is_none() || value["envId"].is_null());
-        assert_eq!(value["url"], "{{base_url}}/x");
-        assert!(names.contains(&"base_url".to_string()));
-        assert!(names.contains(&"token".to_string()));
-    }
-
-    #[test]
-    fn finished_job_records_report_and_incomplete_flag() {
-        let (dir, pool) = crate::notes::test_pool("cluster-job-finish");
-        let job_id = insert_job(
-            &pool,
-            1_000,
-            "master",
-            Some(7),
-            "计划",
-            17801,
-            "{}",
-            2_000,
-            16,
-        )
-        .unwrap();
-        update_job_finished(&pool, job_id, "合并报告 #9 已生成", true, Some(9)).unwrap();
-        let conn = pool.get().unwrap();
-        let (status, report_id, incomplete, message, finished): (
-            String,
-            Option<i64>,
-            i64,
-            String,
-            Option<i64>,
-        ) = conn
-            .query_row(
-                "SELECT status, report_id, incomplete, message, finished_at
-                 FROM cluster_jobs WHERE id = ?1",
-                params![job_id],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
-            )
-            .unwrap();
-        assert_eq!(status, "finished");
-        assert_eq!(report_id, Some(9));
-        assert_eq!(incomplete, 1);
-        assert_eq!(message, "合并报告 #9 已生成");
-        assert!(finished.is_some());
-        drop(conn);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn nodes_settled_requires_master_done() {
-        let mut state = SessionState {
-            status: "running".to_string(),
-            start_at_ms: None,
-            report_id: None,
-            incomplete: false,
-            message: None,
-            pair_code: None,
-            nodes: vec![NodeState::master("m".to_string(), String::new(), 1)],
-            next_node: 1,
-            join_requests: HashMap::new(),
-        };
-        assert!(!nodes_settled(&state));
-        state.nodes[0].status = "done".to_string();
-        assert!(nodes_settled(&state));
-        state
-            .nodes
-            .push(NodeState::master("s".to_string(), String::new(), 1));
-        state.nodes[1].status = "lost".to_string();
-        assert!(nodes_settled(&state));
-    }
-
-    #[test]
-    fn resolve_weights_uses_default_and_rejects_unknown() {
-        let participants = vec![("master".to_string(), 1.0), ("a".to_string(), 1.0)];
-        let resolved = resolve_weights(
-            &participants,
-            &[ClusterNodeWeight {
-                node_id: "a".to_string(),
-                weight: 2.0,
-                min_concurrent: None,
-                max_concurrent: None,
-            }],
-            "custom",
-        )
-        .unwrap();
-        assert_eq!(resolved[0].1, 1.0);
-        assert_eq!(resolved[1].1, 2.0);
-
-        assert!(resolve_weights(
-            &participants,
-            &[ClusterNodeWeight {
-                node_id: "ghost".to_string(),
-                weight: 1.0,
-                min_concurrent: None,
-                max_concurrent: None,
-            }],
-            "custom",
-        )
-        .is_err());
-    }
-}
-
-/// 12.5 性能验收（手动执行，默认测试集跳过）
-///
-/// `cargo test --lib perf_save_cluster_samples -- --ignored --nocapture`
-#[cfg(test)]
-mod perf_tests {
-    use super::*;
-    use r2d2_sqlite::SqliteConnectionManager;
-    use std::time::Instant;
-
-    #[test]
-    #[ignore = "性能验收，需手动执行"]
-    fn perf_save_cluster_samples_24h_16_nodes() {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|value| value.as_nanos())
-            .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!(
-            "astroman-perf-series-{}-{stamp}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let manager = SqliteConnectionManager::file(dir.join("series.db")).with_init(|conn| {
-            conn.execute_batch(
-                "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;",
-            )
-        });
-        let db: crate::state::DbPool = r2d2::Pool::builder()
-            .max_size(2)
-            .build(manager)
-            .unwrap();
-        {
-            let conn = db.get().unwrap();
-            conn.execute_batch(
-                "CREATE TABLE test_reports (id INTEGER PRIMARY KEY);
-                 INSERT INTO test_reports (id) VALUES (1);
-                 CREATE TABLE cluster_report_samples (
-                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                     report_id   INTEGER NOT NULL REFERENCES test_reports(id) ON DELETE CASCADE,
-                     node        TEXT    NOT NULL,
-                     role        TEXT    NOT NULL DEFAULT 'slave',
-                     elapsed_sec INTEGER NOT NULL,
-                     concurrent  INTEGER DEFAULT 0,
-                     qps         REAL    DEFAULT 0,
-                     p95_rt      REAL    DEFAULT 0,
-                     error_count INTEGER DEFAULT 0
-                 );
-                 CREATE INDEX idx_cluster_samples_report
-                     ON cluster_report_samples(report_id, node, elapsed_sec);",
-            )
-            .unwrap();
-        }
-
-        // 24h 抽稀后的上限：16 节点 × 1800 点 = 28,800 行
-        let series = (0..16u32)
-            .map(|index| crate::services::cluster::protocol::NodeSeries {
-                node: format!("node-{index:02}"),
-                role: if index == 0 { "master".into() } else { "slave".into() },
-                points: (0..1_800u64)
-                    .map(|point| crate::services::cluster::protocol::SeriesPoint {
-                        sec: point * 48,
-                        qps: 100.0,
-                        concurrent: 100,
-                        p95: 20.0,
-                        errors: 0,
-                    })
-                    .collect(),
-            })
-            .collect::<Vec<_>>();
-
-        let started = Instant::now();
-        save_cluster_samples(&db, 1, &series).unwrap();
-        let elapsed = started.elapsed();
-        let rows: usize = series.iter().map(|node| node.points.len()).sum();
-        println!("perf_save_cluster_samples: {rows} rows in {elapsed:?}");
-        assert!(rows <= 50_000, "节点序列 {rows} 行超过 50k 目标");
-        assert!(
-            elapsed < std::time::Duration::from_millis(2_000),
-            "写入 {rows} 行耗时 {elapsed:?}，超过 2s 目标"
-        );
-        drop(db);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }

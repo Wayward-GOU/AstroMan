@@ -7,6 +7,9 @@ use tauri::{AppHandle, State};
 
 use crate::services::cluster::client::{parse_master_addr, ClusterSlaveConnectPayload};
 use crate::services::cluster::discovery::{self, DiscoveredMaster, DiscoveryStatus};
+use crate::services::cluster::history::{
+    self, ClusterJobDetail, ClusterJobPage, ClusterSlaveHistoryItem,
+};
 use crate::services::cluster::protocol::{
     ClusterMasterSnapshot, ClusterProtocolInfo, ClusterSlaveSnapshot,
 };
@@ -213,4 +216,62 @@ pub fn cluster_slave_snapshot(state: State<'_, AppState>) -> ClusterSlaveSnapsho
 #[tauri::command]
 pub fn cluster_slave_disconnect(state: State<'_, AppState>) -> Result<(), String> {
     state.cluster_slave.disconnect()
+}
+
+/* ---------- 历史记录 ---------- */
+
+/// 主节点任务历史（分页）；状态与关键字传空串表示不过滤
+#[tauri::command]
+pub fn cluster_jobs_list(
+    state: State<'_, AppState>,
+    page: Option<u32>,
+    page_size: Option<u32>,
+    status: Option<String>,
+    keyword: Option<String>,
+) -> Result<ClusterJobPage, String> {
+    history::list_jobs(
+        &state.pool,
+        page.unwrap_or(1).max(1),
+        page_size.unwrap_or(20).clamp(1, 100),
+        status.as_deref().unwrap_or(""),
+        keyword.as_deref().unwrap_or(""),
+    )
+}
+
+/// 主节点任务详情：任务本身 + 节点明细
+#[tauri::command]
+pub fn cluster_job_detail(
+    state: State<'_, AppState>,
+    job_id: i64,
+) -> Result<ClusterJobDetail, String> {
+    history::job_detail(&state.pool, job_id)
+}
+
+/// 清理已结束的任务历史；`keep_days` 为 0 时清空全部已结束任务
+#[tauri::command]
+pub fn cluster_jobs_clear(
+    state: State<'_, AppState>,
+    keep_days: Option<i64>,
+) -> Result<u32, String> {
+    history::clear_jobs(&state.pool, keep_days.unwrap_or(0))
+}
+
+/// 从节点参与记录：本机连过的主节点与任务
+#[tauri::command]
+pub fn cluster_slave_history_list(
+    state: State<'_, AppState>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<Vec<ClusterSlaveHistoryItem>, String> {
+    history::list_slave_history(
+        &state.pool,
+        limit.unwrap_or(50).clamp(1, 200),
+        offset.unwrap_or(0),
+    )
+}
+
+/// 清空从节点参与记录
+#[tauri::command]
+pub fn cluster_slave_history_clear(state: State<'_, AppState>) -> Result<u32, String> {
+    history::clear_slave_history(&state.pool)
 }

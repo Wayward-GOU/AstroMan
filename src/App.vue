@@ -1018,7 +1018,7 @@ const theme = computed(() => {
   height: 20px;
   flex: none;
   border-radius: 7px;
-  color: #fff;
+  color: var(--fm-on-accent);
   background: linear-gradient(135deg, var(--fm-primary), var(--fm-primary-dark));
   box-shadow: 0 1px 3px color-mix(in srgb, var(--fm-primary) 42%, transparent);
   transition: transform 0.16s ease, box-shadow 0.16s ease;
@@ -1216,7 +1216,7 @@ const theme = computed(() => {
   padding: 0 4px;
   border-radius: 8px;
   background: var(--fm-danger);
-  color: #fff;
+  color: var(--fm-on-accent);
   font-size: 9px;
   line-height: 16px;
   text-align: center;
@@ -1413,13 +1413,13 @@ const theme = computed(() => {
   padding: 8px 16px;
   border-radius: 10px;
   background: rgba(15, 23, 42, 0.88);
-  color: #fff;
+  color: var(--fm-on-accent);
   font-size: 13px;
   font-weight: 600;
   letter-spacing: 0.4px;
   font-variant-numeric: tabular-nums;
   pointer-events: none;
-  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.28);
+  box-shadow: var(--fm-shadow-float);
 }
 
 .zoom-fade-enter-active,

@@ -1044,6 +1044,9 @@ onBeforeUnmount(() => {
               <a-select-option value="token">Token 池</a-select-option>
               <a-select-option value="parameter">参数池</a-select-option>
             </a-select>
+            <div class="hint" style="margin-top: 4px">
+              Token 池存账号 / Token / API Key / Cookie 等凭证；参数池存业务字段（关键词、页码、开关等）
+            </div>
           </div>
           <div class="field" style="width: 130px">
             <div class="label">敏感</div>
@@ -1156,7 +1159,7 @@ onBeforeUnmount(() => {
 .pane {
   background: var(--fm-surface);
   border: 1px solid var(--fm-border);
-  border-radius: var(--fm-radius-lg, 10px);
+  border-radius: var(--fm-radius-lg);
   overflow: hidden;
 }
 
@@ -1241,11 +1244,11 @@ onBeforeUnmount(() => {
 }
 
 .dot-ok {
-  color: var(--fm-success, #17774a);
+  color: var(--fm-success);
 }
 
 .dot-bad {
-  color: var(--fm-danger, #a23333);
+  color: var(--fm-danger);
 }
 
 .tiny-tag {
@@ -1338,7 +1341,7 @@ onBeforeUnmount(() => {
 }
 
 .health-chip.ok b {
-  color: var(--fm-success, #17774a);
+  color: var(--fm-success);
 }
 
 .health-chip.warn b {
@@ -1346,7 +1349,7 @@ onBeforeUnmount(() => {
 }
 
 .health-chip.bad b {
-  color: var(--fm-danger, #a23333);
+  color: var(--fm-danger);
 }
 
 .toolbar {

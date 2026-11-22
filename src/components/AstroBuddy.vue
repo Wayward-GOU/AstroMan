@@ -275,14 +275,14 @@ onBeforeUnmount(() => {
   padding: 5px 10px;
   border-radius: 8px;
   background: rgba(17, 23, 34, 0.92);
-  color: #fff;
+  color: var(--fm-on-accent);
   font-size: 12px;
   line-height: 1.2;
   white-space: nowrap;
   opacity: 0;
   pointer-events: none;
   transition: opacity 0.18s ease, transform 0.18s ease;
-  box-shadow: 0 6px 16px rgba(15, 23, 42, 0.24);
+  box-shadow: var(--fm-shadow-pop);
 }
 
 .buddy:hover .buddy-tip,

@@ -27,6 +27,8 @@
   --fm-text: #1C1F1B;
   --fm-text-2: #3E4742;
   --fm-muted: #636C65;
+  /* 主色 / 深色实底上的文字：两套主题都近白，故不随主题切换 */
+  --fm-on-accent: #FFFFFF;
 
   --fm-sidebar: #15181A;
   --fm-sidebar-hover: #232628;
@@ -46,6 +48,14 @@
   --fm-shadow-sm: none;
   --fm-shadow: none;
   --fm-shadow-lg: 0 18px 48px rgba(20, 24, 27, 0.16);
+
+  /* ---- 浮层投影：纸感主题默认无阴影（见上三条），只有必须脱离页面的层才用。
+     集中定义以免各视图各写一套 rgba（那正是硬编码门禁要拦的东西）。 ---- */
+  --fm-shadow-float: 0 8px 24px rgba(15, 23, 42, 0.28); /* toast / 常驻悬浮条 */
+  --fm-shadow-pop: 0 6px 16px rgba(15, 23, 42, 0.24); /* 气泡提示 */
+  --fm-shadow-panel: 0 10px 28px rgba(15, 23, 42, 0.16); /* 浮层面板 / 任务坞 */
+  --fm-shadow-badge: 0 1px 2px rgba(6, 16, 25, 0.16); /* 徽标贴纸 */
+  --fm-shadow-badge-dark: 0 0 0 1px rgba(255, 255, 255, 0.16), 0 0 12px rgba(0, 0, 0, 0.35); /* 深色侧栏下的徽标描边 */
 
   --fm-brass: #A97C3F;
   --fm-brass-text: #7A5626;

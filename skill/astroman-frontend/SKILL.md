@@ -59,9 +59,12 @@ description: AstroMan 前端开发规范（Vue 3 + Ant Design Vue + Pinia + 设�
 
 - 绑定行的列选择：`"*"` 表示全部列同名注入（隐藏目标输入），具体列默认把目标填成列名；同池多绑定只能选同一 mode
 - 开跑前统一走 `utils/poolGate.ts::ensurePoolPreview`，预览失败或用户取消都要阻止启动
+- 「本次变量」面板（v1.1.2）：池绑定区下方的折叠面板，数据来自 `api.stressVarSources(config)`（只读，不返回值、不拦启动）。每行按真实写法展示 `{{name}}` / `{{secret:name}}` / `{{os:name}}`，标注类型、来源与状态；`ok === false` 的排最前，有问题才自动展开，标题显示「N 个 · X 个待处理」。触发重算的时机：`request` 变化、`modalEnvId` 变化、池绑定变化（400ms 防抖），打开配置抽屉时也刷一次
 - 集群节点表有「兼容」列：`poolColumns` 与 `envBundle` 任意为假都是旧版；计划含自定义列绑定时禁用「下发配置」并给出原因
 - 切片体量：会话快照的 `poolEstimate` / `poolSliceLimitBytes` 用来显示「数据池体量」提示，节点 `poolSliceBytes` 显示在能力列，≥80% 变黄
 - 不要在集群页让用户给从节点单独配池或配刷新；池由主节点统一切片下发
+- 「历史」tab（v1.1.2）：主节点看 `clusterJobsList` / `clusterJobDetail`（筛选、搜索、分页、详情抽屉里是 `ClusterWorkerRow`），从节点看 `clusterSlaveHistoryList`（「本机参与过的任务」，含整机 CPU / 内存 / 网卡峰值）。节点表里「引擎 CPU」与「整机 CPU」是两列，别合并
+- 折线图节流：`liveBuffer` 是**非响应式**缓冲，按 `liveRefreshSec`（1 / 2 / 5 秒）刷到 `chartNodes`（`shallowRef`），`document.hidden` 时停摆，超过 60 点抽稀。不要改回每秒 push 响应式数组，主机侧会卡
 
 ## 工作台与数据大屏
 

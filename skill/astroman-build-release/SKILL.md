@@ -57,7 +57,7 @@ Windows 下 `cargo check` 若报 `hit restricted ... D:\Software\Rust\cargo\.glo
 ## 发版流程
 
 1. 同步版本号：`npm run version:set 1.0.9` 一次写入 `package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml` 三处；脚本**不动** lock 文件——`package-lock.json` 用 `npm install --package-lock-only` 跟上，`Cargo.lock` 跑一次 `cargo check` 会自动同步。`npm run version:check` 必须通过（CI 的 `frontend` job 第一步就是它）
-2. 提交前跑一遍与 CI 同源的门禁：`npm run test`、`npm run build`、`cargo fmt --check --all`、`cargo clippy --lib --all-targets -- -D warnings`、`cargo test --lib`；覆盖率由 `src-tauri/tarpaulin.toml` 的 `fail-under`（当前 25%）判定，报告在 `target/coverage/`
+2. 提交前跑一遍与 CI 同源的门禁：`npm run test`、`npm run ui:check`（硬编码样式 + 23 套主题对比度）、`npm run build`、`cargo fmt --check --all`、`cargo clippy --lib --all-targets -- -D warnings`、`cargo test --lib`；覆盖率由 `src-tauri/tarpaulin.toml` 的 `fail-under`（当前 25%）判定，报告在 `target/coverage/`
 3. 提交后打 tag：`git tag v1.0.9 && git push origin v1.0.9`，同时把 `.github/workflows/release.yml` 里的 `releaseBody` 更新成本次版本说明（GitHub Release 直接用它）；版本说明追加到 `### 本次更新（x.y.z）` 段落。v1.0.9 的 release body 已包含抓包、抓包进阶、记事本 / 待办、92 工具、HAR 导入与认证加密
 4. `.github/workflows/release.yml` 在 tag 推送时自动构建 Windows NSIS 与 macOS universal dmg，上传到 GitHub Release
 5. 应用内更新检查走 `commands/update.rs` 的 `RELEASE_API`（`https://api.github.com/repos/Wayward-GOU/AstroMan/releases/latest`），仓库地址已改为 AstroMan

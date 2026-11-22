@@ -652,7 +652,7 @@ function clearDecoded() {
   flex-direction: column;
   gap: 4px;
   padding: 8px 10px;
-  background: var(--fm-bg-subtle, #f8fafc);
+  background: var(--fm-bg-subtle);
   border: 1px dashed var(--fm-border);
   border-radius: var(--fm-radius-sm);
 }
@@ -683,7 +683,7 @@ function clearDecoded() {
   align-items: center;
   justify-content: center;
   padding: 12px;
-  background: var(--fm-bg-subtle, #f8fafc);
+  background: var(--fm-bg-subtle);
   border-radius: var(--fm-radius-sm);
 }
 
@@ -857,7 +857,7 @@ function clearDecoded() {
   font-size: 12px;
   line-height: 1.6;
   color: var(--fm-text-2);
-  background: var(--fm-bg-subtle, #f8fafc);
+  background: var(--fm-bg-subtle);
   border: 1px solid var(--fm-border);
   border-radius: var(--fm-radius-sm);
   white-space: pre-wrap;

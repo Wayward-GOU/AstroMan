@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use rusqlite::{params, OptionalExtension};
+use sysinfo::{Networks, ProcessRefreshKind, ProcessesToUpdate, System};
 use tauri::AppHandle;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Notify};
@@ -22,13 +23,12 @@ use tokio_tungstenite::tungstenite::Message;
 
 use super::host::ClusterApp;
 use super::protocol::{
-    AbortPayload, ClusterMessage, ClusterSlaveSnapshot, DonePayload, EngineStats, ErrorPayload,
-    EnvBundle, HelloAckPayload, HelloPayload, HelloPendingPayload, HelloRejectedPayload,
-    PingPayload, PongPayload, PoolRefreshRequestPayload, PoolRefreshResultPayload,
-    PreflightPayload, PrepareAckPayload,
-    PreparePayload, StartPayload, TimeAckPayload, TimeProbePayload, DEFAULT_PORT,
-    ENV_BUNDLE_VERSION, HEARTBEAT_MISSES,
-    HEARTBEAT_SEC, MAX_PREPARE_BYTES, PROTOCOL_VERSION,
+    AbortPayload, ClusterMessage, ClusterSlaveSnapshot, DonePayload, EngineStats, EnvBundle,
+    ErrorPayload, HelloAckPayload, HelloPayload, HelloPendingPayload, HelloRejectedPayload,
+    HostSample, PingPayload, PongPayload, PoolRefreshRequestPayload, PoolRefreshResultPayload,
+    PreflightPayload, PrepareAckPayload, PreparePayload, StartPayload, TimeAckPayload,
+    TimeProbePayload, DEFAULT_PORT, ENV_BUNDLE_VERSION, HEARTBEAT_MISSES, HEARTBEAT_SEC,
+    MAX_PREPARE_BYTES, PROTOCOL_VERSION,
 };
 use super::server::local_node_name;
 use crate::commands::stress::{
@@ -48,6 +48,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// 目标预检的总预算：必须小于主节点的失联阈值，避免误判
 const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
+/// 发往主节点的消息队列上限：主节点偶发卡顿时，采样在这里堆积而不是无限吃内存
+const SLAVE_QUEUE: usize = 1024;
+/// 给控制消息预留的空位：队列占用超过该水位时，采样主动丢弃
+const SLAVE_QUEUE_RESERVED: usize = 16;
 
 /// 从节点连接参数
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -169,6 +173,43 @@ struct SlaveState {
     joined_at: Option<i64>,
     /// 最近一次回传主节点的引擎累计计数
     engine_stats: Option<EngineStats>,
+    /// 历史记录主键与本机库：状态变化时同步写 cluster_slave_history
+    history_id: Option<i64>,
+    history_pool: Option<DbPool>,
+    /// 上次落库的状态；相同则跳过，避免重复写
+    history_status: String,
+    master_job_id: Option<i64>,
+    total_concurrent: u32,
+    /// 运行期峰值 QPS：终态会把 qps 清零，历史要用峰值
+    peak_qps: f64,
+    /// 运行期资源峰值：本地采样时顺手记下，历史不必等报告回传
+    peak_host: HostPeaks,
+    ended_at: Option<i64>,
+}
+
+/// 一次施压过程中的资源峰值
+#[derive(Debug, Clone, Copy, Default)]
+struct HostPeaks {
+    /// 施压进程占用核数
+    cpu: f64,
+    /// 施压进程 RSS（MB）
+    mem_mb: u64,
+    /// 整机 CPU 使用率（%）
+    host_cpu_percent: f64,
+    /// 整机内存使用率（%）
+    host_mem_percent: f64,
+    /// 网卡收发合计（KB/s）
+    net_kbps: f64,
+}
+
+impl HostPeaks {
+    fn absorb(&mut self, host: &HostSample) {
+        self.cpu = self.cpu.max(host.cpu);
+        self.mem_mb = self.mem_mb.max(host.mem_mb);
+        self.host_cpu_percent = self.host_cpu_percent.max(host.host_cpu_percent);
+        self.host_mem_percent = self.host_mem_percent.max(host.host_mem_percent);
+        self.net_kbps = self.net_kbps.max(host.net_rx_kbps + host.net_tx_kbps);
+    }
 }
 
 impl SlaveState {
@@ -190,7 +231,47 @@ impl SlaveState {
             missing_vars: Vec::new(),
             joined_at: None,
             engine_stats: None,
+            history_id: None,
+            history_pool: None,
+            history_status: String::new(),
+            master_job_id: None,
+            total_concurrent: 0,
+            peak_qps: 0.0,
+            peak_host: HostPeaks::default(),
+            ended_at: None,
         }
+    }
+
+    /// 状态变化时返回一次落库快照；同一状态重复 emit 不重复写
+    fn take_history_sync(&mut self) -> Option<(DbPool, super::history::SlaveHistorySync)> {
+        let id = self.history_id?;
+        let pool = self.history_pool.clone()?;
+        if self.history_status == self.status {
+            return None;
+        }
+        self.history_status = self.status.clone();
+        Some((
+            pool,
+            super::history::SlaveHistorySync {
+                id,
+                master_node: String::new(),
+                master_job_id: self.master_job_id,
+                node_name: self.node_name.clone(),
+                plan_name: self.plan_name.clone().unwrap_or_default(),
+                concurrent: self.concurrent,
+                total_concurrent: self.total_concurrent,
+                status: self.status.clone(),
+                qps_avg: self.peak_qps,
+                // 峰值取自本机每秒采样，终态也保留（不需要等报告回传）
+                cpu_peak: self.peak_host.cpu,
+                mem_peak_mb: self.peak_host.mem_mb,
+                host_cpu_peak: self.peak_host.host_cpu_percent,
+                net_peak_kbps: self.peak_host.net_kbps,
+                started_at: self.start_at_ms,
+                ended_at: self.ended_at,
+                message: self.error.clone(),
+            },
+        ))
     }
 
     fn idle() -> Self {
@@ -245,7 +326,7 @@ type RefreshWaiter = tokio::sync::oneshot::Sender<Result<(String, i64, Option<St
 ///
 /// 主节点按条目单飞，节点的 401/过期刷新因此不会互相踢掉 `refreshToken`。
 struct WsPoolRefreshRelay {
-    tx: mpsc::UnboundedSender<ClusterMessage>,
+    tx: mpsc::Sender<ClusterMessage>,
     pending: Mutex<HashMap<String, RefreshWaiter>>,
     secret: x25519_dalek::StaticSecret,
     master_public: [u8; 32],
@@ -254,7 +335,7 @@ struct WsPoolRefreshRelay {
 
 impl WsPoolRefreshRelay {
     fn new(
-        tx: mpsc::UnboundedSender<ClusterMessage>,
+        tx: mpsc::Sender<ClusterMessage>,
         secret: x25519_dalek::StaticSecret,
         master_public: [u8; 32],
     ) -> Self {
@@ -349,10 +430,7 @@ impl PoolRefreshRelay for WsPoolRefreshRelay {
         >,
     > {
         Box::pin(async move {
-            let request_id = format!(
-                "pr-{}",
-                self.counter.fetch_add(1, Ordering::Relaxed)
-            );
+            let request_id = format!("pr-{}", self.counter.fetch_add(1, Ordering::Relaxed));
             let (sender, receiver) = tokio::sync::oneshot::channel();
             self.pending.lock().insert(request_id.clone(), sender);
             let request = ClusterMessage::PoolRefreshRequest(PoolRefreshRequestPayload {
@@ -361,7 +439,7 @@ impl PoolRefreshRelay for WsPoolRefreshRelay {
                 item_id,
                 item_index,
             });
-            if self.tx.send(request).is_err() {
+            if self.tx.try_send(request).is_err() {
                 self.pending.lock().remove(&request_id);
                 return Err("与主节点的连接已断开".to_string());
             }
@@ -544,6 +622,13 @@ async fn run_slave(
     notify: Arc<Notify>,
     state: Arc<Mutex<SlaveState>>,
 ) {
+    // 配对历史：连接还没建立就先落一条，失败也能在历史里看到
+    let history_id = super::history::insert_slave_history(&pool, &master.addr, &join_mode);
+    {
+        let mut guard = state.lock();
+        guard.history_id = history_id;
+        guard.history_pool = Some(pool.clone());
+    }
     let mut config = WebSocketConfig::default();
     config.max_message_size = Some(MAX_PREPARE_BYTES);
     config.max_frame_size = Some(MAX_PREPARE_BYTES);
@@ -575,7 +660,7 @@ async fn run_slave(
     };
 
     let (mut sink, mut read) = ws.split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<ClusterMessage>();
+    let (tx, mut rx) = mpsc::channel::<ClusterMessage>(SLAVE_QUEUE);
     let mut writer = tauri::async_runtime::spawn(async move {
         while let Some(message) = rx.recv().await {
             let text = match serde_json::to_string(&message) {
@@ -626,7 +711,7 @@ async fn run_slave(
             }),
         }
     };
-    let _ = tx.send(ClusterMessage::Hello(HelloPayload {
+    let _ = tx.try_send(ClusterMessage::Hello(HelloPayload {
         version: PROTOCOL_VERSION,
         pair_code,
         node_name: node_name.clone(),
@@ -636,6 +721,7 @@ async fn run_slave(
         node_capacity,
         public_key: Some(slave_public),
         pool_columns: true,
+        clock_recheck: true,
     }));
 
     let mut prepared: Option<PreparedStress> = None;
@@ -663,7 +749,7 @@ async fn run_slave(
         tokio::select! {
             _ = notify.notified() => {
                 abort.store(true, Ordering::SeqCst);
-                let _ = tx.send(ClusterMessage::Abort(AbortPayload {
+                let _ = tx.try_send(ClusterMessage::Abort(AbortPayload {
                     reason: Some("从节点主动断开".to_string()),
                 }));
                 set_status(&state, "left", Some("已断开与主节点的会话".to_string()));
@@ -704,7 +790,7 @@ async fn run_slave(
                         break;
                     }
                     Ok(Message::Binary(_)) => {
-                        let _ = tx.send(ClusterMessage::Error(ErrorPayload {
+                        let _ = tx.try_send(ClusterMessage::Error(ErrorPayload {
                             message: "集群协议只接受 JSON 文本消息".to_string(),
                         }));
                         continue;
@@ -727,6 +813,7 @@ async fn run_slave(
                     ClusterMessage::HelloAck(HelloAckPayload {
                         version,
                         node_id,
+                        job_id,
                         public_key,
                         pool_refresh_relay,
                         ..
@@ -755,6 +842,7 @@ async fn run_slave(
                         {
                             let mut guard = state.lock();
                             guard.node_id = Some(node_id);
+                            guard.master_job_id = Some(job_id);
                             guard.joined_at = Some(now_ms());
                         }
                         emit_state(app.as_ref(), &state);
@@ -782,7 +870,7 @@ async fn run_slave(
                         break;
                     }
                     ClusterMessage::TimeProbe(TimeProbePayload { seq, t0 }) => {
-                        let _ = tx.send(ClusterMessage::TimeAck(TimeAckPayload {
+                        let _ = tx.try_send(ClusterMessage::TimeAck(TimeAckPayload {
                             seq,
                             t0,
                             t1: now_ms(),
@@ -794,6 +882,7 @@ async fn run_slave(
                             guard.status = "preparing".to_string();
                             guard.plan_name = Some(payload.plan_name.clone());
                             guard.concurrent = payload.concurrent;
+                            guard.total_concurrent = payload.total_concurrent;
                             guard.error = None;
                             guard.missing_vars.clear();
                         }
@@ -834,7 +923,7 @@ async fn run_slave(
                                 prepared = Some(local.prepared);
                                 local_job = Some(local.job_id);
                                 watch = Some(local.watch);
-                                let _ = tx.send(ClusterMessage::PrepareAck(PrepareAckPayload {
+                                let _ = tx.try_send(ClusterMessage::PrepareAck(PrepareAckPayload {
                                     ok: true,
                                     error: None,
                                     missing_vars: Vec::new(),
@@ -851,14 +940,14 @@ async fn run_slave(
                                 last_rx = Instant::now();
                                 if abort.load(Ordering::SeqCst) {
                                     // 预检期间被断开：主动告诉主节点，避免它等到超时
-                                    let _ = tx.send(ClusterMessage::Abort(AbortPayload {
+                                    let _ = tx.try_send(ClusterMessage::Abort(AbortPayload {
                                         reason: Some("从节点在准备阶段中止".to_string()),
                                     }));
                                     break;
                                 }
                                 if preflight.ok {
                                     set_status(&state, "ready", None);
-                                    let _ = tx.send(ClusterMessage::Preflight(PreflightPayload {
+                                    let _ = tx.try_send(ClusterMessage::Preflight(PreflightPayload {
                                         ok: true,
                                         error: None,
                                     }));
@@ -871,7 +960,7 @@ async fn run_slave(
                                         "rejected",
                                         preflight.error.clone(),
                                     );
-                                    let _ = tx.send(ClusterMessage::Preflight(PreflightPayload {
+                                    let _ = tx.try_send(ClusterMessage::Preflight(PreflightPayload {
                                         ok: false,
                                         error: preflight.error,
                                     }));
@@ -884,7 +973,7 @@ async fn run_slave(
                                     guard.missing_vars = failure.missing.clone();
                                 }
                                 set_status(&state, "rejected", Some(failure.error.clone()));
-                                let _ = tx.send(ClusterMessage::PrepareAck(PrepareAckPayload {
+                                let _ = tx.try_send(ClusterMessage::PrepareAck(PrepareAckPayload {
                                     ok: false,
                                     error: Some(failure.error),
                                     missing_vars: failure.missing,
@@ -898,7 +987,7 @@ async fn run_slave(
                         let (Some(item), Some(job), Some(run_watch)) =
                             (prepared.take(), local_job.take(), watch.take())
                         else {
-                            let _ = tx.send(ClusterMessage::Error(ErrorPayload {
+                            let _ = tx.try_send(ClusterMessage::Error(ErrorPayload {
                                 message: "尚未收到可执行的配置".to_string(),
                             }));
                             break;
@@ -950,7 +1039,7 @@ async fn run_slave(
                         break;
                     }
                     ClusterMessage::Ping(PingPayload { at_ms, .. }) => {
-                        let _ = tx.send(ClusterMessage::Pong(PongPayload {
+                        let _ = tx.try_send(ClusterMessage::Pong(PongPayload {
                             at_ms,
                             stats: None,
                         }));
@@ -998,11 +1087,7 @@ async fn run_slave(
 ///
 /// - `master_wins`（默认）：主节点值覆盖本机同名变量；
 /// - `local_wins`：本机已有值保持不变，只用主节点值补缺失项。
-fn merge_bundle_vars(
-    vars: &mut HashMap<String, String>,
-    bundle: &serde_json::Value,
-    policy: &str,
-) {
+fn merge_bundle_vars(vars: &mut HashMap<String, String>, bundle: &serde_json::Value, policy: &str) {
     let local_wins = policy.eq_ignore_ascii_case("local_wins");
     for field in ["vars", "secrets"] {
         if let Some(map) = bundle.get(field).and_then(|item| item.as_object()) {
@@ -1085,6 +1170,8 @@ fn prepare_local(
         }
         match std::env::var(name) {
             Ok(value) => {
+                // 双键写入：{{os:NAME}} 只认专用键，不会被池或环境变量同名覆盖
+                vars.insert(crate::util::os_var_key(name), value.clone());
                 vars.insert(name.clone(), value);
             }
             Err(_) => os_missing.push(name.clone()),
@@ -1092,10 +1179,20 @@ fn prepare_local(
     }
 
     // 3) 只有真正需要用户提供且仍缺失的变量才拦截
+    // 池切片运行期会注入绑定变量（列名或 target），这些不该算环境变量缺失；
+    // 主节点新版本已从 requiredVars 扣除，这里对旧主节点再兜底一次
+    let provided = super::pool_injected_names(&config.pool_bindings, |name| {
+        payload
+            .pool_slices
+            .iter()
+            .find(|slice| slice.name == name)
+            .map(|slice| slice.columns.clone())
+            .unwrap_or_default()
+    });
     let mut missing: Vec<String> = payload
         .required_vars
         .iter()
-        .filter(|name| !vars.contains_key(*name))
+        .filter(|name| !vars.contains_key(*name) && !provided.iter().any(|item| item == *name))
         .cloned()
         .collect();
     for name in os_missing {
@@ -1187,11 +1284,93 @@ fn query_env_id(conn: &rusqlite::Connection, name: &str) -> Result<i64, PrepareF
     })
 }
 
+/// 从节点资源采样：每秒跟随采样上报，主节点据此展示资源曲线并写入报告
+struct HostSampler {
+    sys: System,
+    networks: Networks,
+    pid: sysinfo::Pid,
+    last_tick: Instant,
+    prev_rx: u64,
+    prev_tx: u64,
+}
+
+impl HostSampler {
+    fn new() -> Self {
+        let mut sys = System::new();
+        sys.refresh_memory();
+        sys.refresh_cpu_usage();
+        Self {
+            sys,
+            networks: Networks::new_with_refreshed_list(),
+            pid: sysinfo::Pid::from_u32(std::process::id()),
+            last_tick: Instant::now(),
+            prev_rx: 0,
+            prev_tx: 0,
+        }
+    }
+
+    fn sample(&mut self) -> HostSample {
+        let now = Instant::now();
+        let elapsed = now
+            .duration_since(self.last_tick)
+            .as_secs_f64()
+            .clamp(0.2, 30.0);
+        self.last_tick = now;
+        self.sys.refresh_memory();
+        self.sys.refresh_cpu_usage();
+        self.networks.refresh(true);
+        self.sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[self.pid]),
+            true,
+            ProcessRefreshKind::nothing().with_cpu().with_memory(),
+        );
+
+        let mut rx_total = 0u64;
+        let mut tx_total = 0u64;
+        for data in self.networks.values() {
+            rx_total = rx_total.saturating_add(data.total_received());
+            tx_total = tx_total.saturating_add(data.total_transmitted());
+        }
+        // 首帧没有基准，速率记 0，避免把开机以来的累计量当成一秒流量
+        let first = self.prev_rx == 0 && self.prev_tx == 0;
+        let net_rx_kbps = if first {
+            0.0
+        } else {
+            rx_total.saturating_sub(self.prev_rx) as f64 / 1024.0 / elapsed
+        };
+        let net_tx_kbps = if first {
+            0.0
+        } else {
+            tx_total.saturating_sub(self.prev_tx) as f64 / 1024.0 / elapsed
+        };
+        self.prev_rx = rx_total;
+        self.prev_tx = tx_total;
+
+        let process = self.sys.process(self.pid);
+        let cpu = process
+            .map(|item| item.cpu_usage() as f64 / 100.0)
+            .unwrap_or(0.0);
+        let mem_mb = process.map(|item| item.memory() / 1024 / 1024).unwrap_or(0);
+        let total_mem = self.sys.total_memory().max(1) as f64;
+        HostSample {
+            cpu,
+            host_cpu_percent: self.sys.global_cpu_usage() as f64,
+            mem_mb,
+            host_mem_percent: (self.sys.used_memory() as f64 / total_mem) * 100.0,
+            threads: 0,
+            net_rx_kbps,
+            net_tx_kbps,
+            load1: System::load_average().one,
+            fd_count: 0,
+        }
+    }
+}
+
 /// 执行引擎并同时处理主节点消息：只在中止 / 失联时提前返回
 #[allow(clippy::too_many_arguments)]
 async fn run_session<S>(
     app: &dyn ClusterApp,
-    tx: &mpsc::UnboundedSender<ClusterMessage>,
+    tx: &mpsc::Sender<ClusterMessage>,
     state: &Arc<Mutex<SlaveState>>,
     abort: &Arc<AtomicBool>,
     notify: &Notify,
@@ -1207,10 +1386,22 @@ where
 {
     let state_for_sink = state.clone();
     let tx_for_sink = tx.clone();
-    let sink: EngineSampleSink = Arc::new(move |sample| {
+    // 主节点消费不过来时的丢弃次数：并入 done.droppedSamples，报告会标不完整
+    let dropped_out = Arc::new(AtomicU64::new(0));
+    let dropped_for_sink = dropped_out.clone();
+    let sampler = Arc::new(Mutex::new(HostSampler::new()));
+    let sampler_for_sink = sampler.clone();
+    let sink: EngineSampleSink = Arc::new(move |mut sample| {
+        // 每秒采样顺手带上本机资源：主节点可直接展示，不必额外开通道
+        let host = sampler_for_sink.lock().sample();
+        sample.host = Some(host.clone());
         {
             let mut guard = state_for_sink.lock();
             guard.qps = sample.qps;
+            guard.peak_host.absorb(&host);
+            if sample.qps > guard.peak_qps {
+                guard.peak_qps = sample.qps;
+            }
             let stats = guard.engine_stats.get_or_insert_with(EngineStats::default);
             stats.elapsed_sec = sample.elapsed_sec;
             stats.concurrent = sample.concurrent;
@@ -1223,7 +1414,17 @@ where
             stats.errors = stats.errors.saturating_add(sample.error_count);
             stats.bytes = stats.bytes.saturating_add(sample.bytes);
         }
-        let _ = tx_for_sink.send(ClusterMessage::Sample(sample));
+        // 给控制消息留空位：队列接近上限时丢弃本秒采样，避免无限堆积
+        if tx_for_sink.capacity() <= SLAVE_QUEUE_RESERVED
+            || tx_for_sink
+                .try_send(ClusterMessage::Sample(sample))
+                .is_err()
+        {
+            let dropped = dropped_for_sink.fetch_add(1, Ordering::Relaxed) + 1;
+            if dropped == 1 || dropped.is_multiple_of(30) {
+                log::warn!("主节点接收拥塞，已丢弃 {dropped} 个采样");
+            }
+        }
     });
     let engine = run_engine(
         prepared,
@@ -1248,7 +1449,7 @@ where
             _ = notify.notified() => {
                 abort.store(true, Ordering::SeqCst);
                 watch.store(true, Ordering::SeqCst);
-                let _ = tx.send(ClusterMessage::Abort(AbortPayload {
+                let _ = tx.try_send(ClusterMessage::Abort(AbortPayload {
                     reason: Some("从节点主动断开".to_string()),
                 }));
                 break (RunEnd::Aborted("已断开与主节点的会话".to_string()), None);
@@ -1276,9 +1477,17 @@ where
                         match message {
                             ClusterMessage::Ping(PingPayload { at_ms, .. }) => {
                                 let stats = state.lock().engine_stats.clone();
-                                let _ = tx.send(ClusterMessage::Pong(PongPayload {
+                                let _ = tx.try_send(ClusterMessage::Pong(PongPayload {
                                     at_ms,
                                     stats,
+                                }));
+                            }
+                            // 运行期时钟复测：主节点怕长任务里时钟漂了，回一拍即可
+                            ClusterMessage::TimeProbe(TimeProbePayload { seq, t0 }) => {
+                                let _ = tx.try_send(ClusterMessage::TimeAck(TimeAckPayload {
+                                    seq,
+                                    t0,
+                                    t1: now_ms(),
                                 }));
                             }
                             ClusterMessage::Abort(AbortPayload { reason }) => {
@@ -1334,8 +1543,12 @@ where
             guard.elapsed_sec = elapsed_sec;
             guard.qps = 0.0;
         }
-        let payload = done_payload(&outcome, offset_ms);
-        let _ = tx.send(ClusterMessage::Done(payload));
+        let mut payload = done_payload(&outcome, offset_ms);
+        // 发送侧因拥塞丢弃的采样也算数据缺失，让报告如实标不完整
+        payload.dropped_samples = payload
+            .dropped_samples
+            .saturating_add(dropped_out.load(Ordering::Relaxed));
+        let _ = tx.try_send(ClusterMessage::Done(payload));
     } else {
         state.lock().qps = 0.0;
     }
@@ -1493,6 +1706,9 @@ fn set_status(state: &Arc<Mutex<SlaveState>>, status: &str, error: Option<String
     let mut guard = state.lock();
     guard.status = status.to_string();
     guard.error = error;
+    if matches!(status, "done" | "lost" | "left" | "rejected") {
+        guard.ended_at = Some(now_ms());
+    }
     if status != "running" {
         guard.qps = 0.0;
     }
@@ -1509,8 +1725,16 @@ fn finish_with_error(
 }
 
 fn emit_state(app: &dyn ClusterApp, state: &Arc<Mutex<SlaveState>>) {
-    // 先取快照再发事件：事件派发期间不占状态锁，UI 查询不会被 emit 拖住
-    let snapshot = state.lock().snapshot();
+    // 先取快照与历史同步项再发事件：事件派发期间不占状态锁，UI 查询不会被 emit 拖住
+    let (snapshot, history) = {
+        let mut guard = state.lock();
+        let snapshot = guard.snapshot();
+        let history = guard.take_history_sync();
+        (snapshot, history)
+    };
+    if let Some((pool, sync)) = history {
+        super::history::sync_slave_history(&pool, &sync);
+    }
     app.emit_slave(snapshot);
 }
 
@@ -1590,5 +1814,34 @@ mod tests {
         // 本机没有的变量仍然从主节点补齐
         assert_eq!(vars.get("only_master").map(String::as_str), Some("m"));
         assert_eq!(vars.get("secret:db").map(String::as_str), Some("master-db"));
+    }
+
+    #[test]
+    fn host_peaks_keep_max_of_each_metric() {
+        let mut peaks = HostPeaks::default();
+        peaks.absorb(&HostSample {
+            cpu: 1.2,
+            host_cpu_percent: 45.0,
+            mem_mb: 320,
+            net_rx_kbps: 800.0,
+            net_tx_kbps: 200.0,
+            ..HostSample::default()
+        });
+        // 第二帧回落：峰值不应被覆盖
+        peaks.absorb(&HostSample {
+            cpu: 0.8,
+            host_cpu_percent: 30.0,
+            mem_mb: 300,
+            net_rx_kbps: 100.0,
+            net_tx_kbps: 50.0,
+            ..HostSample::default()
+        });
+        assert!((peaks.cpu - 1.2).abs() < 1e-9);
+        assert_eq!(peaks.mem_mb, 320);
+        assert!((peaks.host_cpu_percent - 45.0).abs() < 1e-9);
+        assert!(
+            (peaks.net_kbps - 1_000.0).abs() < 1e-9,
+            "网络按收发合计取峰"
+        );
     }
 }

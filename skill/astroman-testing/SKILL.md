@@ -114,7 +114,7 @@ cargo tarpaulin --config tarpaulin.toml --engine llvm
 
 | job | 跑什么 | 关键点 |
 |---|---|---|
-| `frontend`（ubuntu） | `version:check` → `npm test` → `npm run build` | 版本不一致第一步就失败；类型错误由 build 拦 |
+| `frontend`（ubuntu） | `version:check` → `npm test` → `ui:check` → `npm run build` | 版本不一致第一步就失败；类型错误由 build 拦；`ui:check` 是硬编码样式与主题对比度门禁（2026-11-22 起接入 CI） |
 | `rust`（windows） | `fmt --check` → `clippy -D warnings` → `cargo test --lib` → `cargo build --bin astroman-cli` | 先 `npm ci` + `npm run build` + `prepare-cli.mjs`，`externalBin` 要求 CLI 产物先存在 |
 | `coverage`（ubuntu） | `cargo tarpaulin --config tarpaulin.toml` | 需装 `libwebkit2gtk-4.1-dev`、`libgtk-3-dev`、`librsvg2-dev` 等；CLI 用 `prepare-cli.mjs --placeholder` 占位即可；报告 `if: always()` 上传为 `coverage-report` |
 
@@ -123,6 +123,24 @@ cargo tarpaulin --config tarpaulin.toml --engine llvm
 - **不要**把 clippy 和 test 塞进同一个 job：clippy 失败时看不到测试结果，排查成本翻倍
 - job 之间不共享产物，每个 job 都要自己 `npm ci` + `npm run build`
 - `cargo fmt` 与 `clippy` 是**阻断**门禁，不是提示
+
+## 四·补、样式门禁（`npm run ui:check`）
+
+两步：`scripts/check-hardcoded-color.mjs`（硬编码计数）+ `scripts/check-contrast.ts`（23 套主题对比度）。
+
+**统计口径**（2026-11-22 修正，改动前务必读完再动脚本）：
+
+- `hex`：排除 HTML 实体。`&#123;` 是 `{` 的转义，会被 `#[0-9a-f]{3,8}` 当成 3 位 hex —— 旧口径因此虚增 20 余处
+- `radius`：只算**字面值**，`var(--fm-radius*)` 不计。正则必须写 `border-radius\s*:(?!\s*var\()`：写成 `\s*(?!var\()` 时 `\s*` 会回溯一位让否定断言恒成立，把已令牌化的声明全算进来（曾把 175 报成 489）
+- `shadow`：只有同一条声明里出现 `rgb(` / `rgba(` 才算硬编码颜色；纯 `var(--fm-shadow*)`、`none`、`color-mix` 不计
+- `deep`（`:deep(.ant-*)`）：**参考项，不参与失败判定**。覆盖 Ant Design 内部样式没有令牌化替代，计入会逼人写选择器 hack
+- `src/styles/tokens.css` 与 `src/styles/components.css` 是定义处，必须豁免，否则新增令牌文件就自锁
+
+当前基线（只许下降）：`hex 129 / rgba 12 / radius 175 / shadow 0`，`:deep` 118 为参考值。
+
+清理时的正确做法是**集中定义**而不是就地改值：浮层投影收进 `--fm-shadow-float / pop / panel / badge / badge-dark`，深色实底白字收进 `--fm-on-accent`。`docs/` 与导出 HTML 是独立样式体系，不要换成 `var(--fm-*)`（`utils/reportExport.ts` 用的是 `--accent` / `--ink-*`）。
+
+剩下的 hex 集中在文档预览、Mock 面板、antd Tag 这类**有意固定浅色**的局部（它们不跟主题走），要彻底收掉得先定义一组 `--fm-paper-*` 令牌，不要直接把 `--fm-surface` 套上去 —— 深色主题下会变色。
 
 ## 五、版本号一致性
 

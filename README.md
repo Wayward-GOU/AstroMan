@@ -14,7 +14,7 @@
   <img alt="Rust" src="https://img.shields.io/badge/Rust-stable-B7410E?style=flat-square" />
   <img alt="Vue" src="https://img.shields.io/badge/Vue-3.5-42B883?style=flat-square" />
   <img alt="SQLite" src="https://img.shields.io/badge/SQLite-bundled-003B57?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-1.1.2-3B7DDD?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-1.1.3-3B7DDD?style=flat-square" />
 </p>
 
 AstroMan 是一款**本地优先**的 HTTP API 研发工具箱：接口调试、环境与变量、脚本签名、批量运行、性能压测、抓包分析、记事本与待办、离线工具箱与 AI Agent，收敛在同一个桌面工作台里。无需注册、无需后端服务，项目、历史、报告、待办与密钥全部保存在本机。
@@ -47,7 +47,7 @@ AstroMan 是一款**本地优先**的 HTTP API 研发工具箱：接口调试、
 | 压测报告 | 弱 | 弱 | 中（需插件） | — | 强（JSON / HTML / Excel，支持报告横向对比） |
 | 定时拨测 / 巡检 | 中（Monitor，付费云端） | 中（定时任务） | 无（需外挂 Jenkins） | — | 无（规划中） |
 | 离线工具箱 | 无 | 无 | 无 | — | 强（9 分类 92 个工具，纯本地计算） |
-| AI 辅助 | 中（付费，云端） | 中（以问答为主） | 无 | — | 强（自带 Key，126 个工具可直接操作软件） |
+| AI 辅助 | 中（付费，云端） | 中（以问答为主） | 无 | — | 强（自带 Key，130 个工具可直接操作软件） |
 | 文档 / 团队协作 | 强 | 强（一体化） | 无 | — | 弱（仅 OpenAPI 导出，无多人协作） |
 | 导入兼容 | — | 支持 Postman 迁移 | — | HAR / 会话文件 | cURL / Postman / Apifox / OpenAPI 3.0 / Swagger 2.0 |
 | 数据存放 | 云端为主 | 云端为主 | 本地 | 本地 | 本地 SQLite，无账号、无遥测 |
@@ -120,7 +120,7 @@ AstroMan 是一款**本地优先**的 HTTP API 研发工具箱：接口调试、
 - **记事本与待办**：待办 / 笔记 / 灵感 / 资料四种类型，今天 / 本周 / 全部 / 已完成视图，按逾期与截止分组；自然语言快速记录（「明天10点 交周报 #工作 !」）、多标签、列表 / 卡片双视图；应用内提醒、提前量、重复、稍后 10 分钟、暂停与免打扰；截图生成待办、图片附件；托盘菜单与 `Ctrl+Alt+N` 全局快速记录
 - **导入导出**：cURL、Postman / Apifox、OpenAPI 3.0 / Swagger 2.0、HAR 1.2 导入；项目 JSON、OpenAPI 导出
 - **离线工具箱**：9 大分类 92 个工具，全部本地计算，支持收藏与最近使用
-- **航仔 AI Agent**：三协议模型接入、126 个工具（113 业务 + 12 工具箱 + `tool_search`，含 7 抓包域 / 22 测试域 / 17 集群域 / 7 池工具）、写操作确认、上下文预算与摘要、复盘时间线
+- **航仔 AI Agent**：三协议模型接入、130 个工具（117 业务 + 12 工具箱 + `tool_search`，含 7 抓包域 / 22 测试域 / 20 集群域 / 7 池工具）、写操作确认、上下文预算与摘要、复盘时间线
 - **外观**：21 套配色主题（14 浅 / 7 深，含低饱和「陶土红」）、可拖到窗口任意位置的宇航员挂件、64px 窄侧栏与命令面板
 - **本地优先**：SQLite 存储、无账号、无云依赖；数据目录可自定义与迁移
 - **跨平台**：Windows 10/11（x64 / x86）与 macOS 10.15+（Intel / Apple Silicon）
@@ -213,7 +213,8 @@ AstroMan/
 | [系统兼容性](docs/compatibility.md) | Windows / macOS 下限、安装包差异、兼容矩阵、长稳回归 |
 | [企业部署与交付](docs/enterprise.md) | 数据目录、policy.json、更新渠道与灰度、代码签名、离线安装、诊断包 |
 | [脚本 API](docs/script-api.md) | 前后置脚本对象、内置变量、加密示例 |
-| [压测与报告](docs/load-testing.md) | 压测配置、指标、SLA、报告导出与对比 |
+| [压测与报告](docs/load-testing.md) | 压测配置、指标、SLA、数据池轮换语义、变量来源、报告导出与对比 |
+| [分布式压测优化方案](docs/cluster-optimization-plan.md) | 集群侧的优化清单与已落地项：从机资源采集、任务历史、采样节流、时钟复测 |
 | [抓包](docs/capture.md) | 本机 / 手机 HTTPS 抓包、根证书、断点改包、Map Local / Remote、弱网、HAR / ZIP 导出与改参重发 |
 | [记事本与待办](docs/notes-design.md) | 技术设计与交互约定：类型、视图、快速记录、提醒规则、截图识别与附件 |
 | [自动化测试](docs/automated-testing.md) | 测试场景、Python 钩子、压测门禁、套件包与 CLI / CI |
@@ -223,11 +224,12 @@ AstroMan/
 | [常见问题](docs/faq.md) | 安装、构建、数据恢复、AI 与脚本 FAQ |
 | [路线图](docs/roadmap.md) | 已交付能力与规划中方向 |
 | [CHANGELOG](CHANGELOG.md) | 版本变更与问题修复记录 |
-| [v1.1.2 发布说明](docs/release-v1.1.2.md) | 本次新增、升级、兼容与验证基线 |
+| [v1.1.3 发布说明](docs/release-v1.1.3.md) | 本次新增、升级、兼容与验证基线 |
+| [v1.1.2 发布说明](docs/release-v1.1.2.md) | 分布式压测二期与参数池 / Token 池 |
 
 ## 路线图
 
-已交付 M1–M12：请求调试、环境变量、历史、压测与报告、AI Agent、导入导出、品牌升级与双安装包、自动化测试与 CLI / CI、抓包分析（含断点 / 映射 / 弱网）、记事本与待办、压测计划中心与任务注册表，以及 v1.1.2 的分布式压测二期（局域网发现 / 审批配对 / 能力分配 / 变量加密下发 / 池切片）与参数池 / Token 池（自定义列、Excel 导入、401 换条目与 HTTP 刷新）。
+已交付 M1–M13：请求调试、环境变量、历史、压测与报告、AI Agent、导入导出、品牌升级与双安装包、自动化测试与 CLI / CI、抓包分析（含断点 / 映射 / 弱网）、记事本与待办、压测计划中心与任务注册表、v1.1.2 的分布式压测二期（局域网发现 / 审批配对 / 能力分配 / 变量加密下发 / 池切片）与参数池 / Token 池（自定义列、Excel 导入、401 换条目与 HTTP 刷新），以及 v1.1.3 的分布式压测优化（采样裁剪 / 落库节流 / 通道背压 / 配对码限速 / 时钟漂移复测）、从机资源指标、主从历史记录与主节点渲染节流。
 
 规划中：链路编排 Flow、定时巡检与告警、混合多接口压测、分布式压测三期（计划级编排 / 断线重连 / 跨网段）、团队同步、Linux 桌面端。完整说明见 [路线图](docs/roadmap.md)。
 

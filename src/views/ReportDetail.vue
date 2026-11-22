@@ -26,7 +26,7 @@ import type {
   ReportRequestRecord,
   ReportRequestsPage,
 } from '@/types/models'
-import type { ClusterReportMeta, ClusterReportNode } from '@/types/cluster'
+import type { ClusterReportMeta, ClusterReportNode, SeriesPoint } from '@/types/cluster'
 import { buildReportHtml, buildReportSheets } from '@/utils/reportExport'
 import { detectKnee, qpsOverview, reportPeaks, scoreReport, selfCheck } from '@/utils/reportAnalytics'
 import { buildFindings, gradeReport, latencyDrift, type Finding } from '@/utils/reportNarrative'
@@ -223,12 +223,70 @@ const clusterTotalQps = computed(() =>
 
 const CLUSTER_SERIES_COLORS = ['#14655a', '#37628f', '#9c6414', '#a23333', '#6b4c9a', '#17774a']
 
-/** 节点 QPS 曲线：各节点采样长度可能不同，按最右侧对齐，左侧补 0 */
+/* 节点曲线可切换的口径：吞吐看 QPS，定位瓶颈看并发/延迟，看机器瓶颈看资源 */
+type ClusterMetricKey = 'qps' | 'concurrent' | 'p95' | 'hostCpu' | 'mem' | 'net'
+
+const CLUSTER_METRICS: {
+  key: ClusterMetricKey
+  label: string
+  unit: string
+  hint: string
+  pick: (point: SeriesPoint) => number
+}[] = [
+  { key: 'qps', label: 'QPS', unit: 'QPS', hint: '各节点每秒完成的请求数', pick: (point) => point.qps },
+  {
+    key: 'concurrent',
+    label: '并发',
+    unit: '并发',
+    hint: '各节点上报的并发数，用来看分配是否倾斜',
+    pick: (point) => point.concurrent,
+  },
+  { key: 'p95', label: 'P95', unit: 'ms', hint: '节点级 P95 延迟', pick: (point) => point.p95 },
+  {
+    key: 'hostCpu',
+    label: '整机 CPU',
+    unit: '%',
+    hint: '从节点整机 CPU 使用率，判断机器是否被其他进程拖慢',
+    pick: (point) => point.hostCpuPercent ?? 0,
+  },
+  {
+    key: 'mem',
+    label: '进程内存',
+    unit: 'MB',
+    hint: '施压进程 RSS，持续增长说明有泄漏',
+    pick: (point) => point.memMb ?? 0,
+  },
+  {
+    key: 'net',
+    label: '网络',
+    unit: 'KB/s',
+    hint: '网卡收发合计，用来判断是否先被带宽卡住',
+    pick: (point) => (point.netRxKbps ?? 0) + (point.netTxKbps ?? 0),
+  },
+]
+
+const clusterMetric = ref<ClusterMetricKey>('qps')
+const clusterMetricInfo = computed(
+  () => CLUSTER_METRICS.find((item) => item.key === clusterMetric.value) ?? CLUSTER_METRICS[0],
+)
+/** 老报告没有 host 字段，资源类口径直接禁用，避免画出一条全是 0 的线 */
+const clusterHasHost = computed(() =>
+  (cluster.value?.nodeSeries ?? []).some((item) =>
+    item.points?.some((point) => (point.hostCpuPercent ?? 0) > 0 || (point.memMb ?? 0) > 0),
+  ),
+)
+
+function clusterMetricDisabled(key: ClusterMetricKey) {
+  return !clusterHasHost.value && (key === 'hostCpu' || key === 'mem' || key === 'net')
+}
+
+/** 节点曲线：各节点采样长度可能不同，按最右侧对齐，左侧补 0 */
 const clusterNodeSeries = computed(() => {
+  const pick = clusterMetricInfo.value.pick
   const list = (cluster.value?.nodeSeries ?? []).filter((item) => item.points?.length)
   const maxPoints = Math.max(0, ...list.map((item) => item.points.length))
   return list.map((item, index) => {
-    const values = item.points.slice(-maxPoints).map((point) => point.qps)
+    const values = item.points.slice(-maxPoints).map(pick)
     while (values.length < maxPoints) values.unshift(0)
     return {
       name: item.node || `节点 ${index + 1}`,
@@ -264,6 +322,16 @@ function clusterStatusTone(status: string) {
 
 function clusterRoleText(role: string) {
   return role === 'master' ? '主节点' : '从节点'
+}
+
+/** 节点资源峰值：进程口径 + 整机口径 + 网卡，老报告没采集的自动省略 */
+function clusterResourceText(node: ClusterReportNode): string {
+  const parts: string[] = []
+  if (node.cpuPeak) parts.push(`${node.cpuPeak.toFixed(2)} 核`)
+  if (node.memPeakMb) parts.push(fmtBytes(node.memPeakMb * 1024 * 1024))
+  if (node.hostCpuPeak) parts.push(`整机 ${node.hostCpuPeak.toFixed(0)}%`)
+  if (node.netPeakKbps) parts.push(`↓↑ ${(node.netPeakKbps / 1024).toFixed(1)} MB/s`)
+  return parts.length ? parts.join(' · ') : '未采集'
 }
 
 const CLUSTER_HEALTH: Record<string, string> = {
@@ -1747,10 +1815,22 @@ function remove() {
 
           <div v-if="clusterNodeSeries.length" class="cluster-series">
             <div class="cluster-series-head">
-              <span>节点 QPS 曲线</span>
-              <span class="hint">按节点上报的秒级采样绘制，右侧对齐</span>
+              <span>节点曲线 · {{ clusterMetricInfo.label }}</span>
+              <a-radio-group v-model:value="clusterMetric" size="small" button-style="solid">
+                <a-radio-button
+                  v-for="item in CLUSTER_METRICS"
+                  :key="item.key"
+                  :value="item.key"
+                  :disabled="clusterMetricDisabled(item.key)"
+                >
+                  {{ item.label }}
+                </a-radio-button>
+              </a-radio-group>
             </div>
-            <LineChart :series="clusterNodeSeries" unit="QPS" :height="220" />
+            <div class="cluster-series-hint">
+              {{ clusterMetricInfo.hint }} · 按节点上报的秒级采样绘制，右侧对齐、缺采样补 0
+            </div>
+            <LineChart :series="clusterNodeSeries" :unit="clusterMetricInfo.unit" :height="220" />
           </div>
 
           <div class="data-table cluster-nodes">
@@ -1768,8 +1848,7 @@ function remove() {
                   <th class="col-narrow">峰值并发</th>
                   <th class="col-narrow">贡献占比</th>
                   <th>采集健康</th>
-                  <th>CPU 峰值</th>
-                  <th>内存峰值</th>
+                  <th>资源峰值</th>
                   <th>时钟偏移</th>
                   <th class="col-narrow">丢弃采样</th>
                   <th>施压窗口</th>
@@ -1792,10 +1871,12 @@ function remove() {
                   <td class="mono" :class="clusterHealthTone(node)" :title="clusterHealthText(node)">
                     {{ clusterHealthText(node) }}
                   </td>
-                  <td class="mono">{{ node.cpuPeak ? `${node.cpuPeak.toFixed(2)} 核` : '未采集' }}</td>
-                  <td class="mono">{{ node.memPeakMb ? fmtBytes(node.memPeakMb * 1024 * 1024) : '未采集' }}</td>
+                  <td class="mono">{{ clusterResourceText(node) }}</td>
                   <td class="mono">
                     {{ node.clockOffsetMs != null ? `${node.clockOffsetMs} ± ${node.clockUncertaintyMs} ms` : '—' }}
+                    <div v-if="Math.abs(node.clockDriftMs ?? 0) >= 1" class="cluster-drift">
+                      漂移 {{ node.clockDriftMs > 0 ? '+' : '' }}{{ node.clockDriftMs.toFixed(1) }} ms
+                    </div>
                   </td>
                   <td class="mono" :class="{ bad: node.droppedSamples > 0 }">{{ node.droppedSamples }}</td>
                   <td class="mono cluster-window">
@@ -3158,6 +3239,18 @@ function remove() {
   font-size: 13px;
   font-weight: 600;
   margin-bottom: 8px;
+}
+
+.cluster-series-hint {
+  margin-bottom: 6px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--fm-muted);
+}
+
+.cluster-drift {
+  font-size: 11px;
+  color: var(--fm-warning);
 }
 
 .cluster-hero {

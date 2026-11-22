@@ -265,7 +265,7 @@ const precheck = computed(() => {
   flex-direction: column;
   gap: 10px;
   font-size: 12.5px;
-  color: var(--fm-text, #1f2329);
+  color: var(--fm-text);
   line-height: 1.7;
 }
 
@@ -276,7 +276,7 @@ const precheck = computed(() => {
 
 .label {
   flex: 0 0 64px;
-  color: var(--fm-muted, #8a8f99);
+  color: var(--fm-muted);
   font-size: 12px;
 }
 
@@ -293,22 +293,22 @@ const precheck = computed(() => {
   margin-left: 6px;
   font-family: 'JetBrains Mono', Consolas, monospace;
   font-size: 11px;
-  color: var(--fm-muted, #8a8f99);
+  color: var(--fm-muted);
 }
 
 .chip {
   padding: 1px 8px;
   border-radius: 4px;
-  background: var(--fm-fill, #f2f4f7);
-  border: 1px solid var(--fm-border, #e6e8eb);
+  background: var(--fm-fill);
+  border: 1px solid var(--fm-border);
   font-size: 11.5px;
 }
 
 .params {
   width: 100%;
   border-collapse: collapse;
-  background: var(--fm-fill, #f7f8fa);
-  border: 1px solid var(--fm-border, #e6e8eb);
+  background: var(--fm-fill);
+  border: 1px solid var(--fm-border);
   border-radius: 6px;
   overflow: hidden;
   display: block;
@@ -318,8 +318,8 @@ const precheck = computed(() => {
   flex: 1;
   margin: 0;
   padding: 6px 8px;
-  background: var(--fm-fill, #f7f8fa);
-  border: 1px solid var(--fm-border, #e6e8eb);
+  background: var(--fm-fill);
+  border: 1px solid var(--fm-border);
   border-radius: 6px;
   font-family: 'JetBrains Mono', Consolas, monospace;
   font-size: 11.5px;
@@ -332,7 +332,7 @@ const precheck = computed(() => {
   display: flex;
   gap: 10px;
   padding: 4px 8px;
-  border-bottom: 1px solid var(--fm-border, #e6e8eb);
+  border-bottom: 1px solid var(--fm-border);
 }
 
 .param-row:last-child {
@@ -348,7 +348,7 @@ const precheck = computed(() => {
 
 .param-key {
   flex: 0 0 30%;
-  color: var(--fm-muted, #8a8f99);
+  color: var(--fm-muted);
   white-space: nowrap;
   font-size: 11.5px;
 }
@@ -366,7 +366,7 @@ const precheck = computed(() => {
   margin-bottom: 3px;
   font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
   font-size: 10.5px;
-  color: var(--fm-muted, #8a8f99);
+  color: var(--fm-muted);
 }
 
 .long-value {
@@ -374,9 +374,9 @@ const precheck = computed(() => {
   overflow: auto;
   margin: 0;
   padding: 6px 8px;
-  border: 1px solid var(--fm-border, #e6e8eb);
+  border: 1px solid var(--fm-border);
   border-radius: 6px;
-  background: var(--fm-surface, #fff);
+  background: var(--fm-surface);
   font-family: 'JetBrains Mono', Consolas, monospace;
   font-size: 11px;
   line-height: 1.65;
@@ -413,14 +413,14 @@ const precheck = computed(() => {
 }
 
 .muted {
-  color: var(--fm-muted, #8a8f99);
+  color: var(--fm-muted);
 }
 
 .foot {
   margin: 0;
   padding-top: 6px;
-  border-top: 1px dashed var(--fm-border, #e6e8eb);
-  color: var(--fm-muted, #8a8f99);
+  border-top: 1px dashed var(--fm-border);
+  color: var(--fm-muted);
   font-size: 11.5px;
 }
 </style>

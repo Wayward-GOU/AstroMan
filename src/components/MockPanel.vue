@@ -460,7 +460,7 @@ onUnmounted(() => {
 }
 .muted {
   font-size: 12px;
-  color: var(--fm-text-secondary, #6b7280);
+  color: var(--fm-text-secondary);
 }
 .grid {
   display: grid;
@@ -468,7 +468,7 @@ onUnmounted(() => {
   gap: 12px;
 }
 .pane {
-  border: 1px solid var(--fm-border, #e5e7eb);
+  border: 1px solid var(--fm-border);
   border-radius: 2px;
   min-width: 0;
 }
@@ -479,7 +479,7 @@ onUnmounted(() => {
   padding: 8px 10px;
   font-size: 12px;
   font-weight: 600;
-  border-bottom: 1px solid var(--fm-border, #e5e7eb);
+  border-bottom: 1px solid var(--fm-border);
   background: #fafafa;
 }
 .route-list,
@@ -548,7 +548,7 @@ onUnmounted(() => {
   padding: 24px 12px;
   text-align: center;
   font-size: 12px;
-  color: var(--fm-text-secondary, #6b7280);
+  color: var(--fm-text-secondary);
 }
 .time {
   color: #9ca3af;

@@ -37,7 +37,10 @@ fn mask_data(data: &HashMap<String, String>, show: bool) -> HashMap<String, Stri
 
 #[tauri::command]
 pub fn pool_list(state: State<'_, AppState>) -> Result<Vec<pool::PoolRow>, String> {
-    let conn = state.pool.get().map_err(|error| format!("数据库不可用：{error}"))?;
+    let conn = state
+        .pool
+        .get()
+        .map_err(|error| format!("数据库不可用：{error}"))?;
     pool::list_pools(&conn)
 }
 
@@ -55,7 +58,10 @@ pub fn pool_get(
     pool_id: i64,
     page_size: Option<i64>,
 ) -> Result<PoolDetail, String> {
-    let conn = state.pool.get().map_err(|error| format!("数据库不可用：{error}"))?;
+    let conn = state
+        .pool
+        .get()
+        .map_err(|error| format!("数据库不可用：{error}"))?;
     let pool_row = pool::list_pools(&conn)?
         .into_iter()
         .find(|item| item.id == pool_id)
@@ -70,7 +76,10 @@ pub fn pool_get(
         "",
         sensitive,
     )?;
-    Ok(PoolDetail { pool: pool_row, items })
+    Ok(PoolDetail {
+        pool: pool_row,
+        items,
+    })
 }
 
 #[tauri::command]
@@ -101,7 +110,10 @@ pub fn pool_create(
     };
     let raw_columns =
         serde_json::to_string(&columns).map_err(|error| format!("序列化池列失败：{error}"))?;
-    let conn = state.pool.get().map_err(|error| format!("数据库不可用：{error}"))?;
+    let conn = state
+        .pool
+        .get()
+        .map_err(|error| format!("数据库不可用：{error}"))?;
     if pool::pool_id_by_name(&conn, name)?.is_some() {
         return Err(format!("池「{name}」已存在"));
     }
@@ -126,9 +138,15 @@ pub fn pool_create(
 
 #[tauri::command]
 pub fn pool_delete(state: State<'_, AppState>, pool_id: i64) -> Result<(), String> {
-    let conn = state.pool.get().map_err(|error| format!("数据库不可用：{error}"))?;
-    conn.execute("DELETE FROM data_pools WHERE id = ?1", rusqlite::params![pool_id])
-        .map_err(|error| format!("删除池失败：{error}"))?;
+    let conn = state
+        .pool
+        .get()
+        .map_err(|error| format!("数据库不可用：{error}"))?;
+    conn.execute(
+        "DELETE FROM data_pools WHERE id = ?1",
+        rusqlite::params![pool_id],
+    )
+    .map_err(|error| format!("删除池失败：{error}"))?;
     Ok(())
 }
 
@@ -139,7 +157,10 @@ pub fn pool_items(
     pool_id: i64,
     reveal: Option<bool>,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let conn = state.pool.get().map_err(|error| format!("数据库不可用：{error}"))?;
+    let conn = state
+        .pool
+        .get()
+        .map_err(|error| format!("数据库不可用：{error}"))?;
     let sensitive = conn
         .query_row(
             "SELECT sensitive FROM data_pools WHERE id = ?1",
@@ -167,8 +188,15 @@ pub fn pool_items(
 }
 
 #[tauri::command]
-pub fn pool_import(state: State<'_, AppState>, pool_id: i64, text: String) -> Result<usize, String> {
-    let conn = state.pool.get().map_err(|error| format!("数据库不可用：{error}"))?;
+pub fn pool_import(
+    state: State<'_, AppState>,
+    pool_id: i64,
+    text: String,
+) -> Result<usize, String> {
+    let conn = state
+        .pool
+        .get()
+        .map_err(|error| format!("数据库不可用：{error}"))?;
     pool::import_items(&conn, pool_id, &text)
 }
 
@@ -179,7 +207,10 @@ pub fn pool_columns_set(
     pool_id: i64,
     columns: Vec<pool::PoolColumnChange>,
 ) -> Result<Vec<String>, String> {
-    let conn = state.pool.get().map_err(|error| format!("数据库不可用：{error}"))?;
+    let conn = state
+        .pool
+        .get()
+        .map_err(|error| format!("数据库不可用：{error}"))?;
     pool::save_columns(&conn, pool_id, &columns)
 }
 
@@ -190,7 +221,10 @@ pub fn pool_excel_template(
     pool_id: i64,
     path: String,
 ) -> Result<(), String> {
-    let conn = state.pool.get().map_err(|error| format!("数据库不可用：{error}"))?;
+    let conn = state
+        .pool
+        .get()
+        .map_err(|error| format!("数据库不可用：{error}"))?;
     let (name, sensitive): (String, i64) = conn
         .query_row(
             "SELECT name, sensitive FROM data_pools WHERE id = ?1",
@@ -209,15 +243,24 @@ pub fn pool_excel_import(
     pool_id: i64,
     path: String,
 ) -> Result<pool_excel::ExcelImportResult, String> {
-    let conn = state.pool.get().map_err(|error| format!("数据库不可用：{error}"))?;
+    let conn = state
+        .pool
+        .get()
+        .map_err(|error| format!("数据库不可用：{error}"))?;
     pool_excel::import_excel(&conn, pool_id, &path)
 }
 
 #[tauri::command]
 pub fn pool_delete_item(state: State<'_, AppState>, item_id: i64) -> Result<(), String> {
-    let conn = state.pool.get().map_err(|error| format!("数据库不可用：{error}"))?;
-    conn.execute("DELETE FROM data_pool_items WHERE id = ?1", rusqlite::params![item_id])
-        .map_err(|error| format!("删除条目失败：{error}"))?;
+    let conn = state
+        .pool
+        .get()
+        .map_err(|error| format!("数据库不可用：{error}"))?;
+    conn.execute(
+        "DELETE FROM data_pool_items WHERE id = ?1",
+        rusqlite::params![item_id],
+    )
+    .map_err(|error| format!("删除条目失败：{error}"))?;
     Ok(())
 }
 
@@ -231,7 +274,10 @@ pub fn pool_items_page(
     search: Option<String>,
     status: Option<String>,
 ) -> Result<pool::PoolItemsPage, String> {
-    let conn = state.pool.get().map_err(|error| format!("数据库不可用：{error}"))?;
+    let conn = state
+        .pool
+        .get()
+        .map_err(|error| format!("数据库不可用：{error}"))?;
     let sensitive = pool::pool_sensitive(&conn, pool_id)?;
     pool::pool_items_page(
         &conn,
@@ -250,7 +296,10 @@ pub fn pool_item_reveal(
     state: State<'_, AppState>,
     item_id: i64,
 ) -> Result<pool::RevealedItem, String> {
-    let conn = state.pool.get().map_err(|error| format!("数据库不可用：{error}"))?;
+    let conn = state
+        .pool
+        .get()
+        .map_err(|error| format!("数据库不可用：{error}"))?;
     pool::reveal_item(&conn, item_id)
 }
 
@@ -261,14 +310,20 @@ pub fn pool_item_toggle(
     item_id: i64,
     enabled: bool,
 ) -> Result<(), String> {
-    let conn = state.pool.get().map_err(|error| format!("数据库不可用：{error}"))?;
+    let conn = state
+        .pool
+        .get()
+        .map_err(|error| format!("数据库不可用：{error}"))?;
     pool::set_item_enabled(&conn, item_id, enabled)
 }
 
 /// 清空池条目（保留池本身）
 #[tauri::command]
 pub fn pool_clear_items(state: State<'_, AppState>, pool_id: i64) -> Result<usize, String> {
-    let conn = state.pool.get().map_err(|error| format!("数据库不可用：{error}"))?;
+    let conn = state
+        .pool
+        .get()
+        .map_err(|error| format!("数据库不可用：{error}"))?;
     pool::clear_items(&conn, pool_id)
 }
 
@@ -278,7 +333,10 @@ pub fn pool_health_refresh(
     state: State<'_, AppState>,
     pool_id: i64,
 ) -> Result<pool::PoolHealth, String> {
-    let conn = state.pool.get().map_err(|error| format!("数据库不可用：{error}"))?;
+    let conn = state
+        .pool
+        .get()
+        .map_err(|error| format!("数据库不可用：{error}"))?;
     pool::refresh_health(&conn, pool_id)
 }
 
@@ -290,7 +348,10 @@ pub fn pool_preview(
     vu_count: Option<u32>,
     reveal: Option<bool>,
 ) -> Result<serde_json::Value, String> {
-    let conn = state.pool.get().map_err(|error| format!("数据库不可用：{error}"))?;
+    let conn = state
+        .pool
+        .get()
+        .map_err(|error| format!("数据库不可用：{error}"))?;
     let vu_count = vu_count.unwrap_or(0).clamp(0, 100_000);
     let show = reveal.unwrap_or(false);
     let mut summaries = Vec::new();
@@ -298,6 +359,8 @@ pub fn pool_preview(
     let mut identity_preview = Vec::new();
     let mut columns_cache: HashMap<String, Vec<String>> = HashMap::new();
     let mut injected: HashMap<String, HashSet<String>> = HashMap::new();
+    // 变量名 → 注入它的池：跨池同名会在运行期静默覆盖，预览阶段先提示
+    let mut owners: HashMap<String, String> = HashMap::new();
     for binding in &bindings {
         let pool_name = binding.pool.trim().to_string();
         let column = binding.column.trim().to_string();
@@ -320,10 +383,19 @@ pub fn pool_preview(
         };
         let seen = injected.entry(pool_name.clone()).or_default();
         for name in injected_names {
-            if !name.is_empty() && !seen.insert(name.clone()) {
-                problems.push(format!(
-                    "池「{pool_name}」的多个绑定重复注入变量「{name}」"
-                ));
+            if name.is_empty() {
+                continue;
+            }
+            if !seen.insert(name.clone()) {
+                problems.push(format!("池「{pool_name}」的多个绑定重复注入变量「{name}」"));
+                continue;
+            }
+            if let Some(previous) = owners.insert(name.clone(), pool_name.clone()) {
+                if previous != pool_name {
+                    problems.push(format!(
+                        "池「{previous}」和池「{pool_name}」都注入变量「{name}」，后绑定的会覆盖前者"
+                    ));
+                }
             }
         }
         let items = pool::load_items(&conn, &pool_name)?;
@@ -363,7 +435,8 @@ pub fn pool_preview(
         if items.is_empty() {
             problems.push(format!("池「{}」没有启用条目", binding.pool));
         }
-        if vu_count > 0 && mode == "per_vu" && !items.is_empty() && (items.len() as u32) < vu_count {
+        if vu_count > 0 && mode == "per_vu" && !items.is_empty() && (items.len() as u32) < vu_count
+        {
             problems.push(format!(
                 "池「{}」只有 {} 条，{} 个 VU 会循环复用（同一 token 可能被多个 VU 共用）",
                 binding.pool,
@@ -410,7 +483,10 @@ pub fn pool_refresh_get(
     state: State<'_, AppState>,
     name: String,
 ) -> Result<pool::PoolRefreshConfig, String> {
-    let conn = state.pool.get().map_err(|error| format!("数据库不可用：{error}"))?;
+    let conn = state
+        .pool
+        .get()
+        .map_err(|error| format!("数据库不可用：{error}"))?;
     pool::load_refresh_config(&conn, &name)
 }
 
@@ -421,6 +497,9 @@ pub fn pool_refresh_set(
     name: String,
     config: pool::PoolRefreshConfig,
 ) -> Result<(), String> {
-    let conn = state.pool.get().map_err(|error| format!("数据库不可用：{error}"))?;
+    let conn = state
+        .pool
+        .get()
+        .map_err(|error| format!("数据库不可用：{error}"))?;
     pool::save_refresh_config(&conn, &name, &config)
 }

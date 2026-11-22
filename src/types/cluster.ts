@@ -77,9 +77,24 @@ export interface ClusterNodeInfo {
   qps: number
   cpu?: number | null
   memMb?: number | null
+  /** 整机 CPU 使用率（%） */
+  hostCpuPercent?: number | null
+  /** 整机内存使用率（%） */
+  hostMemPercent?: number | null
+  /** 网卡接收 / 发送速率（KB/s） */
+  netRxKbps?: number | null
+  netTxKbps?: number | null
+  /** 进程线程数 */
+  threads?: number | null
+  /** 1 分钟平均负载 */
+  load1?: number | null
   /** 从节点相对主节点的时钟偏移（毫秒，正数表示从节点更快） */
   clockOffsetMs?: number | null
   clockUncertaintyMs?: number | null
+  /** 运行期复测的漂移（毫秒）：相对配对时刻偏移的变化量 */
+  clockDriftMs?: number | null
+  /** 最近一次时钟复测时刻 */
+  clockRecheckAt?: number | null
   droppedSamples: number
   joinedAt: number
   lastSeenAt?: number | null
@@ -320,11 +335,92 @@ export interface ClusterSamplePayload {
   latencyBuckets: [number, number][]
 }
 
-/** 每秒采样事件：前端画各节点实时曲线 */
-export interface ClusterSampleEvent {
-  jobId: number
+/** 单节点某一秒的图表字段：直方图桶留在后端，界面上只画需要的值 */
+export interface ClusterSampleNode {
   nodeId: string
-  sample: ClusterSamplePayload
+  qps: number
+  concurrent: number
+  avgRt: number
+  errorCount: number
+  cpu?: number | null
+  memMb?: number | null
+}
+
+/** 采样帧：每秒一帧，替代逐节点逐条推送 */
+export interface ClusterSampleFrame {
+  jobId: number
+  sec: number
+  nodes: ClusterSampleNode[]
+}
+
+/** 主节点任务历史 */
+export interface ClusterJobSummary {
+  id: number
+  createdAt: number
+  finishedAt?: number | null
+  status: string
+  planName: string
+  masterNode: string
+  totalConcurrent: number
+  nodeCount: number
+  avgQps?: number | null
+  reportId?: number | null
+  incomplete: boolean
+  message?: string | null
+}
+
+export interface ClusterJobPage {
+  total: number
+  items: ClusterJobSummary[]
+}
+
+/** 历史任务里的节点记录 */
+export interface ClusterWorkerRow {
+  nodeName: string
+  addr: string
+  role: string
+  weight: number
+  concurrent: number
+  status: string
+  qps: number
+  cpu?: number | null
+  memMb?: number | null
+  clockOffsetMs: number
+  clockUncertaintyMs: number
+  droppedSamples: number
+  joinedAt: number
+  lastSeenAt?: number | null
+  error?: string | null
+}
+
+export interface ClusterJobDetail {
+  job: ClusterJobSummary
+  nodes: ClusterWorkerRow[]
+}
+
+/** 从节点参与记录 */
+export interface ClusterSlaveHistoryItem {
+  id: number
+  createdAt: number
+  masterAddr: string
+  masterNode: string
+  masterJobId?: number | null
+  nodeName: string
+  planName: string
+  joinMode: string
+  concurrent: number
+  totalConcurrent: number
+  status: string
+  qpsAvg: number
+  cpuPeak: number
+  memPeakMb: number
+  /** 整机 CPU 使用率峰值（%） */
+  hostCpuPeak: number
+  /** 网卡收发合计峰值（KB/s） */
+  netPeakKbps: number
+  startedAt?: number | null
+  endedAt?: number | null
+  message?: string | null
 }
 
 /** 写入报告 config.cluster 的元数据 */
@@ -373,6 +469,11 @@ export interface SeriesPoint {
   concurrent: number
   p95: number
   errors: number
+  cpu?: number
+  hostCpuPercent?: number
+  memMb?: number
+  netRxKbps?: number
+  netTxKbps?: number
 }
 
 export interface ClusterReportNode {
@@ -385,8 +486,16 @@ export interface ClusterReportNode {
   qpsAvg: number
   cpuPeak: number
   memPeakMb: number
+  /** 整机 CPU 使用率峰值（%） */
+  hostCpuPeak: number
+  /** 整机内存使用率峰值（%） */
+  hostMemPeakPercent: number
+  /** 网卡收发合计峰值（KB/s） */
+  netPeakKbps: number
   clockOffsetMs: number
   clockUncertaintyMs: number
+  /** 运行期时钟复测得到的漂移（毫秒） */
+  clockDriftMs: number
   droppedSamples: number
   startMs: number
   endMs: number

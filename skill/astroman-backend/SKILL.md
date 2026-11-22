@@ -152,20 +152,34 @@ note_file_links(note_id, file_id, created_at)   -- 联合主键 + ON DELETE CASC
 - 改列：`save_columns` 在单事务里迁移 `data_json` 并同步 `value/account`；列数不等直接报错，`from` 必须存在且不可重复；删除列会丢该列数据
 - 导入：`insert_rows` 是文本 / JSON / Excel 共用写入口；`pool_excel.rs` 只由 Rust 读写 xlsx（`calamine` + `rust_xlsxwriter`），只读第一个 Sheet、首列必填、单次 5 万行、超 15 位数字给 `numericWarnings`
 - 绑定语义：`PoolBinding.column` 为 `""` 取 `value`、`"*"` 按列名全部注入、其它值取 `data[column]` 映射到 `target`；同池多绑定共用条目，同池 mode 必须一致
+- 轮换语义（`commands/stress.rs::overlay`，改动前先读这段，别按「每 VU 各轮一遍」的直觉改）：
+  - `per_vu` = `(vu + offsets[池]) % len`，集群下 `offsets` 取切片 `start_index`
+  - `per_request` = **按池一个全局游标** `cursors[池名]` 顺序自增取模，不是每 VU 独立。1000 请求 / 100 条 = 每条 10 次；`key` 只用池名，所以同池多条绑定共用一条身份
+  - `random` = `PoolRuntime.rng: AtomicU64` 上 `fetch_add(0x9E3779B97F4A7C15)` 后过 splitmix64，**同一纳秒并发不会撞同一条**；不要再改回 `subsec_nanos % len`
+  - 401 换条写 `refresh[池]` 手位，取用时要**叠加到 base 上**：`position = (base + shift) % len`。老写法 `if let Some(pos) = refresh.get(pool)` 直接跳过模式判断，会让 `per_request` 永久退化成 `per_vu`（已修，勿回退）
+  - 失效 / 冷却 / 过期条目从候选集剔除后再取模，所以扣掉失效项后仍然均匀
+- 绑定校验：`validate_pool_bindings` 用 `owners: HashMap<变量名, 池名>` 拦跨池同名注入（`POOL_VAR_CONFLICT`），同池多列注入不同变量放行；`pool_preview` 同步给软提示
 - 预览：`pool_preview` 是开跑前唯一校验入口，列不存在 / 变量名为空 / 条目不足都应在预览阶段报错，运行期不回退
 - 敏感池：查询、预览、AI 工具结果一律脱敏，明文只走 `pool_item_reveal`
-- 改完跑 `cargo test --lib pool`（列迁移、导入、预览、Excel 往返都有用例）
+- 改完跑 `cargo test --lib pool` 与 `cargo test --lib commands::stress::tests::`（列迁移、导入、预览、Excel 往返、轮换均匀性 `per_request_binding_rotates_evenly_over_requests` / `unauthorized_shift_keeps_per_request_rotation` / `random_mode_spreads_over_items` 都有用例）
 
 ## 分布式压测（`services/cluster/` + `commands/cluster.rs`）
 
-- 协议 `PROTOCOL_VERSION = 2`；主节点 `server.rs`、从节点 `client.rs`、载荷 `protocol.rs`，改动要三处同步并更新 `src/types/cluster.ts`
-- 环境变量：`EnvBundle` 用 X25519 + HKDF-SHA256 + AES-256-GCM；从节点先读本机同名环境再 `merge_bundle_vars`，`master_wins` 主节点覆盖、`local_wins` 本机优先；`{{os:NAME}}` 只注入白名单
+- 协议 `PROTOCOL_VERSION = 2`；主节点在 `server/`（`mod.rs` 会话与协议、`persist.rs` 落库、`pairing.rs` 配对、`tests.rs`），从节点 `client.rs`，载荷 `protocol.rs`，改动要这几处同步并更新 `src/types/cluster.ts`
+- 环境变量：`EnvBundle` 用 X25519 + HKDF-SHA256 + AES-256-GCM；从节点先读本机同名环境再 `merge_bundle_vars`，`master_wins` 主节点覆盖、`local_wins` 本机优先
+- `{{os:NAME}}` 隔离：注入 OS 变量时双键写入——专用键 `__os__:NAME`（`util::os_var_key`）供 `{{os:NAME}}` 取值，裸名 `NAME` 继续供 `{{NAME}}` 按原优先级取值；`resolve_expr` 的 `os:` 分支**只读专用键且不回退裸名**，否则池里同名变量会污染系统值语义。改动点是主机 `prepare_stress_with_relay` 与从机 `prepare_local` 两处，打包 `EnvBundle` 的那处不用动
+- `requiredVars` 误报：`server/mod.rs::create_with` 生成后必须用 `pool_injected_names(bindings, columns_of)` 扣除池会注入的名字（`util` 里同一份算法），从机 `prepare_local` 再用 `payload.pool_slices.columns` 兜底；否则从机会把池列名当环境变量报「缺少变量」
 - 池切片：prepare 时主节点 `pool_slices_for` 读池并按全局 VU 切片，从节点只用 `config.pool_slices`；`per_vu` 不足时下发全量 + `startIndex`，`per_request` / `random` 按节点分片；单节点序列化上限 `MAX_POOL_SLICE_BYTES = 64 MB`
 - 下发前校验：`ensure_pool_slice_size` 返回字节数（写入 `NodeState.pool_slice_bytes` 供前端展示），超限报 `E_POOL_SLICE_TOO_LARGE` 并指出最大来源池；`estimate_pool_bytes` 只做 COUNT / LENGTH 估算，不下发条目
 - 版本兼容：`NodeState.pool_columns` 来自 Hello；计划含非空 `column`（含 `*`）时必须让不支持的旧节点失败并列出节点名；`env_bundle` 能力位取决于是否收到公钥
 - Token 刷新：从节点 401 走 `PoolRefreshRequest / PoolRefreshResult`，主节点 `PoolRefreshCore` 按 `(pool, item_id)` 单飞；主节点本地引擎复用同一核心
-- 新增快照字段后同步 `ClusterNodeInfo` / `ClusterMasterSnapshot` 与前端 digest（航仔 `clusterNodeDigest` 已输出池兼容 / 变量下发 / 池切片 / 数据池体量）
-- 改完跑 `cargo test --lib cluster`（分配、合并、池切片、失联、双机 smoke）
+- 从节点资源采集：`SamplePayload.host` 带 `cpu / host_cpu_percent / mem_mb / host_mem_percent / threads / net_rx_kbps / net_tx_kbps / load1`。**引擎 CPU（`cpu`）与整机 CPU（`host_cpu_percent`）是两个字段**，别混用；从机 `HostSampler` / `HostPeaks` 逐指标取峰写入 `cluster_slave_history`
+- 采样与落库：`SAMPLE_RETAIN = 300` 裁剪内存 samples，`persist_node_throttled` 每 5 秒落库一次；从机发送走有界 `mpsc::channel(1024)`，队列余量 ≤16 时丢采样并累加 `droppedSamples`（丢采样要能在报告里看到，不要静默）
+- 时钟：`clock_drift_ms` 开跑后每 60 秒用 `TimeProbe` / `TimeAck` 复测（序号基数 `RECHECK_SEQ_BASE = 900_000`，阈值 `CLOCK_DRIFT_WARN_MS = 50.0`）；复测分支**只更新 `clock_drift_ms`，不改已校准的 offset**
+- 配对防枚举：`PAIR_FAIL_TOTAL = 10` 次失败后按 IP 5 次 / 10 秒节流（`register_pair_failure`）
+- 历史（`services/cluster/history.rs`，DB_VERSION 21 起）：`cluster_jobs_list` / `cluster_job_detail` / `cluster_jobs_clear` / `cluster_slave_history_list` / `cluster_slave_history_clear`；主节点任务表存计划名、状态、节点数、总并发、平均 QPS、报告号与 `incomplete`（有节点失联或采样缺失）；从机历史存 `host_cpu_peak` / `net_peak_kbps` 等本机峰值，只在本机可见
+- 新增快照字段后同步 `ClusterNodeInfo` / `ClusterMasterSnapshot` / `ClusterJobDetail` 与前端 digest（航仔 `clusterNodeDigest` / `clusterJobDigest` / `clusterWorkerDigest` / `clusterSlaveHistoryDigest`）
+- 改完跑 `cargo test --lib cluster`（分配、合并、池切片、失联、时钟复测、双机 smoke），并行偶发失败时加 `--test-threads=1`
 
 ## 抓包后端（`capture/` + `commands/capture.rs`）
 

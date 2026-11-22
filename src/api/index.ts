@@ -93,6 +93,7 @@ import type {
   StressReport,
   TestPlan,
   UpdateInfo,
+  VarSourceItem,
   WorkspaceStats,
 } from '@/types/models'
 import type {
@@ -114,12 +115,15 @@ import type {
   DocsSiteStatus,
 } from '@/types/docs'
 import type {
+  ClusterJobDetail,
+  ClusterJobPage,
   ClusterMasterSnapshot,
   ClusterMasterStartPayload,
   ClusterNodeWeight,
   ClusterProtocolInfo,
   ClusterSamplePayload,
   ClusterSlaveConnectPayload,
+  ClusterSlaveHistoryItem,
   ClusterSlaveSnapshot,
   DiscoveredMaster,
   DiscoveryStatus,
@@ -495,6 +499,34 @@ export const clusterNodeSamples = (jobId: number, nodeId: string, limit = 30) =>
 export const clusterVarAudit = (jobId: number) =>
   invoke<VarAuditReport>('cluster_var_audit', { jobId })
 
+/* ---------- 集群历史 ---------- */
+
+/** 主节点任务历史：status / keyword 传空串表示不过滤 */
+export const clusterJobsList = (
+  page = 1,
+  pageSize = 20,
+  status = '',
+  keyword = '',
+) =>
+  invoke<ClusterJobPage>('cluster_jobs_list', {
+    page,
+    pageSize,
+    status: status || null,
+    keyword: keyword || null,
+  })
+
+export const clusterJobDetail = (jobId: number) =>
+  invoke<ClusterJobDetail>('cluster_job_detail', { jobId })
+
+export const clusterJobsClear = (keepDays = 0) =>
+  invoke<number>('cluster_jobs_clear', { keepDays })
+
+export const clusterSlaveHistoryList = (limit = 50, offset = 0) =>
+  invoke<ClusterSlaveHistoryItem[]>('cluster_slave_history_list', { limit, offset })
+
+export const clusterSlaveHistoryClear = () =>
+  invoke<number>('cluster_slave_history_clear')
+
 /** 接受待审批节点（审批配对） */
 export const clusterMasterApprove = (jobId: number, nodeId: string) =>
   invoke<ClusterMasterSnapshot>('cluster_master_approve', { jobId, nodeId })
@@ -610,6 +642,10 @@ export const poolPreview = (
   vuCount = 0,
   reveal = false,
 ) => invoke<PoolPreview>('pool_preview', { bindings, vuCount, reveal })
+
+/** 变量来源清单（只读）：区分普通 / 密钥 / 系统变量，并标出当前是否可用 */
+export const stressVarSources = (config: Partial<StressConfig>) =>
+  invoke<VarSourceItem[]>('stress_var_sources', { config })
 
 /** Token 刷新配置（v19） */
 export const poolRefreshGet = (name: string) =>

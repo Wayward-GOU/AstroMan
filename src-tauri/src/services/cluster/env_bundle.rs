@@ -57,7 +57,8 @@ pub fn encrypt_bundle(
     plaintext: &[u8],
 ) -> Result<(String, String, String), String> {
     let key = shared_key(secret, peer);
-    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|error| format!("初始化加密器失败：{error}"))?;
+    let cipher =
+        Aes256Gcm::new_from_slice(&key).map_err(|error| format!("初始化加密器失败：{error}"))?;
     let digest = digest_hex(plaintext);
     // nonce 由会话密钥与明文摘要派生：同一会话内不同明文得到不同 nonce
     let mut nonce_bytes = [0u8; 12];
@@ -67,7 +68,13 @@ pub fn encrypt_bundle(
     nonce_bytes.copy_from_slice(&hasher.finalize()[..12]);
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
-        .encrypt(nonce, Payload { msg: plaintext, aad: HKDF_INFO })
+        .encrypt(
+            nonce,
+            Payload {
+                msg: plaintext,
+                aad: HKDF_INFO,
+            },
+        )
         .map_err(|_| "环境变量包加密失败".to_string())?;
     Ok((B64.encode(nonce_bytes), B64.encode(ciphertext), digest))
 }
@@ -82,7 +89,8 @@ pub fn decrypt_bundle(
         return Err(format!("EnvBundle 版本不支持：{}", bundle.version));
     }
     let key = shared_key(secret, peer);
-    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|error| format!("初始化解密器失败：{error}"))?;
+    let cipher =
+        Aes256Gcm::new_from_slice(&key).map_err(|error| format!("初始化解密器失败：{error}"))?;
     let nonce_bytes = B64
         .decode(bundle.nonce.trim())
         .map_err(|error| format!("nonce 格式错误：{error}"))?;
@@ -95,7 +103,10 @@ pub fn decrypt_bundle(
     let plaintext = cipher
         .decrypt(
             Nonce::from_slice(&nonce_bytes),
-            Payload { msg: &ciphertext, aad: HKDF_INFO },
+            Payload {
+                msg: &ciphertext,
+                aad: HKDF_INFO,
+            },
         )
         .map_err(|_| "环境变量包解密失败：主从会话密钥不一致或数据被篡改".to_string())?;
     let actual = digest_hex(&plaintext);

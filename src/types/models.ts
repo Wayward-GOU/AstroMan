@@ -1154,6 +1154,17 @@ export interface PoolPreview {
   masked: boolean
 }
 
+/** 变量来源清单：开跑前「本次变量」面板的一行 */
+export interface VarSourceItem {
+  name: string
+  /** 变量写法：user 普通 / secret 密钥 / os 系统 */
+  kind: 'user' | 'secret' | 'os'
+  /** 取值来源：env 环境 / runtime 运行期 / pool 数据池 / os 本机 / missing 缺失 */
+  source: 'env' | 'runtime' | 'pool' | 'os' | 'missing'
+  detail: string
+  ok: boolean
+}
+
 export interface ReportSample {
   elapsedSec: number
   concurrent: number

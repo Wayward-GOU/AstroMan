@@ -70,6 +70,8 @@ pub(crate) struct MergedReport {
     pub histogram: Vec<HistogramBucket>,
     pub body_histogram: Vec<HistogramBucket>,
     pub error_types: Vec<ErrorTypeCount>,
+    /// 合并后的 URL 统计（按 method/url/status 相加）
+    pub url_stats: Vec<crate::models::UrlStatRow>,
     pub meta: ClusterReportMeta,
     pub config_snapshot: String,
 }
@@ -116,6 +118,9 @@ pub(crate) fn merge(request: MergeRequest) -> MergedReport {
     let mut body: BTreeMap<u32, u64> = BTreeMap::new();
     let mut codes: BTreeMap<u16, u64> = BTreeMap::new();
     let mut error_kinds: BTreeMap<String, i64> = BTreeMap::new();
+    // URL 统计按 (method, url, status) 合并；任一节点未上报即标记不完整
+    let mut url_rows: BTreeMap<(String, String, i64), crate::models::UrlStatRow> = BTreeMap::new();
+    let mut url_stats_complete = true;
 
     let mut total = 0u64;
     let mut success = 0u64;
@@ -185,6 +190,20 @@ pub(crate) fn merge(request: MergeRequest) -> MergedReport {
             for (kind, count) in &done.error_types {
                 *error_kinds.entry(kind.clone()).or_insert(0) += *count;
             }
+            for row in &done.url_stats {
+                merge_url_row(&mut url_rows, row);
+            }
+            // 旧节点不返回 url_stats；有请求却没有任何 URL 统计时明确标记不完整
+            if done.total > 0 && done.url_stats.is_empty() {
+                log::warn!(
+                    "集群节点 {} 未上报 URL 统计，报告将标记统计不完整",
+                    node.name
+                );
+                url_stats_complete = false;
+            }
+            if !done.url_stats_complete {
+                url_stats_complete = false;
+            }
             cpu_peak = cpu_peak.max(done.cpu_peak);
             mem_peak = mem_peak.max(done.mem_peak_mb);
             stopped |= done.stopped;
@@ -206,8 +225,18 @@ pub(crate) fn merge(request: MergeRequest) -> MergedReport {
                 }
             }
             sum_rt += node_total;
+            // 失联节点只有每秒采样，没有 done 里的 URL 统计
+            if node
+                .samples
+                .iter()
+                .any(|sample| sample.success_count + sample.error_count > 0)
+            {
+                url_stats_complete = false;
+            }
         }
 
+        let (total_requests, success_count, error_count, avg_rt_ms, tps, egress_avg_kbps) =
+            node_load_stats(node);
         node_meta.push(ClusterReportNode {
             name: node.name.clone(),
             role: node.role.clone(),
@@ -252,6 +281,12 @@ pub(crate) fn merge(request: MergeRequest) -> MergedReport {
                 .unwrap_or(node.concurrent),
             share: 0.0,
             health: node_health(node, node_start, node_end),
+            total_requests,
+            success_count,
+            error_count,
+            avg_rt_ms,
+            tps,
+            egress_avg_kbps,
         });
         node_requests.push((
             node.name.clone(),
@@ -326,6 +361,7 @@ pub(crate) fn merge(request: MergeRequest) -> MergedReport {
         plan_id: request.plan_id,
         run_group_id: request.run_group_id,
         plan_name: request.plan_name.clone(),
+        title: None,
         request_id: request.request_id,
         total_requests: total as i64,
         success_count: success as i64,
@@ -389,6 +425,8 @@ pub(crate) fn merge(request: MergeRequest) -> MergedReport {
         note: request.note.clone(),
     };
 
+    let url_stats = clamp_url_rows(url_rows, &mut url_stats_complete);
+
     let mut config: serde_json::Value =
         serde_json::from_str(&request.config_snapshot).unwrap_or_else(|_| json!({}));
     if let Some(map) = config.as_object_mut() {
@@ -404,10 +442,13 @@ pub(crate) fn merge(request: MergeRequest) -> MergedReport {
                 }
             }
         }
-        map.insert(
-            "cluster".to_string(),
-            serde_json::to_value(&meta).unwrap_or_else(|_| json!({})),
-        );
+        // 节点级曲线已单独落 cluster_report_samples 表（report_node_series 可查），
+        // config_json 不再重复存这一大块数据；读取报告详情时再按需拼回。
+        let mut meta_json = serde_json::to_value(&meta).unwrap_or_else(|_| json!({}));
+        if let Some(obj) = meta_json.as_object_mut() {
+            obj.remove("nodeSeries");
+        }
+        map.insert("cluster".to_string(), meta_json);
         // 运行期指标沿用单机位置：导出与报告详情不用改读取路径
         let metrics = map.entry("metrics").or_insert_with(|| json!({}));
         if let Some(metrics) = metrics.as_object_mut() {
@@ -415,6 +456,7 @@ pub(crate) fn merge(request: MergeRequest) -> MergedReport {
             metrics.insert("errorsDropped".to_string(), json!(errors_dropped));
             metrics.insert("recordsDropped".to_string(), json!(records_dropped));
             metrics.insert("clusterNodes".to_string(), json!(meta.nodes.len()));
+            metrics.insert("urlStatsComplete".to_string(), json!(url_stats_complete));
         }
     }
 
@@ -425,9 +467,77 @@ pub(crate) fn merge(request: MergeRequest) -> MergedReport {
         histogram,
         body_histogram,
         error_types,
+        url_stats,
         meta,
         config_snapshot: config.to_string(),
     }
+}
+
+/// 合并单行 URL 统计：计数相加，极值取最大，错误样例保留第一条
+fn merge_url_row(
+    map: &mut BTreeMap<(String, String, i64), crate::models::UrlStatRow>,
+    row: &crate::models::UrlStatRow,
+) {
+    let key = (row.method.clone(), row.url.clone(), row.status_code);
+    let entry = map.entry(key).or_insert_with(|| crate::models::UrlStatRow {
+        method: row.method.clone(),
+        url: row.url.clone(),
+        status_code: row.status_code,
+        ..crate::models::UrlStatRow::default()
+    });
+    entry.requests += row.requests;
+    entry.success_count += row.success_count;
+    entry.error_count += row.error_count;
+    entry.sum_ms += row.sum_ms;
+    entry.bytes = entry.bytes.saturating_add(row.bytes);
+    if row.max_ms > entry.max_ms {
+        entry.max_ms = row.max_ms;
+        entry.max_at_ms = row.max_at_ms;
+        entry.max_request_id = row.max_request_id.clone();
+    }
+    if entry.error_message.is_none() {
+        entry.error_message = row.error_message.clone();
+    }
+}
+
+/// 合并后的键数上限保护：超出部分归入 `__other__`，并标记统计不完整
+fn clamp_url_rows(
+    rows: BTreeMap<(String, String, i64), crate::models::UrlStatRow>,
+    complete: &mut bool,
+) -> Vec<crate::models::UrlStatRow> {
+    const MAX_ROWS: usize = 2_000;
+    let mut items: Vec<crate::models::UrlStatRow> = rows.into_values().collect();
+    items.sort_by(|a, b| {
+        b.requests
+            .cmp(&a.requests)
+            .then_with(|| a.url.cmp(&b.url))
+            .then_with(|| a.status_code.cmp(&b.status_code))
+    });
+    if items.len() <= MAX_ROWS {
+        return items;
+    }
+    *complete = false;
+    let mut other = crate::models::UrlStatRow {
+        method: "__other__".to_string(),
+        url: "__other__".to_string(),
+        ..crate::models::UrlStatRow::default()
+    };
+    for row in items.drain(MAX_ROWS..) {
+        other.requests += row.requests;
+        other.success_count += row.success_count;
+        other.error_count += row.error_count;
+        other.sum_ms += row.sum_ms;
+        other.bytes = other.bytes.saturating_add(row.bytes);
+        if row.max_ms > other.max_ms {
+            other.max_ms = row.max_ms;
+            other.max_at_ms = row.max_at_ms;
+        }
+        if other.error_message.is_none() {
+            other.error_message = row.error_message;
+        }
+    }
+    items.push(other);
+    items
 }
 
 /// 合并各节点回传的池统计：同池按键累加，条目按下标累加，并记录贡献节点
@@ -504,8 +614,12 @@ fn merged_pools(nodes: &[MergeNode]) -> Vec<serde_json::Value> {
     merged
         .into_iter()
         .map(|(name, agg)| {
-            let per_item: Vec<serde_json::Value> = agg
-                .per_item
+            // 条目明细只用于 Excel；集群合并后按请求数保留 TopN，避免大池把 config_json 撑大
+            let mut per_items: Vec<(i64, i64)> = agg.per_item.into_iter().collect();
+            per_items.sort_by_key(|(_, requests)| std::cmp::Reverse(*requests));
+            per_items.truncate(crate::services::pool::PER_ITEM_TOP);
+            per_items.sort_by_key(|(index, _)| *index);
+            let per_item: Vec<serde_json::Value> = per_items
                 .into_iter()
                 .map(|(index, requests)| json!({ "index": index, "requests": requests }))
                 .collect();
@@ -585,7 +699,60 @@ pub(crate) fn done_from_outcome(outcome: &EngineOutcome) -> DonePayload {
             .and_then(|value| value.as_array())
             .cloned()
             .unwrap_or_default(),
+        url_stats: outcome.url_stats.clone(),
+        url_stats_complete: outcome.url_stats_complete,
     }
+}
+
+/// (总请求, 成功, 失败, 平均耗时, TPS, 出站带宽平均)
+type NodeLoadStats = (
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+);
+
+/// 节点施压明细：总/成功/失败、平均耗时、TPS、出站带宽平均
+///
+/// 有 `done` 时以节点上报的累计值为准；失联节点只有每秒采样，用采样汇总
+/// 请求数与耗时，出站字节无法还原（None），页面与导出显示「—」。
+fn node_load_stats(node: &MergeNode) -> NodeLoadStats {
+    if let Some(done) = &node.done {
+        let elapsed = (done.end_ms - done.start_ms).max(0) as f64 / 1000.0;
+        let avg = if done.total > 0 {
+            Some(done.sum_rt_ms as f64 / done.total as f64)
+        } else {
+            None
+        };
+        let tps = (elapsed > 0.0).then_some(done.total as f64 / elapsed);
+        let egress = (elapsed > 0.0).then_some(done.bytes_sent as f64 / elapsed / 1024.0);
+        return (
+            Some(done.total),
+            Some(done.success),
+            Some(done.errors),
+            avg,
+            tps,
+            egress,
+        );
+    }
+    let Some(first) = node.samples.first() else {
+        return (None, None, None, None, None, None);
+    };
+    let last = node.samples.last().unwrap_or(first);
+    let total: u64 = node
+        .samples
+        .iter()
+        .map(|sample| sample.success_count + sample.error_count)
+        .sum();
+    let success: u64 = node.samples.iter().map(|sample| sample.success_count).sum();
+    let errors: u64 = node.samples.iter().map(|sample| sample.error_count).sum();
+    let sum_rt: u64 = node.samples.iter().map(|sample| sample.sum_rt_ms).sum();
+    let span = (last.elapsed_sec.saturating_sub(first.elapsed_sec) + 1) as f64;
+    let avg = (total > 0).then(|| sum_rt as f64 / total as f64);
+    let tps = (span > 0.0).then_some(total as f64 / span);
+    (Some(total), Some(success), Some(errors), avg, tps, None)
 }
 
 /// 节点平均 QPS：优先用 done 的总量 / 时长，失联节点用采样窗口估算
@@ -984,6 +1151,8 @@ mod tests {
             records_dropped: 0,
             dropped_samples: 0,
             pools: Vec::new(),
+            url_stats: Vec::new(),
+            url_stats_complete: false,
         }
     }
 
@@ -1106,16 +1275,36 @@ mod tests {
         use crate::models::{ReportError, ReportRequestRecord, SlowRequest, StageSummary};
 
         let (dir, pool) = crate::notes::test_pool("cluster-merge-report");
+        let url_row = crate::models::UrlStatRow {
+            method: "GET".to_string(),
+            url: "https://a.test/p?token=******".to_string(),
+            status_code: 200,
+            requests: 100,
+            success_count: 100,
+            error_count: 0,
+            sum_ms: 1000.0,
+            max_ms: 50.0,
+            max_at_ms: Some(100),
+            bytes: 1000,
+            error_message: None,
+            max_request_id: None,
+        };
+        let mut first = done(100, vec![(10, 100)]);
+        first.url_stats = vec![url_row.clone()];
+        first.url_stats_complete = true;
+        let mut second = done(100, vec![(20, 100)]);
+        second.url_stats = vec![url_row];
+        second.url_stats_complete = true;
         let merged = merge(request(vec![
             node(
                 "master",
                 vec![sample(1, 10.0, 10, vec![(10, 10)])],
-                Some(done(100, vec![(10, 100)])),
+                Some(first),
             ),
             node(
                 "slave",
                 vec![sample(1, 10.0, 10, vec![(20, 10)])],
-                Some(done(100, vec![(20, 100)])),
+                Some(second),
             ),
         ]));
         let errors: Vec<ReportError> = Vec::new();
@@ -1135,6 +1324,7 @@ mod tests {
                 body_histogram: &merged.body_histogram,
                 slow_requests: &slow,
                 error_types: &merged.error_types,
+                url_stats: &merged.url_stats,
                 config: &merged.config_snapshot,
             },
         )
@@ -1160,8 +1350,101 @@ mod tests {
             )
             .unwrap();
         assert_eq!(samples, merged.samples.len() as i64);
+        let url_rows: (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), SUM(requests) FROM report_url_stats WHERE report_id = ?1",
+                rusqlite::params![report_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(url_rows, (1, 200));
         drop(conn);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn merge_sums_url_stats_and_tracks_max() {
+        let row = |requests: i64, max_ms: f64, at: i64| crate::models::UrlStatRow {
+            method: "GET".to_string(),
+            url: "https://a.test/p".to_string(),
+            status_code: 200,
+            requests,
+            success_count: requests,
+            error_count: 0,
+            sum_ms: requests as f64 * 10.0,
+            max_ms,
+            max_at_ms: Some(at),
+            bytes: requests * 100,
+            error_message: None,
+            max_request_id: None,
+        };
+        let mut first = done(100, vec![(10, 100)]);
+        first.url_stats = vec![row(10, 50.0, 100)];
+        first.url_stats_complete = true;
+        let mut second = done(100, vec![(10, 100)]);
+        second.url_stats = vec![row(5, 80.0, 200)];
+        second.url_stats_complete = true;
+        let merged = merge(request(vec![
+            node(
+                "master",
+                vec![sample(1, 10.0, 10, vec![(10, 10)])],
+                Some(first),
+            ),
+            node(
+                "slave",
+                vec![sample(1, 10.0, 10, vec![(10, 10)])],
+                Some(second),
+            ),
+        ]));
+        assert_eq!(merged.url_stats.len(), 1);
+        let row = &merged.url_stats[0];
+        assert_eq!(row.requests, 15);
+        assert_eq!(row.success_count, 15);
+        assert_eq!(row.max_ms, 80.0);
+        assert_eq!(row.max_at_ms, Some(200));
+        let master = merged
+            .meta
+            .nodes
+            .iter()
+            .find(|node| node.name == "master")
+            .unwrap();
+        assert_eq!(master.total_requests, Some(100));
+        assert_eq!(master.success_count, Some(100));
+        assert_eq!(master.error_count, Some(0));
+        assert_eq!(master.avg_rt_ms, Some(20.0));
+        assert_eq!(master.tps, Some(10.0));
+        assert!((master.egress_avg_kbps.unwrap() - 1000.0 / 10.0 / 1024.0).abs() < 1e-9);
+        let config: serde_json::Value = serde_json::from_str(&merged.config_snapshot).unwrap();
+        assert_eq!(config["metrics"]["urlStatsComplete"], true);
+    }
+
+    #[test]
+    fn merged_node_stats_keep_missing_egress_for_lost_node() {
+        let merged = merge(request(vec![node(
+            "lost-node",
+            vec![sample(1, 10.0, 10, vec![(10, 10)])],
+            None,
+        )]));
+        let node = &merged.meta.nodes[0];
+        assert_eq!(node.total_requests, Some(10));
+        assert_eq!(node.success_count, Some(10));
+        assert_eq!(node.error_count, Some(0));
+        assert_eq!(node.avg_rt_ms, Some(20.0));
+        assert_eq!(node.tps, Some(10.0));
+        // 每秒采样没有发送字节，出站带宽保持缺失，不推断
+        assert_eq!(node.egress_avg_kbps, None);
+    }
+
+    #[test]
+    fn merge_marks_url_stats_incomplete_for_old_node() {
+        // 旧节点有请求但 done 不带 url_stats：主节点必须标记统计不完整
+        let merged = merge(request(vec![node(
+            "master",
+            vec![sample(1, 10.0, 10, vec![(10, 10)])],
+            Some(done(100, vec![(10, 100)])),
+        )]));
+        let config: serde_json::Value = serde_json::from_str(&merged.config_snapshot).unwrap();
+        assert_eq!(config["metrics"]["urlStatsComplete"], false);
     }
 
     #[test]
@@ -1172,6 +1455,7 @@ mod tests {
                 plan_id: None,
                 run_group_id: None,
                 plan_name: "local".to_string(),
+                title: None,
                 request_id: None,
                 peak_qps: 0.0,
                 total_requests: 10,
@@ -1230,6 +1514,8 @@ mod tests {
                 errors_dropped: 2,
                 records_dropped: 3,
             },
+            url_stats: Vec::new(),
+            url_stats_complete: false,
             message: None,
         };
         let payload = done_from_outcome(&outcome);

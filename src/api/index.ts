@@ -671,12 +671,27 @@ export const reportExport = (id: number, path: string) =>
 export const reportWriteFile = (path: string, data: number[]) =>
   invoke<void>('report_write_file', { path, data })
 
+/** Excel 工作表的单元格：undefined 在序列化前统一转 null */
+export type ReportSheetCell = string | number | null
+export interface ReportSheetPayload {
+  name: string
+  rows: ReportSheetCell[][]
+}
+
+/** Excel 报告由后端流式写盘：前端只传汇总工作表，请求明细在 Rust 侧直接查库写入 */
+export const reportExportXlsx = (id: number, path: string, sheets: ReportSheetPayload[]) =>
+  invoke<void>('report_export_xlsx', { id, path, sheets })
+
 export const reportRequests = (id: number, page = 1, pageSize = 50, success?: boolean | null) =>
   invoke<ReportRequestsPage>('report_requests', { id, page, pageSize, success: success ?? null })
 
-/** 保存报告的场景描述与总结 */
-export const reportUpdateTexts = (id: number, scenarioText: string, summaryText: string) =>
-  invoke<void>('report_update_texts', { id, scenarioText, summaryText })
+/** 保存报告标题、场景描述与总结 */
+export const reportUpdateTexts = (
+  id: number,
+  title: string,
+  scenarioText: string,
+  summaryText: string,
+) => invoke<void>('report_update_texts', { id, title, scenarioText, summaryText })
 
 /** 清理某份报告的逐请求明细（保留汇总与采样） */
 export const reportClearDetails = (id: number) =>

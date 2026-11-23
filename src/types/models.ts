@@ -1,4 +1,4 @@
-import type { ClusterReportMeta, ReportPeaks } from './cluster'
+import type { ClusterReportMeta, ClusterReportNode, ReportPeaks } from './cluster'
 
 export interface Project {
   id: number
@@ -1219,6 +1219,8 @@ export interface ReportRequestsPage {
 export interface StressReport {
   id: number
   planName: string
+  /** 用户可编辑的报告标题；为空时展示回退到 planName */
+  title?: string | null
   requestId?: number | null
   /** 来源计划（v15 由任务注册表写入） */
   planId?: number | null
@@ -1442,6 +1444,8 @@ export interface RuntimeMetrics {
   /** 自动降档轨迹（1.6.3） */
   downgradeTrail?: Array<{ atSec: number; from: string; to: string; qps: number }>
   slowRequestCount?: number
+  /** URL 统计是否完整：键溢出或从节点未上报时为 false */
+  urlStatsComplete?: boolean
 }
 
 export interface ReportDetail {
@@ -1457,10 +1461,39 @@ export interface ReportDetail {
   config?: ReportConfigSnapshot | null
   /** TopN 慢请求快照（v15） */
   slowRequests?: SlowRequest[]
+  /** 按 URL 聚合的统计；旧报告为空 */
+  urlStats?: UrlStat[]
+  /** URL 统计是否完整；旧报告缺省为 false */
+  urlStatsComplete?: boolean
+  /** 施压机明细：集群为各节点，单机为本机 1 行；旧报告为空 */
+  loadGenerators?: ClusterReportNode[]
   /** 可编辑的测试场景描述 */
   scenarioText?: string | null
   /** 可编辑的报告总结 */
   summaryText?: string | null
+}
+
+/** 按 URL 聚合的统计：与是否记录请求明细无关 */
+export interface UrlStat {
+  method: string
+  url: string
+  /** 请求数最多的状态码；0 表示无响应错误 */
+  statusCode: number
+  requests: number
+  successCount: number
+  errorCount: number
+  avgMs: number
+  maxMs: number
+  maxAtMs?: number | null
+  /** 总耗时（小时） */
+  totalHours: number
+  /** 平均响应包（KB） */
+  avgKb: number
+  /** 总流量（MB） */
+  totalMb: number
+  errorMessage?: string | null
+  /** 状态码汇总，如 `200×100, 500×2` */
+  statusSummary?: string
 }
 
 /** 慢请求快照：定位模式与长稳报告使用 */

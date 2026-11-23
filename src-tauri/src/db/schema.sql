@@ -136,6 +136,11 @@ CREATE TABLE IF NOT EXISTS test_reports (
     body_histogram_json TEXT,
     -- TopN 慢请求快照，JSON 数组（v15）
     slow_requests_json  TEXT,
+    -- v22：列表页汇总标记。物化后列表查询不再读取整个 config_json
+    is_cluster     INTEGER DEFAULT 0,
+    peak_qps       REAL DEFAULT 0,
+    -- v23：用户可编辑的报告标题；为空时回退到 plan_name
+    report_title   TEXT,
     start_time     INTEGER,
     end_time       INTEGER,
     created_at     INTEGER NOT NULL
@@ -196,6 +201,27 @@ CREATE TABLE IF NOT EXISTS report_requests (
 );
 
 CREATE INDEX IF NOT EXISTS idx_report_requests_report ON report_requests(report_id, id);
+
+-- 按 URL 聚合的请求统计（v23）：与是否记录请求明细无关
+CREATE TABLE IF NOT EXISTS report_url_stats (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_id      INTEGER NOT NULL REFERENCES test_reports(id) ON DELETE CASCADE,
+    method         TEXT    NOT NULL DEFAULT 'GET',
+    url            TEXT    NOT NULL,
+    status_code    INTEGER NOT NULL DEFAULT 0,
+    requests       INTEGER NOT NULL DEFAULT 0,
+    success_count  INTEGER NOT NULL DEFAULT 0,
+    error_count    INTEGER NOT NULL DEFAULT 0,
+    sum_ms         REAL    NOT NULL DEFAULT 0,
+    max_ms         REAL    NOT NULL DEFAULT 0,
+    max_at_ms      INTEGER,
+    bytes          INTEGER NOT NULL DEFAULT 0,
+    error_message  TEXT,
+    max_request_id TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_url_stats_report
+    ON report_url_stats(report_id, status_code);
 
 -- 本机容量探测结果（v15）：分级加压测出的吞吐上限，保留最近 10 次
 CREATE TABLE IF NOT EXISTS machine_capacity (

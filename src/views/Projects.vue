@@ -149,7 +149,14 @@ onMounted(load)
           <div class="desc">{{ project.description || '暂无项目描述' }}</div>
           <div class="card-foot">
             <a-button type="text" size="small" @click="openEdit(project)"><EditOutlined /> 编辑</a-button>
-            <a-button type="text" size="small" danger @click="remove(project)"><DeleteOutlined /></a-button>
+            <a-button
+              type="text"
+              size="small"
+              danger
+              title="删除项目"
+              :aria-label="`删除项目 ${project.name}`"
+              @click="remove(project)"
+            ><DeleteOutlined /></a-button>
             <a-button type="primary" size="small" class="enter" @click="enter(project)">
               进入项目 <ArrowRightOutlined />
             </a-button>

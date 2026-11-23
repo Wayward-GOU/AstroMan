@@ -722,6 +722,7 @@ async fn run_slave(
         public_key: Some(slave_public),
         pool_columns: true,
         clock_recheck: true,
+        url_stats: true,
     }));
 
     let mut prepared: Option<PreparedStress> = None;
@@ -1601,6 +1602,8 @@ fn done_payload(outcome: &EngineOutcome, offset_ms: f64) -> DonePayload {
             .and_then(|value| value.as_array())
             .cloned()
             .unwrap_or_default(),
+        url_stats: outcome.url_stats.clone(),
+        url_stats_complete: outcome.url_stats_complete,
     }
 }
 

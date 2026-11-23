@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
 import {
@@ -15,12 +15,33 @@ import type { StressReport } from '@/types/models'
 const router = useRouter()
 const reports = ref<StressReport[]>([])
 const loading = ref(true)
+
+/** 报告展示标题：用户标题为空时回退到计划名称 */
+function reportTitle(report: StressReport) {
+  return report.title?.trim() || report.planName
+}
 /** 仅看集群报告（v1.1.2 第二批） */
 const clusterOnly = ref(false)
 
 const visibleReports = computed(() =>
   clusterOnly.value ? reports.value.filter((item) => item.isCluster) : reports.value,
 )
+
+/** 列表分页：报告数量多时不再一次性渲染 200 张卡片 */
+const page = ref(1)
+const pageSize = ref(20)
+const pagedReports = computed(() => {
+  const start = (page.value - 1) * pageSize.value
+  return visibleReports.value.slice(start, start + pageSize.value)
+})
+
+watch(clusterOnly, () => {
+  page.value = 1
+})
+watch(visibleReports, (list) => {
+  const maxPage = Math.max(1, Math.ceil(list.length / pageSize.value))
+  page.value = Math.min(page.value, maxPage)
+})
 
 async function load() {
   loading.value = true
@@ -83,7 +104,7 @@ function fmtSize(bytes: number): string {
 
 function remove(report: StressReport) {
   Modal.confirm({
-    title: `删除报告「${report.planName}」？`,
+    title: `删除报告「${reportTitle(report)}」？`,
     content: '报告以及对应的每秒采样与错误明细都会被删除，无法恢复。',
     okText: '删除',
     okType: 'danger',
@@ -167,7 +188,7 @@ function compareMetricRows() {
 
     <a-spin :spinning="loading">
       <div v-if="visibleReports.length" class="report-list">
-        <div v-for="report in visibleReports" :key="report.id" class="fm-card report-card">
+        <div v-for="report in pagedReports" :key="report.id" class="fm-card report-card">
           <div class="report-head">
             <div class="report-title">
               <a-checkbox
@@ -175,7 +196,7 @@ function compareMetricRows() {
                 @change="toggleSelect(report.id, !selectedIds.includes(report.id))"
               />
               <span class="status-dot" :class="{ stopped: report.status === 'stopped' }" />
-              <span class="name">{{ report.planName }}</span>
+              <span class="name">{{ reportTitle(report) }}</span>
               <span class="status-pill" :class="{ stopped: report.status === 'stopped' }">
                 {{ report.status === 'stopped' ? '已停止' : '已完成' }}
               </span>
@@ -237,7 +258,14 @@ function compareMetricRows() {
               }}
             </span>
             <div class="report-actions">
-              <a-button size="small" type="text" danger @click="remove(report)"><DeleteOutlined /></a-button>
+              <a-button
+                size="small"
+                type="text"
+                danger
+                title="删除报告"
+                :aria-label="`删除报告 ${reportTitle(report)}`"
+                @click="remove(report)"
+              ><DeleteOutlined /></a-button>
               <a-button size="small" @click="router.push(`/reports/${report.id}`)">
                 查看详情<ArrowRightOutlined />
               </a-button>
@@ -257,6 +285,16 @@ function compareMetricRows() {
           }}
         </div>
       </div>
+
+      <a-pagination
+        v-if="visibleReports.length > pageSize"
+        v-model:current="page"
+        :page-size="pageSize"
+        :total="visibleReports.length"
+        size="small"
+        show-less-items
+        class="report-pager"
+      />
     </a-spin>
 
     <a-modal v-model:open="compareOpen" title="压测报告对比" :footer="null" width="860px">
@@ -264,7 +302,7 @@ function compareMetricRows() {
         <div class="compare-row compare-head">
           <span class="compare-label">指标</span>
           <span v-for="report in compareReports" :key="report.id" class="compare-col">
-            <b>{{ report.planName }}</b>
+            <b>{{ reportTitle(report) }}</b>
             <i>{{ fmtTime(report.createdAt) }}</i>
           </span>
         </div>
@@ -314,6 +352,10 @@ function compareMetricRows() {
 .report-card {
   padding: 16px 18px;
   transition: border-color 0.18s;
+}
+.report-pager {
+  margin-top: 14px;
+  text-align: right;
 }
 .report-card:hover {
   border-color: var(--fm-border-strong);

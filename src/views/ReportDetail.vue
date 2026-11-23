@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, ref, shallowRef, triggerRef, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
+import dayjs, { type Dayjs } from 'dayjs'
 import { save } from '@tauri-apps/plugin-dialog'
 import {
   ArrowLeftOutlined,
@@ -12,10 +13,15 @@ import {
   DownOutlined,
   EyeOutlined,
   CopyOutlined,
+  PlayCircleOutlined,
 } from '@ant-design/icons-vue'
 import AiSparkIcon from '@/components/AiSparkIcon.vue'
 import PageHeader from '@/components/PageHeader.vue'
 import LineChart from '@/components/LineChart.vue'
+import CdfChart from '@/components/CdfChart.vue'
+import ScatterChart from '@/components/ScatterChart.vue'
+import BarChart from '@/components/BarChart.vue'
+import PieChart from '@/components/PieChart.vue'
 import { useAiAssistStore } from '@/stores/aiAssist'
 import { reportReviewPrompt } from '@/utils/aiScenarios'
 import { formatDateTime } from '@/utils/datetime'
@@ -25,18 +31,27 @@ import type {
   ReportDetail,
   ReportRequestRecord,
   ReportRequestsPage,
+  UrlStat,
 } from '@/types/models'
 import type { ClusterReportMeta, ClusterReportNode, SeriesPoint } from '@/types/cluster'
-import { buildReportHtml, buildReportSheets } from '@/utils/reportExport'
+import {
+  buildReportHtml,
+  buildReportSheets,
+  loadGeneratorsForReport,
+  REPORT_DISCLAIMER,
+} from '@/utils/reportExport'
 import { detectKnee, qpsOverview, reportPeaks, scoreReport, selfCheck } from '@/utils/reportAnalytics'
-import { buildFindings, gradeReport, latencyDrift, type Finding } from '@/utils/reportNarrative'
-import { buildXlsx } from '@/utils/xlsx'
+import { buildFindings, cdfPoints, gradeReport, latencyDrift, type Finding } from '@/utils/reportNarrative'
 import { copyToClipboard } from '@/utils/clipboard'
 
 const route = useRoute()
 const router = useRouter()
 
-const detail = ref<ReportDetail | null>(null)
+/**
+ * 报告详情是整块替换的只读数据（长压测可达数万条采样），
+ * 用 shallowRef 避免为每个采样点创建深层响应式代理。
+ */
+const detail = shallowRef<ReportDetail | null>(null)
 const loading = ref(true)
 const exporting = ref(false)
 /** 导出是否包含参数 / Token 池统计（只含计数，不含明文） */
@@ -185,12 +200,44 @@ function aiReview() {
   })
 }
 const samples = computed(() => detail.value?.samples ?? [])
+/** 每秒明细分页：避免 8 小时压测把数万行一次性塞进 DOM */
+const samplePage = ref(1)
+const samplePageSize = ref(200)
+const samplePageRows = computed(() => {
+  const start = (samplePage.value - 1) * samplePageSize.value
+  return samples.value.slice(start, start + samplePageSize.value)
+})
+watch(
+  () => detail.value?.report.id,
+  () => {
+    samplePage.value = 1
+  },
+)
+watch(samples, (list) => {
+  const maxPage = Math.max(1, Math.ceil(list.length / samplePageSize.value))
+  samplePage.value = Math.min(samplePage.value, maxPage)
+})
 const errors = computed(() => detail.value?.errors ?? [])
 const statusCodes = computed(() => detail.value?.statusCodes ?? [])
 const errorTypes = computed(() => detail.value?.errorTypes ?? [])
 const histogram = computed(() => detail.value?.histogram ?? [])
 const bodyHistogram = computed(() => detail.value?.bodyHistogram ?? [])
 const slowRequests = computed(() => detail.value?.slowRequests ?? [])
+/** 按 URL 聚合的统计：与是否记录请求明细无关 */
+const urlStats = computed(() => detail.value?.urlStats ?? [])
+const urlStatsComplete = computed(
+  () => detail.value?.urlStatsComplete ?? urlStats.value.length > 0,
+)
+/** 错误地址：只展示存在失败请求的 URL */
+const errorUrls = computed(() => urlStats.value.filter((item) => item.errorCount > 0))
+
+function urlSuccessRate(row: UrlStat) {
+  return row.requests > 0 ? (row.successCount / row.requests) * 100 : 0
+}
+
+function urlMaxAt(row: UrlStat) {
+  return row.maxAtMs == null || row.maxAtMs < 0 ? '—' : fmtDuration(row.maxAtMs)
+}
 /** 导出体积预估（1.4.3）：明细按 1KB 请求体 + 2KB 响应体上限估算 */
 const exportEstimate = computed(() => {
   const data = detail.value
@@ -214,6 +261,8 @@ const bytesSent = computed(() => metrics.value?.bytesSent ?? 0)
 const cluster = computed<ClusterReportMeta | null>(() => config.value?.cluster ?? null)
 const clusterNodes = computed(() => cluster.value?.nodes ?? [])
 const clusterPeaks = computed(() => cluster.value?.peaks ?? null)
+/** 施压机明细：单机 1 行、集群 N 行；旧报告缺失字段显示「—」 */
+const loadGenerators = computed(() => (detail.value ? loadGeneratorsForReport(detail.value) : []))
 /** 单机报告峰值专题（集群报告由 cluster.peaks 展示，不重复） */
 const singlePeaks = computed(() => (cluster.value ? null : detail.value ? reportPeaks(detail.value) : null))
 /** 集群总 QPS：各节点平均 QPS 相加，与合并口径一致 */
@@ -561,6 +610,7 @@ const statsRows = computed(() => {
   ]
 })
 
+const titleDraft = ref('')
 const scenarioDraft = ref('')
 const summaryDraft = ref('')
 const textSaving = ref(false)
@@ -568,6 +618,7 @@ const textSaving = ref(false)
 watch(
   detail,
   (value) => {
+    titleDraft.value = value?.report.title ?? ''
     scenarioDraft.value = value?.scenarioText ?? ''
     summaryDraft.value = value?.summaryText ?? ''
   },
@@ -578,17 +629,39 @@ async function saveTexts() {
   if (!report.value) return
   textSaving.value = true
   try {
-    await api.reportUpdateTexts(report.value.id, scenarioDraft.value, summaryDraft.value)
+    await api.reportUpdateTexts(
+      report.value.id,
+      titleDraft.value,
+      scenarioDraft.value,
+      summaryDraft.value,
+    )
     if (detail.value) {
+      detail.value.report.title = titleDraft.value.trim() || null
       detail.value.scenarioText = scenarioDraft.value
       detail.value.summaryText = summaryDraft.value
+      // shallowRef 不会追踪嵌套字段变更，这里手动触发一次视图更新
+      triggerRef(detail)
     }
-    message.success('已保存场景与总结')
+    message.success('已保存标题、场景与总结')
   } catch (e) {
     message.error(String(e))
   } finally {
     textSaving.value = false
   }
+}
+
+function rerunReport() {
+  const current = detail.value
+  if (!current) return
+  const query: Record<string, string> = { reportId: String(current.report.id) }
+  if (current.report.planId) {
+    // 计划最完整：直接按计划重新加载；计划被删时压测页会回退到报告快照
+    query.planId = String(current.report.planId)
+  } else if (current.report.requestId) {
+    // 无计划时按报告快照回填；带 requestId 时可复用请求定义
+    query.requestId = String(current.report.requestId)
+  }
+  void router.push({ name: 'stress', query })
 }
 
 function clearDetails() {
@@ -611,30 +684,253 @@ function clearDetails() {
   })
 }
 
-const chartLabels = computed(() => samples.value.map((s) => `${s.elapsedSec}s`))
+/** 趋势图时间范围：只作用于基于每秒采样的折线/散点图，构成图仍按全报告口径 */
+const chartRange = ref<[number, number]>([0, 0])
+const sampleMin = computed(() => samples.value[0]?.elapsedSec ?? 0)
+const sampleMax = computed(() => samples.value[samples.value.length - 1]?.elapsedSec ?? 0)
+watch(
+  samples,
+  (list) => {
+    chartRange.value = list.length
+      ? [list[0].elapsedSec, list[list.length - 1].elapsedSec]
+      : [0, 0]
+  },
+  { immediate: true },
+)
+const chartSamples = computed(() => {
+  const list = samples.value
+  if (!list.length) return []
+  const [first, second] = chartRange.value
+  const start = Math.min(first, second)
+  const end = Math.max(first, second)
+  return list.filter((item) => item.elapsedSec >= start && item.elapsedSec <= end)
+})
+function resetChartRange() {
+  chartRange.value = [sampleMin.value, sampleMax.value]
+}
+function onChartRangeChange(value: number | [number, number]) {
+  if (Array.isArray(value)) chartRange.value = [value[0], value[1]]
+}
+
+/** 采样秒数换算成报告开始后的完整时钟时间；缺失开始时间时回退到秒数 */
+function elapsedClock(sec: number) {
+  const start = report.value?.startTime
+  if (!start) return `${sec}s`
+  const date = new Date(start + sec * 1000)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(
+    date.getHours(),
+  )}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+}
+
+/** 时间选择器与滑块共用 chartRange（elapsedSec），保证两种入口口径一致 */
+const rangePickerValue = computed<[Dayjs, Dayjs] | null>(() => {
+  const start = report.value?.startTime
+  if (!start || samples.value.length < 2) return null
+  return [dayjs(start + chartRange.value[0] * 1000), dayjs(start + chartRange.value[1] * 1000)]
+})
+
+function onRangePickerChange(value: unknown) {
+  const start = report.value?.startTime
+  if (!start || !Array.isArray(value) || value.length !== 2) return
+  const [first, second] = value as Array<Dayjs | null>
+  if (!first || !second) return
+  const clamp = (ms: number) =>
+    Math.min(sampleMax.value, Math.max(sampleMin.value, Math.round((ms - start) / 1000)))
+  const begin = clamp(first.valueOf())
+  const end = clamp(second.valueOf())
+  chartRange.value = [Math.min(begin, end), Math.max(begin, end)]
+}
+
+const rangeText = computed(
+  () =>
+    `${elapsedClock(chartRange.value[0])} – ${elapsedClock(chartRange.value[1])} · ` +
+    `${chartSamples.value.length} / ${samples.value.length} 个采样点`,
+)
+
+const chartLabels = computed(() => chartSamples.value.map((s) => elapsedClock(s.elapsedSec)))
 
 const qpsSeries = computed(() => [
-  { name: 'QPS', color: 'var(--fm-primary)', values: samples.value.map((s) => s.qps) },
-  { name: '并发', color: 'var(--fm-muted)', values: samples.value.map((s) => s.concurrent) },
+  { name: 'QPS', color: 'var(--fm-primary)', values: chartSamples.value.map((s) => s.qps) },
+])
+
+/** 并发请求数单独成图，避免与 QPS 混在同一纵轴 */
+const concurrencySeries = computed(() => [
+  {
+    name: '并发请求数',
+    color: 'var(--fm-muted)',
+    values: chartSamples.value.map((s) => s.concurrent),
+  },
+])
+
+/** 平均响应时间单独成图，与分位图分开看趋势 */
+const avgRtSeries = computed(() => [
+  {
+    name: '平均响应时间',
+    color: 'var(--fm-primary)',
+    values: chartSamples.value.map((s) => s.avgRt),
+  },
 ])
 
 const latencySeries = computed(() => [
-  { name: '平均', color: 'var(--fm-primary)', values: samples.value.map((s) => s.avgRt) },
-  { name: 'P50', color: 'var(--fm-json-key)', values: samples.value.map((s) => s.p50Rt) },
-  { name: 'P95', color: 'var(--fm-warning)', values: samples.value.map((s) => s.p95Rt) },
-  { name: 'P99', color: 'var(--fm-danger)', values: samples.value.map((s) => s.p99Rt) },
+  { name: '平均', color: 'var(--fm-primary)', values: chartSamples.value.map((s) => s.avgRt) },
+  { name: 'P50', color: 'var(--fm-json-key)', values: chartSamples.value.map((s) => s.p50Rt) },
+  { name: 'P95', color: 'var(--fm-warning)', values: chartSamples.value.map((s) => s.p95Rt) },
+  { name: 'P99', color: 'var(--fm-danger)', values: chartSamples.value.map((s) => s.p99Rt) },
 ])
 
 const errorSeries = computed(() => [
   {
     name: '错误率',
     color: 'var(--fm-danger)',
-    values: samples.value.map((s) => {
+    values: chartSamples.value.map((s) => {
       const total = s.successCount + s.errorCount
       return total > 0 ? (s.errorCount / total) * 100 : 0
     }),
   },
 ])
+
+/** 响应时间累积分布：直接复用导出口径，忽略零计数与开放区间上限 */
+const cdfSeries = computed(() => (detail.value ? cdfPoints(detail.value) : []))
+/** QPS 与平均响应时间散点：观察吞吐上升时延迟是否恶化 */
+const qpsLatencyPoints = computed(() =>
+  chartSamples.value
+    .filter((item) => item.qps > 0 && Number.isFinite(item.avgRt))
+    .map((item) => ({ x: item.qps, y: item.avgRt })),
+)
+/** 接收带宽趋势（KB/s） */
+const bandwidthSeries = computed(() => [
+  {
+    name: '接收带宽',
+    color: 'var(--fm-primary)',
+    values: chartSamples.value.map((item) => item.bytes / 1024),
+  },
+])
+/** TTFB 与响应体读取耗时 */
+const ttfbBodySeries = computed(() => {
+  const series = [
+    {
+      name: 'TTFB',
+      color: '#6b5b95',
+      values: chartSamples.value.map((item) => item.ttfbAvg),
+    },
+  ]
+  if (chartSamples.value.some((item) => item.bodyAvg > 0)) {
+    series.push({
+      name: 'Body 平均',
+      color: '#17774a',
+      values: chartSamples.value.map((item) => item.bodyAvg),
+    })
+  }
+  return series
+})
+/** URL 平均响应对比：单 URL 时没有对比意义 */
+const urlCompareItems = computed(() =>
+  urlStats.value.length > 1
+    ? urlStats.value.slice(0, 12).map((row) => ({
+        label: `${row.method} ${row.url}`,
+        value: row.avgMs,
+        sub: `${fmtNum(row.requests, 0)} 次`,
+      }))
+    : [],
+)
+/** 施压机 TPS 对比：单机时省略 */
+const generatorCompareItems = computed(() =>
+  loadGenerators.value.length > 1
+    ? loadGenerators.value
+        .filter((node) => node.tps != null)
+        .map((node) => ({
+          label: node.name,
+          value: node.tps ?? 0,
+          sub: `${fmtNum(node.concurrent, 0)} 并发`,
+        }))
+    : [],
+)
+
+/** 成功 / 失败 QPS：每秒成功与失败请求数 */
+const successQpsSeries = computed(() => [
+  {
+    name: '成功 QPS',
+    color: 'var(--fm-success)',
+    values: chartSamples.value.map((item) => item.successCount),
+  },
+])
+const failureQpsSeries = computed(() => [
+  {
+    name: '失败 QPS',
+    color: 'var(--fm-danger)',
+    values: chartSamples.value.map((item) => item.errorCount),
+  },
+])
+const successFailureSeries = computed(() => [
+  {
+    name: '成功 QPS',
+    color: 'var(--fm-success)',
+    values: chartSamples.value.map((item) => item.successCount),
+  },
+  {
+    name: '失败 QPS',
+    color: 'var(--fm-danger)',
+    values: chartSamples.value.map((item) => item.errorCount),
+  },
+])
+/** 请求结果构成 */
+const resultPieItems = computed(() =>
+  report.value
+    ? [
+        { label: '成功', value: report.value.successCount, color: '#2A7253' },
+        { label: '失败', value: report.value.errorCount, color: '#A83A2C' },
+      ]
+    : [],
+)
+/** 状态码构成：按数量取前 8 个 */
+const statusPieItems = computed(() =>
+  [...statusCodes.value]
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 8)
+    .map((item) => ({
+      label: `状态码 ${item.code}`,
+      value: item.count,
+      color:
+        item.code >= 500
+          ? '#A83A2C'
+          : item.code >= 400
+            ? '#9C6414'
+            : item.code >= 300
+              ? '#37628F'
+              : '#14655A',
+    })),
+)
+/** 错误类型构成：按数量取前 8 个 */
+const errorTypePieItems = computed(() =>
+  [...errorTypes.value]
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 8)
+    .map((item) => ({ label: item.errorType, value: item.count })),
+)
+/** 流量构成：接收 / 发送 */
+const trafficPieItems = computed(() =>
+  report.value
+    ? [
+        { label: '接收', value: report.value.bytesTotal, color: '#37628f' },
+        { label: '发送', value: bytesSent.value, color: '#9c6414' },
+      ]
+    : [],
+)
+const stageQpsItems = computed(() =>
+  stages.value.map((item, index) => ({
+    label: `阶段 ${index + 1}`,
+    value: item.avgQps,
+    sub: `${fmtNum(item.concurrent, 0)} 并发`,
+  })),
+)
+const stageP95Items = computed(() =>
+  stages.value.map((item, index) => ({
+    label: `阶段 ${index + 1}`,
+    value: item.p95Rt,
+    sub: `${fmtNum(item.concurrent, 0)} 并发`,
+  })),
+)
 
 const durationSec = computed(() => {
   if (!report.value?.startTime || !report.value?.endTime) return 0
@@ -654,6 +950,10 @@ const durationLabel = computed(() => {
 })
 
 const successRate = computed(() => 100 - (report.value?.errorRate ?? 0))
+/** 成功率配色：≥99% 正常、≥95% 关注、其余风险 */
+const successTone = computed(() =>
+  successRate.value >= 99 ? 'ok' : successRate.value >= 95 ? 'warn' : 'bad',
+)
 
 const percentileRows = computed(() => {
   const r = report.value
@@ -802,7 +1102,13 @@ const maxCodeCount = computed(() => Math.max(1, ...statusCodes.value.map((s) => 
 const codeTotal = computed(() => statusCodes.value.reduce((sum, s) => sum + s.count, 0))
 const maxErrorTypeCount = computed(() => Math.max(1, ...errorTypes.value.map((e) => e.count)))
 
-const modeLabel = computed(() => (config.value?.mode === 'stages' ? '阶梯加压' : '固定并发'))
+/** 压测模式文案：集群报告 mode 为 cluster，用阶梯阶段数还原成「分布式压测（阶梯/固定）」 */
+const modeLabel = computed(() => {
+  const cfg = config.value
+  const stages = cfg?.stages?.length ?? 0
+  if (cfg?.mode === 'cluster') return `分布式压测（${stages > 0 ? '阶梯' : '固定'}）`
+  return cfg?.mode === 'stages' ? '阶梯加压' : '固定并发'
+})
 
 function fmtNum(v: number | undefined | null, digits = 1) {
   if (v === undefined || v === null || Number.isNaN(v)) return '-'
@@ -866,7 +1172,7 @@ async function exportReport(format: ExportFormat) {
   const data = detail.value
   if (!current || !data) return
   const meta = EXPORT_META[format]
-  const safeName = current.planName.replace(/[\\/:*?"<>|]/g, '_')
+  const safeName = (current.title || current.planName).replace(/[\\/:*?"<>|]/g, '_')
   exporting.value = true
   try {
     const path = await save({
@@ -886,17 +1192,47 @@ async function exportReport(format: ExportFormat) {
       message.success(`已导出 ${meta.label}，共 ${rows.toLocaleString()} 行`)
       return
     } else {
-      const records = await api.reportRequests(current.id, 1, 50000, null)
+      // HTML 报告只用到首屏明细兜底目标地址与 Top10 慢请求；
+      // Excel 的请求明细改由后端直接查库写入，前端同样只需要一条地址兜底。
+      const htmlMode = format === 'html'
+      const recordLimit = htmlMode
+        ? (data.slowRequests?.length ?? 0) > 0
+          ? 200
+          : 2000
+        : 1
+      const records = await api.reportRequests(current.id, 1, recordLimit, null)
+      // 基线报告单独拉取，导出时直接写进报告，避免阅读者再去翻另一份
+      let baselineDetail: ReportDetail | null = null
+      const baselineId = data.config?.baselineReportId
+      if (baselineId && baselineId !== current.id) {
+        try {
+          baselineDetail = await api.reportGet(baselineId)
+        } catch {
+          baselineDetail = null
+          message.warning('基线报告不存在或已删除，本次导出不含基线对比')
+        }
+      }
       if (format === 'html') {
         const bytes = new TextEncoder().encode(
-          buildReportHtml(data, records.items, { includePools: includePoolStats.value }),
+          buildReportHtml(data, records.items, {
+            includePools: includePoolStats.value,
+            baseline: baselineDetail,
+          }),
         )
         await api.reportWriteFile(target, Array.from(bytes))
       } else {
-        const bytes = buildXlsx(
-          buildReportSheets(data, records.items, { includePools: includePoolStats.value }),
-        )
-        await api.reportWriteFile(target, Array.from(bytes))
+        const sheets = buildReportSheets(data, records.items, {
+          includePools: includePoolStats.value,
+          baseline: baselineDetail,
+          includeRequestRows: false,
+          includeSampleRows: false,
+        })
+        // undefined 在 IPC 序列化前统一成 null，避免后端按缺失字段处理
+        const payload = sheets.map((sheet) => ({
+          name: sheet.name,
+          rows: sheet.rows.map((row) => row.map((cell) => (cell === undefined ? null : cell))),
+        }))
+        await api.reportExportXlsx(current.id, target, payload)
       }
     }
     message.success(`已导出 ${meta.label}`)
@@ -948,6 +1284,10 @@ function remove() {
         <template #icon><ArrowLeftOutlined /></template>
         返回列表
       </a-button>
+      <a-button :disabled="!detail" @click="rerunReport">
+        <template #icon><PlayCircleOutlined /></template>
+        再次运行
+      </a-button>
       <a-checkbox
         v-if="detail?.config?.pools?.length"
         v-model:checked="includePoolStats"
@@ -988,7 +1328,7 @@ function remove() {
           <div class="overview-main">
             <div class="title-row">
               <span class="status-dot" :class="{ stopped: report.status === 'stopped' }" />
-              <h2 class="report-name">{{ report.planName }}</h2>
+              <h2 class="report-name">{{ report.title?.trim() || report.planName }}</h2>
               <span class="status-pill" :class="{ stopped: report.status === 'stopped' }">
                 {{ report.status === 'stopped' ? '已停止' : '已完成' }}
               </span>
@@ -1082,43 +1422,43 @@ function remove() {
         </div>
 
         <div class="metrics">
-          <div class="metric-card fm-card">
+          <div class="metric-card fm-card tone-accent">
             <span class="m-label">总请求</span>
-            <span class="m-value mono">{{ report.totalRequests.toLocaleString() }}</span>
+            <span class="m-value mono accent">{{ report.totalRequests.toLocaleString() }}</span>
           </div>
-          <div class="metric-card fm-card">
+          <div class="metric-card fm-card" :class="`tone-${successTone}`">
             <span class="m-label">成功率</span>
-            <span class="m-value mono" :class="{ bad: successRate < 99 }">{{ successRate.toFixed(2) }}<i>%</i></span>
+            <span class="m-value mono" :class="successTone">{{ successRate.toFixed(2) }}<i>%</i></span>
           </div>
-          <div class="metric-card fm-card">
+          <div class="metric-card fm-card tone-accent">
             <span class="m-label">平均 QPS</span>
-            <span class="m-value mono">{{ fmtNum(qps?.avg) }}</span>
+            <span class="m-value mono accent">{{ fmtNum(qps?.avg) }}</span>
           </div>
-          <div class="metric-card fm-card">
+          <div class="metric-card fm-card tone-info">
             <span class="m-label">峰值 QPS</span>
-            <span class="m-value mono">{{ fmtNum(qps?.max) }}</span>
+            <span class="m-value mono info">{{ fmtNum(qps?.max) }}</span>
           </div>
-          <div class="metric-card fm-card" title="每秒采样 QPS 的 P10：90% 的时间吞吐不低于该值，已剔除升压段与首末不完整秒">
+          <div class="metric-card fm-card tone-ok" title="每秒采样 QPS 的 P10：90% 的时间吞吐不低于该值，已剔除升压段与首末不完整秒">
             <span class="m-label">90% 分布 QPS</span>
-            <span class="m-value mono">{{ fmtNum(qps?.ninety) }}</span>
+            <span class="m-value mono ok">{{ fmtNum(qps?.ninety) }}</span>
           </div>
-          <div class="metric-card fm-card" title="平均 QPS ÷ 并发数，用于对比不同并发档位下单连接的吞吐效率">
+          <div class="metric-card fm-card tone-violet" title="平均 QPS ÷ 并发数，用于对比不同并发档位下单连接的吞吐效率">
             <span class="m-label">单并发 QPS</span>
-            <span class="m-value mono">{{ fmtNum(qps?.perConcurrent, 2) }}</span>
+            <span class="m-value mono violet">{{ fmtNum(qps?.perConcurrent, 2) }}</span>
           </div>
-          <div class="metric-card fm-card">
+          <div class="metric-card fm-card tone-info">
             <span class="m-label">平均延迟</span>
-            <span class="m-value mono">{{ fmtNum(report.avgRt) }}<i>ms</i></span>
+            <span class="m-value mono info">{{ fmtNum(report.avgRt) }}<i>ms</i></span>
           </div>
-          <div class="metric-card fm-card">
+          <div class="metric-card fm-card tone-warn">
             <span class="m-label">P95 延迟</span>
             <span class="m-value mono warn">{{ fmtNum(report.p95Rt) }}<i>ms</i></span>
           </div>
-          <div class="metric-card fm-card">
+          <div class="metric-card fm-card tone-bad">
             <span class="m-label">P99 延迟</span>
             <span class="m-value mono bad">{{ fmtNum(report.p99Rt) }}<i>ms</i></span>
           </div>
-          <div class="metric-card fm-card">
+          <div class="metric-card fm-card" :class="`tone-${apdexGrade.tone}`">
             <span class="m-label">APDEX</span>
             <span class="m-value mono" :class="apdexGrade.tone">{{ report.apdex.toFixed(3) }}
               <i class="m-tag" :class="apdexGrade.tone">{{ apdexGrade.label }}</i>
@@ -1217,10 +1557,19 @@ function remove() {
         <div class="fm-card text-card">
           <div class="card-head">
             <div>
-              <div class="card-title">测试场景与报告总结</div>
-              <div class="card-sub">可编辑，保存后随报告归档，并同步进入 HTML 报告</div>
+              <div class="card-title">报告标题、测试场景与总结</div>
+              <div class="card-sub">可编辑，保存后随报告归档，并同步进入 HTML / Excel 报告</div>
             </div>
             <a-button size="small" :loading="textSaving" @click="saveTexts">保存</a-button>
+          </div>
+          <div class="text-field">
+            <span class="text-label">报告标题</span>
+            <a-input
+              v-model:value="titleDraft"
+              :maxlength="160"
+              allow-clear
+              placeholder="留空时使用压测计划名称"
+            />
           </div>
           <div class="text-grid">
             <div class="text-field">
@@ -1413,13 +1762,119 @@ function remove() {
           </div>
         </div>
 
+        <div class="section-head">
+          <div>
+            <h2 class="section-title">统计分析</h2>
+            <div class="section-desc">
+              成功 / 失败 QPS、请求结果、状态码、错误类型、流量构成与阶段对比；时间范围只作用于趋势图
+            </div>
+          </div>
+        </div>
+
+        <div v-if="samples.length > 1" class="chart-range">
+          <span class="range-title">趋势图时间范围</span>
+          <a-range-picker
+            v-if="rangePickerValue"
+            class="range-picker"
+            show-time
+            :value="rangePickerValue"
+            :allow-clear="false"
+            format="YYYY-MM-DD HH:mm:ss"
+            @change="onRangePickerChange"
+          />
+          <a-slider
+            class="range-slider"
+            range
+            :min="sampleMin"
+            :max="Math.max(sampleMin + 1, sampleMax)"
+            :value="chartRange"
+            @change="onChartRangeChange"
+          />
+          <span class="range-text mono">{{ rangeText }}</span>
+          <a-button size="small" @click="resetChartRange">全部</a-button>
+        </div>
+
+        <template v-if="samples.length > 1">
+          <div class="period-head">
+            <span class="period-title">分时段趋势</span>
+            <span class="period-sub">
+              按上方所选时间段展示成功 QPS、失败 QPS、并发请求数与平均响应时间
+            </span>
+          </div>
+          <div class="charts period-charts">
+            <div class="fm-card chart-card">
+              <div class="chart-head">
+                <span class="chart-title">成功 QPS</span>
+                <span class="chart-sub">每秒成功请求数</span>
+              </div>
+              <LineChart
+                :series="successQpsSeries"
+                :labels="chartLabels"
+                :height="200"
+                :area="false"
+              />
+            </div>
+            <div class="fm-card chart-card">
+              <div class="chart-head">
+                <span class="chart-title">失败 QPS</span>
+                <span class="chart-sub">每秒失败请求数</span>
+              </div>
+              <LineChart
+                :series="failureQpsSeries"
+                :labels="chartLabels"
+                :height="200"
+                :area="false"
+              />
+            </div>
+            <div class="fm-card chart-card">
+              <div class="chart-head">
+                <span class="chart-title">并发请求数</span>
+                <span class="chart-sub">所选时间段内的并发趋势</span>
+              </div>
+              <LineChart
+                :series="concurrencySeries"
+                :labels="chartLabels"
+                :height="200"
+                :area="false"
+              />
+            </div>
+            <div class="fm-card chart-card">
+              <div class="chart-head">
+                <span class="chart-title">平均响应时间</span>
+                <span class="chart-sub">单位 ms</span>
+              </div>
+              <LineChart
+                :series="avgRtSeries"
+                :labels="chartLabels"
+                unit="ms"
+                :height="200"
+                :area="false"
+              />
+            </div>
+          </div>
+        </template>
+
         <div class="charts">
           <div class="fm-card chart-card">
             <div class="chart-head">
-              <span class="chart-title">吞吐与并发</span>
-              <span class="chart-sub">QPS 与实时并发数</span>
+              <span class="chart-title">吞吐量</span>
+              <span class="chart-sub">每秒完成请求数（QPS）</span>
             </div>
             <LineChart :series="qpsSeries" :labels="chartLabels" :area="false" />
+          </div>
+          <div class="fm-card chart-card">
+            <div class="chart-head">
+              <span class="chart-title">并发请求数</span>
+              <span class="chart-sub">每秒实际并发数，观察加压与降压过程</span>
+            </div>
+            <LineChart :series="concurrencySeries" :labels="chartLabels" :area="false" />
+          </div>
+          <div class="fm-card chart-card">
+            <div class="chart-head">
+              <span class="chart-title">平均响应时间</span>
+              <span class="chart-sub">每秒平均耗时，单位 ms</span>
+            </div>
+            <LineChart :series="avgRtSeries" :labels="chartLabels" unit="ms" :area="false" />
           </div>
           <div class="fm-card chart-card">
             <div class="chart-head">
@@ -1472,6 +1927,100 @@ function remove() {
               </div>
             </div>
             <div v-else class="inline-empty">历史报告未记录响应体耗时直方图</div>
+          </div>
+          <div class="fm-card chart-card">
+            <div class="chart-head">
+              <span class="chart-title">响应时间累积分布</span>
+              <span class="chart-sub">横轴 ms · 纵轴累积占比，由直方图还原</span>
+            </div>
+            <CdfChart :points="cdfSeries" />
+          </div>
+          <div class="fm-card chart-card">
+            <div class="chart-head">
+              <span class="chart-title">QPS 与平均响应时间</span>
+              <span class="chart-sub">每点为一秒采样，观察吞吐上升时延迟是否恶化</span>
+            </div>
+            <ScatterChart :points="qpsLatencyPoints" x-unit="req/s" y-unit="ms" />
+          </div>
+          <div class="fm-card chart-card">
+            <div class="chart-head">
+              <span class="chart-title">接收带宽趋势</span>
+              <span class="chart-sub">每秒接收字节折算，单位 KB/s</span>
+            </div>
+            <LineChart :series="bandwidthSeries" :labels="chartLabels" unit="KB/s" :area="false" />
+          </div>
+          <div class="fm-card chart-card">
+            <div class="chart-head">
+              <span class="chart-title">TTFB 与响应体读取耗时</span>
+              <span class="chart-sub">区分首字节等待与服务端/传输读取，单位 ms</span>
+            </div>
+            <LineChart :series="ttfbBodySeries" :labels="chartLabels" unit="ms" :area="false" />
+          </div>
+          <div v-if="urlCompareItems.length" class="fm-card chart-card">
+            <div class="chart-head">
+              <span class="chart-title">URL 平均响应时间对比</span>
+              <span class="chart-sub">按地址对比平均耗时，最多展示前 12 个</span>
+            </div>
+            <BarChart :items="urlCompareItems" unit="ms" :digits="0" />
+          </div>
+          <div v-if="generatorCompareItems.length" class="fm-card chart-card">
+            <div class="chart-head">
+              <span class="chart-title">施压机 TPS 对比</span>
+              <span class="chart-sub">各施压机自身窗口内的总请求 / 施压时长</span>
+            </div>
+            <BarChart :items="generatorCompareItems" unit="TPS" :digits="1" />
+          </div>
+          <div class="fm-card chart-card">
+            <div class="chart-head">
+              <span class="chart-title">成功 / 失败 QPS</span>
+              <span class="chart-sub">每秒成功与失败请求数</span>
+            </div>
+            <LineChart :series="successFailureSeries" :labels="chartLabels" :area="false" />
+          </div>
+          <div class="fm-card chart-card">
+            <div class="chart-head">
+              <span class="chart-title">请求结果构成</span>
+              <span class="chart-sub">成功与失败请求占比</span>
+            </div>
+            <PieChart :items="resultPieItems" />
+          </div>
+          <div class="fm-card chart-card">
+            <div class="chart-head">
+              <span class="chart-title">状态码构成</span>
+              <span class="chart-sub">按状态码请求数占比，最多展示前 8 个</span>
+            </div>
+            <PieChart :items="statusPieItems" />
+          </div>
+          <div class="fm-card chart-card">
+            <div class="chart-head">
+              <span class="chart-title">错误类型构成</span>
+              <span class="chart-sub">按错误类型次数占比，最多展示前 8 个</span>
+            </div>
+            <PieChart :items="errorTypePieItems" />
+          </div>
+          <div class="fm-card chart-card">
+            <div class="chart-head">
+              <span class="chart-title">流量构成</span>
+              <span class="chart-sub">接收与发送字节占比</span>
+            </div>
+            <PieChart
+              :items="trafficPieItems"
+              :center-text="fmtBytes((report?.bytesTotal ?? 0) + bytesSent)"
+            />
+          </div>
+          <div v-if="stages.length > 1" class="fm-card chart-card">
+            <div class="chart-head">
+              <span class="chart-title">阶段平均 QPS 对比</span>
+              <span class="chart-sub">各阶段平均吞吐，观察扩展效率</span>
+            </div>
+            <BarChart :items="stageQpsItems" unit="QPS" :digits="0" />
+          </div>
+          <div v-if="stages.length > 1" class="fm-card chart-card">
+            <div class="chart-head">
+              <span class="chart-title">阶段 P95 响应时间对比</span>
+              <span class="chart-sub">各阶段尾延迟，观察并发上升后的恶化</span>
+            </div>
+            <BarChart :items="stageP95Items" unit="ms" :digits="0" />
           </div>
         </div>
 
@@ -1549,7 +2098,7 @@ function remove() {
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="s in samples" :key="s.elapsedSec">
+                <tr v-for="s in samplePageRows" :key="s.elapsedSec">
                   <td class="mono">{{ s.elapsedSec }}</td>
                   <td class="mono">{{ s.concurrent }}</td>
                   <td class="mono">{{ s.qps }}</td>
@@ -1564,6 +2113,15 @@ function remove() {
                 </tr>
               </tbody>
             </table>
+            <a-pagination
+              v-if="samples.length > samplePageSize"
+              v-model:current="samplePage"
+              :page-size="samplePageSize"
+              :total="samples.length"
+              size="small"
+              show-less-items
+              class="table-pager"
+            />
             <div v-if="!samples.length" class="inline-empty">没有采样数据</div>
           </div>
         </div>
@@ -1624,7 +2182,7 @@ function remove() {
           <div v-if="config" class="config-grid">
             <div class="config-item">
               <span class="c-label">加压模式</span>
-              <span class="c-value mono">{{ config.mode === 'stages' ? '阶梯加压' : '固定并发' }}</span>
+              <span class="c-value mono">{{ modeLabel }}</span>
             </div>
             <div class="config-item">
               <span class="c-label">请求方法</span>
@@ -1713,6 +2271,67 @@ function remove() {
               <span class="hero-value">{{ fmtBytes(singlePeaks.bandwidth.value) }}/s</span>
               <span class="hero-sub">最高错误率 {{ singlePeaks.errorRate.value.toFixed(2) }}%</span>
             </div>
+          </div>
+        </div>
+
+        <div v-if="loadGenerators.length" class="fm-card table-card">
+          <div class="card-head">
+            <div>
+              <div class="card-title">施压机详情</div>
+              <div class="card-sub">单机 1 行、集群按节点展开；缺失字段显示「—」，不做推断</div>
+            </div>
+          </div>
+          <div class="data-table cluster-nodes">
+            <table>
+              <thead>
+                <tr>
+                  <th>施压机</th>
+                  <th class="col-narrow">角色</th>
+                  <th>地址</th>
+                  <th>开始时间</th>
+                  <th>总请求</th>
+                  <th>成功 / 失败</th>
+                  <th class="col-narrow">并发</th>
+                  <th>成功率</th>
+                  <th>平均耗时</th>
+                  <th>TPS</th>
+                  <th>出站带宽平均</th>
+                  <th>状态</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="node in loadGenerators" :key="`lg-${node.role}-${node.name}`">
+                  <td class="mono">{{ node.name }}</td>
+                  <td class="col-narrow">{{ node.role === 'master' ? '主节点' : '从节点' }}</td>
+                  <td class="mono">{{ node.addr || '—' }}</td>
+                  <td class="mono">{{ node.startMs ? fmtTime(node.startMs) : '—' }}</td>
+                  <td class="mono">{{ node.totalRequests == null ? '—' : fmtNum(node.totalRequests, 0) }}</td>
+                  <td class="mono">
+                    {{ node.successCount == null ? '—' : fmtNum(node.successCount, 0) }}
+                    /
+                    <span :class="{ bad: (node.errorCount ?? 0) > 0 }">
+                      {{ node.errorCount == null ? '—' : fmtNum(node.errorCount, 0) }}
+                    </span>
+                  </td>
+                  <td class="col-narrow mono">{{ fmtNum(node.concurrent, 0) }}</td>
+                  <td class="mono">
+                    {{
+                      node.totalRequests != null && node.totalRequests > 0 && node.successCount != null
+                        ? `${((node.successCount / node.totalRequests) * 100).toFixed(2)}%`
+                        : '—'
+                    }}
+                  </td>
+                  <td class="mono">{{ node.avgRtMs == null ? '—' : `${fmtNum(node.avgRtMs, 0)} ms` }}</td>
+                  <td class="mono">{{ node.tps == null ? '—' : fmtNum(node.tps, 1) }}</td>
+                  <td class="mono">
+                    {{ node.egressAvgKbps == null ? '—' : `${fmtNum(node.egressAvgKbps, 1)} KB/s` }}
+                  </td>
+                  <td class="mono">
+                    {{ node.status === 'stopped' ? '已停止' : node.status === 'completed' ? '已完成' : node.status || '—' }}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
           </div>
         </div>
 
@@ -1889,6 +2508,109 @@ function remove() {
               </tbody>
             </table>
             <div v-if="!clusterNodes.length" class="inline-empty">未记录节点明细</div>
+          </div>
+        </div>
+
+        <div class="section-head">
+          <div>
+            <h2 class="section-title">URL 统计</h2>
+            <div class="section-desc">
+              按方法、地址与状态码聚合，与是否记录请求明细无关；URL 中的敏感参数已脱敏。
+              <template v-if="urlStats.length && !urlStatsComplete">
+                统计不完整：URL 键超过上限或部分从节点未上报。
+              </template>
+            </div>
+          </div>
+        </div>
+        <div class="fm-card request-card">
+          <div v-if="urlStats.length" class="data-table request-table">
+            <table>
+              <thead>
+                <tr>
+                  <th class="req-method-col">方法</th>
+                  <th class="req-url-col">URL</th>
+                  <th>请求数</th>
+                  <th>成功 / 失败</th>
+                  <th>成功率</th>
+                  <th>平均耗时</th>
+                  <th>最长耗时</th>
+                  <th>最长耗时时间</th>
+                  <th>总耗时</th>
+                  <th>平均包</th>
+                  <th>总流量</th>
+                  <th>状态码</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="row in urlStats" :key="`${row.method}-${row.url}-${row.statusCode}`">
+                  <td class="req-method-col">
+                    <span class="req-method">{{ row.method }}</span>
+                  </td>
+                  <td class="req-url-col mono" :title="row.url">{{ row.url }}</td>
+                  <td class="mono">{{ fmtNum(row.requests, 0) }}</td>
+                  <td class="mono">
+                    <span>{{ fmtNum(row.successCount, 0) }}</span>
+                    /
+                    <span :class="{ bad: row.errorCount > 0 }">{{ fmtNum(row.errorCount, 0) }}</span>
+                  </td>
+                  <td class="mono" :class="{ bad: row.errorCount > 0 }">
+                    {{ urlSuccessRate(row).toFixed(2) }}%
+                  </td>
+                  <td class="mono">{{ fmtNum(row.avgMs, 0) }} ms</td>
+                  <td class="mono">{{ fmtNum(row.maxMs, 0) }} ms</td>
+                  <td class="mono">{{ urlMaxAt(row) }}</td>
+                  <td class="mono">{{ row.totalHours.toFixed(3) }} h</td>
+                  <td class="mono">{{ row.avgKb.toFixed(1) }} KB</td>
+                  <td class="mono">{{ row.totalMb.toFixed(1) }} MB</td>
+                  <td class="mono" :title="row.statusSummary">{{ row.statusSummary || '—' }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div v-else class="inline-empty">
+            {{ urlStatsComplete ? '本次压测没有可统计的 URL 数据' : '该报告生成于旧版本，未记录按 URL 统计' }}
+          </div>
+        </div>
+
+        <div class="section-head">
+          <div>
+            <h2 class="section-title">错误地址</h2>
+            <div class="section-desc">只列出存在失败请求的 URL；错误信息已脱敏。</div>
+          </div>
+        </div>
+        <div class="fm-card request-card">
+          <div v-if="errorUrls.length" class="data-table request-table">
+            <table>
+              <thead>
+                <tr>
+                  <th class="req-method-col">方法</th>
+                  <th class="req-url-col">URL</th>
+                  <th>错误数</th>
+                  <th>平均耗时</th>
+                  <th>最长耗时</th>
+                  <th>最长耗时时间</th>
+                  <th class="req-error-col">错误信息</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="row in errorUrls" :key="`err-${row.method}-${row.url}-${row.statusCode}`">
+                  <td class="req-method-col">
+                    <span class="req-method">{{ row.method }}</span>
+                  </td>
+                  <td class="req-url-col mono" :title="row.url">{{ row.url }}</td>
+                  <td class="mono bad">{{ fmtNum(row.errorCount, 0) }}</td>
+                  <td class="mono">{{ fmtNum(row.avgMs, 0) }} ms</td>
+                  <td class="mono">{{ fmtNum(row.maxMs, 0) }} ms</td>
+                  <td class="mono">{{ urlMaxAt(row) }}</td>
+                  <td class="req-error-col mono" :title="row.errorMessage ?? ''">
+                    {{ row.errorMessage || '—' }}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div v-else class="inline-empty">
+            {{ urlStats.length ? '本次压测没有失败请求' : '未记录错误地址统计' }}
           </div>
         </div>
 
@@ -2221,6 +2943,10 @@ function remove() {
 
       <div v-else-if="!loading" class="fm-card empty-hint">报告不存在或已被删除</div>
     </a-spin>
+
+    <footer v-if="detail" class="report-disclaimer">
+      <b>免责声明：</b>{{ REPORT_DISCLAIMER }}
+    </footer>
   </div>
 </template>
 
@@ -2387,6 +3113,54 @@ function remove() {
   display: flex;
   flex-direction: column;
   gap: 5px;
+  position: relative;
+  overflow: hidden;
+}
+
+/* 指标顶部语义色条：吞吐主色、峰值蓝、成功率/APDEX 按结果取色、延迟警示色 */
+.metric-card[class*='tone-']::before {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto;
+  height: 2px;
+  background: var(--tone);
+  opacity: 0.75;
+}
+
+.metric-card.tone-accent {
+  --tone: var(--fm-primary);
+}
+
+.metric-card.tone-info {
+  --tone: #37628f;
+}
+
+.metric-card.tone-ok {
+  --tone: var(--fm-success);
+}
+
+.metric-card.tone-warn {
+  --tone: var(--fm-warning);
+}
+
+.metric-card.tone-bad {
+  --tone: var(--fm-danger);
+}
+
+.metric-card.tone-violet {
+  --tone: #6b5b95;
+}
+
+.m-value.accent {
+  color: var(--fm-primary);
+}
+
+.m-value.info {
+  color: #37628f;
+}
+
+.m-value.violet {
+  color: #6b5b95;
 }
 
 .m-label {
@@ -2697,6 +3471,62 @@ function remove() {
 }
 
 /* ---------- 图表 ---------- */
+.chart-range {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin-top: 16px;
+  padding: 10px 14px;
+  background: var(--fm-surface);
+  border: 1px solid var(--fm-border);
+  border-radius: 10px;
+}
+
+.range-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fm-text-2);
+  white-space: nowrap;
+}
+
+.range-picker {
+  width: 400px;
+}
+
+.range-slider {
+  flex: 1;
+  min-width: 180px;
+  margin: 0;
+}
+
+.range-text {
+  font-size: 11px;
+  color: var(--fm-muted);
+  white-space: nowrap;
+}
+
+.period-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-top: 18px;
+}
+
+.period-title {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.period-sub {
+  font-size: 10px;
+  color: var(--fm-muted);
+}
+
+.period-charts {
+  margin-top: 8px;
+}
+
 .charts {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -2840,6 +3670,10 @@ function remove() {
 
 .sample-table {
   max-height: 360px;
+}
+.table-pager {
+  margin-top: 8px;
+  text-align: right;
 }
 
 /* ---------- 请求明细 ---------- */
@@ -3429,6 +4263,9 @@ function remove() {
   .charts {
     grid-template-columns: 1fr;
   }
+  .range-picker {
+    width: 100%;
+  }
   .two-col {
     grid-template-columns: 1fr;
   }
@@ -3831,6 +4668,16 @@ function remove() {
 
 .pool-node-row .pool-node {
   color: var(--fm-text-2);
+}
+
+.report-disclaimer {
+  margin: 18px 0 8px;
+  padding: 12px 14px;
+  border-radius: var(--fm-radius-sm);
+  background: var(--fm-surface-alt);
+  color: var(--fm-text-2);
+  font-size: 12px;
+  line-height: 1.7;
 }
 
 @media (max-width: 1180px) {

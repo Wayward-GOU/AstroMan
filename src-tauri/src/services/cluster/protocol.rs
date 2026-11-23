@@ -149,6 +149,9 @@ pub struct HelloPayload {
     /// 是否支持运行期时钟复测；旧节点缺省 false，主节点不会在施压中打扰它
     #[serde(default)]
     pub clock_recheck: bool,
+    /// 是否支持在 done 中上报按 URL 聚合统计；旧节点缺省 false
+    #[serde(default)]
+    pub url_stats: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -489,6 +492,12 @@ pub struct DonePayload {
     /// 本节点的池运行统计（不含明文）；旧版本节点可缺省
     #[serde(default)]
     pub pools: Vec<serde_json::Value>,
+    /// 本节点按 URL 聚合的统计（已脱敏）；旧版本节点缺省为空
+    #[serde(default)]
+    pub url_stats: Vec<crate::models::UrlStatRow>,
+    /// 本节点的 URL 统计是否完整；旧节点缺省为 false，主节点据此标记不完整
+    #[serde(default)]
+    pub url_stats_complete: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -921,6 +930,23 @@ pub struct ClusterReportNode {
     /// 采集健康度快照
     #[serde(default)]
     pub health: SampleHealth,
+    /// 节点总请求数：旧报告 / 旧节点缺失时为 None，展示「—」，不做推断
+    #[serde(default)]
+    pub total_requests: Option<u64>,
+    /// 成功 / 失败请求数
+    #[serde(default)]
+    pub success_count: Option<u64>,
+    #[serde(default)]
+    pub error_count: Option<u64>,
+    /// 客户端平均耗时：该节点 sum_rt / 请求数
+    #[serde(default)]
+    pub avg_rt_ms: Option<f64>,
+    /// TPS：总请求数 / 该节点施压时长
+    #[serde(default)]
+    pub tps: Option<f64>,
+    /// 出站带宽平均：发送字节 / 施压时长 / 1024（KB/s）
+    #[serde(default)]
+    pub egress_avg_kbps: Option<f64>,
 }
 
 #[cfg(test)]
@@ -970,11 +996,41 @@ mod tests {
             records_dropped: 0,
             dropped_samples: 0,
             pools: Vec::new(),
+            url_stats: Vec::new(),
+            url_stats_complete: true,
         };
         let text = serde_json::to_string(&payload).unwrap();
         let back: DonePayload = serde_json::from_str(&text).unwrap();
         assert_eq!(back.latency_buckets, vec![(1, 2), (9, 1)]);
         assert_eq!(back.status_codes, vec![(200, 2), (500, 1)]);
+    }
+
+    #[test]
+    fn old_cluster_node_json_defaults_new_load_metrics_to_none() {
+        // 旧报告 config.cluster.nodes：没有 v23 的施压机明细字段，读取时保持 None
+        let node: ClusterReportNode = serde_json::from_value(serde_json::json!({
+            "name": "old-node",
+            "role": "slave",
+            "addr": "10.0.0.2:17801",
+            "weight": 1.0,
+            "concurrent": 10,
+            "status": "completed",
+            "qpsAvg": 100.0,
+            "cpuPeak": 1.0,
+            "memPeakMb": 128,
+            "clockOffsetMs": 0.0,
+            "clockUncertaintyMs": 0.0,
+            "droppedSamples": 0,
+            "startMs": 1000,
+            "endMs": 2000
+        }))
+        .unwrap();
+        assert_eq!(node.total_requests, None);
+        assert_eq!(node.success_count, None);
+        assert_eq!(node.error_count, None);
+        assert_eq!(node.avg_rt_ms, None);
+        assert_eq!(node.tps, None);
+        assert_eq!(node.egress_avg_kbps, None);
     }
 
     #[test]

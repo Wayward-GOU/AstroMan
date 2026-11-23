@@ -197,9 +197,28 @@ export function reportReviewPrompt(detail: ReportDetail): string {
   const report = detail.report
   const config = detail.config
   const qps = qpsOverview(detail, { rampUpSec: config?.rampUpSec ?? 0 })
+  const title = report.title?.trim() || report.planName
+  const durationSec =
+    report.startTime && report.endTime
+      ? Math.max(1, Math.round((report.endTime - report.startTime) / 1000))
+      : 0
+  const bytesSent = config?.metrics?.bytesSent ?? 0
+  const bodySamples = detail.samples.filter((item) => item.bodyAvg > 0)
+  const bodyCount = bodySamples.reduce((sum, item) => sum + item.successCount + item.errorCount, 0)
+  const bodyAvg =
+    bodyCount > 0
+      ? bodySamples.reduce(
+          (sum, item) => sum + item.bodyAvg * (item.successCount + item.errorCount),
+          0,
+        ) / bodyCount
+      : null
+  const urlStats = (detail.urlStats ?? []).slice(0, 10)
+  const errorUrls = (detail.urlStats ?? []).filter((item) => item.errorCount > 0).slice(0, 10)
+  const loadGenerators = detail.loadGenerators ?? []
   return `请解读这份压测报告并给出结论。
 
 【压测基本信息】
+标题：${title}
 计划：${report.planName}
 状态：${report.status}
 并发：${report.concurrency}
@@ -210,9 +229,96 @@ export function reportReviewPrompt(detail: ReportDetail): string {
 平均 QPS：${qps.avg.toFixed(1)}，峰值 QPS：${qps.max.toFixed(1)}，90% 分布 QPS：${qps.ninety.toFixed(1)}
 单并发 QPS：${qps.perConcurrent.toFixed(2)}，目标达成率：${qps.attainment === null ? '未设目标' : `${qps.attainment.toFixed(1)}%`}
 Apdex：${report.apdex}
+TTFB 平均：${report.ttfbAvg.toFixed(1)}ms，TTFB P95：${report.ttfbP95.toFixed(1)}ms，Body 平均：${bodyAvg === null ? '未记录' : `${bodyAvg.toFixed(1)}ms`}
+接收流量：${report.bytesTotal} 字节，发送流量：${bytesSent} 字节${
+    durationSec > 0
+      ? `，平均接收 ${(report.bytesTotal / durationSec / 1024).toFixed(1)} KB/s，平均发送 ${(
+          bytesSent /
+          durationSec /
+          1024
+        ).toFixed(1)} KB/s`
+      : ''
+  }
 
 【配置与 SLA】
 ${block(config, 3000)}
+
+【URL 统计（按方法 + 地址 + 状态码聚合，最多 10 个）】
+${
+  urlStats.length
+    ? block(
+        urlStats.map((item) => ({
+          方法: item.method,
+          地址: item.url,
+          状态码: item.statusSummary || item.statusCode,
+          请求数: item.requests,
+          成功数: item.successCount,
+          失败数: item.errorCount,
+          平均耗时: `${item.avgMs.toFixed(1)}ms`,
+          最长耗时: `${item.maxMs.toFixed(1)}ms`,
+          最长耗时时间: item.maxAtMs == null ? '未记录' : `第 ${(item.maxAtMs / 1000).toFixed(2)} 秒`,
+          平均包: `${item.avgKb.toFixed(2)} KB`,
+          总流量: `${item.totalMb.toFixed(3)} MB`,
+          错误样例: item.errorMessage || '无',
+        })),
+        5000,
+      )
+    : '未记录（旧报告或未采集）'
+}
+
+【错误地址（最多 10 个）】
+${
+  errorUrls.length
+    ? block(
+        errorUrls.map((item) => ({
+          方法: item.method,
+          地址: item.url,
+          错误数: item.errorCount,
+          平均耗时: `${item.avgMs.toFixed(1)}ms`,
+          最长耗时: `${item.maxMs.toFixed(1)}ms`,
+          错误信息: item.errorMessage || '未记录',
+        })),
+        3000,
+      )
+    : urlStats.length
+      ? '没有失败请求'
+      : '未记录'
+}
+
+【施压机明细】
+${
+  loadGenerators.length
+    ? block(
+        loadGenerators.map((node) => ({
+          名称: node.name,
+          角色: node.role === 'master' ? '主节点' : '从节点',
+          地址: node.addr || '未记录',
+          状态: node.status,
+          总请求: node.totalRequests ?? '未记录',
+          成功数: node.successCount ?? '未记录',
+          失败数: node.errorCount ?? '未记录',
+          并发: node.concurrent,
+          平均耗时: node.avgRtMs == null ? '未记录' : `${node.avgRtMs.toFixed(1)}ms`,
+          TPS: node.tps == null ? '未记录' : node.tps.toFixed(1),
+          出站带宽: node.egressAvgKbps == null ? '未记录' : `${node.egressAvgKbps.toFixed(1)} KB/s`,
+        })),
+        4000,
+      )
+    : '未记录'
+}
+
+【数据完整性】
+明细模式：${config?.recordDetail ?? config?.metrics?.recordMode ?? '未记录'}
+请求明细丢弃：${config?.metrics?.recordsDropped ?? 0} 条，错误明细丢弃：${
+    config?.metrics?.errorsDropped ?? 0
+  } 条
+URL 统计：${
+    (detail.urlStats ?? []).length
+      ? detail.urlStatsComplete
+        ? '完整'
+        : '不完整（URL 键溢出或部分节点未上报）'
+      : '未记录'
+  }
 
 【阶段明细】
 ${block(detail.stages, 3000)}
@@ -236,10 +342,13 @@ ${block(
 
 请输出：
 1. 一句话结论：本次压测是否达标（若配置了 SLA 就逐项对照）；
-2. 关键指标解读：吞吐、延迟分位、错误率是否正常；
-3. 瓶颈判断与依据（并发、限速、超时、错误类型）；
-4. 可以落地的优化动作，按优先级排序；
-5. 下一轮压测建议（并发梯度、时长、观察指标）。`
+2. 关键指标解读：吞吐、延迟分位、错误率、TTFB/Body 与带宽是否正常；
+3. 按 URL 与施压机的差异分析：是否有地址或节点明显拖后腿；
+4. 瓶颈判断与依据（并发、限速、超时、错误类型、单节点倾斜）；
+5. 可以落地的优化动作，按优先级排序；
+6. 下一轮压测建议（并发梯度、时长、观察指标）。
+
+要求：只使用上面提供的数据；标记为「未记录」的字段不要补 0、不要猜测，也不要编造未提供的请求头或响应体。`
 }
 
 /* ---------------- 压测计划 ---------------- */

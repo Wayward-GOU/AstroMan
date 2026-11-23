@@ -14,7 +14,7 @@
   <img alt="Rust" src="https://img.shields.io/badge/Rust-stable-B7410E?style=flat-square" />
   <img alt="Vue" src="https://img.shields.io/badge/Vue-3.5-42B883?style=flat-square" />
   <img alt="SQLite" src="https://img.shields.io/badge/SQLite-bundled-003B57?style=flat-square" />
-  <img alt="version" src="https://img.shields.io/badge/version-1.1.3-3B7DDD?style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-1.1.4-3B7DDD?style=flat-square" />
 </p>
 
 AstroMan 是一款**本地优先**的 HTTP API 研发工具箱：接口调试、环境与变量、脚本签名、批量运行、性能压测、抓包分析、记事本与待办、离线工具箱与 AI Agent，收敛在同一个桌面工作台里。无需注册、无需后端服务，项目、历史、报告、待办与密钥全部保存在本机。
@@ -224,6 +224,7 @@ AstroMan/
 | [常见问题](docs/faq.md) | 安装、构建、数据恢复、AI 与脚本 FAQ |
 | [路线图](docs/roadmap.md) | 已交付能力与规划中方向 |
 | [CHANGELOG](CHANGELOG.md) | 版本变更与问题修复记录 |
+| [v1.1.4 发布说明](docs/release-v1.1.4.md) | 报告重构、图表增强、完整时间轴与依赖安全 |
 | [v1.1.3 发布说明](docs/release-v1.1.3.md) | 本次新增、升级、兼容与验证基线 |
 | [v1.1.2 发布说明](docs/release-v1.1.2.md) | 分布式压测二期与参数池 / Token 池 |
 

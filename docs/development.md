@@ -29,7 +29,7 @@ Windows 与 macOS 的依赖不同，按目标系统准备。
 
 | 依赖 | 版本 | 说明 |
 |---|---|---|
-| Node.js | 20.x / 22.x | `brew install node` 或官网安装包 |
+| Node.js | 20.11+ / 22.x | `brew install node` 或官网安装包（脚本使用 `import.meta.dirname`，需 20.11+） |
 | npm | 10.x | 随 Node.js 安装 |
 | Rust | stable | 使用 rustup 安装 |
 | Xcode Command Line Tools | 最新 | `xcode-select --install`，编译 rusqlite / Tauri 必需 |

@@ -56,11 +56,11 @@ import {
   projectImport,
   projectList,
   projectUpdate,
-  reportExport,
   reportGet,
   reportList,
   reportDelete,
   reportRequests,
+  reportWriteFile,
   requestDelete,
   requestGet,
   requestList,
@@ -1445,7 +1445,7 @@ function dashboardDigest(metrics: DashboardMetrics) {
 function reportRows(list: StressReport[]): Record<string, unknown>[] {
   return list.map((item) => ({
     报告编号: item.id,
-    名称: item.planName,
+    名称: item.title?.trim() || item.planName,
     状态: cnLabel(REPORT_STATUS_LABELS, item.status, '未知'),
     请求总数: item.totalRequests,
     成功数: item.successCount,
@@ -1479,6 +1479,12 @@ async function reportDigest(detail: ReportDetail) {
           share?: number
           health?: SampleHealth
           status?: string
+          totalRequests?: number | null
+          successCount?: number | null
+          errorCount?: number | null
+          avgRtMs?: number | null
+          tps?: number | null
+          egressAvgKbps?: number | null
         }>
         nodeSeries?: Array<{ node?: string; points?: unknown[] }>
       }
@@ -1541,6 +1547,71 @@ async function reportDigest(detail: ReportDetail) {
     P95响应: `${Math.round(item.p95Rt)} 毫秒`,
   }))
 
+  const urlStats = (detail.urlStats ?? []).slice(0, 20).map((item) => ({
+    方法: item.method,
+    地址: item.url,
+    状态码: item.statusSummary || item.statusCode,
+    请求数: item.requests,
+    成功数: item.successCount,
+    失败数: item.errorCount,
+    成功率: pct(item.successCount, item.requests),
+    平均响应: `${item.avgMs.toFixed(1)} 毫秒`,
+    最长响应: `${item.maxMs.toFixed(1)} 毫秒`,
+    最长耗时时间:
+      item.maxAtMs == null ? '未记录' : `第 ${(item.maxAtMs / 1000).toFixed(2)} 秒`,
+    平均包: `${item.avgKb.toFixed(2)} KB`,
+    总流量: `${item.totalMb.toFixed(3)} MB`,
+    错误信息: item.errorMessage || '无',
+  }))
+  const errorUrls = (detail.urlStats ?? [])
+    .filter((item) => item.errorCount > 0)
+    .slice(0, 20)
+    .map((item) => ({
+      方法: item.method,
+      地址: item.url,
+      错误数: item.errorCount,
+      平均响应: `${item.avgMs.toFixed(1)} 毫秒`,
+      最长响应: `${item.maxMs.toFixed(1)} 毫秒`,
+      错误信息: item.errorMessage || '未记录',
+    }))
+
+  const loadGenerators = (detail.loadGenerators ?? []).map((node) => ({
+    名称: node.name,
+    角色: node.role === 'master' ? '主节点' : '从节点',
+    地址: node.addr || '未记录',
+    状态: cnLabel(NODE_STATUS_LABELS, node.status, node.status || '未知'),
+    总请求: node.totalRequests ?? '未记录',
+    成功数: node.successCount ?? '未记录',
+    失败数: node.errorCount ?? '未记录',
+    并发: node.concurrent,
+    成功率:
+      node.totalRequests != null && node.successCount != null
+        ? pct(node.successCount, node.totalRequests)
+        : '未记录',
+    平均响应: node.avgRtMs == null ? '未记录' : `${node.avgRtMs.toFixed(1)} 毫秒`,
+    TPS: node.tps == null ? '未记录' : Number(node.tps.toFixed(1)),
+    出站带宽: node.egressAvgKbps == null ? '未记录' : `${node.egressAvgKbps.toFixed(1)} KB/s`,
+    开始时间: node.startMs ? fmtTime(node.startMs) : '未记录',
+  }))
+
+  const durationSec =
+    report.startTime && report.endTime
+      ? Math.max(1, Math.round((report.endTime - report.startTime) / 1000))
+      : 0
+  const bytesSent = config?.metrics?.bytesSent ?? 0
+  const bodySamples = detail.samples.filter((item) => item.bodyAvg > 0)
+  const bodyCount = bodySamples.reduce(
+    (sum, item) => sum + item.successCount + item.errorCount,
+    0,
+  )
+  const bodyAvg =
+    bodyCount > 0
+      ? bodySamples.reduce(
+          (sum, item) => sum + item.bodyAvg * (item.successCount + item.errorCount),
+          0,
+        ) / bodyCount
+      : null
+
   const recentErrors = detail.errors.slice(0, 10).map((item) => ({
     发生时间: `第 ${item.elapsedSec} 秒`,
     错误类型: cnLabel(ERROR_TYPE_LABELS, item.errorType, '未知错误'),
@@ -1562,6 +1633,7 @@ async function reportDigest(detail: ReportDetail) {
 
   return {
     报告编号: report.id,
+    报告标题: report.title?.trim() || report.planName || target.request || '未命名报告',
     报告名称: report.planName || target.request || '未命名报告',
     状态: cnLabel(REPORT_STATUS_LABELS, report.status, '未知'),
     压测目标: {
@@ -1608,6 +1680,35 @@ async function reportDigest(detail: ReportDetail) {
       Apdex: report.apdex,
       传输数据量: fmtBytes(report.bytesTotal),
     },
+    响应耗时构成: {
+      TTFB平均: `${report.ttfbAvg.toFixed(1)} 毫秒`,
+      TTFBP95: `${report.ttfbP95.toFixed(1)} 毫秒`,
+      Body平均: bodyAvg === null ? '未记录' : `${bodyAvg.toFixed(1)} 毫秒`,
+      平均接收带宽:
+        durationSec > 0 ? `${(report.bytesTotal / durationSec / 1024).toFixed(1)} KB/s` : '未记录',
+      平均发送带宽:
+        durationSec > 0 && bytesSent > 0
+          ? `${(bytesSent / durationSec / 1024).toFixed(1)} KB/s`
+          : '未记录',
+      发送流量: bytesSent > 0 ? fmtBytes(bytesSent) : '未记录',
+    },
+    URL统计: urlStats.length ? urlStats : '未记录（旧报告或未采集）',
+    错误地址: errorUrls.length
+      ? errorUrls
+      : urlStats.length
+        ? '没有失败请求'
+        : '未记录',
+    施压机明细: loadGenerators.length ? loadGenerators : '未记录',
+    数据完整性: {
+      明细模式: config?.recordDetail ?? config?.metrics?.recordMode ?? '未记录',
+      请求明细丢弃: config?.metrics?.recordsDropped ?? 0,
+      错误明细丢弃: config?.metrics?.errorsDropped ?? 0,
+      URL统计: (detail.urlStats ?? []).length
+        ? detail.urlStatsComplete
+          ? '完整'
+          : '不完整（URL 键溢出或部分节点未上报）'
+        : '未记录',
+    },
     状态码分布: statusCodes,
     错误类型分布: errorTypes,
     延迟直方图: histogram,
@@ -1627,6 +1728,12 @@ async function reportDigest(detail: ReportDetail) {
             平均QPS: Number((node.qpsAvg ?? 0).toFixed(1)),
             峰值QPS: Number((node.peakQps ?? 0).toFixed(1)),
             贡献占比: `${((node.share ?? 0) * 100).toFixed(1)}%`,
+            总请求: node.totalRequests ?? '未记录',
+            成功数: node.successCount ?? '未记录',
+            失败数: node.errorCount ?? '未记录',
+            平均响应: node.avgRtMs == null ? '未记录' : `${node.avgRtMs.toFixed(1)} 毫秒`,
+            TPS: node.tps == null ? '未记录' : Number(node.tps.toFixed(1)),
+            出站带宽: node.egressAvgKbps == null ? '未记录' : `${node.egressAvgKbps.toFixed(1)} KB/s`,
             采集健康: healthDigest(node.health),
           })),
           峰值: peaksDigest,
@@ -3014,7 +3121,7 @@ const SPECS: ToolSpec[] = [
   },
   {
     name: 'report_get',
-    desc: '压测报告详情（指标、状态码、错误、阶段均已转中文标签，项目/请求/环境显示名称而非 ID）',
+    desc: '压测报告详情（指标、状态码、错误、阶段、URL 统计、施压机明细、TTFB/Body/带宽与数据完整性均已转中文标签；项目/请求/环境显示名称而非 ID）',
     handler: async (args) => reportDigest(await reportGet(needNum(args.id, 'id'))),
   },
   {
@@ -4659,14 +4766,20 @@ const SPECS: ToolSpec[] = [
   },
   {
     name: 'report_export',
-    desc: '把压测报告导出为 HTML（会写入用户给出的路径）',
+    desc: '把压测报告导出为 HTML（会写入用户给出的路径，必要时自动补 .html 后缀）',
     danger: true,
     handler: async (args) => {
       const id = needNum(args.id, 'id')
       const path = needPath(args.path)
-      const report = (await reportList(200)).find((item) => item.id === id)
-      await reportExport(id, path)
-      return `已导出报告「${report?.planName ?? '未知报告'}」到 ${path}`
+      const detail = await reportGet(id)
+      // HTML 报告只用到首屏明细兜底目标地址与 Top10 慢请求，避免把几万条明细拉进内存
+      const pageSize = (detail.slowRequests?.length ?? 0) > 0 ? 200 : 2000
+      const page = await reportRequests(id, 1, pageSize, null).catch(() => null)
+      const { buildReportHtml } = await import('./reportExport')
+      const html = buildReportHtml(detail, page?.items ?? [])
+      const target = path.toLowerCase().endsWith('.html') ? path : `${path}.html`
+      await reportWriteFile(target, Array.from(new TextEncoder().encode(html)))
+      return `已导出报告「${detail.report.planName}」为 HTML：${target}`
     },
   },
   {

@@ -8,9 +8,11 @@
  * 4. 若显式关闭了 unsafe-eval，则不允许任何配置再把它加回来。
  */
 import { readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
-const root = resolve(import.meta.dirname, '..')
+// 兼容 Node 18/20.0~20.10：import.meta.dirname 需要 Node 20.11+
+const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const errors = []
 
 const conf = JSON.parse(readFileSync(resolve(root, 'src-tauri/tauri.conf.json'), 'utf8'))

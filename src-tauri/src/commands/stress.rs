@@ -1,6 +1,8 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use rusqlite::{params, OptionalExtension};
@@ -15,7 +17,7 @@ use crate::commands::http::base64_encode;
 use crate::models::{
     CapturePreset, ErrorTypeCount, HistogramBucket, PoolBinding, RecordDetailMode, ReportError,
     ReportRequestRecord, ReportSample, RequestAuth, SlowRequest, StageSummary, StatusCount,
-    StressConfig, StressDone, StressProgress, StressReport, StressStage,
+    StressConfig, StressDone, StressProgress, StressReport, StressStage, UrlStatRow,
 };
 use crate::services::cluster::protocol::PoolItem;
 use crate::services::cluster::protocol::SamplePayload as ClusterSamplePayload;
@@ -67,6 +69,194 @@ const LONG_RUN_ACK_SEC: u64 = 7_200;
 const DEFAULT_TOP_N: u32 = 200;
 /// 慢请求条数硬上限
 const MAX_TOP_N: u32 = 2_000;
+/// URL 聚合分片数：按 key 哈希分片降低单锁竞争
+const URL_STATS_SHARDS: usize = 16;
+/// URL 聚合全局键上限：超出后归入 `__other__`，报告标记不完整
+const URL_STATS_MAX_KEYS: usize = 2_000;
+/// URL 入库前最大长度（字符）
+const MAX_URL_LEN: usize = 2_048;
+/// URL 统计中错误样例的最大长度（字符）
+const MAX_URL_ERROR: usize = 500;
+/// 溢出桶的展示占位
+const URL_OTHER: &str = "__other__";
+
+/// URL 统计的聚合键：同一地址按状态码拆行，便于定位错误码分布
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct UrlKey {
+    method: String,
+    url: String,
+    status: u16,
+}
+
+// 每线程缓存最近一次聚合键：单计划单地址场景下避免逐请求分配与哈希
+thread_local! {
+    static URL_KEY_CACHE: RefCell<Option<(UrlKey, usize)>> = const { RefCell::new(None) };
+}
+
+/// URL 统计累加器：只做计数与极值，不做字符串格式化
+#[derive(Debug, Clone, Default)]
+struct UrlAgg {
+    requests: u64,
+    success: u64,
+    errors: u64,
+    sum_ms: f64,
+    max_ms: f64,
+    max_at_ms: i64,
+    bytes: u64,
+    error_message: Option<String>,
+    max_request_id: Option<String>,
+}
+
+impl UrlAgg {
+    fn update(
+        &mut self,
+        elapsed_ms: i64,
+        latency_ms: u64,
+        bytes: u64,
+        ok: bool,
+        error: Option<&str>,
+    ) {
+        self.requests += 1;
+        if ok {
+            self.success += 1;
+        } else {
+            self.errors += 1;
+            if self.error_message.is_none() {
+                if let Some(message) = error.map(str::trim).filter(|text| !text.is_empty()) {
+                    self.error_message = Some(clip(message, MAX_URL_ERROR));
+                }
+            }
+        }
+        self.sum_ms += latency_ms as f64;
+        if latency_ms as f64 > self.max_ms {
+            self.max_ms = latency_ms as f64;
+            self.max_at_ms = elapsed_ms;
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+}
+
+fn url_shard_index(key: &UrlKey) -> usize {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    (hasher.finish() as usize) % URL_STATS_SHARDS
+}
+
+/// URL 查询参数脱敏：只掩码敏感参数值，保留地址结构与其余参数
+pub(crate) fn sanitize_url(raw: &str) -> String {
+    let truncated: String = raw.chars().take(MAX_URL_LEN).collect();
+    let Some(query_start) = truncated.find('?') else {
+        return truncated;
+    };
+    let (head, rest) = truncated.split_at(query_start + 1);
+    let (query, fragment) = match rest.find('#') {
+        Some(index) => (&rest[..index], &rest[index..]),
+        None => (rest, ""),
+    };
+    let masked = query
+        .split('&')
+        .map(|pair| {
+            let Some(eq) = pair.find('=') else {
+                return pair.to_string();
+            };
+            let (name, _) = pair.split_at(eq);
+            if is_sensitive_query(&name.to_ascii_lowercase()) {
+                format!("{name}=******")
+            } else {
+                pair.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{head}{masked}{fragment}")
+}
+
+fn is_sensitive_query(name: &str) -> bool {
+    const KEYS: &[&str] = &[
+        "token",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "password",
+        "passwd",
+        "secret",
+        "authorization",
+        "cookie",
+        "api_key",
+        "apikey",
+        "client_secret",
+        "session",
+        "sessionid",
+        "signature",
+        "sig",
+    ];
+    KEYS.iter()
+        .any(|key| name == *key || name.ends_with(&format!("_{key}")))
+}
+
+/// 错误信息脱敏：掩码 Bearer / Basic、key=value 与 sk- 形式的密钥
+pub(crate) fn sanitize_error(raw: &str) -> String {
+    static BEARER: OnceLock<regex::Regex> = OnceLock::new();
+    static JSON: OnceLock<regex::Regex> = OnceLock::new();
+    static KV: OnceLock<regex::Regex> = OnceLock::new();
+    static SK: OnceLock<regex::Regex> = OnceLock::new();
+
+    let text: String = raw.chars().take(MAX_URL_ERROR).collect();
+    if text.is_empty() {
+        return text;
+    }
+    let bearer = BEARER.get_or_init(|| {
+        regex::Regex::new(r"(?i)((?:Bearer|Basic)\s+)([A-Za-z0-9._~+/=-]{6,})").expect("bearer")
+    });
+    let out = bearer
+        .replace_all(&text, |caps: &regex::Captures| {
+            if caps[2].contains("******") {
+                caps[0].to_string()
+            } else {
+                format!("{}{}", &caps[1], "******")
+            }
+        })
+        .into_owned();
+
+    // JSON 响应体里的敏感字段：{"token":"abc"} / {"password":"..."}
+    let json = JSON.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?i)("[^"]*(?:api[_-]?key|token|secret|password|authorization|cookie)[^"]*"\s*:\s*)"([^"]*)""#,
+        )
+        .expect("json")
+    });
+    let out = json
+        .replace_all(&out, |caps: &regex::Captures| {
+            if caps[2].contains("******") {
+                caps[0].to_string()
+            } else {
+                format!("{}\"******\"", &caps[1])
+            }
+        })
+        .into_owned();
+
+    let kv = KV.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?i)((?:api[_-]?key|token|secret|password|authorization|cookie)\s*[:=]\s*)([^\s,;}\]"'&]+)"#,
+        )
+        .expect("kv")
+    });
+    let out = kv
+        .replace_all(&out, |caps: &regex::Captures| {
+            if caps[2].contains("******")
+                || caps[2].eq_ignore_ascii_case("bearer")
+                || caps[2].eq_ignore_ascii_case("basic")
+            {
+                caps[0].to_string()
+            } else {
+                format!("{}{}", &caps[1], "******")
+            }
+        })
+        .into_owned();
+
+    let sk = SK.get_or_init(|| regex::Regex::new(r"sk-[A-Za-z0-9]{6,}").expect("sk"));
+    sk.replace_all(&out, "******").into_owned()
+}
 
 /// 运行期明细采集开关（可被 auto 降档动态修改）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +306,17 @@ struct Metrics {
     body_buckets: Vec<AtomicU64>,
     codes: Mutex<HashMap<u16, u64>>,
     error_kinds: Mutex<HashMap<String, i64>>,
+    /// 按 URL 聚合的分片锁：与 recordDetail 无关，off 模式也统计
+    url_shards: Vec<Mutex<HashMap<UrlKey, UrlAgg>>>,
+    /// 键数超过上限后的统一溢出桶
+    url_other: Mutex<UrlAgg>,
+    /// 已占用的 URL 键数量
+    url_keys: AtomicU64,
+    /// 是否发生过键溢出（报告标记 URL 统计不完整）
+    url_overflow: AtomicBool,
+    /// 仅测试用：关闭 URL 聚合以测量单请求开销
+    #[cfg(test)]
+    url_stats_enabled: bool,
 }
 
 impl Metrics {
@@ -138,17 +339,38 @@ impl Metrics {
             body_buckets: (0..=MAX_RT_MS).map(|_| AtomicU64::new(0)).collect(),
             codes: Mutex::new(HashMap::new()),
             error_kinds: Mutex::new(HashMap::new()),
+            url_shards: (0..URL_STATS_SHARDS)
+                .map(|_| Mutex::new(HashMap::new()))
+                .collect(),
+            url_other: Mutex::new(UrlAgg::default()),
+            url_keys: AtomicU64::new(0),
+            url_overflow: AtomicBool::new(false),
+            #[cfg(test)]
+            url_stats_enabled: true,
         }
     }
 
+    /// 测试专用：关闭 URL 聚合，用于对比聚合前后的单请求开销
+    #[cfg(test)]
+    fn new_with_url_stats(enabled: bool) -> Self {
+        let mut metrics = Self::new();
+        metrics.url_stats_enabled = enabled;
+        metrics
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn record(
         &self,
+        method: &str,
+        url: &str,
+        elapsed_ms: i64,
         latency_ms: u64,
         ttfb_ms: u64,
         status: u16,
         bytes: u64,
         sent_bytes: u64,
         ok: bool,
+        error: Option<&str>,
     ) {
         self.total.fetch_add(1, Ordering::Relaxed);
         if ok {
@@ -175,6 +397,146 @@ impl Metrics {
                 *map.entry(status).or_insert(0) += 1;
             }
         }
+        self.record_url(
+            method, url, elapsed_ms, latency_ms, status, bytes, ok, error,
+        );
+    }
+
+    /// URL 聚合：与明细采集解耦，off / sample / full 三种模式都计数
+    #[allow(clippy::too_many_arguments)]
+    fn record_url(
+        &self,
+        method: &str,
+        url: &str,
+        elapsed_ms: i64,
+        latency_ms: u64,
+        status: u16,
+        bytes: u64,
+        ok: bool,
+        error: Option<&str>,
+    ) {
+        #[cfg(test)]
+        if !self.url_stats_enabled {
+            return;
+        }
+        let method = method.trim();
+        let method = if method.is_empty() { "GET" } else { method };
+        // 快路径：单计划单地址时直接复用线程内缓存键，避免逐请求字符串分配与哈希
+        let cached = URL_KEY_CACHE.with(|cell| {
+            let cache = cell.borrow();
+            let Some((key, shard)) = cache.as_ref() else {
+                return false;
+            };
+            if key.status != status || key.url != url || !key.method.eq_ignore_ascii_case(method) {
+                return false;
+            }
+            let mut handled = false;
+            if let Ok(mut map) = self.url_shards[*shard].lock() {
+                if let Some(agg) = map.get_mut(key) {
+                    agg.update(elapsed_ms, latency_ms, bytes, ok, error);
+                    handled = true;
+                }
+            }
+            handled
+        });
+        if cached {
+            return;
+        }
+
+        let key = UrlKey {
+            method: method.to_string(),
+            url: if url.len() <= MAX_URL_LEN {
+                url.to_string()
+            } else {
+                url.chars().take(MAX_URL_LEN).collect()
+            },
+            status,
+        };
+        let shard = url_shard_index(&key);
+        let mut handled = false;
+        if let Ok(mut map) = self.url_shards[shard].lock() {
+            if let Some(agg) = map.get_mut(&key) {
+                agg.update(elapsed_ms, latency_ms, bytes, ok, error);
+                handled = true;
+            } else if self.url_keys.load(Ordering::Relaxed) < URL_STATS_MAX_KEYS as u64 {
+                let mut agg = UrlAgg::default();
+                agg.update(elapsed_ms, latency_ms, bytes, ok, error);
+                map.insert(key.clone(), agg);
+                self.url_keys.fetch_add(1, Ordering::Relaxed);
+                handled = true;
+            }
+        }
+        if handled {
+            URL_KEY_CACHE.with(|cell| *cell.borrow_mut() = Some((key, shard)));
+            return;
+        }
+        // 键已满或锁中毒：统一归入溢出桶，报告标记 URL 统计不完整
+        self.url_overflow.store(true, Ordering::Relaxed);
+        if let Ok(mut other) = self.url_other.lock() {
+            other.update(elapsed_ms, latency_ms, bytes, ok, error);
+        }
+    }
+
+    /// 收尾导出：脱敏后按 (method, url, status) 合并，溢出桶单独成行
+    fn url_stats(&self) -> (Vec<UrlStatRow>, bool) {
+        let mut rows: HashMap<(String, String, i64), UrlStatRow> = HashMap::new();
+        let mut ingest = |method: &str, url: &str, status: i64, agg: &UrlAgg| {
+            let url = sanitize_url(url);
+            let row = rows
+                .entry((method.to_string(), url.clone(), status))
+                .or_insert_with(|| UrlStatRow {
+                    method: method.to_string(),
+                    url,
+                    status_code: status,
+                    ..UrlStatRow::default()
+                });
+            row.requests += agg.requests as i64;
+            row.success_count += agg.success as i64;
+            row.error_count += agg.errors as i64;
+            row.sum_ms += agg.sum_ms;
+            row.bytes = row.bytes.saturating_add(agg.bytes as i64);
+            if agg.max_ms > row.max_ms {
+                row.max_ms = agg.max_ms;
+                row.max_at_ms = Some(agg.max_at_ms);
+            }
+            if let Some(message) = &agg.error_message {
+                let message = sanitize_error(message);
+                if !message.is_empty() && row.error_message.is_none() {
+                    row.error_message = Some(message);
+                }
+            }
+            if let Some(id) = &agg.max_request_id {
+                row.max_request_id = Some(id.clone());
+            }
+        };
+        for shard in &self.url_shards {
+            if let Ok(map) = shard.lock() {
+                for (key, agg) in map.iter() {
+                    ingest(&key.method, &key.url, key.status as i64, agg);
+                }
+            }
+        }
+        let overflow = self.url_overflow.load(Ordering::Relaxed);
+        if let Ok(other) = self.url_other.lock() {
+            if other.requests > 0 {
+                ingest(URL_OTHER, URL_OTHER, 0, &other);
+            }
+        }
+        let mut items: Vec<UrlStatRow> = rows.into_values().collect();
+        if overflow {
+            log::warn!(
+                "URL 统计键超过 {} 上限，超出部分已归入 {}，报告将标记统计不完整",
+                URL_STATS_MAX_KEYS,
+                URL_OTHER
+            );
+        }
+        items.sort_by(|a, b| {
+            b.requests
+                .cmp(&a.requests)
+                .then_with(|| a.url.cmp(&b.url))
+                .then_with(|| a.status_code.cmp(&b.status_code))
+        });
+        (items, !overflow)
     }
 
     fn count(&self) -> u64 {
@@ -693,15 +1055,21 @@ impl PoolRuntime {
                     .unwrap_or(0);
                 let per_item: Vec<serde_json::Value> = counts
                     .map(|list| {
-                        list.iter()
-                            .take(2000)
+                        // 只保留请求数最高的 TopN：条目明细仅用于 Excel，避免大池把 config_json 撑大
+                        let mut top: Vec<(usize, u64)> = list
+                            .iter()
                             .enumerate()
-                            .filter(|(_, count)| count.load(Ordering::Relaxed) > 0)
-                            .map(|(index, count)| {
-                                json!({
-                                    "index": index + 1,
-                                    "requests": count.load(Ordering::Relaxed),
-                                })
+                            .filter_map(|(index, count)| {
+                                let requests = count.load(Ordering::Relaxed);
+                                (requests > 0).then_some((index, requests))
+                            })
+                            .collect();
+                        top.sort_by_key(|(_, requests)| std::cmp::Reverse(*requests));
+                        top.truncate(crate::services::pool::PER_ITEM_TOP);
+                        top.sort_by_key(|(index, _)| *index);
+                        top.into_iter()
+                            .map(|(index, requests)| {
+                                json!({ "index": index + 1, "requests": requests })
                             })
                             .collect()
                     })
@@ -1934,12 +2302,16 @@ async fn worker(ctx: Arc<RunCtx>, index: u32, workers: u32) {
         let latency_ms = started.elapsed().as_millis() as u64;
         ctx.metrics.concurrent.fetch_sub(1, Ordering::Relaxed);
         ctx.metrics.record(
+            ctx.method.as_str(),
+            &attempt.url,
+            ctx.start.elapsed().as_millis() as i64,
             latency_ms,
             attempt.ttfb_ms.min(latency_ms),
             attempt.status,
             attempt.bytes,
             ctx.req_bytes,
             attempt.ok,
+            attempt.error.as_deref(),
         );
 
         let error_type = if attempt.ok {
@@ -3005,6 +3377,10 @@ pub(crate) struct EngineOutcome {
     pub error_types: Vec<ErrorTypeCount>,
     pub config_snapshot: String,
     pub sparse: EngineSparseMetrics,
+    /// 按 URL 聚合的统计（已脱敏）
+    pub url_stats: Vec<UrlStatRow>,
+    /// URL 统计是否完整（键未溢出）
+    pub url_stats_complete: bool,
     pub message: Option<String>,
 }
 
@@ -3051,6 +3427,7 @@ async fn drive_stress(
             body_histogram: &outcome.body_histogram,
             slow_requests: &outcome.slow_requests,
             error_types: &outcome.error_types,
+            url_stats: &outcome.url_stats,
             config: &outcome.config_snapshot,
         },
     ) {
@@ -3398,6 +3775,8 @@ pub(crate) async fn run_engine(
     let status_codes = metrics.status_codes();
     let stage_summaries = summarize_stages(&stages, &samples);
     let error_types = metrics.error_types();
+    // URL 聚合与明细采集解耦：这里拿到最终（已脱敏）的逐地址统计
+    let (url_stats, url_stats_complete) = metrics.url_stats();
 
     // 运行期指标并入配置快照：避免为统计项新增表列，读取集中在 ReportDetail.config
     let config_snapshot = with_runtime_metrics(
@@ -3406,6 +3785,8 @@ pub(crate) async fn run_engine(
             "bytesSent": metrics.bytes_sent.load(Ordering::Relaxed),
             "errorsDropped": metrics.errors_dropped.load(Ordering::Relaxed),
             "recordsDropped": metrics.records_dropped.load(Ordering::Relaxed),
+            // URL 键溢出时页面与导出要标注「统计不完整」
+            "urlStatsComplete": url_stats_complete,
             "recordMode": Capture::from_u8(ctx.capture.load(Ordering::Relaxed)).label(),
             // 自动降档轨迹：事后能解释「明细为何缺失」
             "downgradeTrail": downgrade_trail,
@@ -3424,6 +3805,7 @@ pub(crate) async fn run_engine(
         plan_id: ctx.config.plan_id,
         run_group_id: ctx.config.run_group_id,
         plan_name: name,
+        title: None,
         request_id: ctx.config.request_id,
         total_requests: total as i64,
         success_count: success as i64,
@@ -3512,6 +3894,8 @@ pub(crate) async fn run_engine(
         error_types,
         config_snapshot,
         sparse,
+        url_stats,
+        url_stats_complete,
         message: auto_stop,
     }
 }
@@ -3884,6 +4268,8 @@ pub(crate) struct ReportPayload<'a> {
     /// TopN 慢请求
     pub slow_requests: &'a [crate::models::SlowRequest],
     pub error_types: &'a [ErrorTypeCount],
+    /// 按 URL 聚合的统计（已脱敏）
+    pub url_stats: &'a [UrlStatRow],
     pub config: &'a str,
 }
 
@@ -3906,10 +4292,10 @@ pub(crate) fn save_report(pool: &DbPool, payload: ReportPayload<'_>) -> Result<i
              stddev_rt, ttfb_avg, ttfb_p95, apdex, bytes_total, max_qps, avg_qps, target_rps,
              error_rate, concurrency, status, config_json, stages_json, codes_json,
              histogram_json, error_types_json, start_time, end_time, created_at,
-             body_histogram_json, slow_requests_json, run_group_id)
+             body_histogram_json, slow_requests_json, run_group_id, is_cluster, peak_qps)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
                  ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
-                 ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37)",
+                 ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39)",
         params![
             report.plan_id,
             report.plan_name,
@@ -3948,6 +4334,8 @@ pub(crate) fn save_report(pool: &DbPool, payload: ReportPayload<'_>) -> Result<i
             body_histogram_text,
             slow_requests_text,
             report.run_group_id,
+            report.is_cluster,
+            report.peak_qps,
         ],
     )
     .map_err(err)?;
@@ -4073,6 +4461,64 @@ pub(crate) fn save_report(pool: &DbPool, payload: ReportPayload<'_>) -> Result<i
     } else {
         log::warn!("压测请求明细写入失败：{:?}", detail_result.as_ref().err());
         let _ = tx.execute_batch("ROLLBACK TO req_rows; RELEASE req_rows");
+    }
+
+    // URL 统计：旧库可能没有这张表，先补建再批量写入；失败只影响该段
+    let _ = tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS report_url_stats (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            report_id      INTEGER NOT NULL REFERENCES test_reports(id) ON DELETE CASCADE,
+            method         TEXT    NOT NULL DEFAULT 'GET',
+            url            TEXT    NOT NULL,
+            status_code    INTEGER NOT NULL DEFAULT 0,
+            requests       INTEGER NOT NULL DEFAULT 0,
+            success_count  INTEGER NOT NULL DEFAULT 0,
+            error_count    INTEGER NOT NULL DEFAULT 0,
+            sum_ms         REAL    NOT NULL DEFAULT 0,
+            max_ms         REAL    NOT NULL DEFAULT 0,
+            max_at_ms      INTEGER,
+            bytes          INTEGER NOT NULL DEFAULT 0,
+            error_message  TEXT,
+            max_request_id TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_url_stats_report
+            ON report_url_stats(report_id, status_code);",
+    );
+    let _ = tx.execute_batch("SAVEPOINT url_rows");
+    let url_result = (|| -> Result<(), String> {
+        let mut stmt = tx
+            .prepare(
+                "INSERT INTO report_url_stats
+                    (report_id, method, url, status_code, requests, success_count, error_count,
+                     sum_ms, max_ms, max_at_ms, bytes, error_message, max_request_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            )
+            .map_err(err)?;
+        for item in payload.url_stats {
+            stmt.execute(params![
+                report_id,
+                item.method,
+                item.url,
+                item.status_code,
+                item.requests,
+                item.success_count,
+                item.error_count,
+                item.sum_ms,
+                item.max_ms,
+                item.max_at_ms,
+                item.bytes,
+                item.error_message,
+                item.max_request_id,
+            ])
+            .map_err(err)?;
+        }
+        Ok(())
+    })();
+    if url_result.is_ok() {
+        let _ = tx.execute_batch("RELEASE url_rows");
+    } else {
+        log::warn!("URL 统计写入失败：{:?}", url_result.as_ref().err());
+        let _ = tx.execute_batch("ROLLBACK TO url_rows; RELEASE url_rows");
     }
 
     tx.commit().map_err(err)?;
@@ -4461,6 +4907,117 @@ mod tests {
         // 桶没有变化时不产生空增量
         assert!(bucket_delta(&buckets, &mut previous).is_empty());
     }
+
+    #[test]
+    fn url_stats_aggregate_without_request_detail() {
+        let metrics = Metrics::new();
+        metrics.record(
+            "GET",
+            "https://api.test/a?x=1",
+            100,
+            10,
+            5,
+            200,
+            100,
+            10,
+            true,
+            None,
+        );
+        metrics.record(
+            "GET",
+            "https://api.test/a?x=1",
+            300,
+            30,
+            12,
+            200,
+            50,
+            10,
+            true,
+            None,
+        );
+        metrics.record(
+            "POST",
+            "https://api.test/b",
+            500,
+            50,
+            20,
+            500,
+            20,
+            10,
+            false,
+            Some("HTTP 500"),
+        );
+
+        let (rows, complete) = metrics.url_stats();
+        assert!(complete);
+        assert_eq!(rows.len(), 2);
+        // 请求数多的 URL 排在前
+        assert_eq!(rows[0].url, "https://api.test/a?x=1");
+        assert_eq!(rows[0].requests, 2);
+        assert_eq!(rows[0].success_count, 2);
+        assert_eq!(rows[0].max_ms, 30.0);
+        assert_eq!(rows[0].max_at_ms, Some(300));
+        assert_eq!(rows[0].bytes, 150);
+        let failed = rows.iter().find(|row| row.url.ends_with("/b")).unwrap();
+        assert_eq!(failed.status_code, 500);
+        assert_eq!(failed.error_count, 1);
+        assert_eq!(failed.error_message.as_deref(), Some("HTTP 500"));
+    }
+
+    #[test]
+    fn url_stats_sanitizes_sensitive_query_and_error() {
+        assert_eq!(
+            sanitize_url("https://a.com/p?token=abcdef&page=1"),
+            "https://a.com/p?token=******&page=1"
+        );
+        assert_eq!(
+            sanitize_url("https://a.com/p?access_token=abcdef&x=1#frag"),
+            "https://a.com/p?access_token=******&x=1#frag"
+        );
+        // 参数名大小写不敏感，常见变体也要覆盖
+        assert_eq!(
+            sanitize_url("https://a.com/p?API_KEY=abcdef&client_secret=xyz&keep=1"),
+            "https://a.com/p?API_KEY=******&client_secret=******&keep=1"
+        );
+        let masked = sanitize_error("Authorization: Bearer abcdef123456");
+        assert!(!masked.contains("abcdef123456"));
+        assert!(masked.contains("******"));
+        assert_eq!(
+            sanitize_error(r#"{"token":"abcdef","user":"demo"}"#),
+            r#"{"token":"******","user":"demo"}"#
+        );
+        assert_eq!(
+            sanitize_error("password=hunter2; retry=1"),
+            "password=******; retry=1"
+        );
+        assert_eq!(
+            sanitize_error("invalid key sk-1234567890"),
+            "invalid key ******"
+        );
+    }
+
+    #[test]
+    fn url_stats_overflow_folds_into_other_and_marks_incomplete() {
+        let metrics = Metrics::new();
+        // 直接把键计数拉到上限，模拟第 2001 个不同 URL
+        metrics
+            .url_keys
+            .store(URL_STATS_MAX_KEYS as u64, Ordering::Relaxed);
+        metrics.record("GET", "https://a.test/new", 10, 1, 0, 200, 1, 1, true, None);
+        let (rows, complete) = metrics.url_stats();
+        assert!(!complete);
+        assert!(rows.iter().any(|row| row.url == URL_OTHER));
+    }
+
+    #[test]
+    fn url_stats_truncates_long_url() {
+        let metrics = Metrics::new();
+        let url = format!("https://a.test/{}", "x".repeat(MAX_URL_LEN + 100));
+        metrics.record("GET", &url, 10, 1, 0, 200, 1, 1, true, None);
+        let (rows, _) = metrics.url_stats();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].url.chars().count(), MAX_URL_LEN);
+    }
 }
 
 /// 12.5 无池 5,000 QPS 回归基线
@@ -4607,6 +5164,36 @@ mod perf_tests {
             "durationSec": 10
         }))
         .expect("构造压测配置失败")
+    }
+
+    #[test]
+    #[ignore = "性能基准：URL 聚合单请求开销，手动执行"]
+    fn perf_url_aggregation_overhead() {
+        const ITERATIONS: usize = 1_000_000;
+        let url = "https://api.test/v1/orders?page=1&size=20&tenant=acme";
+        let off = Metrics::new_with_url_stats(false);
+        let on = Metrics::new_with_url_stats(true);
+        let measure = |metrics: &Metrics| {
+            let started = Instant::now();
+            for index in 0..ITERATIONS {
+                metrics.record("GET", url, index as i64, 20, 10, 200, 1024, 500, true, None);
+            }
+            started.elapsed().as_nanos() as f64 / ITERATIONS as f64
+        };
+        // 预热，避免首次分配与正则初始化计入结果
+        let _ = measure(&off);
+        let _ = measure(&on);
+        let off_ns = measure(&off).min(measure(&off));
+        let on_ns = measure(&on).min(measure(&on));
+        let added = (on_ns - off_ns).max(0.0);
+        println!(
+            "perf_url_aggregation_overhead: off={off_ns:.1}ns on={on_ns:.1}ns added={added:.1}ns/req, 10k QPS 估算 CPU 占比 {:.3}%",
+            added * 10_000.0 / 1_000_000_000.0 * 100.0
+        );
+        assert!(
+            added < 2_000.0,
+            "每次请求 URL 聚合新增 {added:.0}ns，超过 2µs 预算"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

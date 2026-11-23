@@ -40,6 +40,7 @@ import type {
   PoolSummary,
   RecordDetailMode,
   ReportSample,
+  ReportConfigSnapshot,
   RequestSearchHit,
   StressDone,
   StressJobSummary,
@@ -58,6 +59,8 @@ const projectId = computed(() => Number(route.query.projectId || 0))
 /** 单实例/多窗口入口参数：计划、任务、环境（1.2.1） */
 const routePlanId = computed(() => Number(route.query.planId || 0))
 const routeJobId = computed(() => Number(route.query.jobId || 0))
+/** 报告页「再次运行」：无计划时按报告快照回填 */
+const routeReportId = computed(() => Number(route.query.reportId || 0))
 const routeEnvId = computed(() => Number(route.query.envId || 0))
 const newWindow = computed(() => route.query.newWindow === '1' || route.query.newWindow === 'true')
 
@@ -907,7 +910,17 @@ async function initFromQuery() {
     return
   }
   if (routePlanId.value) {
-    await openPlan(routePlanId.value)
+    try {
+      await openPlan(routePlanId.value)
+      return
+    } catch (e) {
+      // 计划可能已被删除：有报告快照时回退，避免「再次运行」直接失败
+      if (!routeReportId.value) throw e
+      message.warning('关联计划已不存在，已按报告配置快照回填')
+    }
+  }
+  if (routeReportId.value) {
+    await openReport(routeReportId.value)
     return
   }
   if (!requestId.value) return
@@ -1012,6 +1025,107 @@ async function openPlan(planIdValue: number) {
     targetRequestId.value = plan.requestId
     request.value = await api.requestGet(plan.requestId)
   }
+}
+
+/** 从报告配置快照回填压测页（报告页「再次运行」） */
+async function openReport(reportIdValue: number) {
+  const detail = await api.reportGet(reportIdValue)
+  const config: ReportConfigSnapshot | null = detail.config ?? null
+  activePlanId.value = detail.report.planId ?? null
+  planName.value = detail.report.title?.trim() || detail.report.planName
+
+  const pid = config?.projectId ?? 0
+  if (pid) {
+    targetProjectId.value = pid
+    activeProjectId.value = pid
+    environments.value = await api.envList(pid)
+    modalEnvironments.value = environments.value
+    envId.value = pickEnvId(environments.value, config?.envId ?? routeEnvId.value)
+    await loadPlainVars(envId.value)
+  }
+
+  if (config) {
+    if (config.timeoutMs != null) settings.timeoutMs = config.timeoutMs
+    if (config.connectTimeoutMs != null) settings.connectTimeoutMs = config.connectTimeoutMs
+    if (config.followRedirects != null) settings.followRedirects = config.followRedirects
+    if (config.thinkTimeMs != null) settings.thinkTimeMs = config.thinkTimeMs
+    if (config.rampUpSec != null) settings.rampUpSec = config.rampUpSec
+    if (config.targetRps != null) settings.targetRps = config.targetRps
+    if (config.stopErrorRate != null && config.stopErrorRate > 0) {
+      settings.stopOnErrorRate = true
+      settings.stopErrorRate = config.stopErrorRate
+    }
+    if (config.stopMinRequests != null) settings.stopMinRequests = config.stopMinRequests
+    if (config.recordDetailRequested) {
+      settings.recordDetail = config.recordDetailRequested as RecordDetailMode
+    }
+    if (config.captureMode) settings.captureMode = config.captureMode as CapturePreset
+    if (config.topN != null) settings.topN = config.topN
+    if (config.slowThresholdMs != null) settings.slowThresholdMs = config.slowThresholdMs
+    if (config.baselineReportId != null) settings.baselineReportId = config.baselineReportId
+    if (config.sla) {
+      settings.slaEnabled = true
+      if (config.sla.p95Ms != null) settings.slaP95 = config.sla.p95Ms
+      if (config.sla.p99Ms != null) settings.slaP99 = config.sla.p99Ms
+      if (config.sla.errorRate != null) settings.slaErrorRate = config.sla.errorRate
+      if (config.sla.minRps != null) settings.slaMinRps = config.sla.minRps
+    }
+    if (config.stages?.length) {
+      settings.mode = 'stages'
+      stages.value = config.stages.map((item) => ({
+        concurrent: Number(item.concurrent) || 1,
+        durationSec: Number(item.durationSec) || 1,
+      }))
+    } else {
+      settings.mode = 'fixed'
+      settings.concurrent = Math.max(1, detail.report.concurrency || settings.concurrent)
+      const span = (detail.report.endTime ?? 0) - (detail.report.startTime ?? 0)
+      if (span > 0) settings.durationSec = Math.max(1, Math.round(span / 1000))
+    }
+  }
+
+  if (detail.report.requestId) {
+    // 复用请求定义（请求头 / 体 / 参数），再用报告快照覆盖目标地址与压测参数
+    targetRequestId.value = detail.report.requestId
+    try {
+      request.value = await api.requestGet(detail.report.requestId)
+    } catch {
+      // 请求已被删除：回退到配置快照，不阻断「再次运行」
+      request.value = null
+      targetRequestId.value = null
+      message.warning('关联请求已不存在，已按报告配置快照回填')
+    }
+    if (request.value) {
+      if (config?.method) request.value.method = config.method
+      if (config?.urlTemplate || config?.url) {
+        request.value.url = config.urlTemplate || config.url || request.value.url
+      }
+      return
+    }
+  }
+
+  if (config?.url || config?.urlTemplate) {
+    // 报告未关联请求：只能按快照回填地址与参数，未落库的请求头/体需要用户补齐
+    request.value = {
+      id: 0,
+      collectionId: 0,
+      name: planName.value,
+      method: config?.method || 'GET',
+      url: config?.urlTemplate || config?.url || '',
+      headers: [],
+      params: [],
+      bodyType: config?.bodyType ?? 'none',
+      body: '',
+      preScript: '',
+      postScript: '',
+      assertions: '',
+    }
+    message.warning(
+      '该报告未关联请求或计划：已按配置快照回填地址与压测参数，请求头、请求体与查询参数未存入报告，请补齐后再运行',
+    )
+    return
+  }
+  message.warning('该报告未保存可复用的请求配置，请手动选择请求后再运行')
 }
 
 onBeforeUnmount(() => {

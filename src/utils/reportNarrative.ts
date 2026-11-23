@@ -75,15 +75,27 @@ export function errorWindow(detail: ReportDetail): { from: number; to: number; c
 
 /** 响应时间累积分布（由直方图分桶还原，避免依赖逐请求明细） */
 export function cdfPoints(detail: ReportDetail): Array<{ ms: number; pct: number }> {
-  const buckets = [...(detail.histogram ?? [])].sort((a, b) => a.minMs - b.minMs)
+  const buckets = [...(detail.histogram ?? [])]
+    .filter((item) => item.count > 0)
+    .sort((a, b) => a.minMs - b.minMs)
   const total = buckets.reduce((sum, item) => sum + item.count, 0)
   if (!total) return []
   let cumulative = 0
   const points = [{ ms: 0, pct: 0 }]
   buckets.forEach((bucket) => {
     cumulative += bucket.count
-    points.push({ ms: Math.max(bucket.maxMs, bucket.minMs), pct: (cumulative / total) * 100 })
+    // 最后一档是开放区间（maxMs = f64::MAX）：用 60s 作为可读上界，
+    // 同时跳过零计数档，避免 Infinity 把横轴压成 0~1。
+    const upper =
+      Number.isFinite(bucket.maxMs) && bucket.maxMs <= 600_000
+        ? bucket.maxMs
+        : Math.max(bucket.minMs, 60_000)
+    points.push({
+      ms: Math.max(upper, bucket.minMs),
+      pct: Math.min(100, (cumulative / total) * 100),
+    })
   })
+  points[points.length - 1].pct = 100
   return points
 }
 

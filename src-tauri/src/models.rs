@@ -899,6 +899,57 @@ pub struct StageSummary {
     pub p95_rt: f64,
 }
 
+/// 按 URL 聚合的原始统计：引擎采集、集群上报与入库共用
+///
+/// 与 `report_url_stats` 表字段一一对应（不含 report_id）。集群上报时按
+/// `(method, url, statusCode)` 合并，因此 `requests / successCount / errorCount`
+/// 可直接相加，`maxMs` 取较大值。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct UrlStatRow {
+    pub method: String,
+    pub url: String,
+    /// HTTP 状态码；0 表示连接失败 / 超时等无响应错误
+    pub status_code: i64,
+    pub requests: i64,
+    pub success_count: i64,
+    pub error_count: i64,
+    /// 总耗时（毫秒），用于计算平均耗时与总耗时
+    pub sum_ms: f64,
+    pub max_ms: f64,
+    /// 最长耗时发生时刻（相对压测开始的毫秒）
+    pub max_at_ms: Option<i64>,
+    pub bytes: i64,
+    /// 该 URL 的第一条错误样例（已脱敏、截断）
+    pub error_message: Option<String>,
+    /// 最长耗时请求标识；取不到时为 None，导出显示「—」
+    pub max_request_id: Option<String>,
+}
+
+/// 报告详情中的 URL 统计：在原始计数上补派生字段，前端直接渲染
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UrlStat {
+    pub method: String,
+    pub url: String,
+    pub status_code: i64,
+    pub requests: i64,
+    pub success_count: i64,
+    pub error_count: i64,
+    pub avg_ms: f64,
+    pub max_ms: f64,
+    pub max_at_ms: Option<i64>,
+    /// 总耗时（小时）
+    pub total_hours: f64,
+    /// 平均响应包（KB）
+    pub avg_kb: f64,
+    /// 总流量（MB）
+    pub total_mb: f64,
+    pub error_message: Option<String>,
+    /// 状态码汇总，如 `200×100, 500×2`
+    pub status_summary: String,
+}
+
 /// TopN 慢请求快照（v1.1.1）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -952,6 +1003,9 @@ pub struct StressReport {
     /// 同批多报告分组号
     pub run_group_id: Option<i64>,
     pub plan_name: String,
+    /// 用户可编辑的报告标题；为空时展示回退到 plan_name
+    #[serde(default)]
+    pub title: Option<String>,
     pub request_id: Option<i64>,
     pub total_requests: i64,
     pub success_count: i64,
@@ -1001,6 +1055,15 @@ pub struct ReportDetail {
     /// TopN 慢请求（定位模式）
     #[serde(default)]
     pub slow_requests: Vec<SlowRequest>,
+    /// 按 URL 聚合的统计（与是否记录请求明细无关）
+    #[serde(default)]
+    pub url_stats: Vec<UrlStat>,
+    /// URL 统计是否完整：键溢出或从节点未上报时为 false
+    #[serde(default)]
+    pub url_stats_complete: bool,
+    /// 施压机明细：集群为各节点，单机为本机 1 行；旧报告为空
+    #[serde(default)]
+    pub load_generators: Vec<crate::services::cluster::protocol::ClusterReportNode>,
     pub config: Option<serde_json::Value>,
     /// 用户可编辑的测试场景描述
     pub scenario_text: Option<String>,

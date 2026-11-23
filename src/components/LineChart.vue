@@ -14,8 +14,10 @@ const props = withDefaults(
     unit?: string
     area?: boolean
     height?: number
+    /** 强制旋转横轴标签；默认在标签较长（例如完整日期时间）时自动旋转 */
+    rotateLabels?: boolean
   }>(),
-  { labels: () => [], unit: '', area: true, height: 230 },
+  { labels: () => [], unit: '', area: true, height: 230, rotateLabels: false },
 )
 
 const W = 720
@@ -23,6 +25,10 @@ const padL = 52
 const padR = 18
 const padT = 16
 const padB = 26
+
+/** 横轴为完整时间时旋转 35°，并预留标签高度 */
+const longLabels = computed(() => props.rotateLabels || props.labels.some((label) => label.length > 8))
+const padBottom = computed(() => (longLabels.value ? 74 : padB))
 
 const uid = `fm-${Math.random().toString(36).slice(2, 9)}`
 
@@ -43,7 +49,7 @@ function px(index: number) {
 }
 
 function py(value: number) {
-  const inner = props.height - padT - padB
+  const inner = props.height - padT - padBottom.value
   const ratio = Math.min(1, Math.max(0, value / max.value))
   return padT + inner - ratio * inner
 }
@@ -54,7 +60,7 @@ const lines = computed(() =>
     const line = points.length ? `M${points.join(' L')}` : ''
     const first = px(0)
     const last = px(Math.max(0, s.values.length - 1))
-    const baseline = props.height - padB
+    const baseline = props.height - padBottom.value
     const area = points.length
       ? `${line} L${last.toFixed(1)},${baseline} L${first.toFixed(1)},${baseline} Z`
       : ''
@@ -84,7 +90,7 @@ const gridRows = computed(() => [
 const xTicks = computed(() => {
   const n = count.value
   if (n <= 1) return [{ x: px(0), label: props.labels[0] ?? '0s' }]
-  const wanted = Math.min(6, n)
+  const wanted = Math.min(longLabels.value ? 4 : 6, n)
   const ticks: Array<{ x: number; label: string }> = []
   for (let i = 0; i < wanted; i++) {
     const index = Math.round((i / (wanted - 1)) * (n - 1))
@@ -93,6 +99,11 @@ const xTicks = computed(() => {
   }
   return ticks
 })
+
+/** 旋转标签时基线略高于底部留白，避免超出画布 */
+const xLabelY = computed(() =>
+  longLabels.value ? props.height - padBottom.value + 13 : props.height - 8,
+)
 
 const hasData = computed(() => props.series.some((s) => s.values.length > 0))
 </script>
@@ -124,7 +135,15 @@ const hasData = computed(() => props.series.some((s) => s.values.length > 0))
         </g>
 
         <g v-for="tick in xTicks" :key="tick.label">
-          <text :x="tick.x" :y="height - 8" class="axis-text" text-anchor="middle">{{ tick.label }}</text>
+          <text
+            :x="tick.x"
+            :y="xLabelY"
+            :transform="longLabels ? `rotate(-35 ${tick.x} ${xLabelY})` : undefined"
+            :text-anchor="longLabels ? 'end' : 'middle'"
+            :class="['axis-text', { 'axis-text-dense': longLabels }]"
+          >
+            {{ tick.label }}
+          </text>
         </g>
 
         <template v-for="s in lines" :key="`shape-${s.name}`">
@@ -188,6 +207,10 @@ const hasData = computed(() => props.series.some((s) => s.values.length > 0))
   fill: var(--fm-muted);
   font-size: 10px;
   font-family: 'Inter', sans-serif;
+}
+
+.axis-text-dense {
+  font-size: 9px;
 }
 
 .chart-empty {

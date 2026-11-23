@@ -6,7 +6,7 @@ import type {
   PoolReportStat,
   StatusCount,
 } from '@/types/models'
-import type { ClusterReportMeta } from '@/types/cluster'
+import type { ClusterReportMeta, ClusterReportNode, ReportPeaks } from '@/types/cluster'
 import type { CellValue, XlsxSheet } from './xlsx'
 import { detectKnee, downsample, qpsOverview, reportPeaks, scoreReport, selfCheck, type QpsOverview } from './reportAnalytics'
 import { buildAdvice, buildFindings, cdfPoints, gradeReport, type FindingLevel } from './reportNarrative'
@@ -29,6 +29,77 @@ const RECORD_MODE_LABELS: Record<string, string> = {
 const MODE_LABELS: Record<string, string> = {
   fixed: '固定并发',
   stages: '阶梯加压',
+  cluster: '分布式压测',
+}
+
+/**
+ * 压测模式文案：集群报告的 mode 会被写成 cluster，
+ * 这里结合阶梯阶段数还原成「分布式压测（阶梯/固定）」，页面与导出共用同一口径。
+ */
+function modeLabelText(mode: string | null | undefined, stageCount = 0): string {
+  if (mode === 'cluster') return `分布式压测（${stageCount > 0 ? '阶梯' : '固定'}）`
+  if (mode) return MODE_LABELS[mode] ?? mode
+  return stageCount > 0 ? '阶梯加压' : '固定并发'
+}
+
+/** 页面、HTML 与 Excel 共用的免责声明，保证三处口径一致 */
+export const REPORT_DISCLAIMER =
+  '该报告仅真实体现当时环境下的测试情况，由此造成的任何误解或相关风险，本软件不承担任何法律责任。'
+
+/** 报告展示标题：用户标题为空时回退到计划名称 */
+export function reportTitle(report: { title?: string | null; planName: string }): string {
+  const title = report.title?.trim()
+  return title || report.planName
+}
+
+/**
+ * 施压机明细：优先用后端返回的 loadGenerators；旧接口缺省时在前端按报告
+ * 聚合值合成单机 1 行（集群报告仍使用 config.cluster.nodes），字段缺失不推断。
+ */
+export function loadGeneratorsForReport(detail: ReportDetail): ClusterReportNode[] {
+  if (detail.loadGenerators?.length) return detail.loadGenerators
+  const clusterNodes = detail.config?.cluster?.nodes ?? []
+  if (clusterNodes.length) return clusterNodes
+
+  const report = detail.report
+  const config = detail.config
+  const start = report.startTime ?? 0
+  const end = report.endTime ?? 0
+  const duration = Math.max(0, end - start) / 1000
+  const total = report.totalRequests
+  const bytesSent = config?.metrics?.bytesSent
+  return [
+    {
+      name: '本机',
+      role: 'master',
+      addr: config?.agent?.host || '—',
+      weight: 1,
+      concurrent: report.concurrency,
+      status: report.status,
+      qpsAvg: report.avgQps,
+      cpuPeak: config?.metrics?.cpuPeakCores ?? 0,
+      memPeakMb: config?.metrics?.memPeakMb ?? 0,
+      hostCpuPeak: 0,
+      hostMemPeakPercent: 0,
+      netPeakKbps: 0,
+      clockOffsetMs: 0,
+      clockUncertaintyMs: 0,
+      clockDriftMs: 0,
+      droppedSamples: 0,
+      startMs: start,
+      endMs: end,
+      peakQps: Math.max(report.peakQps ?? 0, report.maxQps ?? 0),
+      peakConcurrent: report.concurrency,
+      share: 1,
+      health: { state: 'done', expected: 0, received: 0, lost: 0, gapSec: 0 },
+      totalRequests: total,
+      successCount: report.successCount,
+      errorCount: report.errorCount,
+      avgRtMs: total > 0 ? report.avgRt : null,
+      tps: duration > 0 ? total / duration : null,
+      egressAvgKbps: duration > 0 && bytesSent != null ? bytesSent / duration / 1024 : null,
+    },
+  ]
 }
 
 function fmtInt(value: number | null | undefined): string {
@@ -185,13 +256,6 @@ function slaRows(detail: ReportDetail): SlaRow[] {
   return rows
 }
 
-/** 供 Excel 概览页使用的单行结论 */
-function verdict(detail: ReportDetail): { title: string; desc: string; tone: string } {
-  const grade = gradeReport(detail)
-  const tone = grade.grade === 'pass' ? 'ok' : grade.grade === 'conditional' ? 'warn' : 'bad'
-  return { title: grade.label, desc: grade.reason, tone }
-}
-
 /* ---------- 文档样式 ---------- */
 
 const STYLE = `
@@ -318,10 +382,22 @@ button.copy:hover { color: var(--accent); border-color: var(--accent); }
 
 /* ---- KPI ---- */
 .kpis { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-top: 1px solid var(--line); border-left: 1px solid var(--line); }
-.kpi { padding: 13px 14px 12px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.kpi { padding: 13px 14px 12px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); box-shadow: inset 0 2px 0 var(--kpi-tone, transparent); }
+.kpi-tone-accent { --kpi-tone: var(--accent); background: linear-gradient(180deg, rgba(20,101,90,.05), transparent 55%); }
+.kpi-tone-info { --kpi-tone: var(--info); background: linear-gradient(180deg, rgba(55,98,143,.05), transparent 55%); }
+.kpi-tone-ok { --kpi-tone: var(--ok); background: linear-gradient(180deg, rgba(23,119,74,.05), transparent 55%); }
+.kpi-tone-warn { --kpi-tone: var(--warn); background: linear-gradient(180deg, rgba(156,100,20,.055), transparent 55%); }
+.kpi-tone-bad { --kpi-tone: var(--bad); background: linear-gradient(180deg, rgba(162,51,51,.055), transparent 55%); }
+.kpi-tone-violet { --kpi-tone: #6b5b95; background: linear-gradient(180deg, rgba(107,91,149,.055), transparent 55%); }
 .kpi-k { font-size: 9.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-4); font-weight: 700; }
 .kpi-v { font-size: 21px; font-weight: 700; letter-spacing: -.02em; margin: 3px 0 1px; font-variant-numeric: tabular-nums; }
 .kpi-v span { font-size: 11px; font-weight: 600; color: var(--ink-3); margin-left: 3px; letter-spacing: 0; }
+.kpi-tone-accent .kpi-v { color: var(--accent); }
+.kpi-tone-info .kpi-v { color: var(--info); }
+.kpi-tone-ok .kpi-v { color: var(--ok); }
+.kpi-tone-warn .kpi-v { color: var(--warn); }
+.kpi-tone-bad .kpi-v { color: var(--bad); }
+.kpi-tone-violet .kpi-v { color: #6b5b95; }
 .kpi-n { font-size: 10.5px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
 .strip {
   display: flex; flex-wrap: wrap; gap: 0; margin-top: 10px; border: 1px solid var(--line);
@@ -381,6 +457,19 @@ button.copy:hover { color: var(--accent); border-color: var(--accent); }
 .lg i { width: 11px; height: 2px; border-radius: 1px; display: inline-block; }
 .lg i.dot { width: 7px; height: 7px; border-radius: 50%; }
 .lg i.dash { background-image: linear-gradient(90deg, currentColor 55%, transparent 0); background-size: 6px 2px; }
+
+/* ---- 构成环形图：四张一排 ---- */
+.pie-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin: 10px 0 20px; }
+.pie-card { border: 1px solid var(--line); border-radius: 8px; padding: 9px; background: var(--paper); break-inside: avoid; }
+.pie-card-head { display: flex; justify-content: space-between; gap: 6px; font-size: 10px; font-weight: 700; color: var(--ink-2); margin-bottom: 2px; }
+.pie-card-head span:last-child { color: var(--ink-4); font-weight: 600; }
+.pie-card svg { width: 100%; max-width: 150px; height: auto; display: block; margin: 2px auto 4px; }
+.pie-legend { display: flex; flex-direction: column; gap: 3px; }
+.pie-legend-row { display: grid; grid-template-columns: 7px 1fr auto auto; gap: 4px; align-items: center; font-size: 9px; }
+.pie-legend-row .dot { width: 7px; height: 7px; border-radius: 2px; }
+.pie-legend-row .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-3); }
+.pie-legend-row .val { color: var(--ink); }
+.pie-legend-row .pct { color: var(--ink-4); min-width: 32px; text-align: right; }
 
 /* ---- 布局 ---- */
 .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 26px; align-items: start; }
@@ -507,6 +596,15 @@ function clockLabel(sec: number): string {
   return minute ? `${minute}:${String(second).padStart(2, '0')}` : `${total}s`
 }
 
+/** 秒数 → 报告实际时钟（YYYY-MM-DD HH:mm:ss），用于完整时间轴 */
+function wallClock(startMs: number, sec: number): string {
+  const date = new Date(startMs + sec * 1000)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(
+    date.getHours(),
+  )}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+}
+
 interface ChartSeries {
   name: string
   color: string
@@ -528,6 +626,8 @@ interface LineChartOptions {
   /** 说明文字，渲染在图题右侧 */
   note?: string
   legend?: boolean
+  /** 报告开始时间（epoch ms）：传入后横轴改用完整时钟时间并旋转标签 */
+  startMs?: number
 }
 
 /**
@@ -537,9 +637,20 @@ interface LineChartOptions {
  * 描边与字号失真 —— 这是原版报告图表「看着不专业」的主因之一。
  */
 function lineChart(title: string, options: LineChartOptions): string {
-  const { xs, series, unit = '', height = 208, refLines = [], band, legend: showLegend = true } = options
+  const {
+    xs,
+    series,
+    unit = '',
+    height: baseHeight = 208,
+    refLines = [],
+    band,
+    legend: showLegend = true,
+    startMs,
+  } = options
   const width = 760
-  const pad = { left: 58, right: 26, top: 18, bottom: 30 }
+  // 完整时间轴会旋转标签，额外预留底部空间，保持绘图区高度不变
+  const pad = { left: 58, right: 26, top: 18, bottom: startMs ? 78 : 30 }
+  const height = baseHeight + (startMs ? 48 : 0)
   const plotW = width - pad.left - pad.right
   const plotH = height - pad.top - pad.bottom
 
@@ -579,12 +690,15 @@ function lineChart(title: string, options: LineChartOptions): string {
   const xAxis = ticks
     .map((time) => {
       const x = X(time)
+      const labelY = pad.top + plotH + (startMs ? 13 : 16)
+      const label = startMs ? wallClock(startMs, time) : clockLabel(time)
+      const labelAttr = startMs
+        ? `text-anchor="end" transform="rotate(-35 ${x.toFixed(1)} ${labelY.toFixed(1)})"`
+        : 'text-anchor="middle"'
       return `<line x1="${x.toFixed(1)}" y1="${(pad.top + plotH).toFixed(1)}" x2="${x.toFixed(
         1,
       )}" y2="${(pad.top + plotH + 4).toFixed(1)}" stroke="#cfd7db" stroke-width="1"/>
-<text x="${x.toFixed(1)}" y="${(pad.top + plotH + 16).toFixed(1)}" text-anchor="middle" font-size="9.5" fill="#9aa6ad">${clockLabel(
-        time,
-      )}</text>`
+<text x="${x.toFixed(1)}" y="${labelY.toFixed(1)}" ${labelAttr} font-size="9.5" fill="#9aa6ad">${label}</text>`
     })
     .join('')
 
@@ -692,71 +806,6 @@ ${xAxis}${paths}${lines}${refs}
 </svg>${legendHtml}</figure>`
 }
 
-/** 每秒成功 / 失败堆叠柱 */
-function stackedBars(title: string, rows: ReportSample[], note?: string): string {
-  if (!rows.length) return ''
-  const width = 760
-  const height = 190
-  const pad = { left: 58, right: 26, top: 16, bottom: 30 }
-  const plotW = width - pad.left - pad.right
-  const plotH = height - pad.top - pad.bottom
-  const data = downsample(rows, CHART_MAX_POINTS)
-  const totals = data.map((item) => item.successCount + item.errorCount)
-  const yMax = niceMax(Math.max(1, ...totals) * 1.04)
-  const slot = plotW / data.length
-  const barWidth = Math.max(0.7, slot - 0.5)
-
-  const grids = Array.from({ length: 5 }, (_, index) => {
-    const y = pad.top + (plotH / 4) * index
-    const value = yMax * (1 - index / 4)
-    return `<line x1="${pad.left}" y1="${y.toFixed(1)}" x2="${width - pad.right}" y2="${y.toFixed(
-      1,
-    )}" stroke="#eef1f3" stroke-width="1"/>
-<text x="${pad.left - 9}" y="${(y + 3.5).toFixed(1)}" text-anchor="end" font-size="9.5" fill="#9aa6ad">${axisNumber(
-      value,
-      yMax,
-    )}</text>`
-  }).join('')
-
-  const baseY = pad.top + plotH
-  const bars = data
-    .map((item, index) => {
-      const x = pad.left + index * slot
-      const successHeight = (item.successCount / yMax) * plotH
-      const errorHeight = (item.errorCount / yMax) * plotH
-      const successBar = `<rect x="${x.toFixed(1)}" y="${(baseY - successHeight).toFixed(
-        1,
-      )}" width="${barWidth.toFixed(1)}" height="${successHeight.toFixed(1)}" fill="#17774a" opacity=".72"/>`
-      const errorBar = errorHeight
-        ? `<rect x="${x.toFixed(1)}" y="${(baseY - successHeight - errorHeight).toFixed(1)}" width="${barWidth.toFixed(
-            1,
-          )}" height="${errorHeight.toFixed(1)}" fill="#a23333" opacity=".9"/>`
-        : ''
-      return successBar + errorBar
-    })
-    .join('')
-
-  const tickCount = Math.min(6, data.length)
-  const xAxis = Array.from({ length: tickCount }, (_, index) => {
-    const at = Math.round((index / Math.max(1, tickCount - 1)) * (data.length - 1))
-    const x = pad.left + at * slot + barWidth / 2
-    return `<text x="${x.toFixed(1)}" y="${(baseY + 16).toFixed(1)}" text-anchor="middle" font-size="9.5" fill="#9aa6ad">${clockLabel(
-      data[at].elapsedSec,
-    )}</text>`
-  }).join('')
-
-  return `<figure class="fig">
-<div class="fig-h"><span class="fig-t">${escapeHtml(title)}</span><span class="fig-u">单位：req/s</span>${
-    note ? `<span class="fig-n">${escapeHtml(note)}</span>` : ''
-  }</div>
-<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(title)}">
-${grids}<line x1="${pad.left}" y1="${baseY}" x2="${width - pad.right}" y2="${baseY}" stroke="#cfd7db" stroke-width="1"/>
-${bars}${xAxis}
-</svg>
-<div class="lg"><span><i style="background:#17774a"></i>成功</span><span><i style="background:#a23333"></i>失败</span></div>
-</figure>`
-}
-
 /** 负载-延迟散点：横轴 QPS，纵轴平均 RT */
 function scatterChart(title: string, rows: ReportSample[]): string {
   if (!rows.length) return ''
@@ -809,8 +858,123 @@ ${xAxis}${dots}
 </svg></figure>`
 }
 
+/** 横向条形图：URL 平均响应、施压机 TPS 等离散对象对比 */
+function barChart(
+  title: string,
+  items: Array<{ label: string; value: number; sub?: string }>,
+  unit: string,
+): string {
+  const rows = items.filter((item) => Number.isFinite(item.value) && item.value >= 0)
+  if (!rows.length) return ''
+  const width = 760
+  const rowH = 30
+  const pad = { left: 200, right: 96, top: 12, bottom: 12 }
+  const height = pad.top + pad.bottom + rows.length * rowH
+  const plotW = width - pad.left - pad.right
+  const max = niceMax(Math.max(1, ...rows.map((item) => item.value)) * 1.02)
+  const bars = rows
+    .map((item, index) => {
+      const y = pad.top + index * rowH
+      const barW = Math.max(1, (Math.min(item.value, max) / max) * plotW)
+      const label =
+        item.label.length > 34 ? `${item.label.slice(0, 33)}…` : item.label
+      const valueText = `${fmtNum(item.value, unit === 'TPS' ? 1 : 0)} ${unit}`
+      return `<text x="${pad.left - 9}" y="${(y + 13).toFixed(1)}" text-anchor="end" font-size="9.5" fill="#53616a">${escapeHtml(
+        label,
+      )}</text>
+${
+  item.sub
+    ? `<text x="${pad.left - 9}" y="${(y + 24).toFixed(1)}" text-anchor="end" font-size="8" fill="#9aa6ad">${escapeHtml(
+        item.sub,
+      )}</text>`
+    : ''
+}
+<rect x="${pad.left}" y="${(y + 6).toFixed(1)}" width="${plotW}" height="11" rx="2" fill="#eef1f3"/>
+<rect x="${pad.left}" y="${(y + 6).toFixed(1)}" width="${barW.toFixed(1)}" height="11" rx="2" fill="#14655a"/>
+<text x="${(pad.left + barW + 6).toFixed(1)}" y="${(y + 15).toFixed(1)}" font-size="9" fill="#414d55">${escapeHtml(
+        valueText,
+      )}</text>`
+    })
+    .join('')
+  return `<figure class="fig">
+<div class="fig-h"><span class="fig-t">${escapeHtml(title)}</span><span class="fig-u">横轴 ${escapeHtml(
+    unit,
+  )}</span><span class="fig-n">${rows.length} 项</span></div>
+<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(title)}">${bars}</svg></figure>`
+}
+
+const PIE_COLORS = [
+  '#14655a',
+  '#37628f',
+  '#9c6414',
+  '#a23333',
+  '#6b4c9a',
+  '#17774a',
+  '#8a5a2b',
+  '#5b6b73',
+]
+
+/** 环形构成图：请求结果、状态码、错误类型、流量构成 */
+function pieChart(
+  title: string,
+  items: Array<{ label: string; value: number; color?: string; display?: string }>,
+  centerText = '',
+): string {
+  const rows = items.filter((item) => Number.isFinite(item.value) && item.value > 0)
+  const total = rows.reduce((sum, item) => sum + item.value, 0)
+  if (!rows.length || total <= 0) return ''
+  const size = 164
+  const cx = size / 2
+  const cy = size / 2
+  const radius = 58
+  const circumference = 2 * Math.PI * radius
+  let offset = 0
+  const segments = rows
+    .map((item, index) => {
+      const length = (item.value / total) * circumference
+      const color = item.color || PIE_COLORS[index % PIE_COLORS.length]
+      const segment = `<circle cx="${cx}" cy="${cy}" r="${radius}" fill="none" stroke="${color}" stroke-width="20" stroke-dasharray="${length.toFixed(
+        2,
+      )} ${(circumference - length).toFixed(2)}" stroke-dashoffset="${(-offset).toFixed(
+        2,
+      )}" transform="rotate(-90 ${cx} ${cy})"/>`
+      offset += length
+      return segment
+    })
+    .join('')
+  const legend = rows
+    .map((item, index) => {
+      const color = item.color || PIE_COLORS[index % PIE_COLORS.length]
+      const pct = ((item.value / total) * 100).toFixed(1)
+      return `<div class="pie-legend-row">
+  <span class="dot" style="background:${color}"></span>
+  <span class="name">${escapeHtml(item.label)}</span>
+  <span class="val mono">${escapeHtml(item.display ?? fmtInt(item.value))}</span>
+  <span class="pct mono">${pct}%</span>
+</div>`
+    })
+    .join('')
+  return `<div class="pie-card">
+  <div class="pie-card-head"><span>${escapeHtml(title)}</span><span>${escapeHtml(
+    centerText || fmtInt(total),
+  )}</span></div>
+  <svg viewBox="0 0 ${size} ${size}" role="img" aria-label="${escapeHtml(title)}">
+    <circle cx="${cx}" cy="${cy}" r="${radius}" fill="none" stroke="#eef1f3" stroke-width="20"/>
+    ${segments}
+    <text x="${cx}" y="${cy - 1}" text-anchor="middle" font-size="15" font-weight="700" fill="#1b2420">${escapeHtml(
+      centerText || fmtInt(total),
+    )}</text>
+    <text x="${cx}" y="${cy + 13}" text-anchor="middle" font-size="8" fill="#9aa6ad">合计</text>
+  </svg>
+  <div class="pie-legend">${legend}</div>
+</div>`
+}
+
 /** 响应时间累积分布曲线（由直方图分桶还原） */
-function cdfChart(title: string, points: Array<{ ms: number; pct: number }>): string {
+function cdfChart(title: string, rawPoints: Array<{ ms: number; pct: number }>): string {
+  const points = rawPoints.filter(
+    (item) => Number.isFinite(item.ms) && Number.isFinite(item.pct),
+  )
   if (points.length < 2) return ''
   const width = 760
   const height = 210
@@ -947,46 +1111,128 @@ ${rings}${axes}<polygon points="${shape}" fill="rgba(20,101,90,.14)" stroke="#14
 
 /* ---------- 报告渲染 ---------- */
 
-function kpiBlock(detail: ReportDetail, qps: QpsOverview): string {
+/**
+ * 响应体读取耗时统计：按成功/失败请求数加权平均，
+ * P95 取报告层直方图（分位数不能由两个分位数相减）；
+ * 旧报告没有 body_avg / body_p95 / body_histogram 时返回 null，避免把缺失当成 0。
+ */
+function bodyLatencyStats(detail: ReportDetail): { avg: number | null; p95: number | null } {
+  const samples = detail.samples ?? []
+  const buckets = detail.bodyHistogram ?? []
+  const available =
+    buckets.length > 0 ||
+    samples.some((sample) => sample.bodyAvg != null || sample.bodyP95 != null)
+  if (!available) return { avg: null, p95: null }
+
+  let sum = 0
+  let weight = 0
+  for (const sample of samples) {
+    const count = sample.successCount + sample.errorCount
+    sum += (sample.bodyAvg || 0) * count
+    weight += count
+  }
+  const avg = weight ? sum / weight : null
+
+  const total = buckets.reduce((acc, item) => acc + item.count, 0)
+  let p95: number | null
+  if (!total) {
+    p95 = samples.length ? Math.max(0, ...samples.map((sample) => sample.bodyP95 || 0)) : null
+  } else {
+    const target = total * 0.95
+    let acc = 0
+    p95 = 0
+    for (const bucket of buckets) {
+      acc += bucket.count
+      if (acc >= target) {
+        p95 = Number.isFinite(bucket.maxMs) ? (bucket.minMs + bucket.maxMs) / 2 : bucket.minMs
+        break
+      }
+    }
+  }
+  return { avg, p95 }
+}
+
+function kpiBlock(detail: ReportDetail, qps: QpsOverview, peaks: ReportPeaks | null): string {
   const report = detail.report
-  const cards = [
-    { k: '总请求数', v: fmtInt(report.totalRequests), u: '', n: `并发 ${fmtInt(report.concurrency)}` },
+  const peakValue = qps.max || peaks?.qps.value || 0
+  const peakNote = peaks
+    ? `第 ${peaks.qps.second} 秒 · 平台期 ${peaks.qps.heldSec} 秒`
+    : '所有采样点中的最大值'
+  const successRate = 100 - report.errorRate
+  // 指标按语义分色：吞吐用主色、峰值用蓝、成功率与 APDEX 按结果取色、延迟用警示色
+  const cards: Array<{ k: string; v: string; u: string; n: string; tone: string }> = [
+    {
+      k: '总请求数',
+      v: fmtInt(report.totalRequests),
+      u: '',
+      n: `并发 ${fmtInt(report.concurrency)}`,
+      tone: 'accent',
+    },
     {
       k: '平均 QPS',
       v: fmtInt(qps.avg),
       u: 'req/s',
-      n: `峰值 ${fmtInt(qps.max)}`,
+      n: `峰值 ${fmtInt(peakValue)}`,
+      tone: 'accent',
+    },
+    {
+      k: '峰值 QPS',
+      v: fmtInt(peakValue),
+      u: 'req/s',
+      n: peakNote,
+      tone: 'info',
     },
     {
       k: '90% 分布 QPS',
       v: qps.used > 0 ? fmtInt(qps.ninety) : '—',
       u: qps.used > 0 ? 'req/s' : '',
       n: qps.used > 0 ? `剔除 ${fmtInt(qps.dropped)} 个升温采样点` : '采样不足，无法计算',
+      tone: 'ok',
     },
     {
       k: '单并发 QPS',
       v: fmtNum(qps.perConcurrent, 2),
       u: 'req/s',
       n: `平均 QPS ÷ ${fmtInt(report.concurrency)} 并发`,
+      tone: 'violet',
     },
     {
       k: '成功率',
-      v: (100 - report.errorRate).toFixed(2),
+      v: successRate.toFixed(2),
       u: '%',
       n: `失败 ${fmtInt(report.errorCount)} 次 · 错误率 ${report.errorRate.toFixed(2)}%`,
+      tone: successRate >= 99 ? 'ok' : successRate >= 95 ? 'warn' : 'bad',
     },
-    { k: '平均响应时间', v: fmtNum(report.avgRt), u: 'ms', n: `TTFB ${fmtNum(report.ttfbAvg)} ms` },
-    { k: 'P95 延迟', v: fmtNum(report.p95Rt), u: 'ms', n: `P99 ${fmtNum(report.p99Rt)} ms` },
-    { k: 'APDEX', v: report.apdex.toFixed(3), u: '', n: apdexGrade(report.apdex) },
+    {
+      k: '平均响应时间',
+      v: fmtNum(report.avgRt),
+      u: 'ms',
+      n: `TTFB ${fmtNum(report.ttfbAvg)} ms`,
+      tone: 'info',
+    },
+    {
+      k: 'P95 延迟',
+      v: fmtNum(report.p95Rt),
+      u: 'ms',
+      n: `P99 ${fmtNum(report.p99Rt)} ms`,
+      tone: 'warn',
+    },
+    {
+      k: 'APDEX',
+      v: report.apdex.toFixed(3),
+      u: '',
+      n: apdexGrade(report.apdex),
+      tone: report.apdex >= 0.85 ? 'ok' : report.apdex >= 0.7 ? 'warn' : 'bad',
+    },
   ]
   return `<div class="kpis">${cards
     .map(
       (item) =>
-        `<div class="kpi"><div class="kpi-k">${escapeHtml(item.k)}</div><div class="kpi-v">${escapeHtml(
-          item.v,
-        )}${item.u ? `<span>${escapeHtml(item.u)}</span>` : ''}</div><div class="kpi-n">${escapeHtml(
-          item.n,
-        )}</div></div>`,
+        `<div class="kpi kpi-tone-${item.tone}"><div class="kpi-k">${escapeHtml(
+          item.k,
+        )}</div><div class="kpi-v">${escapeHtml(item.v)}${
+          item.u ? `<span>${escapeHtml(item.u)}</span>` : ''
+        }</div><div class="kpi-n">${escapeHtml(item.n)}</div></div>`,
     )
     .join('')}</div>`
 }
@@ -1129,14 +1375,315 @@ function capacityBlock(detail: ReportDetail): string {
   <div><span>CPU / 峰值</span><b>${capacity.cores ?? '—'} 核${
     capacity.cpuPeak ? ` / ${fmtNum(capacity.cpuPeak, 1)} 核` : ''
   }</b></div>
+  <div><span>饱和并发</span><b>${capacity.saturationConcurrent ?? '—'}</b></div>
 </div>
 <div class="note">${usageNote}回环检测值，非目标系统容量，实际受网络 RTT 与目标侧影响。</div>`
+}
+
+const CLUSTER_HEALTH_LABELS: Record<string, string> = {
+  ok: '正常',
+  waiting: '等待首样',
+  gap: '采样缺口',
+  lost: '无数据',
+  done: '正常结束',
+}
+
+/* ---------- 基线对比 ---------- */
+
+interface BaselineCompareRow {
+  label: string
+  current: string
+  base: string
+  delta: string
+  tone: 'ok' | 'warn' | 'bad' | 'muted'
+}
+
+const TONE_COLORS: Record<BaselineCompareRow['tone'], string> = {
+  ok: 'var(--ok)',
+  warn: 'var(--warn)',
+  bad: 'var(--bad)',
+  muted: 'var(--ink-3)',
+}
+
+/**
+ * 基线与本次报告的对比行，口径与报告页一致：
+ * 延迟上升 >15% 关注、>40% 风险；吞吐下降 >5% 关注、>20% 风险；错误率绝对值抬升同理。
+ */
+function baselineCompareRows(current: ReportDetail, baseline: ReportDetail): BaselineCompareRow[] {
+  const c = current.report
+  const b = baseline.report
+  const ratio = (value: number, origin: number) =>
+    origin > 0 ? ((value - origin) / origin) * 100 : null
+  const deltaText = (value: number | null) =>
+    value === null ? '—' : `${value >= 0 ? '+' : ''}${value.toFixed(1)}%`
+  const latencyRow = (label: string, value: number, origin: number): BaselineCompareRow => {
+    const pct = ratio(value, origin)
+    return {
+      label,
+      current: `${fmtNum(value)} ms`,
+      base: `${fmtNum(origin)} ms`,
+      delta: deltaText(pct),
+      tone: pct === null ? 'muted' : pct > 40 ? 'bad' : pct > 15 ? 'warn' : 'ok',
+    }
+  }
+  const qpsPct = ratio(c.avgQps, b.avgQps)
+  const errPct = ratio(c.errorRate, b.errorRate)
+  return [
+    latencyRow('P95 延迟', c.p95Rt, b.p95Rt),
+    latencyRow('P99 延迟', c.p99Rt, b.p99Rt),
+    latencyRow('平均延迟', c.avgRt, b.avgRt),
+    {
+      label: '平均 QPS',
+      current: fmtNum(c.avgQps),
+      base: fmtNum(b.avgQps),
+      delta: deltaText(qpsPct),
+      tone: qpsPct === null ? 'muted' : qpsPct < -20 ? 'bad' : qpsPct < -5 ? 'warn' : 'ok',
+    },
+    {
+      label: '错误率',
+      current: `${c.errorRate.toFixed(2)}%`,
+      base: `${b.errorRate.toFixed(2)}%`,
+      delta: deltaText(errPct),
+      tone:
+        errPct === null
+          ? 'muted'
+          : c.errorRate - b.errorRate > 0.5
+            ? 'bad'
+            : c.errorRate - b.errorRate > 0.1
+              ? 'warn'
+              : 'ok',
+    },
+  ]
+}
+
+/** 基线对比区块：未选择基线或基线已被删除时不渲染 */
+function baselineBlock(detail: ReportDetail, baseline: ReportDetail | null | undefined): string {
+  if (!baseline || baseline.report.id === detail.report.id) return ''
+  const rows = baselineCompareRows(detail, baseline)
+  if (!rows.length) return ''
+  return `<div class="sub">基线对比<span class="hint">对照报告 R-${baseline.report.id} · ${escapeHtml(
+    reportTitle(baseline.report),
+  )}</span></div>
+${tableHtml(
+  ['指标', '本次', '基线', '变化'],
+  rows.map((row) => [
+    escapeHtml(row.label),
+    row.current,
+    row.base,
+    `<span style="color:${TONE_COLORS[row.tone]};font-weight:600">${row.delta}</span>`,
+  ]),
+  [1, 2, 3],
+)}
+<div class="note">延迟上升超过 15% 或吞吐下降超过 5% 需要关注；变化为「本次相对基线」的百分比。</div>`
+}
+
+/* ---------- 分布式压测 ---------- */
+
+const NODE_SERIES_COLORS = [
+  '#14655a',
+  '#37628f',
+  '#9c6414',
+  '#a23333',
+  '#6b4c9a',
+  '#17774a',
+  '#8a5a2b',
+  '#2f6f7e',
+  '#7a3b52',
+  '#4f5d2f',
+]
+
+/** 节点数超过预设色板时按色相继续生成，避免多条曲线共用同一颜色 */
+function nodeSeriesColor(index: number): string {
+  return NODE_SERIES_COLORS[index] ?? `hsl(${(index * 47) % 360} 42% 38%)`
+}
+
+/** 节点曲线：按秒取并集对齐，缺采样补 0，避免不同节点曲线错位 */
+function nodeSeriesChart(
+  cluster: ClusterReportMeta,
+  pick: (point: ClusterReportMeta['nodeSeries'][number]['points'][number]) => number,
+  title: string,
+  unit: string,
+  startMs?: number,
+): string {
+  // 旧报告可能没有 points 字段，按页面同款防御式读取，避免整份导出失败
+  const series = (cluster.nodeSeries ?? []).filter((item) => item.points?.length)
+  if (!series.length) return ''
+  const seconds = Array.from(
+    new Set(series.flatMap((item) => item.points.map((point) => point.sec))),
+  ).sort((a, b) => a - b)
+  const chartSeries = series.map((item, index) => {
+    const bySec = new Map(item.points.map((point) => [point.sec, pick(point)]))
+    return {
+      name: item.node,
+      color: nodeSeriesColor(index),
+      values: seconds.map((sec) => bySec.get(sec) ?? 0),
+    }
+  })
+  return lineChart(title, {
+    xs: seconds,
+    series: chartSeries,
+    unit,
+    height: 220,
+    note: `${series.length} 个节点 · 缺采样补 0`,
+    startMs,
+  })
+}
+
+/**
+ * 节点资源曲线只有在采集到整机数据时才输出，
+ * 与报告页一致：老报告没有 host 字段时不画一条全 0 的线。
+ */
+function clusterHasHostSeries(cluster: ClusterReportMeta): boolean {
+  return (cluster.nodeSeries ?? []).some((item) =>
+    (item.points ?? []).some(
+      (point) => (point.hostCpuPercent ?? 0) > 0 || (point.memMb ?? 0) > 0,
+    ),
+  )
+}
+
+/** 集群节点资源峰值：进程口径 + 整机口径 + 网卡，未采集的项自动省略 */
+function nodeResourceText(node: ClusterReportMeta['nodes'][number]): string {
+  const parts: string[] = []
+  if (node.cpuPeak) parts.push(`进程 ${node.cpuPeak.toFixed(2)} 核`)
+  if (node.hostCpuPeak) parts.push(`整机 ${node.hostCpuPeak.toFixed(0)}%`)
+  if (node.memPeakMb) parts.push(fmtBytes(node.memPeakMb * 1024 * 1024))
+  if (node.netPeakKbps) parts.push(`↓↑ ${(node.netPeakKbps / 1024).toFixed(1)} MB/s`)
+  return parts.length ? parts.join(' · ') : '未采集'
+}
+
+function clusterHealthText(node: ClusterReportMeta['nodes'][number]): string {
+  const state = node.health?.state ?? ''
+  const label = CLUSTER_HEALTH_LABELS[state] ?? state ?? '—'
+  return node.health?.message ? `${label}（${node.health.message}）` : label
+}
+
+/**
+ * 分布式压测区块：集群概览、峰值专题与节点贡献表。
+ * 页面与 Excel 都已经有这部分，HTML 导出此前完全缺失，导致集群报告只能看到合并后的单机指标。
+ */
+function clusterBlock(detail: ReportDetail): string {
+  const cluster = detail.config?.cluster
+  if (!cluster) return ''
+  const nodes = cluster.nodes ?? []
+  const totalQps = nodes.reduce((sum, node) => sum + (node.qpsAvg ?? 0), 0)
+
+  const headRows = kvRows([
+    ['协议版本', `v${cluster.protocolVersion}`],
+    ['主节点', escapeHtml(cluster.masterNode || '—')],
+    ['节点数', fmtInt(nodes.length)],
+    ['集群总 QPS', `${fmtInt(totalQps)} req/s`],
+    ['分配总并发', fmtInt(cluster.totalConcurrent)],
+    ['起跑 / 结束', `${fmtTime(cluster.startedAt)} / ${fmtTime(cluster.finishedAt)}`],
+    ['丢弃采样', `${fmtInt(cluster.droppedSamples)} 条`],
+    [
+      '结果完整性',
+      cluster.incomplete
+        ? `<span style="color:var(--bad);font-weight:600">不完整</span>${
+            cluster.note ? `：${escapeHtml(cluster.note)}` : ''
+          }`
+        : '<span style="color:var(--ok);font-weight:600">完整</span>',
+    ],
+  ])
+
+  const peaks = cluster.peaks
+  const peakTable = peaks
+    ? tableHtml(
+        ['峰值指标', '数值', '出现秒', '平台期(秒)', '来源节点'],
+        [
+          ['峰值 QPS', fmtInt(peaks.qps.value), String(peaks.qps.second), String(peaks.qps.heldSec), escapeHtml(peaks.qps.topNode || '—')],
+          ['峰值并发', fmtInt(peaks.concurrent.value), String(peaks.concurrent.second), String(peaks.concurrent.heldSec), '—'],
+          ['最差 P95(ms)', fmtNum(peaks.p95.value, 0), String(peaks.p95.second), String(peaks.p95.heldSec), '—'],
+          ['最差 P99(ms)', fmtNum(peaks.p99.value, 0), String(peaks.p99.second), String(peaks.p99.heldSec), '—'],
+          ['峰值带宽(B/s)', fmtBytes(peaks.bandwidth.value), String(peaks.bandwidth.second), String(peaks.bandwidth.heldSec), '—'],
+          ['最高错误率(%)', peaks.errorRate.value.toFixed(2), String(peaks.errorRate.second), String(peaks.errorRate.heldSec), '—'],
+        ],
+        [1, 2, 3],
+      )
+    : '<div class="note">本次集群报告未记录峰值专题。</div>'
+
+  const nodeRows = nodes.map((node) => [
+    escapeHtml(node.name || '—'),
+    node.role === 'master' ? '主节点' : '从节点',
+    `<span class="mono break">${escapeHtml(node.addr || '—')}</span>`,
+    fmtNum(node.weight, 2),
+    fmtInt(node.concurrent),
+    fmtNum(node.qpsAvg),
+    fmtNum(node.peakQps),
+    fmtInt(node.peakConcurrent),
+    `${((node.share ?? 0) * 100).toFixed(1)}%`,
+    escapeHtml(clusterHealthText(node)),
+    escapeHtml(nodeResourceText(node)),
+    node.clockOffsetMs != null
+      ? `${Number(node.clockOffsetMs).toFixed(1)} ± ${Number(node.clockUncertaintyMs ?? 0).toFixed(1)} ms${
+          Math.abs(node.clockDriftMs ?? 0) >= 1
+            ? `（漂移 ${node.clockDriftMs > 0 ? '+' : ''}${node.clockDriftMs.toFixed(1)} ms）`
+            : ''
+        }`
+      : '—',
+    fmtInt(node.droppedSamples),
+    `${fmtTime(node.startMs)}${node.startMs && node.endMs ? ` · ${fmtDuration(node.startMs, node.endMs)}` : ''}`,
+  ])
+
+  // 与报告页一致的 6 种节点曲线口径；整机资源类仅在采集到时输出
+  const hasHostSeries = clusterHasHostSeries(cluster)
+  const clusterStartMs = detail.report.startTime || undefined
+  const nodeCharts = [
+    nodeSeriesChart(cluster, (point) => point.qps, '节点 QPS 曲线', 'req/s', clusterStartMs),
+    nodeSeriesChart(cluster, (point) => point.concurrent, '节点并发曲线', '并发', clusterStartMs),
+    nodeSeriesChart(cluster, (point) => point.p95, '节点 P95 曲线', 'ms', clusterStartMs),
+    hasHostSeries
+      ? nodeSeriesChart(
+          cluster,
+          (point) => point.hostCpuPercent ?? 0,
+          '节点整机 CPU 曲线',
+          '%',
+          clusterStartMs,
+        )
+      : '',
+    hasHostSeries
+      ? nodeSeriesChart(
+          cluster,
+          (point) => point.memMb ?? 0,
+          '节点进程内存曲线',
+          'MB',
+          clusterStartMs,
+        )
+      : '',
+    hasHostSeries
+      ? nodeSeriesChart(
+          cluster,
+          (point) => (point.netRxKbps ?? 0) + (point.netTxKbps ?? 0),
+          '节点网络曲线',
+          'KB/s',
+          clusterStartMs,
+        )
+      : '',
+  ].join('')
+
+  return `<div class="sub">分布式压测<span class="hint">主从节点合并口径，数值为主节点汇聚结果</span></div>
+${tableHtml(['项目', '取值'], headRows, [], { kv: true })}
+<div class="sub">集群峰值专题<span class="hint">按合并后的每秒采样统计</span></div>
+${peakTable}
+${
+  nodeCharts
+    ? `<div class="sub">节点曲线<span class="hint">按节点上报的秒级采样绘制，缺采样补 0</span></div>${nodeCharts}`
+    : ''
+}
+${
+  nodeRows.length
+    ? `<div class="sub">节点贡献<span class="hint">贡献占比 = 节点平均 QPS ÷ 集群总 QPS</span></div>
+${tableHtml(
+  ['节点', '角色', '地址', '权重', '分配并发', '平均 QPS', '峰值 QPS', '峰值并发', '贡献占比', '采集健康', '资源峰值', '时钟偏移', '丢弃采样', '施压窗口'],
+  nodeRows,
+  [3, 4, 5, 6, 7, 8, 12],
+)}`
+    : '<div class="note">未记录节点明细。</div>'}`
 }
 
 function renderHtml(
   detail: ReportDetail,
   requests: ReportRequestRecord[] = [],
-  options: { includePools?: boolean } = {},
+  options: { includePools?: boolean; baseline?: ReportDetail | null } = {},
 ): string {
   const report = detail.report
   const config = detail.config
@@ -1145,13 +1692,15 @@ function renderHtml(
   const samples = detail.samples ?? []
   const seconds = durationSeconds(detail)
   const rows = downsample(samples, CHART_MAX_POINTS)
+  /** 趋势图横轴统一使用报告实际开始时间，旧报告缺失时回退到相对秒数 */
+  const startMs = report.startTime || undefined
 
   const qps = qpsOverview(detail, { rampUpSec: config?.rampUpSec ?? 0 })
-  const knee = detectKnee(detail)
-  const score = scoreReport(detail)
+  const peaks = reportPeaks(detail)
+  const peakQps = qps.max || peaks?.qps.value || 0
+  const bodyStats = bodyLatencyStats(detail)
   const checks = selfCheck(detail)
   const checksPassed = checks.every((item) => item.pass)
-  const grade = gradeReport(detail)
   const sla = slaRows(detail)
   const slaPassed = sla.every((row) => row.pass)
 
@@ -1162,8 +1711,14 @@ function renderHtml(
   const droppedRecords = metrics?.recordsDropped ?? 0
   const droppedErrors = metrics?.errorsDropped ?? 0
 
-  const modeText = MODE_LABELS[config?.mode ?? ''] ?? (detail.stages.length ? '阶梯加压' : '固定并发')
+  const modeText = modeLabelText(config?.mode, detail.stages.length)
   const rampUp = config?.rampUpSec ?? 0
+  const machineCount = config?.cluster?.nodes?.length ?? 1
+  const rampText = config?.stages?.length
+    ? config.stages.map((stage) => `${stage.concurrent}C/${stage.durationSec}s`).join(' → ')
+    : rampUp > 0
+      ? `升压 ${rampUp}s`
+      : '固定并发'
 
   /* ---- 03 吞吐 ---- */
   const throughput = lineChart('吞吐量（每秒完成请求数）', {
@@ -1175,13 +1730,40 @@ function renderHtml(
       : [],
     band: rampUp > 1 ? { from: 0, to: rampUp, label: '升压期' } : undefined,
     note: `90% 分布 ${fmtInt(qps.ninety)} req/s`,
+    startMs,
   })
 
-  const stacked = stackedBars(
-    '每秒成功 / 失败请求数',
-    rows,
-    `失败合计 ${fmtInt(report.errorCount)} 次`,
-  )
+  const concurrencyTrend = lineChart('并发数趋势', {
+    xs: rows.map((item) => item.elapsedSec),
+    series: [
+      { name: '并发', color: '#37628f', values: rows.map((item) => item.concurrent), area: true },
+    ],
+    unit: '并发',
+    height: 170,
+    startMs,
+  })
+
+  const successQpsTrend = lineChart('成功 QPS（每秒成功请求数）', {
+    xs: rows.map((item) => item.elapsedSec),
+    series: [
+      { name: '成功 QPS', color: '#17774a', values: rows.map((item) => item.successCount), area: true },
+    ],
+    unit: 'req/s',
+    height: 170,
+    note: `成功合计 ${fmtInt(report.successCount)} 次`,
+    startMs,
+  })
+
+  const failureQpsTrend = lineChart('失败 QPS（每秒失败请求数）', {
+    xs: rows.map((item) => item.elapsedSec),
+    series: [
+      { name: '失败 QPS', color: '#a23333', values: rows.map((item) => item.errorCount), area: true },
+    ],
+    unit: 'req/s',
+    height: 170,
+    note: `失败合计 ${fmtInt(report.errorCount)} 次`,
+    startMs,
+  })
 
   const bandwidth = lineChart('网络吞吐（接收字节 / 秒）', {
     xs: rows.map((item) => item.elapsedSec),
@@ -1190,7 +1772,78 @@ function renderHtml(
     ],
     unit: 'KB/s',
     note: `接收合计 ${fmtBytes(bytesReceived)} · 发送合计 ${fmtBytes(bytesSent)}`,
+    startMs,
   })
+
+  const resultPie = pieChart('请求结果构成', [
+    { label: '成功', value: report.successCount, color: '#2A7253' },
+    { label: '失败', value: report.errorCount, color: '#A83A2C' },
+  ])
+  const trafficPie = pieChart(
+    '流量构成',
+    [
+      { label: '接收', value: bytesReceived, color: '#37628f', display: fmtBytes(bytesReceived) },
+      {
+        label: '发送',
+        value: bytesSent,
+        color: '#9c6414',
+        display: bytesSent > 0 ? fmtBytes(bytesSent) : '未记录',
+      },
+    ],
+    fmtBytes(bytesReceived + bytesSent),
+  )
+  const statusColor = (code: number) =>
+    code >= 500 ? '#a23333' : code >= 400 ? '#9c6414' : code >= 300 ? '#37628f' : '#14655a'
+  const statusPie = pieChart(
+    '状态码分布',
+    [...detail.statusCodes]
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 8)
+      .map((item) => ({
+        label: `状态码 ${item.code}`,
+        value: item.count,
+        color: statusColor(item.code),
+      })),
+  )
+  const errorTypePie = pieChart(
+    '错误类型分布',
+    [...detail.errorTypes]
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 8)
+      .map((item) => ({
+        label: item.errorType,
+        value: item.count,
+      })),
+  )
+  const stageQpsBar =
+    detail.stages.length > 1
+      ? barChart(
+          '阶段平均 QPS 对比',
+          detail.stages.map((item) => ({
+            label: `阶段 ${item.index + 1}`,
+            value: item.avgQps,
+            sub: `${item.concurrent} 并发`,
+          })),
+          'QPS',
+        )
+      : ''
+  const stageP95Bar =
+    detail.stages.length > 1
+      ? barChart(
+          '阶段 P95 响应时间对比',
+          detail.stages.map((item) => ({
+            label: `阶段 ${item.index + 1}`,
+            value: item.p95Rt,
+            sub: `${item.concurrent} 并发`,
+          })),
+          'ms',
+        )
+      : ''
+
+  const compositionBlock = [resultPie, statusPie, errorTypePie, trafficPie].some(Boolean)
+    ? `<div class="sub">构成分析<span class="hint">请求结果、状态码、错误类型与流量占比</span></div>
+<div class="pie-grid">${resultPie}${statusPie}${errorTypePie}${trafficPie}</div>`
+    : ''
 
   /* ---- 04 响应时间 ---- */
   const latency = lineChart('响应时间分位趋势', {
@@ -1205,19 +1858,50 @@ function renderHtml(
     refLines: config?.sla?.p95Ms
       ? [{ value: config.sla.p95Ms, label: `SLA P95 ≤ ${config.sla.p95Ms} ms`, color: '#9c6414' }]
       : [],
+    startMs,
+  })
+
+  const avgRtTrend = lineChart('平均响应时间', {
+    xs: rows.map((item) => item.elapsedSec),
+    series: [
+      { name: '平均响应时间', color: '#14655a', values: rows.map((item) => item.avgRt), area: true },
+    ],
+    unit: 'ms',
+    height: 170,
+    note: `整体平均 ${fmtNum(report.avgRt)} ms`,
+    startMs,
   })
 
   const cdf = cdfChart('响应时间累积分布', cdfPoints(detail))
+  const qpsLatency = scatterChart('QPS 与平均响应时间', rows)
 
-  const ttfb = lineChart('首字节时间（TTFB）趋势', {
+  const bodySeries = rows.some((item) => item.bodyAvg > 0)
+    ? [{ name: 'Body 平均', color: '#17774a', values: rows.map((item) => item.bodyAvg) }]
+    : []
+  const ttfb = lineChart('TTFB 与响应体读取耗时趋势', {
     xs: rows.map((item) => item.elapsedSec),
-    series: [{ name: 'TTFB 平均', color: '#6b5b95', values: rows.map((item) => item.ttfbAvg), area: true }],
+    series: [
+      { name: 'TTFB 平均', color: '#6b5b95', values: rows.map((item) => item.ttfbAvg), area: true },
+      ...bodySeries,
+    ],
     unit: 'ms',
-    height: 170,
-    note: `P95 ${fmtNum(report.ttfbP95)} ms`,
+    height: 190,
+    note: `TTFB P95 ${fmtNum(report.ttfbP95)} ms`,
+    startMs,
   })
 
   /* ---- 05 错误 ---- */
+  const errorCountTrend = lineChart('错误数趋势', {
+    xs: rows.map((item) => item.elapsedSec),
+    series: [
+      { name: '错误数', color: '#a23333', values: rows.map((item) => item.errorCount), area: true },
+    ],
+    unit: '个/s',
+    height: 170,
+    note: `失败合计 ${fmtInt(report.errorCount)} 次`,
+    startMs,
+  })
+
   const errorTrend = lineChart('错误率趋势', {
     xs: rows.map((item) => item.elapsedSec),
     series: [
@@ -1228,6 +1912,7 @@ function renderHtml(
     refLines: config?.sla?.errorRate
       ? [{ value: config.sla.errorRate, label: `SLA ≤ ${config.sla.errorRate}%`, color: '#a23333' }]
       : [],
+    startMs,
   })
 
   /* ---- 表格 ---- */
@@ -1235,7 +1920,7 @@ function renderHtml(
     ['样本总数', fmtInt(report.totalRequests)],
     ['成功 / 失败', `${fmtInt(report.successCount)} / ${fmtInt(report.errorCount)}`],
     ['错误率', `${report.errorRate.toFixed(3)}%`],
-    ['平均 / 峰值 QPS', `${fmtInt(qps.avg)} / ${fmtInt(qps.max)} req/s`],
+    ['平均 / 峰值 QPS', `${fmtInt(qps.avg)} / ${fmtInt(peakQps)} req/s`],
     ['90% 分布 QPS', qps.used > 0 ? `${fmtInt(qps.ninety)} req/s` : '—'],
     ['最低 QPS（稳态下限）', qps.used > 0 ? `${fmtInt(qps.min)} req/s` : '—'],
     ['单并发 QPS', `${fmtNum(qps.perConcurrent, 2)} req/s`],
@@ -1250,7 +1935,12 @@ function renderHtml(
     ['最大响应时间', `${fmtNum(report.maxRt)} ms`],
     ['标准差', `${fmtNum(report.stddevRt)} ms`],
     ['APDEX', report.apdex.toFixed(3)],
-    ['总流量（入 / 出）', `${fmtBytes(bytesSent)} / ${fmtBytes(bytesReceived)}`],
+    ['接收带宽', `${(bytesReceived / Math.max(1, seconds) / 1024).toFixed(1)} KB/s`],
+    ['发送带宽', `${(bytesSent / Math.max(1, seconds) / 1024).toFixed(1)} KB/s`],
+    ...(bodyStats.avg != null ? [['Body 平均', `${fmtNum(bodyStats.avg)} ms`] as [string, string]] : []),
+    ...(bodyStats.p95 != null ? [['Body P95', `${fmtNum(bodyStats.p95)} ms`] as [string, string]] : []),
+    ['明细 / 错误丢弃', `${fmtInt(droppedRecords)} / ${fmtInt(droppedErrors)} 条`],
+    ['总流量（入 / 出）', `${fmtBytes(bytesReceived)} / ${fmtBytes(bytesSent)}`],
   ])
 
 
@@ -1270,6 +1960,14 @@ function renderHtml(
   const histogramRows = detail.histogram.map((item) => [
     `<span class="mono">${escapeHtml(item.label)}</span>`,
     meter(item.count, histogramMax),
+    `${((item.count / Math.max(1, report.totalRequests)) * 100).toFixed(2)}%`,
+  ])
+
+  const bodyBuckets = detail.bodyHistogram ?? []
+  const bodyHistogramMax = Math.max(1, ...bodyBuckets.map((item) => item.count))
+  const bodyHistogramRows = bodyBuckets.map((item) => [
+    `<span class="mono">${escapeHtml(item.label)}</span>`,
+    meter(item.count, bodyHistogramMax),
     `${((item.count / Math.max(1, report.totalRequests)) * 100).toFixed(2)}%`,
   ])
 
@@ -1302,27 +2000,25 @@ function renderHtml(
       ]
     })
 
-  // 分阶段：补扩展效率（并发增幅与吞吐增幅的比值）
-  const stageRows = detail.stages.map((stage, index) => {
-    const steady = knee.stages[index]
-    const prev = detail.stages[index - 1]
-    const concurGain =
-      prev && prev.concurrent > 0 ? (stage.concurrent - prev.concurrent) / prev.concurrent : null
-    const efficiency = steady && concurGain !== null && concurGain > 0 ? steady.gain / concurGain : null
-    return [
-      `<span class="mono">S${stage.index + 1}</span>`,
-      fmtInt(stage.concurrent),
-      `${stage.durationSec}s`,
-      fmtInt(stage.requests),
-      fmtInt(stage.errors),
-      fmtNum(stage.avgQps),
-      steady ? fmtInt(steady.qps) : '—',
-      fmtNum(stage.avgRt),
-      fmtNum(stage.p95Rt),
-      steady ? `${(steady.gain * 100).toFixed(1)}%` : '—',
-      efficiency === null ? '—' : `${(efficiency * 100).toFixed(0)}%`,
-    ]
-  })
+  // 分阶段只展示实测值，不再输出扩展效率等推断性指标
+  const stageRows = detail.stages.map((stage) => [
+    `<span class="mono">S${stage.index + 1}</span>`,
+    fmtInt(stage.concurrent),
+    `${stage.durationSec}s`,
+    fmtInt(stage.requests),
+    fmtInt(stage.errors),
+    fmtNum(stage.avgQps),
+    fmtNum(stage.avgRt),
+    fmtNum(stage.p95Rt),
+  ])
+  const stageBlock = stageRows.length
+    ? `<div class="sub">分阶段汇总<span class="hint">仅展示实测值</span></div>
+${tableHtml(
+  ['阶段', '并发', '时长', '请求数', '错误', '平均 QPS', '平均 RT', 'P95'],
+  stageRows,
+  [1, 2, 3, 4, 5, 6, 7],
+)}`
+    : ''
 
   // 定位模式没有全量明细，优先用报告自带的 TopN 慢请求
   const slowRows = (
@@ -1347,9 +2043,9 @@ function renderHtml(
     <span class="badge plain">报告编号 R-${report.id}</span>
   </div>
   <div class="cover-kicker">Performance Test Report · 性能测试报告</div>
-  <h1 class="cover-title">${escapeHtml(report.planName)}</h1>
-  <p class="cover-lead">${escapeHtml(grade.statement)}</p>
-  <span class="badge ${grade.grade}">${escapeHtml(grade.label)}</span>
+  <h1 class="cover-title">${escapeHtml(reportTitle(report))}</h1>
+  <p class="cover-lead">共执行 <b>${fmtInt(report.totalRequests)}</b> 次请求，成功率 <b>${(100 - report.errorRate).toFixed(2)}%</b>，平均吞吐 <b>${fmtInt(qps.avg)}</b> QPS，错误率 <b>${report.errorRate.toFixed(2)}%</b>。</p>
+  <span class="badge plain">${escapeHtml(statusLabel(report.status))}</span>
   <dl class="meta">
     <div><dt>被测目标</dt><dd class="mono target-url">${escapeHtml(
       resolvedTargetUrl(detail, requests),
@@ -1363,28 +2059,28 @@ function renderHtml(
     <div><dt>持续时长</dt><dd>${fmtDuration(report.startTime, report.endTime)}<small>并发 ${fmtInt(
       report.concurrency,
     )}</small></dd></div>
+    <div><dt>测试机数量</dt><dd>${fmtInt(machineCount)} 台<small>${escapeHtml(rampText)}</small></dd></div>
   </dl>
 </header>
 
 <nav class="toc">
   <div class="toc-h">目录 · Contents</div>
   <ol>
-    <li><span class="n">01</span><a href="#s1">执行摘要</a></li>
+    <li><span class="n">01</span><a href="#s1">结果汇总</a></li>
     <li><span class="n">02</span><a href="#s2">测试环境与配置</a></li>
-    <li><span class="n">03</span><a href="#s3">吞吐量与稳定性</a></li>
+    <li><span class="n">03</span><a href="#s3">吞吐与并发</a></li>
     <li><span class="n">04</span><a href="#s4">响应时间分析</a></li>
-    <li><span class="n">05</span><a href="#s5">错误分析</a></li>
-    <li><span class="n">06</span><a href="#s6">容量评估与瓶颈定位</a></li>
-    <li><span class="n">07</span><a href="#s7">结论与优化建议</a></li>
+    <li><span class="n">05</span><a href="#s5">错误与状态码</a></li>
+    <li><span class="n">06</span><a href="#s6">URL 与施压机</a></li>
     <li><span class="n">A</span><a href="#sa">指标口径定义</a></li>
     <li><span class="n">B</span><a href="#sb">数据完整性与自洽校验</a></li>
     <li><span class="n">C</span><a href="#sc">明细数据与导出</a></li>
   </ol>
 </nav>`
 
-  const statement = `<div class="statement ${grade.grade}">
-<div class="statement-t">${escapeHtml(grade.label)} · ${escapeHtml(grade.reason)}</div>
-<div class="statement-d">${escapeHtml(grade.statement)} 共执行 <b>${fmtInt(
+  const statement = `<div class="statement">
+<div class="statement-t">结果汇总</div>
+<div class="statement-d">共执行 <b>${fmtInt(
     report.totalRequests,
   )}</b> 次请求，平均吞吐 <b>${fmtInt(qps.avg)}</b> QPS（90% 分布 <b>${fmtInt(
     qps.ninety,
@@ -1420,11 +2116,12 @@ ${tableHtml(
 
   const scene = (detail.scenarioText ?? '').trim()
   const summary = (detail.summaryText ?? '').trim()
-  const peaks = reportPeaks(detail)
   const peaksBlock = peaks
     ? `<div class="sub">峰值专题<span class="hint">出现时刻与平台期按每秒采样统计</span></div>
 <div class="strip">
-  <div><span>峰值 QPS</span><b>${fmtNum(peaks.qps.value, 0)}</b><em>第 ${peaks.qps.second} 秒 · 持续 ${peaks.qps.heldSec} 秒</em></div>
+  <div><span>峰值 QPS</span><b>${fmtNum(peaks.qps.value, 0)}</b><em>第 ${peaks.qps.second} 秒 · 持续 ${peaks.qps.heldSec} 秒${
+    peaks.qps.topNode ? ` · ${escapeHtml(peaks.qps.topNode)}` : ''
+  }</em></div>
   <div><span>峰值并发</span><b>${fmtNum(peaks.concurrent.value, 0)}</b><em>第 ${peaks.concurrent.second} 秒 · 持续 ${peaks.concurrent.heldSec} 秒</em></div>
   <div><span>最差 P95 / P99</span><b>${fmtNum(peaks.p95.value, 0)} / ${fmtNum(peaks.p99.value, 0)} ms</b><em>峰值时刻延迟</em></div>
   <div><span>峰值带宽 / 错误率</span><b>${fmtBytes(peaks.bandwidth.value)}/s</b><em>最高错误率 ${peaks.errorRate.value.toFixed(2)}%</em></div>
@@ -1434,27 +2131,32 @@ ${tableHtml(
   const sec1 = section(
     's1',
     '01',
-    '执行摘要',
-    'Executive Summary',
+    '结果汇总',
+    'Result Summary',
     `${statement}
 <div class="sub">核心指标</div>
-${kpiBlock(detail, qps)}
+${kpiBlock(detail, qps, peaks)}
 <div class="strip">
   <div><span>目标 / 达成</span><b>${
     qps.target
       ? `${fmtInt(qps.target)} / ${fmtNum(qps.attainment, 1)}%`
       : '不限速'
   }</b></div>
-  <div><span>总流量</span><b>${fmtBytes(totalTraffic)}</b></div>
+  <div><span>总流量（入+出）</span><b>${fmtBytes(totalTraffic)}</b></div>
   <div><span>接收 / 发送</span><b>${fmtBytes(bytesReceived)} / ${fmtBytes(bytesSent)}</b></div>
   <div><span>明细模式</span><b>${escapeHtml(recordModeLabel(recordMode))}</b></div>
   <div><span>施压端</span><b>${escapeHtml(agent?.host ?? '未记录')}</b></div>
 </div>
 ${peaksBlock}
+${compositionBlock}
 ${slaSection}
 ${capacityBlock(detail)}
-<div class="sub">关键发现<span class="hint">按严重程度排序</span></div>
-${findingsBlock(detail)}`,
+${baselineBlock(detail, options.baseline)}
+${
+  summary
+    ? `<div class="sub">报告总结</div><div class="prose">${escapeHtml(summary).replace(/\n/g, '<br/>')}</div>`
+    : ''
+}`,
   )
 
   const targetUrl = resolvedTargetUrl(detail, requests)
@@ -1558,9 +2260,9 @@ ${
   const sec3 = section(
     's3',
     '03',
-    '吞吐量与稳定性',
-    'Throughput & Stability',
-    `${throughput}${stacked}${bandwidth}`,
+    '吞吐与并发',
+    'Throughput & Concurrency',
+    `${throughput}${concurrencyTrend}${successQpsTrend}${failureQpsTrend}${bandwidth}${stageQpsBar}${stageP95Bar}${stageBlock}`,
   )
 
   const sec4 = section(
@@ -1568,7 +2270,7 @@ ${
     '04',
     '响应时间分析',
     'Latency Analysis',
-    `${latency}${cdf}
+    `${avgRtTrend}${latency}${cdf}${qpsLatency}
 <div class="cols">
 <div><div class="sub">分位统计</div>${tableHtml(['分位', '响应时间'], percentileRows, [1], { kv: true })}</div>
 <div><div class="sub">响应时间分布<span class="hint">按区间计数</span></div>${
@@ -1577,19 +2279,26 @@ ${
         : '<div class="note">暂无直方图数据。</div>'
     }</div>
 </div>
+${
+  bodyHistogramRows.length
+    ? `<div class="sub">响应体读取耗时分布<span class="hint">body = 总耗时 − TTFB，单位 ms</span></div>
+${tableHtml(['区间', '数量', '占比'], bodyHistogramRows, [2])}`
+    : ''
+}
 ${ttfb}`,
   )
 
   const sec5 = section(
     's5',
     '05',
-    '错误分析',
-    'Error Analysis',
+    '错误与状态码',
+    'Errors & Status Codes',
     `${
       report.errorCount === 0
         ? '<div class="note" style="margin-top:0">本次压测未产生失败请求，以下分布仅含成功响应。</div>'
         : ''
     }
+${errorCountTrend}
 ${errorTrend}
 <div class="cols">
 <div><div class="sub">状态码分布</div>${
@@ -1609,51 +2318,123 @@ ${tableHtml(['#', '错误类型', '次数', '代表信息'], topErrors, [0, 2])}
 }`,
   )
 
+  const urlStatsData = detail.urlStats ?? []
+  const urlStatsComplete = detail.urlStatsComplete ?? urlStatsData.length > 0
+  // HTML 只展示前 500 个 URL，Excel 输出全量，避免报告体积随 URL 基数膨胀
+  const visibleUrlStats = urlStatsData.slice(0, 500)
+  const urlRows = visibleUrlStats.map((row) => [
+    `<span class="mono">${escapeHtml(row.method)}</span>`,
+    urlCell(row.url),
+    fmtInt(row.requests),
+    `${fmtInt(row.successCount)} / ${fmtInt(row.errorCount)}`,
+    `${(row.requests > 0 ? (row.successCount / row.requests) * 100 : 0).toFixed(2)}%`,
+    `${fmtNum(row.avgMs, 0)} ms`,
+    `${fmtNum(row.maxMs, 0)} ms`,
+    row.maxAtMs == null ? '—' : `${(row.maxAtMs / 1000).toFixed(2)} s`,
+    `${row.totalHours.toFixed(3)} h`,
+    `${row.avgKb.toFixed(1)} KB`,
+    `${row.totalMb.toFixed(1)} MB`,
+    escapeHtml(row.statusSummary || '—'),
+  ])
+  const errorUrlRows = visibleUrlStats
+    .filter((row) => row.errorCount > 0)
+    .map((row) => [
+      `<span class="mono">${escapeHtml(row.method)}</span>`,
+      urlCell(row.url),
+      fmtInt(row.errorCount),
+      `${fmtNum(row.avgMs, 0)} ms`,
+      `${fmtNum(row.maxMs, 0)} ms`,
+      row.maxAtMs == null ? '—' : `${(row.maxAtMs / 1000).toFixed(2)} s`,
+      `<span class="mono break">${escapeHtml(row.errorMessage || '—')}</span>`,
+    ])
+  const urlStatsBlock = `${urlStatsData.length
+      ? `<div class="sub">按 URL 聚合统计<span class="hint">与是否记录请求明细无关，URL 中的敏感参数已脱敏</span></div>
+${tableHtml(
+  ['方法', 'URL', '请求数', '成功 / 失败', '成功率', '平均耗时', '最长耗时', '最长耗时时间', '总耗时', '平均包', '总流量', '状态码'],
+  urlRows,
+  [2, 3, 4, 5, 6, 7, 8, 9, 10],
+)}${
+        urlStatsData.length > visibleUrlStats.length
+          ? `<div class="note">仅展示请求数最多的前 ${visibleUrlStats.length} 个 URL，完整数据请在 Excel 导出中查看。</div>`
+          : ''
+      }
+<div class="sub">错误地址<span class="hint">只列出存在失败请求的 URL</span></div>
+${
+  errorUrlRows.length
+    ? tableHtml(['方法', 'URL', '错误数', '平均耗时', '最长耗时', '最长耗时时间', '错误信息'], errorUrlRows, [2, 3, 4, 5])
+    : '<div class="note">本次压测没有失败请求。</div>'
+}`
+      : `<div class="note">${
+          urlStatsComplete
+            ? '本次压测没有可统计的 URL 数据。'
+            : '该报告生成于旧版本，未记录按 URL 统计。'
+        }</div>`}${
+    urlStatsData.length && !urlStatsComplete
+      ? '<div class="note">URL 统计不完整：URL 键超过上限或部分从节点未上报。</div>'
+      : ''
+  }`
+
+  const loadGenerators = loadGeneratorsForReport(detail)
+  const loadRows = loadGenerators.map((node) => {
+    const total = node.totalRequests
+    const success = node.successCount
+    const errors = node.errorCount
+    return [
+      `<span class="mono">${escapeHtml(node.name)}</span><span class="hint">${node.role === 'master' ? '主节点' : '从节点'}</span>`,
+      `<span class="mono break">${escapeHtml(node.addr || '—')}</span>`,
+      node.startMs ? fmtTime(node.startMs) : '—',
+      total == null ? '—' : fmtInt(total),
+      `${success == null ? '—' : fmtInt(success)} / ${errors == null ? '—' : fmtInt(errors)}`,
+      fmtInt(node.concurrent),
+      total != null && total > 0 && success != null
+        ? `${((success / total) * 100).toFixed(2)}%`
+        : '—',
+      node.avgRtMs == null ? '—' : `${fmtNum(node.avgRtMs, 0)} ms`,
+      node.tps == null ? '—' : fmtNum(node.tps, 1),
+      node.egressAvgKbps == null ? '—' : `${fmtNum(node.egressAvgKbps, 1)} KB/s`,
+    ]
+  })
+  const loadGeneratorBlock = `<div class="sub">施压机明细<span class="hint">请求数、TPS 与出站带宽按该施压机自身施压窗口统计</span></div>
+${tableHtml(
+  ['施压机', '地址', '开始时间', '总请求', '成功 / 失败', '并发', '成功率', '平均耗时', 'TPS', '出站带宽平均'],
+  loadRows,
+  [3, 4, 5, 6, 7, 8, 9],
+)}`
+
+  // URL / 施压机对比图：单 URL 或单机时没有对比意义，直接省略
+  const urlCompare =
+    urlStatsData.length > 1
+      ? barChart(
+          'URL 平均响应时间对比',
+          urlStatsData.slice(0, 12).map((row) => ({
+            label: `${row.method} ${row.url}`,
+            value: row.avgMs,
+            sub: `${fmtInt(row.requests)} 次`,
+          })),
+          'ms',
+        )
+      : ''
+  const generatorCompare =
+    loadGenerators.length > 1
+      ? barChart(
+          '施压机 TPS 对比',
+          loadGenerators
+            .filter((node) => node.tps != null)
+            .map((node) => ({
+              label: node.name,
+              value: node.tps ?? 0,
+              sub: `${fmtInt(node.concurrent)} 并发`,
+            })),
+          'TPS',
+        )
+      : ''
+
   const sec6 = section(
     's6',
     '06',
-    '容量评估与瓶颈定位',
-    'Capacity & Bottleneck',
-    `<div class="statement" style="border-left-color:${
-      knee.saturated ? 'var(--warn)' : 'var(--accent)'
-    };margin-bottom:16px">
-<div class="statement-t">${knee.saturated ? '已检出饱和拐点' : '未检出饱和拐点'}</div>
-<div class="statement-d">${escapeHtml(knee.note)}</div>
-</div>
-${scatterChart('负载-延迟关系', rows)}
-${
-  stageRows.length
-    ? `<div class="sub">分阶段明细<span class="hint">稳态值取阶段中位，扩展效率 = 吞吐增幅 / 并发增幅</span></div>
-${tableHtml(
-        ['阶段', '并发', '时长', '请求数', '错误', '平均 QPS', '稳态 QPS', '平均 RT', 'P95', '吞吐增幅', '扩展效率'],
-        stageRows,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
-      )}`
-    : '<div class="note">固定并发模式不做分阶段容量判定，如需测量容量上限请改用阶梯加压。</div>'
-}
-<div class="sub">综合体检<span class="hint">四维等权评分，规则见下方注</span></div>
-<div class="cols">
-<div>${radarChart(score.dimensions)}</div>
-<div>${scoreBlock(detail)}</div>
-</div>`,
-  )
-
-  const sec7 = section(
-    's7',
-    '07',
-    '结论与优化建议',
-    'Conclusion & Recommendations',
-    `<div class="statement ${grade.grade}">
-<div class="statement-t">${escapeHtml(grade.label)}</div>
-<div class="statement-d">${escapeHtml(grade.statement)}</div>
-</div>
-<div class="sub">优化建议<span class="hint">P0 阻断上线 / P1 本次迭代 / P2 长期</span></div>
-${adviceBlock(detail)}
-${
-  summary
-    ? `<div class="sub">补充说明</div><div class="prose">${escapeHtml(summary).replace(/\n/g, '<br/>')}</div>`
-    : ''
-}`,
+    'URL 与施压机',
+    'URL & Load Generators',
+    `${urlStatsBlock}${loadGeneratorBlock}${urlCompare}${generatorCompare}${clusterBlock(detail)}`,
   )
 
   const metricDefs: string[][] = [
@@ -1669,10 +2450,8 @@ ${
     ['目标达成率', '平均 QPS ÷ 目标 QPS；与 SLA「最小 QPS」同一口径，超过 100% 表示超出限速目标。'],
     ['TTFB', '首字节时间，从请求发出到收到响应首字节的耗时，可区分网络/排队与服务端处理。'],
     ['APDEX', '(满意请求数 + 容忍请求数 / 2) / 总请求数，容忍阈值 T = 4 × 平均响应时间。'],
-    ['错误率', '失败请求数 / 总请求数。SLA 判定与红黄绿结论均以此口径为准。'],
+    ['错误率', '失败请求数 / 总请求数。SLA 判定以此口径为准。'],
     ['总流量', '发送字节 + 接收字节；趋势图中的带宽按每秒采样折算。'],
-    ['稳态 QPS', '该阶段剔除前 20%（升压）与后 10%（切换抖动）后采样 QPS 的中位数。'],
-    ['扩展效率', '吞吐增幅百分比 ÷ 并发增幅百分比；100% 表示线性扩展，明显低于 100% 说明已接近瓶颈。'],
   ]
 
   const secA = section(
@@ -1737,11 +2516,15 @@ ${
 ${
   slowRows.length
     ? `<div class="sub">Top 10 慢请求<span class="hint">取自已记录明细${
-        recordMode === 'off' ? '（本次未记录）' : `（共 ${fmtInt(requests.length)} 条样本）`
+        recordMode === 'off' ? '（本次未记录）' : `（共 ${fmtInt(report.totalRequests)} 条请求）`
       }</span></div>
 ${tableHtml(['时间点', 'URL', '耗时(ms)', '状态码', '结果'], slowRows, [2, 3])}`
     : ''
-}`,
+}
+<div class="sub">脱敏说明</div>
+<div class="prose"><p>URL 中的 token / password / secret / authorization / cookie 等参数值已掩码；错误信息中的 Bearer、password、token、sk- 等凭证已掩码。</p></div>
+<div class="sub">免责声明</div>
+<div class="prose"><p>${escapeHtml(REPORT_DISCLAIMER)}</p></div>`,
   )
 
   return `<!DOCTYPE html>
@@ -1749,7 +2532,7 @@ ${tableHtml(['时间点', 'URL', '耗时(ms)', '状态码', '结果'], slowRows,
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>${escapeHtml(report.planName)} · 性能测试报告 R-${report.id}</title>
+<title>${escapeHtml(reportTitle(report))} · 性能测试报告 R-${report.id}</title>
 <style>${STYLE}</style>
 </head>
 <body>
@@ -1761,7 +2544,6 @@ ${sec3}
 ${sec4}
 ${sec5}
 ${sec6}
-${sec7}
 ${secA}
 ${secB}
 ${secC}
@@ -1772,7 +2554,7 @@ ${secC}
       recordModeLabel(recordMode),
     )}</span>
   </div>
-  <div style="margin-top:6px">本报告仅反映上述施压端、目标环境与参数组合下的实测结果，不代表目标系统的绝对容量上限。容量结论应在生产等价拓扑与真实数据量下复测确认。</div>
+  <div style="margin-top:6px"><b>免责声明：</b>${escapeHtml(REPORT_DISCLAIMER)}</div>
 </footer>
 </div>
 <script>
@@ -1811,7 +2593,7 @@ document.addEventListener('click', function (event) {
 export function buildReportHtml(
   detail: ReportDetail,
   requests: ReportRequestRecord[] = [],
-  options: { includePools?: boolean } = {},
+  options: { includePools?: boolean; baseline?: ReportDetail | null } = {},
 ): string {
   return renderHtml(detail, requests, options)
 }
@@ -1852,7 +2634,7 @@ function poolSheet(detail: ReportDetail): CellValue[][] {
   }
   const perItemPools = pools.filter((pool) => pool.perItem?.length)
   if (perItemPools.length) {
-    rows.push([], ['条目使用明细', '', '', '', '', '', ''])
+    rows.push([], ['条目使用明细（按请求数取 Top 200）', '', ''])
     rows.push(['池名', '条目序号', '请求次数'])
     perItemPools.forEach((pool) => {
       pool.perItem?.forEach((item) => rows.push([pool.name, item.index, item.requests]))
@@ -1865,6 +2647,7 @@ function poolSheet(detail: ReportDetail): CellValue[][] {
 
 function percentileSheet(detail: ReportDetail): CellValue[][] {
   const report = detail.report
+  const body = bodyLatencyStats(detail)
   return [
     ['指标', '数值', '单位'],
     ['最小响应时间', report.minRt, 'ms'],
@@ -1879,6 +2662,8 @@ function percentileSheet(detail: ReportDetail): CellValue[][] {
     ['标准差', report.stddevRt, 'ms'],
     ['TTFB 平均', report.ttfbAvg, 'ms'],
     ['TTFB P95', report.ttfbP95, 'ms'],
+    ...(body.avg != null ? [['Body 平均', Number(body.avg.toFixed(1)), 'ms'] as CellValue[]] : []),
+    ...(body.p95 != null ? [['Body P95', Number(body.p95.toFixed(1)), 'ms'] as CellValue[]] : []),
   ]
 }
 
@@ -1886,21 +2671,33 @@ function percentileSheet(detail: ReportDetail): CellValue[][] {
 export function buildReportSheets(
   detail: ReportDetail,
   requests: ReportRequestRecord[] = [],
-  options: { includePools?: boolean } = {},
+  options: {
+    includePools?: boolean
+    baseline?: ReportDetail | null
+    includeRequestRows?: boolean
+    includeSampleRows?: boolean
+  } = {},
 ): XlsxSheet[] {
   const report = detail.report
+  const config = detail.config
+  const metrics = config?.metrics
+  const agent = config?.agent
+  const capacity = config?.machineCapacity
   const sla = slaRows(detail)
   const qps = qpsOverview(detail, { rampUpSec: detail.config?.rampUpSec ?? 0 })
+  const peaks = reportPeaks(detail)
+  const peakQps = qps.max || peaks?.qps.value || 0
+  const body = bodyLatencyStats(detail)
+  const receivedBytes = report.bytesTotal ?? 0
+  const sentBytes = metrics?.bytesSent ?? 0
 
   const overview: CellValue[][] = [
-    ['压测报告', report.planName],
+    ['压测报告', reportTitle(report)],
     ['报告编号', `R-${report.id}`],
     ['执行状态', statusLabel(report.status)],
     ['开始时间', fmtTime(report.startTime)],
     ['结束时间', fmtTime(report.endTime)],
     ['持续时长', fmtDuration(report.startTime, report.endTime)],
-    ['压测结论', verdict(detail).title],
-    ['结论依据', verdict(detail).desc],
     [],
     ['核心指标', '数值'],
     ['总请求数', report.totalRequests],
@@ -1909,7 +2706,9 @@ export function buildReportSheets(
     ['错误率(%)', report.errorRate],
     ['成功率(%)', Number((100 - report.errorRate).toFixed(4))],
     ['平均 QPS', qps.avg],
-    ['峰值 QPS', qps.max],
+    ['峰值 QPS', peakQps],
+    ['峰值 QPS 出现秒', peaks ? peaks.qps.second : '—'],
+    ['峰值 QPS 平台期(秒)', peaks ? peaks.qps.heldSec : '—'],
     ['90% 分布 QPS', Number(qps.ninety.toFixed(1))],
     ['最低 QPS', qps.used > 0 ? Number(qps.min.toFixed(1)) : '—'],
     ['单并发 QPS', Number(qps.perConcurrent.toFixed(4))],
@@ -1923,21 +2722,26 @@ export function buildReportSheets(
     ['P95(ms)', report.p95Rt],
     ['P99(ms)', report.p99Rt],
     ['APDEX', report.apdex],
-    ['流量总量(B)', report.bytesTotal],
+    ...(body.avg != null ? [['Body 平均(ms)', Number(body.avg.toFixed(1))] as CellValue[]] : []),
+    ...(body.p95 != null ? [['Body P95(ms)', Number(body.p95.toFixed(1))] as CellValue[]] : []),
+    ['接收流量(B)', receivedBytes],
+    ['发送流量(B)', sentBytes],
+    ['总流量(B)', receivedBytes + sentBytes],
+    ['明细丢弃(条)', metrics?.recordsDropped ?? 0],
+    ['错误丢弃(条)', metrics?.errorsDropped ?? 0],
     [],
   ]
 
   // 峰值专题：与报告页、AI 共用 reportPeaks，集群取 cluster.peaks，单机取 metricsPeaks
-  const peaks = reportPeaks(detail)
   if (peaks) {
     overview.push(
-      ['峰值专题', '数值', '出现秒', '平台期(秒)'],
-      ['秒级峰值 QPS', peaks.qps.value, peaks.qps.second, peaks.qps.heldSec],
-      ['峰值并发', peaks.concurrent.value, peaks.concurrent.second, peaks.concurrent.heldSec],
-      ['峰值带宽(B/s)', peaks.bandwidth.value, peaks.bandwidth.second, peaks.bandwidth.heldSec],
-      ['最差 P95(ms)', peaks.p95.value, peaks.p95.second, peaks.p95.heldSec],
-      ['最差 P99(ms)', peaks.p99.value, peaks.p99.second, peaks.p99.heldSec],
-      ['最高错误率(%)', peaks.errorRate.value, peaks.errorRate.second, peaks.errorRate.heldSec],
+      ['峰值专题', '数值', '出现秒', '平台期(秒)', '来源节点'],
+      ['秒级峰值 QPS', peaks.qps.value, peaks.qps.second, peaks.qps.heldSec, peaks.qps.topNode || '—'],
+      ['峰值并发', peaks.concurrent.value, peaks.concurrent.second, peaks.concurrent.heldSec, '—'],
+      ['峰值带宽(B/s)', peaks.bandwidth.value, peaks.bandwidth.second, peaks.bandwidth.heldSec, '—'],
+      ['最差 P95(ms)', peaks.p95.value, peaks.p95.second, peaks.p95.heldSec, '—'],
+      ['最差 P99(ms)', peaks.p99.value, peaks.p99.second, peaks.p99.heldSec, '—'],
+      ['最高错误率(%)', peaks.errorRate.value, peaks.errorRate.second, peaks.errorRate.heldSec, '—'],
       [],
     )
   }
@@ -1948,7 +2752,7 @@ export function buildReportSheets(
   }
 
   const samples: CellValue[][] = [
-    ['时间(s)', '并发', 'QPS', '平均 RT(ms)', 'P50(ms)', 'P95(ms)', 'P99(ms)', 'TTFB(ms)', '流量(B)', '成功数', '失败数'],
+    ['时间(s)', '并发', 'QPS', '平均 RT(ms)', 'P50(ms)', 'P95(ms)', 'P99(ms)', 'TTFB(ms)', 'Body 平均(ms)', 'Body P95(ms)', '流量(B)', '成功数', '失败数'],
     ...detail.samples.map((sample: ReportSample) => [
       sample.elapsedSec,
       sample.concurrent,
@@ -1958,6 +2762,8 @@ export function buildReportSheets(
       sample.p95Rt,
       sample.p99Rt,
       sample.ttfbAvg,
+      sample.bodyAvg,
+      sample.bodyP95,
       sample.bytes,
       sample.successCount,
       sample.errorCount,
@@ -2033,6 +2839,71 @@ export function buildReportSheets(
     ]),
   ]
 
+  const urlStatsSheet: CellValue[][] = detail.urlStats?.length
+    ? [
+        [
+          '方法',
+          'URL',
+          '状态码',
+          '请求数',
+          '成功数',
+          '失败数',
+          '成功率(%)',
+          '平均耗时(ms)',
+          '最长耗时(ms)',
+          '最长耗时时间(s)',
+          '总耗时(h)',
+          '平均包(KB)',
+          '总流量(MB)',
+          '状态码汇总',
+          '错误信息',
+        ],
+        ...detail.urlStats.map((row) => [
+          row.method,
+          row.url,
+          row.statusCode || '—',
+          row.requests,
+          row.successCount,
+          row.errorCount,
+          Number((row.requests > 0 ? (row.successCount / row.requests) * 100 : 0).toFixed(2)),
+          Number(row.avgMs.toFixed(1)),
+          Number(row.maxMs.toFixed(1)),
+          row.maxAtMs == null ? '—' : Number((row.maxAtMs / 1000).toFixed(3)),
+          Number(row.totalHours.toFixed(4)),
+          Number(row.avgKb.toFixed(2)),
+          Number(row.totalMb.toFixed(3)),
+          row.statusSummary || '—',
+          clip(row.errorMessage ?? '', 500),
+        ]),
+      ]
+    : [
+        [
+          '说明',
+          (detail.urlStatsComplete ?? false)
+            ? '本次压测没有可统计的 URL 数据'
+            : '该报告生成于旧版本，未记录按 URL 统计',
+        ],
+      ]
+
+  const errorUrlSheet: CellValue[][] = (() => {
+    const rows = (detail.urlStats ?? []).filter((row) => row.errorCount > 0)
+    if (!rows.length) {
+      return [['说明', detail.urlStats?.length ? '本次压测没有失败请求' : '未记录错误地址统计']]
+    }
+    return [
+      ['方法', 'URL', '错误数', '平均耗时(ms)', '最长耗时(ms)', '最长耗时时间(s)', '错误信息'],
+      ...rows.map((row) => [
+        row.method,
+        row.url,
+        row.errorCount,
+        Number(row.avgMs.toFixed(1)),
+        Number(row.maxMs.toFixed(1)),
+        row.maxAtMs == null ? '—' : Number((row.maxAtMs / 1000).toFixed(3)),
+        clip(row.errorMessage ?? '', 500),
+      ]),
+    ]
+  })()
+
   const histogram: CellValue[][] = [
     ['区间', '最小值(ms)', '最大值(ms)', '数量', '占比(%)'],
     ...detail.histogram.map((item) => [
@@ -2058,22 +2929,29 @@ export function buildReportSheets(
     ]),
   ]
 
-  const config = detail.config
   const snapshot: CellValue[][] = config
     ? [
         ['配置项', '取值'],
-        ['压测模式', MODE_LABELS[config.mode ?? ''] ?? config.mode ?? '-'],
+        ['压测模式', modeLabelText(config.mode, config.stages?.length ?? 0)],
         ['请求方法', config.method ?? '-'],
         ['请求地址', resolvedTargetUrl(detail, requests)],
         ['请求头数量', config.headers ?? 0],
         ['参数数量', config.params ?? 0],
         ['请求体类型', config.bodyType ?? '-'],
         ['环境 ID', config.envId ?? '-'],
+        ['环境名称', config.envName ?? '-'],
+        ['测试机数量', config.cluster?.nodes?.length ?? 1],
         ['超时时间(ms)', config.timeoutMs ?? '-'],
+        ['连接超时(ms)', config.connectTimeoutMs ?? '-'],
+        ['跟随重定向', config.followRedirects ? '是' : '否'],
         ['思考时间(ms)', config.thinkTimeMs ?? '-'],
         ['加压时间(s)', config.rampUpSec ?? '-'],
         ['目标 QPS', config.targetRps || '不限速'],
         ['明细记录模式', recordModeLabel(config.recordDetail)],
+        ['采集预设', config.captureMode ?? '-'],
+        ['TopN 慢请求', config.topN ?? '-'],
+        ['慢请求阈值(ms)', config.slowThresholdMs ?? '-'],
+        ['采样间隔(s)', metrics?.sampleIntervalSec ?? '-'],
         [
           '阶梯配置',
           config.stages?.length
@@ -2084,28 +2962,40 @@ export function buildReportSheets(
         ['SLA P99(ms)', config.sla?.p99Ms ?? '-'],
         ['SLA 错误率(%)', config.sla?.errorRate ?? '-'],
         ['SLA 最小 QPS', config.sla?.minRps ?? '-'],
-        ['施压端主机', config.agent?.host ?? '-'],
+        ['基线报告 ID', config.baselineReportId ?? '-'],
+        ['同主机施压告警', config.sameHostWarning ?? '-'],
+        ['施压工具', `${agent?.tool ?? 'AstroMan'} ${agent?.version ?? ''}`.trim()],
+        ['施压端主机', agent?.host ?? '-'],
+        ['操作系统', `${agent?.os ?? '-'} ${agent?.osVersion ?? ''}`.trim()],
+        ['CPU 核数', agent?.cpuCores ?? '-'],
+        ['内存(MB)', agent?.memTotalMb ?? '-'],
+        ['压测期峰值 CPU(核)', metrics?.cpuPeakCores ?? '-'],
+        ['压测期峰值内存(MB)', metrics?.memPeakMb ?? '-'],
+        ['客户端极限 QPS', capacity?.maxQps ?? '-'],
+        ['客户端负载占比(%)', capacity?.maxQps ? Number(((report.avgQps / capacity.maxQps) * 100).toFixed(1)) : '-'],
+        ['饱和并发', capacity?.saturationConcurrent ?? '-'],
+        ['明细丢弃(条)', metrics?.recordsDropped ?? 0],
+        ['错误丢弃(条)', metrics?.errorsDropped ?? 0],
         ['报告生成时间', fmtTime(Date.now())],
       ]
     : [['配置项', '取值'], ['说明', '该报告未保存配置快照']]
 
-  const advice: CellValue[][] = [
-    ['优先级', '建议', '说明'],
-    ...buildAdvice(detail).map((item) => [item.priority, item.title, item.detail]),
-  ]
-
   const clusterMeta = (config as unknown as { cluster?: ClusterReportMeta } | null)?.cluster
+  const clusterTotalQps = (clusterMeta?.nodes ?? []).reduce((sum, node) => sum + (node.qpsAvg ?? 0), 0)
   // 集群概览放在峰值页顶部，避免与「概览」工作表重复
   const clusterHead: CellValue[][] = clusterMeta
     ? [
         ['分布式压测', ''],
         ['协议版本', `v${clusterMeta.protocolVersion}`],
         ['主节点', clusterMeta.masterNode || '—'],
+        ['节点数', clusterMeta.nodes.length],
+        ['集群总 QPS', Number(clusterTotalQps.toFixed(1))],
         ['总并发', clusterMeta.totalConcurrent],
         ['起跑时间', fmtTime(clusterMeta.startedAt)],
         ['结束时间', fmtTime(clusterMeta.finishedAt)],
         ['丢弃采样', clusterMeta.droppedSamples],
         ['结果完整', clusterMeta.incomplete ? '不完整' : '完整'],
+        ['不完整原因', clusterMeta.note || '-'],
         [],
       ]
     : []
@@ -2135,8 +3025,9 @@ export function buildReportSheets(
           '节点',
           '角色',
           '地址',
-          '状态',
+          '权重',
           '分配并发',
+          '状态',
           '平均 QPS',
           '峰值 QPS',
           '峰值并发',
@@ -2144,17 +3035,22 @@ export function buildReportSheets(
           '采集健康',
           '进程核数',
           '整机 CPU 峰值(%)',
+          '整机内存峰值(%)',
           '进程内存峰值(MB)',
           '网络峰值(KB/s)',
           '时钟偏移(ms)',
           '时钟漂移(ms)',
+          '丢弃采样',
+          '施压开始时间',
+          '施压时长(s)',
         ],
         ...clusterMeta.nodes.map((node) => [
           node.name,
           node.role === 'master' ? '主节点' : '从节点',
           node.addr,
-          node.status,
+          node.weight ?? 1,
           node.concurrent,
+          node.status,
           node.qpsAvg,
           node.peakQps,
           node.peakConcurrent,
@@ -2164,59 +3060,202 @@ export function buildReportSheets(
             : node.health?.message || node.health?.state || '—',
           node.cpuPeak ? Number(node.cpuPeak.toFixed(2)) : null,
           node.hostCpuPeak ? Number(node.hostCpuPeak.toFixed(1)) : null,
+          node.hostMemPeakPercent ? Number(node.hostMemPeakPercent.toFixed(1)) : null,
           node.memPeakMb || null,
           node.netPeakKbps ? Number(node.netPeakKbps.toFixed(1)) : null,
           Number((node.clockOffsetMs ?? 0).toFixed(1)),
           node.clockDriftMs ? Number(node.clockDriftMs.toFixed(1)) : null,
+          node.droppedSamples ?? 0,
+          fmtTime(node.startMs),
+          node.startMs && node.endMs ? Number(((node.endMs - node.startMs) / 1000).toFixed(1)) : null,
         ]),
       ]
     : []
 
-  // 节点秒级曲线单独一张表：按秒对齐，缺采样留空，避免把 0 当成真实低吞吐
+  // 施压机明细：单机 1 行、集群 N 行；缺失字段输出「—」，不推断
+  const loadGenerators = loadGeneratorsForReport(detail)
+  const loadGeneratorSheet: CellValue[][] = loadGenerators.length
+    ? [
+        [
+          '施压机',
+          '角色',
+          '地址',
+          '状态',
+          '开始时间',
+          '结束时间',
+          '施压时长(s)',
+          '总请求',
+          '成功数',
+          '失败数',
+          '并发',
+          '成功率(%)',
+          '平均耗时(ms)',
+          'TPS',
+          '出站带宽平均(KB/s)',
+        ],
+        ...loadGenerators.map((node) => {
+          const total = node.totalRequests
+          const success = node.successCount
+          const errors = node.errorCount
+          return [
+            node.name,
+            node.role === 'master' ? '主节点' : '从节点',
+            node.addr || '—',
+            node.status,
+            node.startMs ? fmtTime(node.startMs) : '—',
+            node.endMs ? fmtTime(node.endMs) : '—',
+            node.startMs && node.endMs
+              ? Number(((node.endMs - node.startMs) / 1000).toFixed(1))
+              : '—',
+            total ?? '—',
+            success ?? '—',
+            errors ?? '—',
+            node.concurrent,
+            total != null && total > 0 && success != null
+              ? Number(((success / total) * 100).toFixed(2))
+              : '—',
+            node.avgRtMs != null ? Number(node.avgRtMs.toFixed(1)) : '—',
+            node.tps != null ? Number(node.tps.toFixed(1)) : '—',
+            node.egressAvgKbps != null ? Number(node.egressAvgKbps.toFixed(1)) : '—',
+          ]
+        }),
+      ]
+    : [['说明', '该报告未记录施压机明细']]
+
+  // 节点秒级曲线单独一张表：按秒对齐（取各节点秒并集），缺采样留空，
+  // 避免节点晚加入或采样错位时按下标对齐画出错误曲线。
   const clusterSeriesSheet: CellValue[][] = []
   if (clusterMeta?.nodeSeries?.length) {
-    const series = clusterMeta.nodeSeries.filter((item) => item.points.length)
+    const series = clusterMeta.nodeSeries.filter((item) => item.points?.length)
     if (series.length) {
+      const seconds = Array.from(
+        new Set(series.flatMap((item) => item.points.map((point) => point.sec))),
+      ).sort((a, b) => a - b)
+      const bySec = series.map(
+        (item) => new Map(item.points.map((point) => [point.sec, point])),
+      )
       clusterSeriesSheet.push(
         ['节点秒级采样', ...series.map((item) => item.node)],
         [
           '秒',
           ...series.map((item) => `${item.node} QPS`),
           ...series.map((item) => `${item.node} 并发`),
+          ...series.map((item) => `${item.node} P95(ms)`),
           ...series.map((item) => `${item.node} 整机CPU%`),
+          ...series.map((item) => `${item.node} 进程内存MB`),
           ...series.map((item) => `${item.node} 网络KB/s`),
         ],
       )
-      const maxPoints = Math.max(...series.map((item) => item.points.length))
-      for (let index = 0; index < maxPoints; index += 1) {
+      for (const sec of seconds) {
+        const points = bySec.map((map) => map.get(sec))
         clusterSeriesSheet.push([
-          index + 1,
-          ...series.map((item) => item.points[index]?.qps ?? null),
-          ...series.map((item) => item.points[index]?.concurrent ?? null),
-          ...series.map((item) => item.points[index]?.hostCpuPercent ?? null),
-          ...series.map((item) =>
-            item.points[index]
-              ? Number(((item.points[index].netRxKbps ?? 0) + (item.points[index].netTxKbps ?? 0)).toFixed(1))
-              : null,
+          sec,
+          ...points.map((point) => point?.qps ?? null),
+          ...points.map((point) => point?.concurrent ?? null),
+          ...points.map((point) => (point?.p95 != null ? Number(point.p95.toFixed(1)) : null)),
+          ...points.map((point) => point?.hostCpuPercent ?? null),
+          ...points.map((point) => point?.memMb ?? null),
+          ...points.map((point) =>
+            point ? Number(((point.netRxKbps ?? 0) + (point.netTxKbps ?? 0)).toFixed(1)) : null,
           ),
         ])
       }
     }
   }
 
+  const bodyBucketsAll = detail.bodyHistogram ?? []
+  const bodyHistogramSheet: CellValue[][] = bodyBucketsAll.length
+    ? [
+        ['区间', '最小值(ms)', '最大值(ms)', '数量', '占比(%)'],
+        ...bodyBucketsAll.map((item) => [
+          item.label,
+          item.minMs,
+          item.maxMs,
+          item.count,
+          Number(((item.count / Math.max(1, report.totalRequests)) * 100).toFixed(4)),
+        ]),
+      ]
+    : []
+
+  // 说明页：口径、完整性、脱敏与免责声明，与 HTML/页面保持一致
+  const notesSheet: CellValue[][] = [
+    ['说明', '内容'],
+    [
+      '指标口径',
+      '平均 QPS = 总请求数 ÷ 实际施压时长；P50 / P95 / P99 为逐请求耗时线性插值分位数。',
+    ],
+    [
+      '吞吐口径',
+      '峰值 QPS 取每秒采样最大值，仅反映瞬时能力；90% 分布 QPS 为每秒采样 QPS 的 P10。',
+    ],
+    [
+      '施压机口径',
+      '客户端平均耗时 = 节点 sum_rt / 请求数；TPS = 总请求 / 施压时长；出站带宽平均 = 发送字节 / 施压时长 / 1024。',
+    ],
+    [
+      'URL 口径',
+      'URL 统计按方法 + 地址 + 状态码聚合，与是否记录请求明细无关；平均耗时与包大小按该 URL 请求数计算。',
+    ],
+    [
+      '数据完整性',
+      `明细模式：${recordModeLabel(metrics?.recordMode ?? config?.recordDetail ?? 'full')}；请求明细丢弃 ${fmtInt(
+        metrics?.recordsDropped ?? 0,
+      )} 条；错误明细丢弃 ${fmtInt(metrics?.errorsDropped ?? 0)} 条；URL 统计${
+        detail.urlStats?.length
+          ? detail.urlStatsComplete
+            ? '完整'
+            : '不完整（键溢出或节点未上报）'
+          : '未记录'
+      }。`,
+    ],
+    [
+      '脱敏说明',
+      'URL 中的 token / password / secret / authorization / cookie 等参数值已掩码；错误信息中的 Bearer、password、token、sk- 等凭证已掩码。',
+    ],
+    ['免责声明', REPORT_DISCLAIMER],
+  ]
+
+  const baseline = options.baseline ?? null
+  const baselineSheet: CellValue[][] =
+    baseline && baseline.report.id !== report.id
+      ? [
+          ['基线报告', `R-${baseline.report.id} · ${reportTitle(baseline.report)}`],
+          ['基线执行时间', fmtTime(baseline.report.startTime)],
+          [],
+          ['指标', '本次', '基线', '变化', '结论'],
+          ...baselineCompareRows(detail, baseline).map((row) => [
+            row.label,
+            row.current,
+            row.base,
+            row.delta,
+            row.tone === 'ok' ? '正常' : row.tone === 'warn' ? '关注' : row.tone === 'bad' ? '风险' : '—',
+          ]),
+        ]
+      : []
+
   const sheets: XlsxSheet[] = [
-    { name: '概览', rows: overview },
+    { name: '说明', rows: notesSheet },
+    { name: '结果汇总', rows: overview },
     { name: '配置快照', rows: snapshot },
-    { name: '优化建议', rows: advice },
     { name: '延迟分位', rows: percentileSheet(detail) },
-    { name: '采样明细', rows: samples },
-    { name: '请求明细', rows: requestSheet },
+    { name: '采样明细', rows: options.includeSampleRows === false ? [] : samples },
+    // 后端生成 Excel 时这里留空，由 Rust 直接查库流式写入请求明细
+    { name: '请求明细', rows: options.includeRequestRows === false ? [] : requestSheet },
     { name: '响应时间分布', rows: histogram },
     { name: '状态码分布', rows: statusCodes },
     { name: '错误类型', rows: errorTypes },
     { name: '错误明细', rows: errors },
+    { name: 'URL 统计', rows: urlStatsSheet },
+    { name: '错误地址', rows: errorUrlSheet },
+    { name: '施压机详情', rows: loadGeneratorSheet },
     { name: '分阶段汇总', rows: stages },
   ]
+  if (baselineSheet.length) {
+    sheets.splice(1, 0, { name: '基线对比', rows: baselineSheet })
+  }
+  if (bodyHistogramSheet.length) {
+    sheets.push({ name: '响应体耗时分布', rows: bodyHistogramSheet })
+  }
   if (clusterPeakSheet.length) {
     sheets.push({ name: '集群峰值', rows: clusterPeakSheet })
   }

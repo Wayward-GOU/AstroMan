@@ -137,7 +137,7 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: 'AstroMan ${{ github.ref_name }}'
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
           releaseBody: |
@@ -171,7 +171,34 @@ jobs:
 
             > 安装包已做 ad-hoc 签名但未做 Apple 公证，SmartScreen / Gatekeeper 首次提示属正常现象。
 
-            ### 本次更新（1.1.3）
+            ### 本次更新（1.1.4）
+
+            **压测报告重构（纯事实）**
+            - 报告不再输出关键发现、优化建议、评分与推断性容量结论，章节调整为结果汇总、配置、吞吐与并发、响应时间、错误与状态码、URL 与施压机、附录
+            - 新增 URL 聚合统计（方法 + 地址 + 状态码），与明细记录开关无关；查询参数与错误信息统一脱敏
+            - 新增施压机明细：单机 / 集群节点的请求量、成功失败、平均耗时、TPS 与出站带宽，失联节点显示「—」
+            - 报告支持编辑标题与「再次运行」；页面、HTML、Excel 统一免责声明
+
+            **图表与导出**
+            - 修复响应时间累积分布在 >60s 开放区间与零计数桶下的空图
+            - 新增 QPS、并发、平均响应时间、成功 / 失败 QPS、QPS-延迟散点、带宽、TTFB / Body 趋势，以及结果 / 状态码 / 错误 / 流量环形图
+            - 多 URL / 多施压机 / 多阶段时输出平均响应、TPS、阶段 QPS 与 P95 对比图
+            - 页面新增分时段查看：时间选择器 + 双滑块，按所选时间段展示成功 QPS、失败 QPS、并发与平均响应时间
+            - 页面与 HTML 导出时间轴统一为完整时间 `YYYY-MM-DD HH:mm:ss` 并旋转展示；导出成功 / 失败 QPS 拆成独立趋势图
+            - 核心指标按语义分色；HTML 四张环形图一行紧凑布局；Excel 新增 URL 统计 / 错误地址 / 施压机详情工作表
+
+            **AI 与数据**
+            - 报告解读与 report_get 接入 URL、施压机、TTFB / Body、带宽与数据完整性；缺失字段标注「未记录」，不补 0、不猜测
+
+            **依赖安全**
+            - calamine 0.38、rust_xlsxwriter 0.103：移除带 11 条安全公告的 zip / quick-xml；cargo audit 漏洞数 11 → 0
+            - url、rustix、async-executor 补丁升级，Excel 模板与导入导出行为不变
+
+            **升级说明**
+            - 数据库自动增量迁移到 v23：新增 report_url_stats 表与 report_title 列，只补表补列，旧报告保持可读
+            - 主从协议仍为 v2：新字段全部可选，新旧节点可混合组网；URL 统计缺失自动标记不完整，不阻塞任务
+
+            ### 历史更新（1.1.3）
 
             **分布式压测优化**
             - 主节点采样改环形缓冲（保留最近 300 条），采样 5 秒批量落库，不再和压测引擎抢内存与 SQLite 写锁

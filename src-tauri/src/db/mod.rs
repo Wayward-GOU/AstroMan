@@ -26,7 +26,9 @@ mod seed;
 /// 19 = Token 刷新配置（data_pools.refresh_mode / refresh_json）与集群节点级采样表
 /// 20 = 池自定义列（data_pools.columns_json / data_pool_items.data_json）
 /// 21 = 集群配对 / 执行历史（cluster_slave_history）+ 报告样本资源列
-pub const DB_VERSION: i64 = 21;
+/// 22 = 报告列表汇总列（test_reports.is_cluster / peak_qps），列表页不再解析 config_json
+/// 23 = 按 URL 聚合的 report_url_stats + 报告标题列 test_reports.report_title
+pub const DB_VERSION: i64 = 23;
 
 /// 每条连接都要应用的 SQLite 参数（P-06）。
 ///
@@ -311,6 +313,8 @@ const COLUMN_MIGRATIONS: &[(&str, &str, &str)] = &[
     ("data_pool_items", "data_json", "TEXT NOT NULL DEFAULT '{}'"),
     // v21：集群报告样本补资源维度（旧报告为 0，界面显示「未采集」）
     ("cluster_report_samples", "cpu", "REAL DEFAULT 0"),
+    // v23：用户可编辑报告标题；为空时回退到 plan_name
+    ("test_reports", "report_title", "TEXT"),
     (
         "cluster_report_samples",
         "host_cpu_percent",
@@ -330,6 +334,9 @@ const COLUMN_MIGRATIONS: &[(&str, &str, &str)] = &[
         "net_peak_kbps",
         "REAL NOT NULL DEFAULT 0",
     ),
+    // v22：报告列表汇总列，避免列表查询解析大体积 config_json
+    ("test_reports", "is_cluster", "INTEGER DEFAULT 0"),
+    ("test_reports", "peak_qps", "REAL DEFAULT 0"),
 ];
 
 fn column_exists(conn: &rusqlite::Connection, table: &str, column: &str) -> Result<bool, String> {
@@ -440,8 +447,38 @@ fn migrate(pool: &DbPool) -> Result<(), String> {
 
     {
         let tx = conn.unchecked_transaction().map_err(err)?;
+        let mut added_report_summary = false;
         for (table, column, ddl) in COLUMN_MIGRATIONS {
-            add_column_if_missing(&tx, table, column, ddl)?;
+            let added = add_column_if_missing(&tx, table, column, ddl)?;
+            if added
+                && *table == "test_reports"
+                && (*column == "is_cluster" || *column == "peak_qps")
+            {
+                added_report_summary = true;
+            }
+        }
+        // v22：首次补出汇总列时，从旧 config_json 回填一次；之后列表查询不再触碰 JSON。
+        // json_valid 先挡住损坏的配置，避免迁移阶段因 malformed JSON 直接失败。
+        if added_report_summary {
+            tx.execute_batch(
+                "UPDATE test_reports
+                 SET is_cluster = CASE
+                         WHEN config_json IS NULL OR config_json = '' OR json_valid(config_json) = 0
+                             THEN 0
+                         WHEN json_extract(config_json, '$.mode') = 'cluster' THEN 1
+                         ELSE 0
+                     END,
+                     peak_qps = CASE
+                         WHEN config_json IS NULL OR config_json = '' OR json_valid(config_json) = 0
+                             THEN 0
+                         ELSE CAST(COALESCE(
+                             json_extract(config_json, '$.cluster.peaks.qps.value'),
+                             json_extract(config_json, '$.metricsPeaks.qps.value'),
+                             0
+                         ) AS REAL)
+                     END",
+            )
+            .map_err(err)?;
         }
         // 依赖 updated_at 的索引必须在补列之后创建，否则老库会在建索引时报「no such column」
         tx.execute(
@@ -609,6 +646,7 @@ mod tests {
             "test_run_assertions",
             "test_artifacts",
             "notes",
+            "report_url_stats",
         ] {
             let count: i64 = conn
                 .query_row(
@@ -622,6 +660,7 @@ mod tests {
 
         assert!(has_column(&pool, "request_history", "origin"));
         assert!(has_column(&pool, "request_runs", "origin"));
+        assert!(has_column(&pool, "test_reports", "report_title"));
         for column in [
             "request_body_size",
             "response_body_size",

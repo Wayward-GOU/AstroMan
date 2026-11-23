@@ -14,6 +14,9 @@ use crate::services::cluster::protocol::PoolItem;
 /// 结构化池错误码（第三批 11）：前端按前缀识别并给出针对性引导
 pub const E_POOL_EMPTY: &str = "POOL_EMPTY";
 pub const E_POOL_BINDING_INVALID: &str = "POOL_BINDING_INVALID";
+/// 报告 config_json 里每个池最多保留的条目使用明细（按请求数取 TopN）。
+/// 条目明细只用于 Excel「条目使用明细」，不参与运行期，无需全量落库。
+pub const PER_ITEM_TOP: usize = 200;
 /// 同一个变量被多个池绑定：运行期后写入者会静默覆盖先写入者，按配置错误拦下
 ///
 /// 命名与技术方案 `docs/v1.1.2-tech-plan.md` 的池问题码表保持一致。

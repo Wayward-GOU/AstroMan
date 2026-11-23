@@ -2851,6 +2851,7 @@ impl MasterSession {
                 body_histogram: &merged.body_histogram,
                 slow_requests: &slow,
                 error_types: &merged.error_types,
+                url_stats: &merged.url_stats,
                 config: &merged.config_snapshot,
             },
         );

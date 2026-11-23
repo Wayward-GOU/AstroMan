@@ -504,4 +504,14 @@ export interface ClusterReportNode {
   /** 贡献占比（0~1） */
   share: number
   health: SampleHealth
+  /** 节点总请求数：旧报告 / 旧节点缺失时为 null */
+  totalRequests?: number | null
+  successCount?: number | null
+  errorCount?: number | null
+  /** 客户端平均耗时（ms） */
+  avgRtMs?: number | null
+  /** 总请求数 / 施压时长 */
+  tps?: number | null
+  /** 出站带宽平均（KB/s） */
+  egressAvgKbps?: number | null
 }

@@ -589,6 +589,7 @@ pub fn run() {
             commands::report::report_node_series,
             commands::report::report_delete,
             commands::report::report_export,
+            commands::report::report_export_xlsx,
             commands::report::report_write_file,
             commands::report::report_requests,
             commands::report::report_update_texts,

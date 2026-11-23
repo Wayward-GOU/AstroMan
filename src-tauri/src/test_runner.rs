@@ -3561,6 +3561,7 @@ mod tests {
             plan_id: None,
             run_group_id: None,
             plan_name: "fixture".to_string(),
+            title: None,
             request_id: None,
             peak_qps: 0.0,
             total_requests: 100,

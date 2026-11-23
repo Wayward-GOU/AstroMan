@@ -7,8 +7,10 @@
  */
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
-const root = resolve(import.meta.dirname, '..')
+// 兼容 Node 18/20.0~20.10：import.meta.dirname 需要 Node 20.11+
+const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const args = process.argv.slice(2)
 const outIndex = args.indexOf('--out')
 const out = resolve(

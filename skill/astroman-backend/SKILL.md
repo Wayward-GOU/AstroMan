@@ -187,8 +187,8 @@ note_file_links(note_id, file_id, created_at)   -- 联合主键 + ON DELETE CASC
 - 代理跑独立线程 + `current_thread` tokio runtime（线程名 `capture-proxy`）；`Runtime` 不能在 async 上下文 drop，也不要和 Tauri 主 runtime 混用。
 - 默认端口 8888，占用时向上扫 10 个；`bind_addr` 默认 `127.0.0.1`，手机抓包显式传 `0.0.0.0`。
 - 单条 body 上限 2 MB、完整读取上限 8 MB、图片预览上限 1 MB；SSE 不缓冲；压缩响应先解码。
-- CA 文件在 `<数据目录>/certs/`；Windows 一键安装走 `certutil -user -f -addstore Root`，macOS / Linux 只支持导出。
-- 系统代理由 `capture/sysproxy.rs` 接管 Windows `HKCU` WinINET，改动前备份到数据目录，停止 / 线程退出 / 下次启动都会还原；非 Windows 返回明确错误。
+- CA 文件在 `<数据目录>/certs/`；Windows 一键安装走 `certutil -user -f -addstore Root`，macOS 走 `security add-trusted-cert` 写入登录钥匙串；Linux 只支持导出。
+- 系统代理由 `capture/sysproxy.rs` 接管：Windows 改 `HKCU` WinINET，macOS 用 `networksetup` 改当前网络服务（必要时 `osascript` 提权）；改动前备份到数据目录，停止 / 线程退出 / 下次启动都会还原；Linux 返回明确错误。
 - 改配置结构（`CaptureConfig` / `CaptureStatus` / `CaptureFlow*`）要同步 `src/types/capture.ts`；新增命令注册到 `lib.rs::generate_handler!`。
 - 改录制或重发逻辑后跑 `cargo test --lib capture`（代理转发 + 未录制重发覆盖参数），再用 `npm run tauri dev` 手工冒烟。
 - 断点 / 映射 / 弱网在 `capture/intercept.rs`：挂起队列上限 `MAX_PENDING = 32`、`PAUSE_TIMEOUT = 120s`，Map Local 文件上限 `MAX_MAP_FILE = 50MB`，弱网单次最多等 120 秒后返回 504；规则持久化到 `<数据目录>/capture/intercept.json`，改规则后同步 `capture_intercept_state`，解析失败的规则要跳过而不是让整个抓包启动失败。

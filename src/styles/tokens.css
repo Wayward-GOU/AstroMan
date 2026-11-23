@@ -45,6 +45,17 @@
   --fm-json-bool: #6A4A87;
   --fm-json-punct: #8B959B;
 
+  /* ---- 图表色板：页面内 SVG / 图例统一取令牌，避免各处散落字面色值 ---- */
+  --fm-chart-1: #14655a;
+  --fm-chart-2: #37628f;
+  --fm-chart-3: #9c6414;
+  --fm-chart-4: #a23333;
+  --fm-chart-5: #6b4c9a;
+  --fm-chart-6: #17774a;
+  --fm-chart-7: #8a5a2b;
+  --fm-chart-8: #5b6b73;
+  --fm-chart-violet: #6b5b95;
+
   --fm-shadow-sm: none;
   --fm-shadow: none;
   --fm-shadow-lg: 0 18px 48px rgba(20, 24, 27, 0.16);
@@ -64,6 +75,8 @@
   --fm-radius-sm: 2px;
   --fm-radius: 3px;
   --fm-radius-lg: 3px;
+  --fm-radius-card: 10px;
+  --fm-radius-pill: 999px;
   --fm-gap-1: 4px;
   --fm-gap-2: 8px;
   --fm-gap-3: 12px;

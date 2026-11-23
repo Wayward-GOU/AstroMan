@@ -11,14 +11,14 @@ const props = withDefaults(
 )
 
 const COLORS = [
-  '#14655a',
-  '#37628f',
-  '#9c6414',
-  '#a23333',
-  '#6b4c9a',
-  '#17774a',
-  '#8a5a2b',
-  '#5b6b73',
+  'var(--fm-chart-1)',
+  'var(--fm-chart-2)',
+  'var(--fm-chart-3)',
+  'var(--fm-chart-4)',
+  'var(--fm-chart-5)',
+  'var(--fm-chart-6)',
+  'var(--fm-chart-7)',
+  'var(--fm-chart-8)',
 ]
 
 const rows = computed(() =>
@@ -144,6 +144,6 @@ svg {
   color: var(--fm-muted);
   font-size: 12px;
   background: var(--fm-surface-alt);
-  border-radius: 10px;
+  border-radius: var(--fm-radius-card);
 }
 </style>

@@ -270,7 +270,14 @@ const clusterTotalQps = computed(() =>
   clusterNodes.value.reduce((sum, node) => sum + (node.qpsAvg ?? 0), 0),
 )
 
-const CLUSTER_SERIES_COLORS = ['#14655a', '#37628f', '#9c6414', '#a23333', '#6b4c9a', '#17774a']
+const CLUSTER_SERIES_COLORS = [
+  'var(--fm-chart-1)',
+  'var(--fm-chart-2)',
+  'var(--fm-chart-3)',
+  'var(--fm-chart-4)',
+  'var(--fm-chart-5)',
+  'var(--fm-chart-6)',
+]
 
 /* 节点曲线可切换的口径：吞吐看 QPS，定位瓶颈看并发/延迟，看机器瓶颈看资源 */
 type ClusterMetricKey = 'qps' | 'concurrent' | 'p95' | 'hostCpu' | 'mem' | 'net'
@@ -811,14 +818,14 @@ const ttfbBodySeries = computed(() => {
   const series = [
     {
       name: 'TTFB',
-      color: '#6b5b95',
+      color: 'var(--fm-chart-violet)',
       values: chartSamples.value.map((item) => item.ttfbAvg),
     },
   ]
   if (chartSamples.value.some((item) => item.bodyAvg > 0)) {
     series.push({
       name: 'Body 平均',
-      color: '#17774a',
+      color: 'var(--fm-chart-6)',
       values: chartSamples.value.map((item) => item.bodyAvg),
     })
   }
@@ -878,8 +885,8 @@ const successFailureSeries = computed(() => [
 const resultPieItems = computed(() =>
   report.value
     ? [
-        { label: '成功', value: report.value.successCount, color: '#2A7253' },
-        { label: '失败', value: report.value.errorCount, color: '#A83A2C' },
+        { label: '成功', value: report.value.successCount, color: 'var(--fm-success)' },
+        { label: '失败', value: report.value.errorCount, color: 'var(--fm-danger)' },
       ]
     : [],
 )
@@ -893,12 +900,12 @@ const statusPieItems = computed(() =>
       value: item.count,
       color:
         item.code >= 500
-          ? '#A83A2C'
+          ? 'var(--fm-danger)'
           : item.code >= 400
-            ? '#9C6414'
+            ? 'var(--fm-warning)'
             : item.code >= 300
-              ? '#37628F'
-              : '#14655A',
+              ? 'var(--fm-chart-2)'
+              : 'var(--fm-chart-1)',
     })),
 )
 /** 错误类型构成：按数量取前 8 个 */
@@ -912,8 +919,8 @@ const errorTypePieItems = computed(() =>
 const trafficPieItems = computed(() =>
   report.value
     ? [
-        { label: '接收', value: report.value.bytesTotal, color: '#37628f' },
-        { label: '发送', value: bytesSent.value, color: '#9c6414' },
+        { label: '接收', value: report.value.bytesTotal, color: 'var(--fm-chart-2)' },
+        { label: '发送', value: bytesSent.value, color: 'var(--fm-chart-3)' },
       ]
     : [],
 )
@@ -2987,7 +2994,7 @@ function remove() {
 .status-pill {
   font-size: 10px;
   padding: 1px 9px;
-  border-radius: 999px;
+  border-radius: var(--fm-radius-pill);
   background: var(--fm-success-soft);
   color: var(--fm-success);
 }
@@ -3000,7 +3007,7 @@ function remove() {
 .mode-pill {
   font-size: 10px;
   padding: 1px 9px;
-  border-radius: 999px;
+  border-radius: var(--fm-radius-pill);
   background: var(--fm-primary-soft);
   color: var(--fm-primary);
 }
@@ -3132,7 +3139,7 @@ function remove() {
 }
 
 .metric-card.tone-info {
-  --tone: #37628f;
+  --tone: var(--fm-chart-2);
 }
 
 .metric-card.tone-ok {
@@ -3148,7 +3155,7 @@ function remove() {
 }
 
 .metric-card.tone-violet {
-  --tone: #6b5b95;
+  --tone: var(--fm-chart-violet);
 }
 
 .m-value.accent {
@@ -3156,11 +3163,11 @@ function remove() {
 }
 
 .m-value.info {
-  color: #37628f;
+  color: var(--fm-chart-2);
 }
 
 .m-value.violet {
-  color: #6b5b95;
+  color: var(--fm-chart-violet);
 }
 
 .m-label {
@@ -3251,7 +3258,7 @@ function remove() {
 
 .sla-badge {
   padding: 2px 10px;
-  border-radius: 999px;
+  border-radius: var(--fm-radius-pill);
   font-size: 10px;
   font-weight: 600;
 }
@@ -3302,7 +3309,7 @@ function remove() {
   font-size: 10px;
   font-weight: 600;
   padding: 1px 9px;
-  border-radius: 999px;
+  border-radius: var(--fm-radius-pill);
 }
 
 .sla-result.ok {
@@ -3423,14 +3430,14 @@ function remove() {
 
 .code-bar-wrap {
   height: 7px;
-  border-radius: 999px;
+  border-radius: var(--fm-radius-pill);
   background: var(--fm-surface-alt);
   overflow: hidden;
 }
 
 .code-bar {
   height: 100%;
-  border-radius: 999px;
+  border-radius: var(--fm-radius-pill);
   background: var(--fm-success);
 }
 
@@ -3480,7 +3487,7 @@ function remove() {
   padding: 10px 14px;
   background: var(--fm-surface);
   border: 1px solid var(--fm-border);
-  border-radius: 10px;
+  border-radius: var(--fm-radius-card);
 }
 
 .range-title {
@@ -3579,14 +3586,14 @@ function remove() {
 
 .hist-track {
   height: 9px;
-  border-radius: 999px;
+  border-radius: var(--fm-radius-pill);
   background: var(--fm-surface-alt);
   overflow: hidden;
 }
 
 .hist-bar {
   height: 100%;
-  border-radius: 999px;
+  border-radius: var(--fm-radius-pill);
   background: linear-gradient(90deg, var(--fm-primary), var(--fm-primary-dark));
   transition: width 0.3s ease;
 }
@@ -3754,7 +3761,7 @@ function remove() {
 .req-result {
   display: inline-block;
   padding: 0 7px;
-  border-radius: 999px;
+  border-radius: var(--fm-radius-pill);
   font-size: 10px;
   line-height: 17px;
 }
@@ -4062,7 +4069,7 @@ function remove() {
   margin-top: 14px;
   padding: 12px 14px;
   border: 1px solid var(--fm-border);
-  border-radius: 10px;
+  border-radius: var(--fm-radius-card);
 }
 
 .cluster-series-head {
@@ -4100,7 +4107,7 @@ function remove() {
   gap: 3px;
   padding: 12px 14px;
   border: 1px solid var(--fm-border);
-  border-radius: 10px;
+  border-radius: var(--fm-radius-card);
   background: var(--fm-surface-2);
 }
 
@@ -4401,7 +4408,7 @@ function remove() {
 .grade-badge {
   font-size: 11px;
   padding: 2px 10px;
-  border-radius: 999px;
+  border-radius: var(--fm-radius-pill);
   font-weight: 600;
 }
 .grade-badge.pass {
@@ -4553,7 +4560,7 @@ function remove() {
 .capacity-badge {
   font-size: 11px;
   padding: 2px 10px;
-  border-radius: 999px;
+  border-radius: var(--fm-radius-pill);
   color: var(--fm-primary);
   background: var(--fm-primary-soft);
   font-weight: 600;

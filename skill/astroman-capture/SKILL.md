@@ -73,7 +73,7 @@ astroman-ca.json   创建时间 / 过期时间 / 指纹元数据
 
 - `capture_ca_info` 每次都会 `ensure`：不存在则自动生成；同时用系统证书库检测**当前这张证书**是否已信任。
 - `capture_ca_generate(force=true)` 重新生成。**旧证书随即失效**，已安装的旧证书必须重新安装。
-- `capture_ca_install`：Windows 走 `certutil -user -f -addstore Root`，装进「当前用户 → 受信任的根证书颁发机构」，不需要管理员权限。macOS / Linux 返回「请手动导入」。
+- `capture_ca_install`：Windows 走 `certutil -user -f -addstore Root`，装进「当前用户 → 受信任的根证书颁发机构」，不需要管理员权限；macOS 走 `security add-trusted-cert -r trustRoot -k <登录钥匙串>`，写入用户域信任设置。Linux 返回「请手动导入」。
 - `capture_ca_export(path)`：把 PEM 证书导出到用户选择的位置，供手机或其它设备安装。
 - 前端每 10 秒轮询一次信任状态（已信任后停止），装完证书通常几秒内变「CA 已信任」；外部卸载后点「刷新」重新检测。
 - Firefox 使用独立证书库与代理设置，需要单独导入证书、单独填代理；系统层面信任对它不生效。
@@ -81,10 +81,11 @@ astroman-ca.json   创建时间 / 过期时间 / 指纹元数据
 
 ## 5. 系统代理接管
 
-- 只改 **Windows 当前用户** 的 WinINET：`HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings` 的 `ProxyEnable` / `ProxyServer`。
-- 开启前把原值备份到 `<数据目录>/capture-proxy-backup.json`，关闭时按备份还原；原值为空则删除键值。
+- Windows 只改 **当前用户** 的 WinINET：`HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings` 的 `ProxyEnable` / `ProxyServer`。
+- macOS 通过 `networksetup` 改默认路由网卡对应网络服务的 HTTP / HTTPS 代理（`-setwebproxy` / `-setsecurewebproxy`）；普通权限失败时用 `osascript` 请求一次管理员授权。
+- 开启前把原值备份到 `<数据目录>/capture-proxy-backup.json`，关闭时按备份还原；原值为空则删除键值（macOS 则关闭代理状态）。
 - 停止录制、代理线程退出、应用下次启动（`restore_stale`）都会尝试恢复，避免崩溃后系统断网。
-- macOS / Linux **不支持一键接管**，命令返回明确错误，需用户手动把系统代理指向 `127.0.0.1:端口`。
+- Linux **不支持一键接管**，命令返回明确错误，需用户手动把系统代理指向 `127.0.0.1:端口`。
 - 接管只影响走系统代理的程序；自己指定代理的 App、Firefox、HTTP/3（QUIC）流量不会经过这里。
 
 ## 6. 手机抓包

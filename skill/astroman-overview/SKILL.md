@@ -136,7 +136,7 @@ Windows 下 `cargo check` 在受限沙箱里会命中 `D:\Software\Rust\cargo\.g
 - 自动化测试：桌面端与 `astroman-cli` 共用 `test_runner::run_suite`，产物写 `<数据目录>/test-reports/<runId>/` 且库里只存相对路径；改判定逻辑必须两端一起验
 - 工具箱：92 个工具的实现全部在 `src/tools/*.ts` 纯函数，`registry.ts` 只做声明；页面与 `ToolWorkbench` 只管交互
 - 压测报告 QPS 指标组唯一入口：`utils/reportAnalytics.ts::qpsOverview()`，详情页与 HTML / Excel 导出都调它
-- 抓包：流量**只存内存**（5000 条 / 128 MB body），不写 SQLite；根证书在 `<数据目录>/certs/`；Windows 系统代理改动先备份到数据目录并在停止/退出/下次启动时还原；macOS / Linux 只能手动设代理与装证书
+- 抓包：流量**只存内存**（5000 条 / 128 MB body），不写 SQLite；根证书在 `<数据目录>/certs/`；Windows / macOS 系统代理改动先备份到数据目录并在停止/退出/下次启动时还原（macOS 需一次管理员授权）；Linux 只能手动设代理与装证书
 - 抓包网络请求由 hudsucker MITM 代理转发，不走 `commands/http.rs` 的 reqwest 客户端；「重发」在录制中经本机代理，未录制时直连
 - 抓包拦截：断点队列上限 32 条、120 秒自动放行；Map Local 文件 ≤ 50 MB；弱网超时返回 504；规则写 `<数据目录>/capture/intercept.json`，改规则后必须同步 `capture_intercept_state`
 - 记事本：数据库结构版本 6（`notes` / `note_files` / `note_file_links`）；提醒只发**应用内卡片**（`notes:reminder`），不调系统通知，30 秒轮询一次，暂停 / 免打扰期间整轮跳过；「稍后 10 分钟」必须改写 `snooze_until` 并在到点后重新触发，不能只改前端展示

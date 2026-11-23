@@ -53,6 +53,7 @@ import {
 import CaptureInterceptDrawer from '@/components/CaptureInterceptDrawer.vue'
 import CaptureBreakpointModal from '@/components/CaptureBreakpointModal.vue'
 import { copyToClipboard } from '@/utils/clipboard'
+import { isMac } from '@/utils/platform'
 
 /** 树形列表的扁平化行：域名根 / 路径目录 / 请求叶子 */
 type TreeRow =
@@ -904,7 +905,11 @@ async function exportCa() {
     })
     if (!path) return
     await api.captureCaExport(path)
-    message.success('证书已导出，双击安装到「受信任的根证书颁发机构」')
+    message.success(
+      isMac
+        ? '证书已导出，双击导入钥匙串并把「安全套接字层（SSL）」设为「始终信任」'
+        : '证书已导出，双击安装到「受信任的根证书颁发机构」',
+    )
   } catch (error) {
     message.error(String(error))
   }
@@ -913,8 +918,9 @@ async function exportCa() {
 function installCa() {
   Modal.confirm({
     title: '安装当前根证书？',
-    content:
-      '将把当前根证书安装到「当前用户 → 受信任的根证书颁发机构」。安装后 HTTPS 流量才能被解密；如果之前装过旧证书，这一步会用当前证书覆盖安装。',
+    content: isMac
+      ? '将把当前根证书写入登录钥匙串并设为「始终信任」（可能需要输入一次登录密码）。安装后 HTTPS 流量才能被解密；如果之前装过旧证书，这一步会用当前证书覆盖安装。'
+      : '将把当前根证书安装到「当前用户 → 受信任的根证书颁发机构」。安装后 HTTPS 流量才能被解密；如果之前装过旧证书，这一步会用当前证书覆盖安装。',
     okText: '安装',
     cancelText: '取消',
     async onOk() {
@@ -1977,7 +1983,7 @@ watch(settingsOpen, (open) => {
             </a-button>
           </div>
           <p class="settings-hint">
-            接管后会修改 Windows 系统代理，停止录制或退出应用时自动恢复原值。手机抓包把监听地址切到
+            接管后会修改当前网络服务的系统代理（macOS 会请求一次管理员授权），停止录制或退出应用时自动恢复原值。手机抓包把监听地址切到
             0.0.0.0，手机和电脑连同一 Wi-Fi，Wi-Fi 代理填上面的「手机代理」地址；HTTPS 还需在手机上安装根证书。
           </p>
         </section>
@@ -2044,6 +2050,9 @@ watch(settingsOpen, (open) => {
           <p class="card-hint" :class="{ 'hint-ok': ca.installed }">
             <template v-if="ca.installed">
               <CheckCircleOutlined /> 当前证书已被系统信任，HTTPS 可以解密。
+            </template>
+            <template v-else-if="isMac">
+              检测不到当前证书的信任记录。若确定装过，请确认装的是当前这张（重新生成后旧证书会失效），点「一键安装」重建信任；仍失败时到「钥匙串访问」把该证书的「安全套接字层（SSL）」设为「始终信任」，再点「检测」。
             </template>
             <template v-else>
               检测不到当前证书。若确定装过，多半装成了旧证书（重新生成后旧证书会失效），点「一键安装」覆盖即可。

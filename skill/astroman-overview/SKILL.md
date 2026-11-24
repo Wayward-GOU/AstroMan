@@ -19,11 +19,12 @@ AstroMan/
 │  ├─ api/            # invoke 封装（index.ts 为主，project.ts 等按域拆分）
 │  ├─ assets/         # buddy.png：航仔宇航员挂件贴图（透明底，界面唯一使用的位图）
 │  ├─ components/     # PageHeader / CodeArea / JsonTree / KeyValueEditor / LineChart / AppLogo
+│  │                  # LargeTextViewer（大响应分块渲染）、split/（SplitPane / PaneDivider / SplitLayoutSwitch）
 │  │                  # DashboardMetrics（历史记录页数据大屏）、tools/（20 个工具组件 + ToolWorkbench）
 │  │                  # 抓包：CaptureInterceptDrawer（断点/映射/弱网）、CaptureBreakpointModal（断点改包）
 │  │                  # 记事本：notes/NotesEditor、NotesImageViewer、NotesImportDialog（截图识别）、NotesReminderHost
 │  │                  # 航仔：AstroBuddy.vue（挂件，可拖拽）/ AstroBuddyIcon.vue（1em 线框图标）
-│  ├─ stores/         # pinia：project（项目+集合树+环境）、tabs（标签页持久化）、theme（21 套主题）、toolPrefs（工具收藏/最近）、notes（待办列表/筛选/设置）
+│  ├─ stores/         # pinia：project（项目+集合树+环境）、tabs（标签页持久化）、theme（23 套主题）、toolPrefs（工具收藏/最近）、notes（待办列表/筛选/设置）
 │  ├─ styles/main.css # 设计系统：--fm-* 变量
 │  ├─ tools/          # 离线工具箱：registry.ts（92 个工具 / 9 分类）+ 各域纯函数 + __tests__/toolbox.spec.ts
 │  ├─ types/models.ts # 与 Rust models.rs 对应的 TS 类型
@@ -76,11 +77,11 @@ npm run tauri dev  # 完整桌面应用
 npm run build      # vue-tsc --noEmit + vite build
 npm run build:win  # tauri build --bundles nsis
 npm run build:mac  # tauri build --target universal-apple-darwin --bundles dmg
-npm run test       # vitest run：35 spec / 322 条
+npm run test       # vitest run：39 spec / 391 条
 npm run version:check       # 三处版本号一致性校验，不一致退出码 1
 npm run version:set 1.0.9   # 一次写入 package.json / tauri.conf.json / Cargo.toml
 cargo check        # 在 src-tauri 目录执行
-cargo test --lib   # 426 条 Rust 用例（6 ignored）
+cargo test --lib   # 475 条 Rust 用例（8 ignored）
 cargo tarpaulin --config tarpaulin.toml   # 覆盖率门槛；Windows 本地加 --engine llvm
 ```
 
@@ -128,7 +129,7 @@ Windows 下 `cargo check` 在受限沙箱里会命中 `D:\Software\Rust\cargo\.g
 
 - 前端调用：`invoke<返回类型>('snake_case_command', { camelCaseArgs })`
 - Rust 模型：`#[serde(rename_all = "camelCase")]`，前端类型在 `src/types/models.ts`
-- 样式：只用 `--fm-*` 变量，不写死颜色；主题在 `stores/theme.ts`（**21 套**，14 浅 / 7 深，每套覆盖 35 个颜色 / 阴影变量）里整体覆盖
+- 样式：只用 `--fm-*` 变量，不写死颜色；主题在 `stores/theme.ts`（**23 套**，16 浅 / 7 深，每套覆盖 35 个颜色 / 阴影变量）里整体覆盖
 - 航仔入口：`components/AstroBuddy.vue`，用设计稿贴图 `src/assets/buddy.png`（透明底，显示 72×121），可拖拽；小尺寸图标用 `AstroBuddyIcon.vue` 的 1em 线框版，不要把位图缩到 14px
 - 命令全部返回 `Result<T, String>`，错误文案面向用户、中文
 - 请求 Body（JSON）允许写 `//`、`/* */` 注释，发送前由 `util::strip_json_comments` 剥离；前端 `CodeArea` 负责着色与 `Ctrl / ⌘ + /` 注释，不负责删除
@@ -149,7 +150,7 @@ Windows 下 `cargo check` 在受限沙箱里会命中 `D:\Software\Rust\cargo\.g
 | `astroman-add-feature` | 端到端新增功能（命令 → api → 页面 → 注册） |
 | `astroman-backend` | Rust 命令、SQLite 迁移、压测引擎、数据池与 Excel 导入、分布式压测协议与池切片、主密钥与钥匙串规范 |
 | `astroman-frontend` | 页面骨架、主题变量、CodeMirror 编辑器与 JSON 模板格式化、数据池 / 压测绑定 / 集群页、脚本引擎、导出 |
-| `astroman-appearance` | 21 套主题的变量约定与新增流程、对比度校验、航仔贴图与拖拽、线框图标 |
+| `astroman-appearance` | 23 套主题的变量约定与新增流程、对比度校验、航仔贴图与拖拽、线框图标 |
 | `astroman-dashboard` | 工作台首页区块、历史记录页数据大屏、引导 / 技巧 / FAQ 文案口径、Runner 与测试场景介绍 |
 | `astroman-capture` | 抓包模块：MITM 代理、录制上限、根证书、系统代理、手机与微信边界、HAR / ZIP 导出、改参重发、断点 / 映射 / 弱网 |
 | `astroman-notes` | 记事本与待办：四种类型、标签与 50% 抽屉、提醒 / 重复 / 稍后 / 暂停 / 免打扰、快速记录、截图识别、附件去重、数据表 |

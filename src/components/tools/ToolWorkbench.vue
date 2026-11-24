@@ -8,10 +8,15 @@ import {
   ThunderboltOutlined,
 } from '@ant-design/icons-vue'
 import CodeArea from '@/components/CodeArea.vue'
+import SplitLayoutSwitch from '@/components/split/SplitLayoutSwitch.vue'
+import SplitPane from '@/components/split/SplitPane.vue'
+import { useSplitLayout } from '@/composables/useSplitLayout'
 import type { OptionState, ToolDef } from '@/tools/types'
 import { copyToClipboard } from '@/utils/clipboard'
 
 const props = defineProps<{ tool: ToolDef }>()
+
+const { direction, isVertical, setDirection, ratioKey } = useSplitLayout('astroman:tools:workbench')
 
 const input = ref('')
 const output = ref('')
@@ -133,6 +138,10 @@ if (!hasInput.value) void run()
         </label>
       </div>
       <div class="wb-actions">
+        <template v-if="hasInput">
+          <SplitLayoutSwitch :model-value="direction" @update:model-value="setDirection" />
+          <span class="wb-sep" aria-hidden="true" />
+        </template>
         <a-button v-if="simple.sample" size="small" @click="loadSample">
           <ThunderboltOutlined /> 示例
         </a-button>
@@ -145,37 +154,66 @@ if (!hasInput.value) void run()
       </div>
     </div>
 
-    <div class="wb-body" :class="{ single: !hasInput }">
-      <section v-if="hasInput" class="wb-panel">
-        <header class="wb-head">
-          <span>{{ simple.inputLabel }}</span>
-          <span class="wb-stat">{{ inputStats }}</span>
-        </header>
-        <CodeArea
-          v-model="input"
-          :rows="18"
-          :placeholder="simple.inputPlaceholder ?? '在此粘贴或输入内容'"
-          @update:model-value="error = ''"
-        />
-      </section>
+    <SplitPane
+      v-if="hasInput"
+      class="wb-body"
+      :class="{ 'is-vertical': isVertical }"
+      :direction="direction"
+      :storage-key="ratioKey"
+      :min-first="isVertical ? 150 : 260"
+      :min-second="isVertical ? 150 : 260"
+    >
+      <template #first>
+        <section class="wb-panel">
+          <header class="wb-head">
+            <span>{{ simple.inputLabel }}</span>
+            <span class="wb-stat">{{ inputStats }}</span>
+          </header>
+          <CodeArea
+            v-model="input"
+            fill
+            :placeholder="simple.inputPlaceholder ?? '在此粘贴或输入内容'"
+            @update:model-value="error = ''"
+          />
+        </section>
+      </template>
 
-      <section class="wb-panel">
-        <header class="wb-head">
-          <span>{{ simple.outputLabel ?? '输出结果' }}</span>
-          <span class="wb-stat">{{ outputStats }}</span>
-          <a-button type="link" size="small" :disabled="!output" @click="copyOutput">
-            <CopyOutlined /> 复制
-          </a-button>
-        </header>
-        <a-alert v-if="error" type="error" :message="error" show-icon class="wb-error" />
-        <CodeArea
-          :model-value="output"
-          :rows="18"
-          readonly
-          :placeholder="simple.outputPlaceholder ?? '执行后在此显示结果'"
-        />
-      </section>
-    </div>
+      <template #second>
+        <section class="wb-panel">
+          <header class="wb-head">
+            <span>{{ simple.outputLabel ?? '输出结果' }}</span>
+            <span class="wb-stat">{{ outputStats }}</span>
+            <a-button type="link" size="small" :disabled="!output" @click="copyOutput">
+              <CopyOutlined /> 复制
+            </a-button>
+          </header>
+          <a-alert v-if="error" type="error" :message="error" show-icon class="wb-error" />
+          <CodeArea
+            :model-value="output"
+            fill
+            readonly
+            :placeholder="simple.outputPlaceholder ?? '执行后在此显示结果'"
+          />
+        </section>
+      </template>
+    </SplitPane>
+
+    <section v-else class="wb-body wb-body-single">
+      <header class="wb-head">
+        <span>{{ simple.outputLabel ?? '输出结果' }}</span>
+        <span class="wb-stat">{{ outputStats }}</span>
+        <a-button type="link" size="small" :disabled="!output" @click="copyOutput">
+          <CopyOutlined /> 复制
+        </a-button>
+      </header>
+      <a-alert v-if="error" type="error" :message="error" show-icon class="wb-error" />
+      <CodeArea
+        :model-value="output"
+        fill
+        readonly
+        :placeholder="simple.outputPlaceholder ?? '执行后在此显示结果'"
+      />
+    </section>
   </div>
 </template>
 
@@ -223,14 +261,28 @@ if (!hasInput.value) void run()
   gap: 8px;
 }
 
-.wb-body {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 12px;
+.wb-sep {
+  width: 1px;
+  height: 16px;
+  background: var(--fm-border);
+  flex: none;
 }
 
-.wb-body.single {
-  grid-template-columns: minmax(0, 1fr);
+.wb-body {
+  /* 固定可用高度，内部两栏按比例分，CodeArea 用 fill 撑满各自一侧 */
+  height: clamp(560px, 76vh, 1080px);
+  min-height: 0;
+}
+
+/* 上下分栏时两栏各分一半高度，容器不拉高就只剩几行 */
+.wb-body.is-vertical {
+  height: clamp(620px, 82vh, 1200px);
+}
+
+.wb-body-single {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
 .wb-panel {
@@ -238,6 +290,8 @@ if (!hasInput.value) void run()
   flex-direction: column;
   gap: 8px;
   min-width: 0;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .wb-head {
@@ -262,9 +316,12 @@ if (!hasInput.value) void run()
 }
 
 @media (max-width: 1100px) {
-  .wb-body,
-  .wb-body.single {
-    grid-template-columns: minmax(0, 1fr);
+  .wb-body {
+    height: clamp(520px, 74vh, 980px);
+  }
+
+  .wb-body.is-vertical {
+    height: clamp(560px, 84vh, 1080px);
   }
 }
 </style>

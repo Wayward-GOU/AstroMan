@@ -10,7 +10,12 @@ import {
 } from '@ant-design/icons-vue'
 import CodeArea from '@/components/CodeArea.vue'
 import JsonTree from '@/components/JsonTree.vue'
+import SplitLayoutSwitch from '@/components/split/SplitLayoutSwitch.vue'
+import SplitPane from '@/components/split/SplitPane.vue'
+import { useSplitLayout } from '@/composables/useSplitLayout'
 import { copyToClipboard } from '@/utils/clipboard'
+
+const { direction, isVertical, setDirection, ratioKey } = useSplitLayout('astroman:tools:json')
 
 const input = ref('')
 const output = ref('')
@@ -252,6 +257,7 @@ function loadEscapedSample() {
         <a-button size="small" @click="clearAll"><DeleteOutlined /> 清空</a-button>
       </div>
       <div class="jw-view">
+        <SplitLayoutSwitch :model-value="direction" @update:model-value="setDirection" />
         <a-segmented v-model:value="view" :options="[{ label: '树形', value: 'tree' }, { label: '文本', value: 'text' }]" size="small" />
         <template v-if="view === 'tree'">
           <a-tooltip title="全部展开">
@@ -267,44 +273,55 @@ function loadEscapedSample() {
       </div>
     </div>
 
-    <div class="jw-body">
-      <section class="jw-pane">
-        <header class="jw-head">
-          <span>原始 JSON</span>
-          <span class="jw-stat">{{ inputStats }}</span>
-        </header>
-        <CodeArea v-model="input" :rows="22" placeholder="在此粘贴 JSON，例如 {&quot;a&quot;:1}" />
-      </section>
+    <SplitPane
+      class="jw-body"
+      :class="{ 'is-vertical': isVertical }"
+      :direction="direction"
+      :storage-key="ratioKey"
+      :min-first="isVertical ? 150 : 260"
+      :min-second="isVertical ? 150 : 260"
+    >
+      <template #first>
+        <section class="jw-pane">
+          <header class="jw-head">
+            <span>原始 JSON</span>
+            <span class="jw-stat">{{ inputStats }}</span>
+          </header>
+          <CodeArea v-model="input" fill placeholder="在此粘贴 JSON，例如 {&quot;a&quot;:1}" />
+        </section>
+      </template>
 
-      <section class="jw-pane">
-        <header class="jw-head">
-          <span>{{ view === 'tree' ? '结构视图' : '结果文本' }}</span>
-          <a-tag v-if="notice" color="green" class="jw-notice">{{ notice }}</a-tag>
-          <span class="jw-stat">{{ outputStats }}</span>
-        </header>
-        <a-alert
-          v-if="error"
-          type="error"
-          show-icon
-          :message="error"
-          :description="errorLocation ? `错误位置：${errorLocation}` : undefined"
-          class="jw-error"
-        />
-        <div class="jw-output">
-          <div v-if="view === 'tree'" class="jw-tree scroll-y">
-            <JsonTree v-if="parsedOk" :key="treeMode" :value="parsed" :mode="treeMode" />
-            <div v-else class="empty-hint">格式化后在此以树形查看结构</div>
-          </div>
-          <CodeArea
-            v-else
-            :model-value="output"
-            :rows="22"
-            readonly
-            placeholder="执行结果会显示在这里"
+      <template #second>
+        <section class="jw-pane">
+          <header class="jw-head">
+            <span>{{ view === 'tree' ? '结构视图' : '结果文本' }}</span>
+            <a-tag v-if="notice" color="green" class="jw-notice">{{ notice }}</a-tag>
+            <span class="jw-stat">{{ outputStats }}</span>
+          </header>
+          <a-alert
+            v-if="error"
+            type="error"
+            show-icon
+            :message="error"
+            :description="errorLocation ? `错误位置：${errorLocation}` : undefined"
+            class="jw-error"
           />
-        </div>
-      </section>
-    </div>
+          <div class="jw-output">
+            <div v-if="view === 'tree'" class="jw-tree scroll-y">
+              <JsonTree v-if="parsedOk" :key="treeMode" :value="parsed" :mode="treeMode" />
+              <div v-else class="empty-hint">格式化后在此以树形查看结构</div>
+            </div>
+            <CodeArea
+              v-else
+              :model-value="output"
+              fill
+              readonly
+              placeholder="执行结果会显示在这里"
+            />
+          </div>
+        </section>
+      </template>
+    </SplitPane>
   </div>
 </template>
 
@@ -336,9 +353,14 @@ function loadEscapedSample() {
 }
 
 .jw-body {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 12px;
+  /* 固定可用高度，两栏由分隔条按比例分，内部各自滚动 */
+  height: clamp(560px, 76vh, 1080px);
+  min-height: 0;
+}
+
+/* 上下分栏时两栏各分一半高度，容器要再高一档，否则输入区与结果区都只剩几行 */
+.jw-body.is-vertical {
+  height: clamp(620px, 82vh, 1200px);
 }
 
 .jw-pane {
@@ -346,6 +368,8 @@ function loadEscapedSample() {
   flex-direction: column;
   gap: 8px;
   min-width: 0;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .jw-head {
@@ -378,10 +402,12 @@ function loadEscapedSample() {
 .jw-output {
   flex: 1;
   min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 .jw-tree {
-  height: calc(22 * 20px + 22px);
+  height: 100%;
   padding: 10px 12px;
   background: var(--fm-code-bg);
   border: 1px solid var(--fm-border);
@@ -394,7 +420,11 @@ function loadEscapedSample() {
 
 @media (max-width: 1200px) {
   .jw-body {
-    grid-template-columns: minmax(0, 1fr);
+    height: clamp(520px, 74vh, 980px);
+  }
+
+  .jw-body.is-vertical {
+    height: clamp(560px, 84vh, 1080px);
   }
 }
 </style>

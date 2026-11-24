@@ -481,3 +481,21 @@ mod perf_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[test]
+fn resource_peak_only_goes_up() {
+    let mut cpu = None;
+    // 首个样本建立基线
+    bump_peak(&mut cpu, 42.6);
+    assert_eq!(cpu, Some(42.6));
+    // 回落不覆盖峰值，卡片上要能看出「最吃紧到过多少」
+    bump_peak(&mut cpu, 18.0);
+    assert_eq!(cpu, Some(42.6));
+    // 更高的值刷新
+    bump_peak(&mut cpu, 78.2);
+    assert_eq!(cpu, Some(78.2));
+    // 采集异常（NaN / inf）不能污染峰值
+    bump_peak(&mut cpu, f64::NAN);
+    bump_peak(&mut cpu, f64::INFINITY);
+    assert_eq!(cpu, Some(78.2));
+}

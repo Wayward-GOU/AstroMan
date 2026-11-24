@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
+use bytes::Bytes;
 use encoding_rs::Encoding;
 use rusqlite::{params, Connection};
 use tauri::State;
@@ -44,6 +45,68 @@ const MAX_REDIRECTS: usize = 10;
 const DRAIN_LIMIT: usize = 256 * 1024;
 /// 重试退避基数
 const RETRY_BASE_MS: u64 = 200;
+
+/// 请求体硬上限。
+///
+/// body 要经 IPC 反序列化、写入 SQLite、再交给 reqwest，三处成本都随体积线性增长；
+/// 超过这个量级在桌面端已经不值得硬扛，直接拒发并说明替代做法。
+/// 与前端 `src/utils/bodySize.ts` 的 `REQUEST_BODY_MAX_BYTES` 保持一致，
+/// 前端拦在触发前置脚本之前，这里兜住批量 / 套件 / AI / CLI 等其它入口。
+const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+/// 超过上限时的统一提示；`bytes` 为 UTF-8 字节数
+fn check_request_body_size(bytes: usize) -> Result<(), String> {
+    if bytes <= MAX_REQUEST_BODY_BYTES {
+        return Ok(());
+    }
+    Err(format!(
+        "请求体 {:.1} MB 超过 {} MB 上限，未发送；请改用文件上传，或把内容拆成多个请求",
+        bytes as f64 / 1024.0 / 1024.0,
+        MAX_REQUEST_BODY_BYTES / 1024 / 1024
+    ))
+}
+
+/// 单个上传文件的上限：2 GB。
+/// 文件是整份读进内存再发的，上限的意义是「别让一次误选把进程顶爆」，
+/// 而不是服务端接受能力——真要传更大的文件，得先做流式上传。
+const MAX_UPLOAD_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// 体积判定独立出来：边界值本身放行，便于单测覆盖而不必真的读 2GB
+fn check_upload_size(len: u64, label: &str) -> Result<(), String> {
+    if len <= MAX_UPLOAD_FILE_BYTES {
+        return Ok(());
+    }
+    Err(format!(
+        "{label}为 {:.2} GB，超过单个文件 {} GB 上限，未发送",
+        len as f64 / 1024.0 / 1024.0 / 1024.0,
+        MAX_UPLOAD_FILE_BYTES / 1024 / 1024 / 1024
+    ))
+}
+
+/// 读取待上传文件：先看元数据体积再读，避免为了报错先把几 GB 读进内存
+fn read_upload_file(path: &str, label: &str) -> Result<Vec<u8>, String> {
+    let meta = std::fs::metadata(path).map_err(|e| format!("读取上传文件失败（{path}）：{e}"))?;
+    if !meta.is_file() {
+        return Err(format!("{label}不是文件，无法上传：{path}"));
+    }
+    check_upload_size(meta.len(), label)?;
+    std::fs::read(path).map_err(|e| format!("读取上传文件失败（{path}）：{e}"))
+}
+
+/// 计入体积上限的字节数：只算「用户敲进编辑器」的内容。
+/// 本机文件读取的部分（binary 正文、multipart 的文件字段）不参与，
+/// 否则选一个 40MB 的视频就会和 40MB 的手写 JSON 一样被拒，与文件上传的本意相反。
+fn text_body_bytes(body: &PlannedBody) -> usize {
+    match body {
+        PlannedBody::None | PlannedBody::File(_) => 0,
+        PlannedBody::Bytes(bytes) => bytes.len(),
+        PlannedBody::Multipart(parts) => parts
+            .iter()
+            .filter(|part| part.filename.is_none())
+            .map(|part| part.bytes.len())
+            .sum(),
+    }
+}
 
 /// 落库策略：套件 / CLI 运行默认不写单接口历史与快照，避免冲掉手工调试记录
 #[derive(Debug, Clone)]
@@ -105,17 +168,23 @@ pub(crate) async fn execute(
     execute_with(state, payload, RecordOptions::manual(), None).await
 }
 
-/// 请求体的可重建形态：重试与重定向需要用同一份内容重新构造请求
+/// 请求体的可重建形态：重试与重定向需要用同一份内容重新构造请求。
+///
+/// 正文用 `Bytes` 而不是 `Vec<u8>`：重试 / 重定向会把同一份内容重新交给 reqwest，
+/// 而 `Bytes` 的 clone 只加引用计数，2GB 上传不会在发送时又复制出一份 2GB。
 enum PlannedBody {
     None,
-    Bytes(Vec<u8>),
+    /// 用户手写 / 拼接出来的正文，受 `MAX_REQUEST_BODY_BYTES` 约束
+    Bytes(Bytes),
+    /// 由用户选中的本机文件读入，上传体积不受正文上限约束，单列一类避免被误拦
+    File(Bytes),
     Multipart(Vec<MultipartPart>),
 }
 
 struct MultipartPart {
     key: String,
     filename: Option<String>,
-    bytes: Vec<u8>,
+    bytes: Bytes,
 }
 
 struct RequestPlan {
@@ -136,6 +205,9 @@ pub(crate) async fn execute_with(
     record: RecordOptions,
     cookie_jar: Option<&cookie::CookieJar>,
 ) -> Result<HttpResult, String> {
+    // 尽早失败：变量渲染、建连接之前就挡掉超大正文
+    check_request_body_size(payload.body.as_ref().map_or(0, String::len))?;
+
     let vars = match payload.env_id {
         Some(env_id) => {
             let conn = state.pool.get().map_err(err)?;
@@ -254,6 +326,11 @@ pub(crate) async fn execute_with(
             &mut has_content_type,
         )?;
     }
+
+    // 变量渲染可能把正文撑大，按实际要发出去的字节再校验一次；
+    // 文件读取的正文不计入，上传不设正文上限
+    let text_bytes = text_body_bytes(&planned);
+    check_request_body_size(text_bytes)?;
 
     // HTTP/2 会直接拒绝 connection-specific 头：https 且未强制 HTTP/1.1 时静默剔除
     let mut ignored_headers = Vec::new();
@@ -461,6 +538,8 @@ fn finish_record(
         let body_text = match &plan.body {
             PlannedBody::None => String::new(),
             PlannedBody::Bytes(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+            // 二进制文件内容不入库：一方面是几十 MB 的乱码，另一方面快照只需要知道发过文件
+            PlannedBody::File(bytes) => format!("（文件 {} 字节，内容不入库）", bytes.len()),
             PlannedBody::Multipart(parts) => parts
                 .iter()
                 .map(|part| match &part.filename {
@@ -486,6 +565,8 @@ fn finish_record(
                 let entity_body = match &plan.body {
                     PlannedBody::None => String::new(),
                     PlannedBody::Bytes(_) => body_text.clone(),
+                    // 实体存的是文件路径，不能拿文件内容覆盖
+                    PlannedBody::File(_) => payload.body.clone().unwrap_or_default(),
                     PlannedBody::Multipart(parts) => {
                         let fields: Vec<FormField> = parts
                             .iter()
@@ -567,12 +648,11 @@ fn build_body_plan(
                     if path.is_empty() {
                         continue;
                     }
-                    let bytes = std::fs::read(&path)
-                        .map_err(|e| format!("读取上传文件失败（{path}）：{e}"))?;
                     let filename = Path::new(&path)
                         .file_name()
                         .map(|name| name.to_string_lossy().to_string())
                         .unwrap_or_else(|| "file".to_string());
+                    let bytes = read_upload_file(&path, &format!("文件字段「{filename}」"))?.into();
                     parts.push(MultipartPart {
                         key,
                         filename: Some(filename),
@@ -582,7 +662,7 @@ fn build_body_plan(
                     parts.push(MultipartPart {
                         key,
                         filename: None,
-                        bytes: render(&field.value, vars).into_bytes(),
+                        bytes: render(&field.value, vars).into_bytes().into(),
                     });
                 }
             }
@@ -593,8 +673,7 @@ fn build_body_plan(
             if path.is_empty() {
                 return Err("请选择要上传的二进制文件".to_string());
             }
-            let bytes =
-                std::fs::read(&path).map_err(|e| format!("读取上传文件失败（{path}）：{e}"))?;
+            let bytes = read_upload_file(&path, "上传文件")?.into();
             if !*has_content_type {
                 headers.push((
                     "Content-Type".to_string(),
@@ -602,7 +681,7 @@ fn build_body_plan(
                 ));
                 *has_content_type = true;
             }
-            Ok(PlannedBody::Bytes(bytes))
+            Ok(PlannedBody::File(bytes))
         }
         _ => {
             if !*has_content_type {
@@ -622,7 +701,9 @@ fn build_body_plan(
             } else {
                 raw.to_string()
             };
-            Ok(PlannedBody::Bytes(render(&source, vars).into_bytes()))
+            Ok(PlannedBody::Bytes(
+                render(&source, vars).into_bytes().into(),
+            ))
         }
     }
 }
@@ -636,11 +717,16 @@ fn apply_body(
     };
     match body {
         PlannedBody::None => builder,
-        PlannedBody::Bytes(bytes) => builder.body(bytes.clone()),
+        PlannedBody::Bytes(bytes) | PlannedBody::File(bytes) => builder.body(bytes.clone()),
         PlannedBody::Multipart(parts) => {
             let mut form = reqwest::multipart::Form::new();
             for part in parts {
-                let piece = reqwest::multipart::Part::bytes(part.bytes.clone());
+                // 用 stream_with_length 而不是 bytes：后者要 Cow，会把 Bytes 复制成 Vec；
+                // 长度显式给出，仍然是 Content-Length 而不是 chunked
+                let piece = reqwest::multipart::Part::stream_with_length(
+                    reqwest::Body::from(part.bytes.clone()),
+                    part.bytes.len() as u64,
+                );
                 let piece = match &part.filename {
                     Some(name) => piece.file_name(name.clone()),
                     None => piece,
@@ -1585,7 +1671,7 @@ mod tests {
     #[test]
     fn apply_body_keeps_get_body_but_allows_head_to_drop_it() {
         let client = reqwest::Client::new();
-        let body = PlannedBody::Bytes(b"{\"q\":1}".to_vec());
+        let body = PlannedBody::Bytes(Bytes::from_static(b"{\"q\":1}"));
         let get = apply_body(client.get("https://example.com/search"), Some(&body))
             .build()
             .expect("应能构建 GET");
@@ -1628,5 +1714,159 @@ mod tests {
         let result = send_with_cancel(client.get("http://127.0.0.1:9"), Some(&flag)).await;
         assert!(matches!(result, Err(error) if error.cancelled));
         assert!(flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn body_size_limit_accepts_boundary_and_rejects_beyond() {
+        assert!(check_request_body_size(0).is_ok());
+        assert!(check_request_body_size(1024).is_ok());
+        // 边界值本身放行，再大一个字节就拒发
+        assert!(check_request_body_size(MAX_REQUEST_BODY_BYTES).is_ok());
+        assert!(check_request_body_size(MAX_REQUEST_BODY_BYTES + 1).is_err());
+    }
+
+    #[test]
+    fn body_size_limit_error_is_actionable() {
+        let error = check_request_body_size(MAX_REQUEST_BODY_BYTES + 1).unwrap_err();
+        assert!(error.contains("32 MB"), "提示要写明上限：{error}");
+        assert!(error.contains("文件上传"), "提示要给出替代做法：{error}");
+    }
+
+    #[test]
+    fn uploaded_file_does_not_count_against_text_limit() {
+        // 40MB 的视频走 Binary 上传应该放行，不能被 32MB 的正文上限挡住
+        let video = PlannedBody::File(Bytes::from(vec![0u8; 40 * 1024 * 1024]));
+        assert_eq!(text_body_bytes(&video), 0);
+        assert!(check_request_body_size(text_body_bytes(&video)).is_ok());
+    }
+
+    #[test]
+    fn multipart_counts_text_fields_but_not_files() {
+        let body = PlannedBody::Multipart(vec![
+            MultipartPart {
+                key: "avatar".to_string(),
+                filename: Some("big.bin".to_string()),
+                bytes: Bytes::from(vec![0u8; 33 * 1024 * 1024]),
+            },
+            MultipartPart {
+                key: "name".to_string(),
+                filename: None,
+                bytes: Bytes::from_static(b"astroman"),
+            },
+        ]);
+        assert_eq!(text_body_bytes(&body), 8);
+        assert!(check_request_body_size(text_body_bytes(&body)).is_ok());
+    }
+
+    #[test]
+    fn rendered_text_body_still_counted() {
+        let body = PlannedBody::Bytes(Bytes::from(vec![b'x'; MAX_REQUEST_BODY_BYTES + 1]));
+        assert_eq!(text_body_bytes(&body), MAX_REQUEST_BODY_BYTES + 1);
+        assert!(check_request_body_size(text_body_bytes(&body)).is_err());
+    }
+
+    #[test]
+    fn upload_limit_is_two_gigabytes_and_boundary_inclusive() {
+        assert!(check_upload_size(0, "上传文件").is_ok());
+        assert!(check_upload_size(MAX_UPLOAD_FILE_BYTES, "上传文件").is_ok());
+        let error = check_upload_size(MAX_UPLOAD_FILE_BYTES + 1, "上传文件").unwrap_err();
+        assert!(error.contains("2 GB"), "提示要写明上限：{error}");
+        assert!(error.contains("超过"), "提示要说清是被上限挡下的：{error}");
+    }
+
+    #[test]
+    fn oversized_file_is_rejected_before_reading() {
+        // 稀疏文件：set_len 只改元数据，不占磁盘，也不会把 2GB 读进内存
+        let path =
+            std::env::temp_dir().join(format!("astroman-upload-limit-{}.bin", std::process::id()));
+        {
+            let file = std::fs::File::create(&path).expect("创建临时文件");
+            file.set_len(MAX_UPLOAD_FILE_BYTES + 1024)
+                .expect("设置稀疏文件长度");
+        }
+
+        let started = std::time::Instant::now();
+        let error = read_upload_file(path.to_str().expect("临时路径可转字符串"), "上传文件")
+            .expect_err("超限文件应被拒绝");
+        let elapsed = started.elapsed();
+
+        assert!(error.contains("超过单个文件 2 GB 上限"), "{error}");
+        // 只读了元数据：真的读 2GB 不可能这么快
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "疑似先把文件读进内存才判断体积：{elapsed:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn small_file_reads_normally() {
+        let path =
+            std::env::temp_dir().join(format!("astroman-upload-small-{}.bin", std::process::id()));
+        std::fs::write(&path, b"astroman").expect("写入临时文件");
+        let bytes = read_upload_file(path.to_str().expect("临时路径可转字符串"), "上传文件")
+            .expect("小文件应能读取");
+        assert_eq!(bytes, b"astroman");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn directory_is_not_uploadable() {
+        let dir = std::env::temp_dir();
+        let error = read_upload_file(dir.to_str().expect("临时目录可转字符串"), "上传文件")
+            .expect_err("目录不能当文件上传");
+        assert!(error.contains("不是文件"), "{error}");
+    }
+
+    /// 文件正文改成 Bytes + stream_with_length 后，multipart 必须仍然带 Content-Length。
+    /// 一旦退化成 chunked，部分老网关会拒收上传，必须由测试盯住。
+    #[tokio::test]
+    async fn multipart_upload_keeps_content_length() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定本地端口");
+        let addr = listener.local_addr().expect("读取本地端口");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("接受连接");
+            let mut head = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let read = socket.read(&mut chunk).await.expect("读取请求");
+                if read == 0 {
+                    break;
+                }
+                head.extend_from_slice(&chunk[..read]);
+            }
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            String::from_utf8_lossy(&head).to_string()
+        });
+
+        let plan = PlannedBody::Multipart(vec![MultipartPart {
+            key: "file".to_string(),
+            filename: Some("a.bin".to_string()),
+            bytes: Bytes::from_static(b"hello-upload"),
+        }]);
+        let client = reqwest::Client::new();
+        let response = apply_body(client.post(format!("http://{addr}/upload")), Some(&plan))
+            .send()
+            .await
+            .expect("上传请求应成功");
+        assert_eq!(response.status().as_u16(), 200);
+
+        let head = server.await.expect("mock 服务结束");
+        let lower = head.to_ascii_lowercase();
+        assert!(
+            lower.contains("content-length:"),
+            "缺少 Content-Length：{head}"
+        );
+        assert!(
+            !lower.contains("transfer-encoding: chunked"),
+            "退化成了 chunked：{head}"
+        );
     }
 }

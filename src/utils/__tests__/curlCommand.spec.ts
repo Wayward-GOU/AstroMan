@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { buildCurl, extractCurlCommand } from '../curl'
+import { buildCurl, extractCurlCommand, previewRequest } from '../curl'
 import type { EnvVariable, HttpRequestDetail, RequestAuth } from '@/types/models'
 
 function auth(patch: Partial<RequestAuth> = {}): RequestAuth {
@@ -111,5 +111,69 @@ describe('buildCurl', () => {
       variables,
     )
     expect(code).toContain('q=a%20b')
+  })
+})
+
+describe('previewRequest', () => {
+  it('把变量替换与 Query 拼接算进最终地址', () => {
+    const variables: EnvVariable[] = [
+      { key: 'host', value: 'api.example.com', isSecret: false, sortOrder: 1 },
+      { key: 'id', value: '42', isSecret: false, sortOrder: 2 },
+    ]
+    const preview = previewRequest(
+      detail({
+        url: 'https://{{host}}/items',
+        params: [
+          { key: 'id', value: '{{id}}', enabled: true },
+          { key: 'skip', value: 'me', enabled: false },
+        ],
+      }),
+      variables,
+    )
+    expect(preview.url).toBe('https://api.example.com/items?id=42')
+    expect(preview.unresolved).toEqual([])
+  })
+
+  it('标注请求头来源：手填 / 认证注入 / 自动补 Content-Type', () => {
+    const preview = previewRequest(
+      detail({
+        method: 'post',
+        headers: [{ key: 'X-Trace', value: 't-1', enabled: true }],
+        auth: auth({ kind: 'bearer', token: 'abc' }),
+        bodyType: 'json',
+        body: '{"a":1}',
+      }),
+    )
+    expect(preview.method).toBe('POST')
+    const byKey = Object.fromEntries(preview.headers.map((item) => [item.key, item]))
+    expect(byKey['X-Trace'].source).toBe('user')
+    expect(byKey['Authorization']).toMatchObject({ value: 'Bearer abc', source: 'auth' })
+    expect(byKey['Content-Type']).toMatchObject({ value: 'application/json', source: 'auto' })
+    expect(preview.bodyBytes).toBe(7)
+  })
+
+  it('未定义变量列出待补，敏感变量不展开', () => {
+    const variables: EnvVariable[] = [
+      { key: 'token', value: '••••••', isSecret: true, sortOrder: 1 },
+    ]
+    const preview = previewRequest(
+      detail({
+        url: 'https://api.example.com/{{missing}}/x',
+        headers: [{ key: 'Authorization', value: 'Bearer {{token}}', enabled: true }],
+      }),
+      variables,
+    )
+    expect(preview.unresolved).toEqual(['missing'])
+    expect(preview.secretVars).toEqual(['token'])
+    expect(preview.headers.find((item) => item.key === 'Authorization')?.value).toBe(
+      'Bearer {{token}}',
+    )
+  })
+
+  it('文件上传类不统计正文字节', () => {
+    const preview = previewRequest(
+      detail({ bodyType: 'binary', body: '/tmp/big.zip' }),
+    )
+    expect(preview.bodyBytes).toBe(0)
   })
 })

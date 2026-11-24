@@ -36,6 +36,7 @@ import { checkForUpdates, isAutoUpdateEnabled, setAutoUpdateEnabled } from '@/ut
 import { toolNames } from '@/utils/aiTools'
 import { scriptTimeoutMs, setScriptTimeoutMs, SCRIPT_TIMEOUT_RANGE } from '@/utils/scriptHost'
 import { copyToClipboard } from '@/utils/clipboard'
+import { useZoom } from '@/composables/useZoom'
 import type {
   AiProvider,
   AppInfo,
@@ -54,6 +55,17 @@ import type {
 import type { StressBudget } from '@/types/cluster'
 
 const router = useRouter()
+
+/* 界面缩放：与 App.vue 共用同一份状态，侧边栏徽标与本页滑块永远一致 */
+const { zoomPercent, resetZoom, setZoomPercent } = useZoom()
+
+function onZoomChange(value: number | number[]) {
+  setZoomPercent(Array.isArray(value) ? value[0] : value)
+}
+
+function formatZoomTip(value?: number) {
+  return `${value ?? zoomPercent.value}%`
+}
 
 /** 航仔 可调用的工具总数，随注册表自动变化 */
 const aiToolCount = toolNames().length
@@ -251,6 +263,21 @@ onBeforeUnmount(() => {
 /* ---------- 并发预算（v1.1.2） ---------- */
 const budget = ref<StressBudget | null>(null)
 const budgetLoading = ref(false)
+
+/** 受限项的中文口径：后端只回 cpu / mem / fd / probe / manual */
+const BUDGET_LIMIT_LABELS: Record<string, string> = {
+  cpu: 'CPU 核数',
+  mem: '内存',
+  fd: '文件句柄',
+  probe: '能力探测',
+  manual: '手动指定',
+}
+const budgetLimitLabel = computed(() => {
+  const key = budget.value?.sources.limitedBy ?? ''
+  return BUDGET_LIMIT_LABELS[key] ?? key
+})
+/** 受句柄限制时补一条可操作提示：这是唯一用户自己能让预算变大的项 */
+const budgetFdLimited = computed(() => budget.value?.sources.limitedBy === 'fd')
 
 async function loadBudget() {
   try {
@@ -964,13 +991,26 @@ async function openReleasePage() {
             <div class="group-title">界面缩放</div>
             <div class="row">
               <div class="row-label">
-                <div class="row-title">调整整体缩放</div>
-                <div class="row-desc">侧边栏底部的 − / 百分比 / + 控件，或用快捷键切换</div>
+                <div class="row-title">整体缩放</div>
+                <div class="row-desc">
+                  界面等比放大，编辑区与表格一起变化；也可用 {{ shortcutText('+') }} / {{ shortcutText('-') }}
+                  调整，{{ shortcutText('0') }} 复位
+                </div>
               </div>
-              <div class="row-control">
-                <kbd>{{ shortcutText('+') }}</kbd>
-                <kbd>{{ shortcutText('-') }}</kbd>
-                <kbd>{{ shortcutText('0') }}</kbd>
+              <div class="row-control zoom-control">
+                <a-slider
+                  class="zoom-slider"
+                  :value="zoomPercent"
+                  :min="50"
+                  :max="200"
+                  :step="5"
+                  :tip-formatter="formatZoomTip"
+                  @change="onZoomChange"
+                />
+                <span class="zoom-value mono">{{ zoomPercent }}%</span>
+                <a-button size="small" :disabled="zoomPercent === 100" @click="resetZoom">
+                  恢复 100%
+                </a-button>
               </div>
             </div>
           </div>
@@ -1597,11 +1637,16 @@ async function openReleasePage() {
               <div class="row-control wide">
                 <span class="mono">
                   {{ budget.sources.cores }} 核 · {{ budget.sources.memGb }} GB · 句柄
-                  {{ budget.sources.fdLimit }} · 受限项 {{ budget.sources.limitedBy }}
+                  {{ budget.sources.fdLimit }} · 受限项 {{ budgetLimitLabel }}
                   <template v-if="budget.sources.probeSaturation">
                     · 探测饱和 {{ budget.sources.probeSaturation }}
                   </template>
                 </span>
+                <div v-if="budgetFdLimited" class="capacity-limit-hint">
+                  句柄上限把本机并发压到了 {{ budget.machineLimit }}（每个在途连接占 1 个
+                  fd，按上限 60% 折算）。启动时已尝试自动抬到系统硬上限，仍受限于此说明硬上限本身较低，可用
+                  <span class="mono">ulimit -n 65535</span> 提高后重启。
+                </div>
               </div>
             </div>
 
@@ -2516,6 +2561,22 @@ async function openReleasePage() {
 .row-control.wide {
   flex: 0 0 340px;
   min-width: 220px;
+}
+
+.zoom-control {
+  gap: 10px;
+}
+
+.zoom-slider {
+  width: 168px;
+  margin: 0;
+}
+
+.zoom-value {
+  min-width: 42px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--fm-text);
 }
 
 .row-control.wide :deep(.ant-input),

@@ -18,10 +18,11 @@ import {
   CodeOutlined,
   FileTextOutlined,
   PlusOutlined,
-  DownOutlined,
   SettingOutlined,
   SearchOutlined,
   HistoryOutlined,
+  KeyOutlined,
+  SafetyCertificateOutlined,
 } from '@ant-design/icons-vue'
 import AiSparkIcon from '@/components/AiSparkIcon.vue'
 import KeyValueEditor from '@/components/KeyValueEditor.vue'
@@ -31,6 +32,7 @@ import EnvironmentDrawer from '@/components/EnvironmentDrawer.vue'
 import DocsPreviewDrawer from '@/components/DocsPreviewDrawer.vue'
 import RequestEntityEditor from '@/components/RequestEntityEditor.vue'
 import RequestHistoryDrawer from '@/components/RequestHistoryDrawer.vue'
+import PaneDivider from '@/components/split/PaneDivider.vue'
 import { useAiAssistStore } from '@/stores/aiAssist'
 import {
   requestAssertionPrompt,
@@ -45,10 +47,18 @@ import { useErrorDialogStore } from '@/stores/errorDialog'
 import { useWorkspaceStore, type RequestTurnState, type RequestWorkspaceSnapshot } from '@/stores/workspace'
 import { setHandoff } from '@/stores/handoff'
 import { formatDateTime } from '@/utils/datetime'
-import { buildSnippets, type Snippet } from '@/utils/curl'
+import { buildSnippets, previewRequest, type Snippet } from '@/utils/curl'
 import { formatJsonTemplateAsync } from '@/utils/formatJson'
 import { findMatches } from '@/utils/jsonHighlight'
 import { replaceAllLiteral } from '@/utils/bodyReplace'
+import {
+  REQUEST_BODY_MAX_BYTES,
+  REQUEST_BODY_WARN_BYTES,
+  bodyBytes,
+  bodySizeLevel,
+  isFileBackedBodyType,
+  UPLOAD_FILE_MAX_BYTES,
+} from '@/utils/bodySize'
 import { diffLines, diffStats, type DiffLine } from '@/utils/diff'
 import { readLastRequest, rememberLastRequest } from '@/utils/lastRequest'
 import {
@@ -1695,6 +1705,15 @@ async function send() {
     message.warning('请填写 URL')
     return
   }
+  // 请求体超过硬上限直接拒发：Rust 侧 execute_with 也会兜一次，
+  // 这里先拦是为了不让前置脚本白跑一遍
+  const plannedBytes = bodyBytes(form.value.body)
+  if (bodySizeLevel(plannedBytes) === 'blocked') {
+    message.error(
+      `请求体 ${fmtSize(plannedBytes)} 超过 ${fmtSize(REQUEST_BODY_MAX_BYTES)} 上限，未发送；请改用文件上传或拆分请求`,
+    )
+    return
+  }
   // 记住发起时的接口与关键配置：中途切标签后，后台请求仍按发起时的口径完成
   const ownerId = form.value.id
   const ownerName = form.value.name
@@ -2541,6 +2560,15 @@ watch(
   { immediate: true },
 )
 
+/** 体积档位：ok / warn（建议值内偏大）/ blocked（超过硬上限，禁止发送） */
+const bodyLevel = computed(() => bodySizeLevel(bodySize.value))
+
+/** 文件类 Body 的说明：不受正文上限约束，但单个文件有 2GB 上限（文件要整份读进内存） */
+const uploadFileHint = `文件由本机直接读取，不受请求体体积上限限制，单个文件最大 ${UPLOAD_FILE_MAX_BYTES / 1024 / 1024 / 1024} GB`
+
+/** 文件类型（Binary / Form-Data）的正文只存路径，文件由后端直接读取，不受体积上限约束 */
+const bodySizeApplies = computed(() => !isFileBackedBodyType(form.value.bodyType))
+
 const projectName = computed(
   () => store.projects.find((p) => p.id === projectId.value)?.name ?? '',
 )
@@ -2631,6 +2659,49 @@ async function copyBody() {
   } catch {
     message.error('复制失败')
   }
+}
+
+/* ---------- 实际请求：发送前把「变量替换 + Query 拼接 + 认证头」算一遍 ---------- */
+const sentPreview = computed(() => {
+  const env = store.environments.find((item) => item.id === envId.value)
+  return previewRequest(form.value, env?.variables)
+})
+const sentHeaderQuery = ref('')
+const filteredSentHeaders = computed(() => {
+  const keyword = sentHeaderQuery.value.trim().toLowerCase()
+  if (!keyword) return sentPreview.value.headers
+  return sentPreview.value.headers.filter(
+    (item) =>
+      item.key.toLowerCase().includes(keyword) || item.value.toLowerCase().includes(keyword),
+  )
+})
+const HEADER_SOURCE_TEXT: Record<string, string> = {
+  user: '手填',
+  auth: '认证注入',
+  auto: '自动补',
+}
+
+function copySentUrl() {
+  const url = sentPreview.value.url
+  if (!url) {
+    message.warning('还没有填写 URL')
+    return
+  }
+  copyToClipboard(url)
+    .then(() => message.success('已复制最终地址'))
+    .catch(() => message.error('复制失败'))
+}
+
+function copySentHeaders() {
+  const list = filteredSentHeaders.value
+  if (!list.length) {
+    message.warning('没有可复制的请求头')
+    return
+  }
+  const text = list.map((item) => `${item.key}: ${item.value}`).join('\n')
+  copyToClipboard(text)
+    .then(() => message.success(`已复制 ${list.length} 条请求头`))
+    .catch(() => message.error('复制失败'))
 }
 
 /* ---------- 代码片段（Postman 风格） ---------- */
@@ -2736,6 +2807,27 @@ const responseHeaders = computed(() => {
   if (!result.value) return []
   return Object.entries(result.value.headers).map(([key, value]) => ({ key, value }))
 })
+
+const responseHeaderQuery = ref('')
+const filteredResponseHeaders = computed(() => {
+  const keyword = responseHeaderQuery.value.trim().toLowerCase()
+  if (!keyword) return responseHeaders.value
+  return responseHeaders.value.filter(
+    (item) =>
+      item.key.toLowerCase().includes(keyword) || item.value.toLowerCase().includes(keyword),
+  )
+})
+
+function copyResponseHeaders() {
+  const list = filteredResponseHeaders.value
+  if (!list.length) {
+    message.warning('没有可复制的响应头')
+    return
+  }
+  copyToClipboard(list.map((item) => `${item.key}: ${item.value}`).join('\n'))
+    .then(() => message.success(`已复制 ${list.length} 条响应头`))
+    .catch(() => message.error('复制失败'))
+}
 </script>
 
 <template>
@@ -2768,7 +2860,53 @@ const responseHeaders = computed(() => {
           </span>
         </div>
         <div class="right">
-          <a-checkbox v-model:checked="insecure" class="insecure">忽略证书校验</a-checkbox>
+          <a-tooltip :title="form.id ? '请求历史' : '先保存接口后才能查看历史'">
+            <span class="icon-wrap">
+              <a-button
+                class="icon-btn"
+                :disabled="!form.id"
+                @click="historyOpen = true"
+              >
+                <template #icon><HistoryOutlined /></template>
+              </a-button>
+            </span>
+          </a-tooltip>
+          <a-tooltip :title="form.id ? '接口文档' : '先保存接口后才能生成文档'">
+            <span class="icon-wrap">
+              <a-button class="icon-btn" :disabled="!form.id" @click="docsOpen = true">
+                <template #icon><FileTextOutlined /></template>
+              </a-button>
+            </span>
+          </a-tooltip>
+          <a-tooltip title="生成调用代码">
+            <a-button class="icon-btn" @click="openCode">
+              <template #icon><CodeOutlined /></template>
+            </a-button>
+          </a-tooltip>
+          <a-tooltip title="Cookie 管理">
+            <a-button class="icon-btn" @click="openCookies">
+              <template #icon><KeyOutlined /></template>
+            </a-button>
+          </a-tooltip>
+
+          <a-dropdown :trigger="['click']" placement="bottomRight">
+            <a-tooltip title="AI 分析">
+              <a-button class="icon-btn">
+                <template #icon><AiSparkIcon /></template>
+              </a-button>
+            </a-tooltip>
+            <template #overlay>
+              <a-menu @click="(info: any) => onAiMenu(String(info.key))">
+                <a-menu-item key="explain">解释这次请求 / 响应</a-menu-item>
+                <a-menu-item key="assert">生成断言脚本</a-menu-item>
+                <a-menu-item key="post">生成后置提取脚本</a-menu-item>
+                <a-menu-item key="optimize">优化这个接口定义</a-menu-item>
+                <a-menu-divider />
+                <a-menu-item key="handoff">带这次请求去航仔</a-menu-item>
+              </a-menu>
+            </template>
+          </a-dropdown>
+
           <a-popover trigger="click" placement="bottomRight" :overlay-style="{ width: '340px' }">
             <template #content>
               <div class="send-opt-panel">
@@ -2820,53 +2958,50 @@ const responseHeaders = computed(() => {
                 </template>
               </div>
             </template>
-            <a-button size="small" class="send-opt-btn">
-              <template #icon><SettingOutlined /></template>
-              发送选项
-              <span v-if="protocol !== 'auto' || !followRedirects || retryEnabled" class="send-opt-dot" />
-            </a-button>
+            <a-tooltip
+              :title="
+                protocol !== 'auto' || !followRedirects || retryEnabled
+                  ? '发送选项（当前有非默认项）'
+                  : '发送选项'
+              "
+            >
+              <a-button
+                class="icon-btn"
+                :class="{ 'has-badge': protocol !== 'auto' || !followRedirects || retryEnabled }"
+              >
+                <template #icon><SettingOutlined /></template>
+              </a-button>
+            </a-tooltip>
           </a-popover>
-          <a-button v-if="form.id" type="text" size="small" danger class="del-btn" @click="deleteRequest">
-            <template #icon><DeleteOutlined /></template>
-            删除
-          </a-button>
-          <a-dropdown :trigger="['click']" placement="bottomRight">
-            <a-button>
-              <template #icon><AiSparkIcon /></template>
-              AI 分析
-              <DownOutlined class="ai-caret" />
+
+          <a-tooltip
+            :title="insecure ? '已关闭证书校验，正在忽略 TLS 错误' : '忽略证书校验'"
+          >
+            <a-button
+              class="icon-btn cert-btn"
+              :class="{ danger: insecure }"
+              :aria-pressed="insecure"
+              @click="insecure = !insecure"
+            >
+              <template #icon><SafetyCertificateOutlined /></template>
             </a-button>
-            <template #overlay>
-              <a-menu @click="(info: any) => onAiMenu(String(info.key))">
-                <a-menu-item key="explain">解释这次请求 / 响应</a-menu-item>
-                <a-menu-item key="assert">生成断言脚本</a-menu-item>
-                <a-menu-item key="post">生成后置提取脚本</a-menu-item>
-                <a-menu-item key="optimize">优化这个接口定义</a-menu-item>
-                <a-menu-divider />
-                <a-menu-item key="handoff">带这次请求去航仔</a-menu-item>
-              </a-menu>
-            </template>
-          </a-dropdown>
-          <a-button @click="openCookies">Cookie</a-button>
-          <a-button :disabled="!form.id" @click="historyOpen = true">
-            <template #icon><HistoryOutlined /></template>
-            历史
-          </a-button>
-          <a-button :disabled="!form.id" @click="docsOpen = true">
-            <template #icon><FileTextOutlined /></template>
-            文档
-          </a-button>
-          <a-button @click="openCode">
-            <template #icon><CodeOutlined /></template>
-            代码
+          </a-tooltip>
+
+          <a-tooltip v-if="form.id" title="删除这个请求">
+            <a-button class="icon-btn del-btn" danger @click="deleteRequest">
+              <template #icon><DeleteOutlined /></template>
+            </a-button>
+          </a-tooltip>
+
+          <span class="topbar-sep" />
+
+          <a-button class="stress-btn" @click="openStress">
+            <template #icon><ThunderboltOutlined /></template>
+            压测
           </a-button>
           <a-button :loading="saving" @click="save()">
             <template #icon><SaveOutlined /></template>
             保存
-          </a-button>
-          <a-button class="stress-btn" @click="openStress">
-            <template #icon><ThunderboltOutlined /></template>
-            压测
           </a-button>
         </div>
       </div>
@@ -2924,7 +3059,6 @@ const responseHeaders = computed(() => {
               {{ item.label }}
             </a-select-option>
           </a-select>
-          <span class="bar-divider" />
           <a-select v-model:value="form.method" class="method-select" :class="`m-${form.method}`" :bordered="false">
             <a-select-option v-for="m in methods" :key="m" :value="m">{{ m }}</a-select-option>
           </a-select>
@@ -2942,7 +3076,6 @@ const responseHeaders = computed(() => {
             "
             @press-enter="isRealtime ? connectRealtime() : send()"
           />
-          <span class="bar-divider" />
           <a-select
             v-model:value="envId"
             class="env-select"
@@ -3004,11 +3137,12 @@ const responseHeaders = computed(() => {
             <a class="faker-entry">faker 变量</a>
           </a-popover>
           <span v-if="fakerCount" class="faker-count">· 将生成 {{ fakerCount }} 个随机值</span>
-          <span>Enter 发送 · 支持环境变量</span>
+          <span class="url-hint">Enter 发送 · 支持环境变量</span>
         </span>
       </div>
 
       <div class="panes">
+        <PaneDivider storage-key="astroman:request:split" />
         <div class="req-pane fm-card">
           <div class="pane-head">
             <span class="pane-title">
@@ -3062,7 +3196,7 @@ const responseHeaders = computed(() => {
             </a-tab-pane>
             <a-tab-pane key="auth">
               <template #tab>
-                Auth <span class="tab-count" :class="{ off: !authActive }">{{ authActive ? authKind : '无' }}</span>
+                Auth <span v-if="authActive" class="tab-count">{{ authKind }}</span>
               </template>
               <div class="tab-body auth-tab">
                 <a-radio-group v-model:value="authKind" size="small" button-style="solid">
@@ -3125,7 +3259,7 @@ const responseHeaders = computed(() => {
             </a-tab-pane>
             <a-tab-pane key="body">
               <template #tab>
-                Body <span class="tab-count" :class="{ off: form.bodyType === 'none' }">{{ form.bodyType }}</span>
+                Body <span v-if="form.bodyType !== 'none'" class="tab-count">{{ form.bodyType }}</span>
               </template>
               <div class="tab-body body-tab">
                 <div class="body-head">
@@ -3152,7 +3286,22 @@ const responseHeaders = computed(() => {
                   >
                     批量替换
                   </a-button>
-                  <span v-if="form.body" class="body-size mono">{{ fmtSize(bodySize) }}</span>
+                  <span
+                    v-if="form.body && bodySizeApplies"
+                    class="body-size mono"
+                    :class="bodyLevel"
+                  >{{ fmtSize(bodySize) }}</span>
+                </div>
+
+                <div v-if="bodySizeApplies && bodyLevel !== 'ok'" class="body-alert" :class="bodyLevel">
+                  <template v-if="bodyLevel === 'blocked'">
+                    请求体 {{ fmtSize(bodySize) }}，已超过 {{ fmtSize(REQUEST_BODY_MAX_BYTES) }} 上限，
+                    发送会被拒绝；请改用文件上传，或把内容拆成多个请求。
+                  </template>
+                  <template v-else>
+                    请求体 {{ fmtSize(bodySize) }}，超过 {{ fmtSize(REQUEST_BODY_WARN_BYTES) }} 建议值；
+                    自动保存、发送与复制都会明显变慢。
+                  </template>
                 </div>
 
                 <div
@@ -3223,12 +3372,15 @@ const responseHeaders = computed(() => {
                   </div>
                   <div v-if="!multipartFields.length" class="empty-hint">还没有字段，点击右上角添加</div>
                   <div class="header-hint">Content-Type 会自动设为 multipart/form-data（含 boundary），无需手动填写</div>
+                  <div class="header-hint">{{ uploadFileHint }}</div>
                 </div>
 
                 <div v-else-if="form.bodyType === 'binary'" class="binary">
                   <a-input v-model:value="binaryPath" placeholder="选择要上传的文件" readonly />
                   <a-button @click="pickBinaryFile">选择文件</a-button>
-                  <span class="header-hint">默认以 application/octet-stream 发送，可在 Headers 中覆盖 Content-Type</span>
+                  <span class="header-hint">
+                    默认以 application/octet-stream 发送，可在 Headers 中覆盖 Content-Type；{{ uploadFileHint }}
+                  </span>
                 </div>
 
                 <div v-else-if="form.bodyType === 'graphql'" class="graphql">
@@ -3382,7 +3534,7 @@ const responseHeaders = computed(() => {
             <a-tab-pane key="requestEntity">
               <template #tab>
                 请求实体
-                <span class="tab-count" :class="{ off: !requestEntityCount }">{{ requestEntityCount }}</span>
+                <span v-if="requestEntityCount" class="tab-count">{{ requestEntityCount }}</span>
               </template>
               <div class="tab-body">
                 <RequestEntityEditor
@@ -3509,37 +3661,50 @@ const responseHeaders = computed(() => {
               </span>
             </a-tooltip>
             <template v-if="result">
-              <span class="status-pill mono" :class="{ ok: result.status > 0 && result.status < 400, bad: result.status >= 400 || !result.status }">
-                {{ result.status || 'ERR' }}{{ result.statusText ? ` ${result.statusText}` : '' }}
+              <span class="meta-group">
+                <span class="status-pill mono" :class="{ ok: result.status > 0 && result.status < 400, bad: result.status >= 400 || !result.status }">
+                  {{ result.status || 'ERR' }}{{ result.statusText ? ` ${result.statusText}` : '' }}
+                </span>
+                <span class="meta mono">{{ result.durationMs }} ms</span>
+                <span class="meta mono">{{ fmtSize(result.sizeBytes) }}</span>
+                <a-tooltip v-if="result.httpVersion" :title="`实际协商协议：${result.httpVersion}`">
+                  <span class="proto-pill mono">{{ result.httpVersion }}</span>
+                </a-tooltip>
               </span>
-              <span class="meta-divider" />
-              <span class="meta mono">{{ result.durationMs }} ms</span>
-              <span class="meta-divider" />
-              <span class="meta mono">{{ fmtSize(result.sizeBytes) }}</span>
-              <a-tooltip v-if="result.httpVersion" :title="`实际协商协议：${result.httpVersion}`">
-                <span class="proto-pill mono">{{ result.httpVersion }}</span>
-              </a-tooltip>
-              <a-tooltip
-                v-if="result.cancelled"
-                title="本次请求被手动停止，数据可能不完整"
+              <span
+                v-if="result.cancelled || result.retries.length || result.redirects.length || scriptAssertions.length"
+                class="meta-group meta-group-flags"
               >
-                <span class="proto-pill warn mono">已停止</span>
-              </a-tooltip>
-              <a-tooltip
-                v-else-if="result.retries.length"
-                :title="`共发生 ${result.retries.length} 次重试`"
-              >
-                <span class="proto-pill retry mono">重试 ×{{ result.retries.length }}</span>
-              </a-tooltip>
-              <a-tooltip
-                v-if="result.redirects.length"
-                :title="`跟随了 ${result.redirects.length} 跳重定向`"
-              >
-                <span class="proto-pill mono">跳转 ×{{ result.redirects.length }}</span>
-              </a-tooltip>
+                <a-tooltip
+                  v-if="result.cancelled"
+                  title="本次请求被手动停止，数据可能不完整"
+                >
+                  <span class="proto-pill warn mono">已停止</span>
+                </a-tooltip>
+                <a-tooltip
+                  v-else-if="result.retries.length"
+                  :title="`共发生 ${result.retries.length} 次重试`"
+                >
+                  <span class="proto-pill retry mono">重试 ×{{ result.retries.length }}</span>
+                </a-tooltip>
+                <a-tooltip
+                  v-if="result.redirects.length"
+                  :title="`跟随了 ${result.redirects.length} 跳重定向`"
+                >
+                  <span class="proto-pill mono">跳转 ×{{ result.redirects.length }}</span>
+                </a-tooltip>
+                <span
+                  v-if="scriptAssertions.length"
+                  class="assert-pill mono"
+                  :class="{ bad: failedAssertions > 0 }"
+                >
+                  {{ failedAssertions > 0 ? '✗' : '✓' }}
+                  断言 {{ passedAssertions }}/{{ scriptAssertions.length }}
+                </span>
+              </span>
             </template>
             <span
-              v-if="scriptAssertions.length"
+              v-else-if="scriptAssertions.length"
               class="assert-pill mono"
               :class="{ bad: failedAssertions > 0 }"
             >
@@ -3673,10 +3838,25 @@ const responseHeaders = computed(() => {
                 <template #tab>
                   Headers <span class="tab-count">{{ responseHeaders.length }}</span>
                 </template>
+                <div class="res-header-pane">
+                <div class="res-header-tools">
+                  <a-input
+                    v-model:value="responseHeaderQuery"
+                    size="small"
+                    allow-clear
+                    placeholder="筛选名称或值"
+                    class="res-header-filter"
+                  />
+                  <span class="res-header-count">{{ filteredResponseHeaders.length }} / {{ responseHeaders.length }}</span>
+                  <a class="res-header-copy" @click="copyResponseHeaders">复制全部</a>
+                </div>
                 <div class="res-header-list">
-                  <div v-for="h in responseHeaders" :key="h.key" class="res-header-row">
+                  <div v-for="h in filteredResponseHeaders" :key="h.key" class="res-header-row">
                     <span class="mono hk">{{ h.key }}</span>
                     <span class="mono hv">{{ h.value }}</span>
+                  </div>
+                  <div v-if="!filteredResponseHeaders.length" class="empty-hint">
+                    {{ responseHeaderQuery ? '没有匹配的响应头' : '这次响应没有返回请求头' }}
                   </div>
                   <div v-if="result.ignoredHeaders.length" class="ignored-headers">
                     <div class="ignored-title">因 HTTP/2 被剔除的请求头</div>
@@ -3687,12 +3867,98 @@ const responseHeaders = computed(() => {
                     </div>
                   </div>
                 </div>
+                </div>
+              </a-tab-pane>
+
+              <a-tab-pane key="sent">
+                <template #tab>
+                  实际请求
+                  <span
+                    v-if="sentPreview.unresolved.length"
+                    class="tab-count bad"
+                  >{{ sentPreview.unresolved.length }}</span>
+                </template>
+                <div class="sent-panel">
+                  <div v-if="sentPreview.unresolved.length" class="sent-warn">
+                    这些变量在当前环境里没有定义，会原样带占位符发出：
+                    <span class="mono sent-warn-list">{{ sentPreview.unresolved.join('、') }}</span>
+                  </div>
+
+                  <div class="sent-block">
+                    <div class="sent-row-head">
+                      <span class="sent-label">请求行</span>
+                      <span class="sent-spacer" />
+                      <a class="sent-copy" @click="copySentUrl">复制地址</a>
+                    </div>
+                    <div class="sent-line mono">
+                      <span class="sent-method" :class="`m-${form.method}`">{{ sentPreview.method }}</span>
+                      <span class="sent-url">{{ sentPreview.url || '（未填写 URL）' }}</span>
+                    </div>
+                  </div>
+
+                  <div v-if="sentPreview.bodyType !== 'none'" class="sent-block">
+                    <div class="sent-row-head">
+                      <span class="sent-label">正文</span>
+                    </div>
+                    <div class="sent-line mono">
+                      <span>{{ sentPreview.bodyType }}</span>
+                      <template v-if="sentPreview.bodyBytes">
+                        <span class="sent-dot">·</span>
+                        <span>{{ fmtSize(sentPreview.bodyBytes) }}</span>
+                      </template>
+                      <template v-else>
+                        <span class="sent-dot">·</span>
+                        <span class="sent-hint-inline">文件内容不在此展开</span>
+                      </template>
+                    </div>
+                  </div>
+
+                  <div class="sent-block sent-block-grow">
+                    <div class="sent-row-head">
+                      <span class="sent-label">
+                        请求头
+                        <em>
+                          {{ filteredSentHeaders.length }}<template
+                            v-if="sentHeaderQuery"
+                          > / {{ sentPreview.headers.length }}</template>
+                        </em>
+                      </span>
+                      <a-input
+                        v-model:value="sentHeaderQuery"
+                        size="small"
+                        allow-clear
+                        placeholder="筛选名称或值"
+                        class="sent-filter"
+                      />
+                      <a class="sent-copy" @click="copySentHeaders">复制全部</a>
+                    </div>
+                    <div class="res-header-list sent-header-list">
+                      <div v-for="h in filteredSentHeaders" :key="h.key" class="res-header-row">
+                        <span class="mono hk">{{ h.key }}</span>
+                        <span class="mono hv">{{ h.value || '（空）' }}</span>
+                        <span class="sent-src" :class="`s-${h.source}`">
+                          {{ HEADER_SOURCE_TEXT[h.source] ?? h.source }}
+                        </span>
+                      </div>
+                      <div v-if="!filteredSentHeaders.length" class="empty-hint">
+                        {{ sentHeaderQuery ? '没有匹配的请求头' : '这条请求没有请求头' }}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="sent-note">
+                    Host、User-Agent、Accept-Encoding、Content-Length 等由 HTTP 客户端与网络层补齐，不在此列出{{
+                      sentPreview.secretVars.length
+                        ? '；敏感变量只保留占位符，不显示实际值'
+                        : ''
+                    }}。
+                  </div>
+                </div>
               </a-tab-pane>
 
               <a-tab-pane key="timing">
                 <template #tab>
                   计时
-                  <span class="tab-count">{{ Math.round(result.durationMs) }}ms</span>
                 </template>
                 <div class="timing-panel">
                   <div v-if="!timings" class="empty-hint">
@@ -3755,10 +4021,11 @@ const responseHeaders = computed(() => {
                 <template #tab>
                   测试
                   <span
+                    v-if="scriptAssertions.length"
                     class="tab-count"
                     :class="{ bad: failedAssertions > 0, ok: scriptAssertions.length > 0 && failedAssertions === 0 }"
                   >
-                    {{ scriptAssertions.length ? `${passedAssertions}/${scriptAssertions.length}` : '0' }}
+                    {{ passedAssertions }}/{{ scriptAssertions.length }}
                   </span>
                 </template>
                 <div class="test-panel">
@@ -3813,7 +4080,7 @@ const responseHeaders = computed(() => {
               <a-tab-pane key="responseEntity">
                 <template #tab>
                   返回实体
-                  <span class="tab-count" :class="{ off: !responseEntityCount }">{{ responseEntityCount }}</span>
+                  <span v-if="responseEntityCount" class="tab-count">{{ responseEntityCount }}</span>
                 </template>
                 <div class="tab-body">
                   <RequestEntityEditor
@@ -4131,9 +4398,65 @@ const responseHeaders = computed(() => {
   flex-direction: column;
 }
 
-.ai-caret {
-  font-size: 10px;
-  margin-left: 4px;
+/* ---------- 顶栏图标按钮：把 10 个文字按钮收成主操作 + 图标组 ---------- */
+.icon-wrap {
+  display: inline-flex;
+}
+
+.right .icon-btn {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--fm-text-2);
+  border-color: transparent;
+  background: transparent;
+  transition: color 0.14s ease, background 0.14s ease, border-color 0.14s ease;
+}
+
+.right .icon-btn:not(:disabled):hover {
+  color: var(--fm-primary);
+  background: var(--fm-surface-alt);
+  border-color: var(--fm-border);
+}
+
+/* 有非默认项的标记：不占位，只点一个小圆点 */
+.icon-btn.has-badge {
+  position: relative;
+}
+
+.icon-btn.has-badge::after {
+  content: '';
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--fm-primary);
+}
+
+/* 证书校验被关闭 = 不安全状态，必须一眼可见 */
+.right .cert-btn.danger,
+.right .cert-btn.danger:not(:disabled):hover {
+  color: var(--fm-danger);
+  background: var(--fm-danger-soft);
+  border-color: var(--fm-danger);
+}
+
+.right .del-btn:not(:disabled):hover {
+  color: var(--fm-danger);
+  background: var(--fm-danger-soft);
+  border-color: var(--fm-danger);
+}
+
+.topbar-sep {
+  width: 1px;
+  height: 18px;
+  flex-shrink: 0;
+  background: var(--fm-border);
 }
 
 .topbar {
@@ -4381,11 +4704,6 @@ const responseHeaders = computed(() => {
   color: var(--fm-danger);
 }
 
-.insecure {
-  font-size: 12px;
-  color: var(--fm-muted);
-}
-
 .stress-btn {
   color: var(--fm-warning);
   border-color: var(--fm-border-strong);
@@ -4412,7 +4730,7 @@ const responseHeaders = computed(() => {
   min-width: 0;
   display: flex;
   align-items: center;
-  gap: 2px;
+  gap: 4px;
   height: 38px;
   padding: 2px 3px 2px 4px;
   border: 1px solid var(--fm-border-control);
@@ -4432,9 +4750,16 @@ const responseHeaders = computed(() => {
 }
 
 .proto-select {
-  width: 92px;
+  /* 必须容得下最长的 GraphQL，否则会截断成 HT… */
+  width: 96px;
   flex-shrink: 0;
+  font-size: 11px;
   font-weight: 600;
+}
+
+/* 协议是次要选择：字色压一档，让方法色块与 URL 成为视觉焦点 */
+.proto-select :deep(.ant-select-selection-item) {
+  color: var(--fm-muted);
 }
 
 .proto-select :deep(.ant-select-selector) {
@@ -4524,6 +4849,7 @@ const responseHeaders = computed(() => {
 
 .send-btn {
   height: 32px;
+  min-width: 76px;
   flex-shrink: 0;
   border-radius: var(--fm-radius-sm);
   font-weight: 600;
@@ -4578,12 +4904,14 @@ const responseHeaders = computed(() => {
 }
 
 .panes {
+  position: relative;
   flex: 1 1 auto;
   /* 固定高度：请求 / 响应各自内部滚动，长 Body 不再把整页撑长 */
   height: clamp(380px, 58vh, 660px);
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  /* 第一列宽度由 PaneDivider 写入 --split-first；默认等分（扣掉 12px 间距） */
+  grid-template-columns: var(--split-first, calc(50% - 6px)) minmax(0, 1fr);
   gap: 12px;
   padding: 12px 14px 14px;
   overflow: hidden;
@@ -4664,7 +4992,32 @@ const responseHeaders = computed(() => {
 }
 
 .tabs :deep(.ant-tabs-nav) {
-  margin-bottom: 8px;
+  margin-bottom: 6px;
+}
+
+/* 细线页签：间距拉开、选中加粗，靠一条底线定位，不用方块底 */
+.tabs :deep(.ant-tabs-nav-list) {
+  gap: 12px;
+}
+
+.tabs :deep(.ant-tabs-tab) {
+  padding: 8px 0;
+  font-size: 11.5px;
+  color: var(--fm-muted);
+  transition: color 0.14s ease;
+}
+
+.tabs :deep(.ant-tabs-tab:hover) {
+  color: var(--fm-text-2);
+}
+
+.tabs :deep(.ant-tabs-tab-active .ant-tabs-tab-btn) {
+  color: var(--fm-text);
+  font-weight: 600;
+}
+
+.tabs :deep(.ant-tabs-ink-bar) {
+  height: 2px;
 }
 
 .tabs :deep(.ant-tabs-content-holder) {
@@ -4777,9 +5130,24 @@ const responseHeaders = computed(() => {
 
 .binary {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
   margin-top: 10px;
+}
+
+/* 说明文字较长，单独占一行，避免把输入框和按钮挤窄 */
+.binary .header-hint {
+  flex: 1 1 100%;
+}
+
+.binary .ant-input {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.binary .ant-btn {
+  flex: 0 0 auto;
 }
 
 .graphql {
@@ -5066,9 +5434,37 @@ const responseHeaders = computed(() => {
 }
 
 .body-size {
+  flex-shrink: 0;
   margin-left: auto;
+  white-space: nowrap;
   font-size: 10px;
   color: var(--fm-muted);
+}
+
+.body-size.warn {
+  color: var(--fm-warning);
+}
+
+.body-size.blocked {
+  color: var(--fm-danger);
+  font-weight: 600;
+}
+
+/* 体积超过建议值时的说明条：只在超阈值时出现，不占常驻空间 */
+.body-alert {
+  margin: 0 0 8px;
+  padding: 6px 10px;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--fm-text-2);
+  border-left: 2px solid var(--fm-warning);
+  border-radius: 0 6px 6px 0;
+  background: var(--fm-warning-soft);
+}
+
+.body-alert.blocked {
+  border-left-color: var(--fm-danger);
+  background: var(--fm-danger-soft);
 }
 
 .replace-bar {
@@ -5390,6 +5786,19 @@ const responseHeaders = computed(() => {
   padding: 0 9px;
 }
 
+/* 指标分组：状态/耗时/大小/协议一组，异常与重试/断言另一组，组间一条竖线 */
+.meta-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.res-head > .meta-group-flags {
+  padding-left: 10px;
+  border-left: 1px solid var(--fm-border-strong);
+}
+
 .meta-divider {
   width: 1px;
   height: 12px;
@@ -5492,8 +5901,47 @@ const responseHeaders = computed(() => {
   color: var(--fm-warning);
 }
 
-.res-header-list {
+.res-header-pane {
   height: 100%;
+  min-height: 0;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+}
+
+.res-header-tools {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 14px 8px;
+}
+
+.res-header-filter {
+  width: 220px;
+}
+
+.res-header-count {
+  margin-left: auto;
+  font-size: 10.5px;
+  color: var(--fm-muted);
+}
+
+.res-header-copy {
+  font-size: 11px;
+  color: var(--fm-primary);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.res-header-copy:hover {
+  text-decoration: underline;
+}
+
+.res-header-list {
+  height: auto;
+  flex: 1;
+  min-height: 0;
   box-sizing: border-box;
   padding: 4px 0 10px;
   overflow: auto;
@@ -5516,6 +5964,168 @@ const responseHeaders = computed(() => {
 .hv {
   flex: 1;
   word-break: break-all;
+  color: var(--fm-muted);
+}
+
+/* ---------- 实际请求（发送前预览） ---------- */
+.sent-panel {
+  height: 100%;
+  min-height: 0;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 10px 14px 12px;
+  overflow: auto;
+}
+
+.sent-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex-shrink: 0;
+  min-height: 0;
+}
+
+.sent-block-grow {
+  flex: 1 1 auto;
+  min-height: 140px;
+}
+
+.sent-row-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.sent-label {
+  font-size: 11px;
+  color: var(--fm-muted);
+  white-space: nowrap;
+}
+
+.sent-label em {
+  margin-left: 4px;
+  font-style: normal;
+  font-weight: 600;
+  color: var(--fm-text-2);
+}
+
+.sent-spacer {
+  flex: 1;
+}
+
+.sent-copy {
+  font-size: 11px;
+  color: var(--fm-primary);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.sent-copy:hover {
+  text-decoration: underline;
+}
+
+.sent-line {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--fm-border);
+  border-radius: var(--fm-radius);
+  background: var(--fm-surface-alt);
+  font-size: 11.5px;
+  word-break: break-all;
+}
+
+.sent-method {
+  flex-shrink: 0;
+  font-weight: 700;
+}
+
+.sent-method.m-GET {
+  color: var(--fm-success);
+}
+.sent-method.m-POST {
+  color: var(--fm-warning);
+}
+.sent-method.m-PUT {
+  color: var(--fm-primary);
+}
+.sent-method.m-PATCH {
+  color: var(--fm-purple);
+}
+.sent-method.m-DELETE {
+  color: var(--fm-danger);
+}
+
+.sent-url {
+  flex: 1;
+  min-width: 0;
+  color: var(--fm-text);
+}
+
+.sent-dot {
+  color: var(--fm-muted);
+}
+
+.sent-hint-inline {
+  color: var(--fm-muted);
+  font-style: italic;
+}
+
+.sent-filter {
+  width: 150px;
+  margin-left: auto;
+}
+
+.sent-header-list {
+  height: auto;
+  flex: 1;
+  min-height: 0;
+  padding: 0;
+  border: 1px solid var(--fm-border);
+  border-radius: var(--fm-radius);
+  background: var(--fm-surface);
+}
+
+.sent-src {
+  flex-shrink: 0;
+  width: 52px;
+  text-align: right;
+  font-size: 9.5px;
+  color: var(--fm-muted);
+}
+
+.sent-src.s-auth {
+  color: var(--fm-primary);
+}
+
+.sent-src.s-auto {
+  color: var(--fm-warning);
+}
+
+.sent-warn {
+  flex-shrink: 0;
+  padding: 7px 10px;
+  border: 1px solid var(--fm-warning);
+  border-left-width: 3px;
+  border-radius: var(--fm-radius-sm);
+  background: var(--fm-warning-soft);
+  color: var(--fm-warning);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.sent-warn-list {
+  margin-left: 4px;
+  font-weight: 600;
+}
+
+.sent-note {
+  flex-shrink: 0;
+  font-size: 10.5px;
+  line-height: 1.6;
   color: var(--fm-muted);
 }
 
@@ -5794,6 +6404,11 @@ const responseHeaders = computed(() => {
   .saved-hint {
     display: none;
   }
+
+  /* URL 条右侧的快捷键说明是辅助信息，窄窗口下让位给输入框 */
+  .url-hint {
+    display: none;
+  }
 }
 
 @media (max-width: 1100px) {
@@ -5804,6 +6419,11 @@ const responseHeaders = computed(() => {
     height: clamp(600px, 82vh, 940px);
     min-height: 0;
     overflow: hidden;
+  }
+
+  /* 上下叠放时左右拖拽无意义，隐藏分隔条 */
+  .panes :deep(.pane-divider) {
+    display: none;
   }
 
   .req-pane,
@@ -6001,21 +6621,6 @@ const responseHeaders = computed(() => {
 }
 
 /* ---------- v1.0.8：发送选项 / 停止按钮 / 协议徽标 ---------- */
-.send-opt-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  position: relative;
-}
-
-.send-opt-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--fm-primary);
-  margin-left: 2px;
-}
-
 .send-opt-panel {
   display: flex;
   flex-direction: column;

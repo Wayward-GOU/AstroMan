@@ -788,30 +788,14 @@ impl AppState {
         let mem_gb = total_memory_bytes() as f64 / (1024.0 * 1024.0 * 1024.0);
         let fd_limit = fd_limit();
         let probe_saturation = latest_probe_saturation(&self.pool);
-        let by_cpu = cores.saturating_mul(512);
-        let by_fd = (fd_limit as f64 * 0.8) as u32;
-        let by_mem = (mem_gb * 256.0) as u32;
+        let auto = auto_budget(cores, mem_gb, fd_limit, probe_saturation);
         let mode = BudgetMode::normalize(&settings.stress_budget_mode);
         let (machine_limit, limited_by) = match mode {
             BudgetMode::Manual => {
                 let manual = settings.stress_max_concurrent.clamp(1, 100_000) as u32;
                 (manual, "manual".to_string())
             }
-            BudgetMode::Auto => {
-                let candidate = by_cpu.max(probe_saturation.unwrap_or(0));
-                let upper = by_fd.min(by_mem).min(100_000);
-                let limit = candidate.max(1000).min(upper.max(1));
-                let limited_by = if limit == by_fd {
-                    "fd"
-                } else if limit == by_mem {
-                    "mem"
-                } else if probe_saturation.is_some_and(|value| value >= limit && value > by_cpu) {
-                    "probe"
-                } else {
-                    "cpu"
-                };
-                (limit, limited_by.to_string())
-            }
+            BudgetMode::Auto => (auto.limit, auto.limited_by.to_string()),
         };
         ConcurrencyBudget {
             mode: mode.as_str().to_string(),
@@ -824,9 +808,9 @@ impl AppState {
                 mem_gb,
                 fd_limit,
                 probe_saturation,
-                by_cpu,
-                by_fd,
-                by_mem,
+                by_cpu: auto.by_cpu,
+                by_fd: auto.by_fd,
+                by_mem: auto.by_mem,
                 limited_by,
                 computed_at: crate::util::now_ms(),
             },
@@ -1011,12 +995,119 @@ impl AppState {
     }
 }
 
+/// auto 模式并发预算的推导结果（三项上界一并返回，设置页要逐项展示）
+#[derive(Debug, Clone, Copy)]
+struct AutoBudget {
+    by_cpu: u32,
+    by_fd: u32,
+    by_mem: u32,
+    limit: u32,
+    limited_by: &'static str,
+}
+
+/// 按 CPU / 句柄 / 内存推导本机并发预算
+///
+/// 抽成纯函数是为了能覆盖「句柄软上限只有 256」这类本机复现不了的组合。
+fn auto_budget(
+    cores: u32,
+    mem_gb: f64,
+    fd_limit: u64,
+    probe_saturation: Option<u32>,
+) -> AutoBudget {
+    let by_cpu = cores.saturating_mul(512);
+    // 每个在途连接占 1 个 fd，另要给 SQLite / 日志 / WebView / 抓包留余量，
+    // 所以只把句柄上限的 60% 折算成并发预算（原先 80% 会让并发几乎吃满句柄）
+    let by_fd = (fd_limit as f64 * 0.6) as u32;
+    let by_mem = (mem_gb * 256.0) as u32;
+    let candidate = by_cpu.max(probe_saturation.unwrap_or(0));
+    let upper = by_fd.min(by_mem).min(100_000);
+    let limit = candidate.max(1000).min(upper.max(1));
+    let limited_by = if limit == by_fd {
+        "fd"
+    } else if limit == by_mem {
+        "mem"
+    } else if probe_saturation.is_some_and(|value| value >= limit && value > by_cpu) {
+        "probe"
+    } else {
+        "cpu"
+    };
+    AutoBudget {
+        by_cpu,
+        by_fd,
+        by_mem,
+        limit,
+        limited_by,
+    }
+}
+
 /// 本机物理内存（字节）
 pub fn total_memory_bytes() -> u64 {
     let mut system = sysinfo::System::new();
     system.refresh_memory();
     system.total_memory()
 }
+
+/// 压测并发需要的句柄目标值
+///
+/// 与 `budget()` 里 10 万的预算上限同口径，同时避免把 `rlim_cur` 顶成
+/// `RLIM_INFINITY`（部分老接口遇到无穷值会直接失败）。
+#[cfg(unix)]
+const FD_TARGET: u64 = 100_000;
+
+/// 启动时把 `RLIMIT_NOFILE` 软上限抬到硬上限（不超过 `FD_TARGET`）
+///
+/// 压测每个 keep-alive 连接占 1 个 fd，而 macOS 上从 Finder / launchd 启动的
+/// 进程软上限可能只有 256：`budget()` 的 `by_fd` 直接由它算出，不抬就会把整机
+/// 并发预算压到 204，用户只会在设置页看到「受 fd 限制」却查不出原因。
+///
+/// 只升不降；失败（沙箱 / 容器禁止 setrlimit）时保留原值并记一条 warn。
+#[cfg(unix)]
+pub fn raise_fd_limit() {
+    // SAFETY: 只读写本进程的 rlimit，结构体由本函数初始化后传给内核
+    unsafe {
+        let mut limit: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+            log::warn!("读取 RLIMIT_NOFILE 失败，沿用当前软上限");
+            return;
+        }
+        let hard = limit.rlim_max;
+        let soft = limit.rlim_cur;
+        let target = FD_TARGET as libc::rlim_t;
+        let want = if hard == libc::RLIM_INFINITY {
+            target
+        } else {
+            hard.min(target)
+        };
+        if soft >= want {
+            // 硬上限本身就很低（部分沙箱/容器）时无解，但必须留下可查的线索：
+            // 否则用户只会看到「受 fd 限制 153 并发」却不知道为什么
+            if soft < FD_TARGET {
+                log::warn!(
+                    "RLIMIT_NOFILE 软上限 {soft} 已达硬上限（{hard}），无法提升；\
+                     压测并发预算将被限制在约 {} 并发",
+                    (soft as f64 * 0.6) as u32
+                );
+            }
+            return;
+        }
+        let next = libc::rlimit {
+            rlim_cur: want,
+            rlim_max: hard,
+        };
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &next) != 0 {
+            let error = std::io::Error::last_os_error();
+            log::warn!(
+                "提升 RLIMIT_NOFILE 失败（{error}），压测并发预算将被 fd 软上限 {soft} 限制"
+            );
+            return;
+        }
+        log::info!("RLIMIT_NOFILE 软上限已从 {soft} 提升到 {want}");
+    }
+}
+
+/// Windows 没有 fd 概念，无需处理
+#[cfg(not(unix))]
+pub fn raise_fd_limit() {}
 
 /// 进程可打开文件数上限；Windows 没有 fd 概念，按 8192 兜底
 fn fd_limit() -> u64 {
@@ -1528,5 +1619,113 @@ mod tests {
         assert_eq!(snapshot[0].qps, 1235);
         assert_eq!(registry.window_label(id).as_deref(), Some("stress-1"));
         registry.finish(id);
+    }
+
+    #[test]
+    fn auto_budget_is_capped_by_fd_ratio() {
+        // 10 核 / 32GB / 句柄 10240：CPU 5120、句柄 6144、内存 8192 → CPU 先到顶，
+        // 但句柄项必须算对，否则低配机器上会误判瓶颈归属
+        let budget = auto_budget(10, 32.0, 10240, None);
+        assert_eq!(budget.by_cpu, 5120);
+        assert_eq!(budget.by_fd, 6144);
+        assert_eq!(budget.by_mem, 8192);
+        assert_eq!(budget.limit, 5120);
+        assert_eq!(budget.limited_by, "cpu");
+    }
+
+    #[test]
+    fn auto_budget_flags_small_fd_limit_instead_of_silently_shrinking() {
+        // macOS GUI 进程若继承到 256 的软上限：预算只能是 153，且必须报 fd，
+        // 用户才看得出「为什么这台机器只能跑一百多并发」
+        let budget = auto_budget(10, 32.0, 256, None);
+        assert_eq!(budget.by_fd, 153);
+        assert_eq!(budget.limit, 153);
+        assert_eq!(budget.limited_by, "fd");
+    }
+
+    #[test]
+    fn auto_budget_prefers_memory_when_fd_is_plentiful() {
+        // 句柄抬到 10 万后，64 核 / 32GB 机器的瓶颈回到内存（8192）
+        let budget = auto_budget(64, 32.0, 100_000, None);
+        assert_eq!(budget.by_mem, 8192);
+        assert_eq!(budget.limit, 8192);
+        assert_eq!(budget.limited_by, "mem");
+    }
+
+    #[test]
+    fn auto_budget_can_be_lifted_by_probe_saturation() {
+        // 能力检测测出更高饱和并发时，允许超过 CPU 估算，但不越过内存上限
+        let budget = auto_budget(8, 64.0, 65_536, Some(9000));
+        assert_eq!(budget.by_cpu, 4096);
+        assert_eq!(budget.limit, 9000);
+        assert_eq!(budget.limited_by, "probe");
+    }
+
+    #[test]
+    fn auto_budget_never_exceeds_hard_cap() {
+        // 256 核 / 512GB / 句柄 100 万：三项都远超 10 万，仍要卡在 10 万
+        let budget = auto_budget(256, 512.0, 1_000_000, None);
+        assert_eq!(budget.limit, 100_000);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raise_fd_limit_is_idempotent_and_never_lowers() {
+        let before = fd_limit();
+        raise_fd_limit();
+        let raised = fd_limit();
+        assert!(raised >= before, "软上限被调低了：{before} -> {raised}");
+        raise_fd_limit();
+        assert_eq!(fd_limit(), raised, "重复调用应保持幂等");
+        // 抬高后预算的 fd 项必须跟着变大或持平，不能在 256 上原地不动
+        let budget = auto_budget(10, 32.0, raised, None);
+        assert!(budget.by_fd >= (before as f64 * 0.6) as u32);
+    }
+
+    /// 复现 macOS GUI 的真实处境：软上限 256、硬上限更高
+    ///
+    /// 必须放到子进程里做：拉低本进程软上限会让并行跑的其他用例偶发 EMFILE。
+    #[cfg(unix)]
+    #[test]
+    fn raise_fd_limit_lifts_a_lowered_soft_limit() {
+        const CHILD_ENV: &str = "ASTROMAN_FD_CHILD";
+        const CHILD_TEST: &str = "state::tests::raise_fd_limit_lifts_a_lowered_soft_limit";
+
+        if std::env::var(CHILD_ENV).is_ok() {
+            // SAFETY: 只改本进程 rlimit
+            let hard = unsafe {
+                let mut limit: libc::rlimit = std::mem::zeroed();
+                libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit);
+                limit.rlim_max
+            };
+            if hard > 256 {
+                // SAFETY: hard 已确认大于 256，压低软上限一定合法
+                unsafe {
+                    let next = libc::rlimit {
+                        rlim_cur: 256,
+                        rlim_max: hard,
+                    };
+                    assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &next), 0);
+                }
+            }
+            raise_fd_limit();
+            let soft = fd_limit();
+            if hard > 256 {
+                assert!(
+                    soft >= 2560,
+                    "软上限没有被抬起，仍是 {soft}；压测预算会被压到 {}",
+                    auto_budget(10, 32.0, soft, None).limit
+                );
+            }
+            return;
+        }
+
+        let exe = std::env::current_exe().expect("current_exe");
+        let status = std::process::Command::new(exe)
+            .args(["--exact", CHILD_TEST, "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .status()
+            .expect("spawn child");
+        assert!(status.success(), "子进程未能把软上限抬起来");
     }
 }

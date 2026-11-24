@@ -665,12 +665,55 @@
   text-transform: uppercase;
 }
 
+/* ---------- 分栏方向切换：左右 / 上下 ----------
+   工具箱两个工作台都要用（JSON 专用与通用工具），放组件层避免各写一份。 */
+.fm-split-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--fm-border);
+  border-radius: var(--fm-radius);
+  background: var(--fm-surface-alt);
+  flex: none;
+}
+
+.fm-split-switch button {
+  width: 24px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: var(--fm-radius-sm);
+  background: transparent;
+  color: var(--fm-muted);
+  font-size: 12px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: color 0.15s ease, background 0.15s ease;
+}
+
+.fm-split-switch button:hover {
+  color: var(--fm-text);
+  background: var(--fm-surface);
+}
+
+/* 选中态用主色实底：--fm-primary-soft 与 --fm-surface-alt 明度太近，
+   淡底在米白工具栏上几乎看不出来，用户找不到「当前是哪种分栏」。 */
+.fm-split-switch button.active {
+  color: var(--fm-on-accent);
+  background: var(--fm-primary);
+}
+
 /* ---------- 焦点与可达性 ---------- */
 .fm-btn:focus-visible,
 .fm-input:focus-visible,
 .fm-nav-item:focus-visible,
 .fm-step:focus-visible,
 .fm-chip:focus-visible,
+.fm-split-switch button:focus-visible,
 .fm-faq .q:focus-visible {
   outline: 2px solid var(--fm-primary);
   outline-offset: 1px;

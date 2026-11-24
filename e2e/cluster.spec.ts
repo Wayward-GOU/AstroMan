@@ -39,4 +39,31 @@ test.describe('分布式压测', () => {
     await expect(page.getByText(/准备时按「平均分配（余数依次补齐）」拆分总并发/)).toBeVisible()
     await expect(page.locator('.planned-value')).toHaveText(['≈ 10', '≈ 10'])
   })
+
+  test('节点视图：卡片展示机器配置，可切回表格', async ({ page, app }) => {
+    await app.goto('/cluster')
+
+    // 默认卡片视图：每台机器一张卡，配置、资源与分配并发都在卡内
+    const cards = page.locator('.node-card')
+    await expect(cards).toHaveCount(2)
+    await expect(cards.first().locator('.nc-spec .v')).toHaveText(['8 核', '16 GB', '3,000'])
+    await expect(cards.first().locator('.nc-meter')).toHaveCount(2)
+    await expect(cards.first().locator('.planned-value')).toHaveText('≈ 13')
+
+    // 指标格下方一行灰度小字：本次配对以来的全部峰值（QPS / 并发 / 资源）
+    await expect(cards.first().locator('.nc-peak')).toHaveText(
+      '峰值 CPU 55% · 内存 69% · 网卡 2.6 MB/s'
+    )
+    await expect(cards.nth(1).locator('.nc-peak')).toHaveText(
+      '峰值 QPS 1,800 · 并发 200 · CPU 86% · 内存 52% · 网卡 6.5 MB/s'
+    )
+
+    // 切到表格：13 列密集对照，卡片不再渲染
+    await page.getByText('表格', { exact: true }).click()
+    await expect(page.locator('.node-card')).toHaveCount(0)
+    await expect(page.locator('.node-panel .ant-table')).toBeVisible()
+
+    await page.getByText('卡片', { exact: true }).click()
+    await expect(page.locator('.node-card')).toHaveCount(2)
+  })
 })

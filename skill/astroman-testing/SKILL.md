@@ -7,10 +7,10 @@ description: AstroMan 的测试体系与质量门禁：vitest 前端纯函数用
 
 四层验收，命令与规模：
 
-| 层 | 命令 | 规模（2026-11-04 实测） | 位置 |
+| 层 | 命令 | 规模（2026-11-24 实测） | 位置 |
 |---|---|---|---|
-| 前端纯函数 | `npm run test` | 35 spec / 322 条 | `src/**/*.spec.ts` |
-| Rust lib | `cd src-tauri && cargo test --lib` | 426 条 / 6 ignored | 模块内 `#[cfg(test)]` |
+| 前端纯函数 | `npm run test` | 39 spec / 391 条 | `src/**/*.spec.ts` |
+| Rust lib | `cd src-tauri && cargo test --lib` | 475 条 / 8 ignored | 模块内 `#[cfg(test)]` |
 | Rust 覆盖率 | `cargo tarpaulin --config tarpaulin.toml` | 门槛 25%（防倒退） | `src-tauri/tarpaulin.toml` |
 | 类型 / 构建 | `npm run build` | `vue-tsc --noEmit` + `vite build` | — |
 
@@ -142,6 +142,15 @@ cargo tarpaulin --config tarpaulin.toml --engine llvm
 
 剩下的 hex 集中在文档预览、Mock 面板、antd Tag 这类**有意固定浅色**的局部（它们不跟主题走），要彻底收掉得先定义一组 `--fm-paper-*` 令牌，不要直接把 `--fm-surface` 套上去 —— 深色主题下会变色。
 
+## 四·补二、端到端（Playwright 假桥）
+
+- `npm run e2e` 驱动的是 Vite 起的同一套前端代码，页面加载前注入 `__TAURI_INTERNALS__` 假桥（`e2e/fixtures/tauri.ts`）；只验证 UI 行为与渲染，**不替代** Rust 单测
+- 浏览器：本机默认系统 Chrome（`PW_CHANNEL=chrome`），CI 用安装的 Chromium；视觉基线只在 Windows + Chrome 上生成，其它平台只跑冒烟
+- 现有用例：`smoke.spec.ts`（导航冒烟）、`visual.spec.ts`（视觉基线）、`report.spec.ts`、`enterprise.spec.ts`、`cluster.spec.ts`（分布式审批 / 分配预览 / 节点卡片与峰值行）
+- 给假桥补字段时注意对象字面量**不能有重复键**（TS1117）：节点里已有 `peakQps: 0` / `peakConcurrent: 0` 时直接改值，别再追加一组
+- 临时截图用例：核对样式时可在 spec 末尾追加一个 `page.locator('.xxx').screenshot({ path: '/tmp/x.png' })` 的用例，**提交前必须删掉**，否则会污染用例数与 CI 时长
+- 构建、类型与单测对 CSS 丢失是无感的（误删样式块时三者全绿），改样式后至少截图看一眼，别只看 exit code
+
 ## 五、版本号一致性
 
 版本号在三个文件里各存一份，漏一处就会出现「关于页版本和安装包不一致」：
@@ -169,6 +178,7 @@ npm run version:set 1.0.9    # 三处统一写入
 - [ ] `cargo test --lib` 全绿
 - [ ] 新增敏感代码路径时 `cargo test --lib secret::` 全绿，且没有新增写钥匙串的分支
 - [ ] 改了覆盖率相关配置时，本地至少跑一次 `cargo tarpaulin --config tarpaulin.toml --engine llvm`
+- [ ] 改了大量交互 / 样式时跑 `npx playwright test e2e/cluster.spec.ts` 这类针对性 spec，并确认临时截图用例已删除
 
 ## 七、常见失败对照
 

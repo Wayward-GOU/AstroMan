@@ -1,24 +1,37 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { CloseOutlined, DownOutlined, SearchOutlined, UpOutlined } from '@ant-design/icons-vue'
+import LargeTextViewer from '@/components/LargeTextViewer.vue'
 import { findMatches, highlightJson, highlightPlain } from '@/utils/jsonHighlight'
+import { formatCharCount } from '@/utils/textChunk'
 
 const props = withDefaults(
   defineProps<{
     text: string
     /** json 会区分字段名 / 字符串 / 数字 / 注释 / {{变量}} */
     language?: 'json' | 'plain'
-    /** 超过该字符数不再着色与搜索，避免大响应重排卡顿（低端机门槛 1MB） */
-    highlightMax?: number
+    /**
+     * 超过该字符数改为分块渲染并关闭搜索。
+     * 单块 `<pre>` 装几 MB 正文时，浏览器要对全部字符做折行排版，主线程会被占满。
+     */
+    chunkMax?: number
+    /**
+     * 超过该字符数关闭语法着色，只保留搜索标记。
+     * 着色成本随体积超线性增长（实测 128KB 约 0.13s、512KB 约 1.7s、1MB 约 6.7s），
+     * 阈值定在 128KB 既不牺牲常规响应的体验，也避免大响应打开即卡死。
+     */
+    colorMax?: number
   }>(),
   {
     language: 'json',
-    highlightMax: 1024 * 1024,
+    chunkMax: 1024 * 1024,
+    colorMax: 128 * 1024,
   },
 )
 
 const rootEl = ref<HTMLElement | null>(null)
 const preEl = ref<HTMLElement | null>(null)
+const largeRef = ref<InstanceType<typeof LargeTextViewer> | null>(null)
 const inputRef = ref<{ focus?: () => void } | null>(null)
 
 const searchOpen = ref(false)
@@ -28,8 +41,9 @@ const query = ref('')
 const current = ref(0)
 let queryTimer: number | undefined
 
-const tooLarge = computed(() => props.text.length > props.highlightMax)
-const searchable = computed(() => !tooLarge.value)
+const chunked = computed(() => props.text.length > props.chunkMax)
+const searchable = computed(() => !chunked.value)
+const colorized = computed(() => props.text.length <= props.colorMax)
 
 const matches = computed(() =>
   searchable.value ? findMatches(props.text, query.value) : [],
@@ -39,6 +53,8 @@ const matchCount = computed(() => matches.value.length)
 const html = computed(() => {
   if (!searchable.value) return ''
   const options = { query: query.value }
+  // 超过着色阈值只包搜索标记：DOM 里只有文本节点加少量 mark，排版成本与体积线性相关
+  if (!colorized.value) return highlightPlain(props.text, options)
   return props.language === 'json'
     ? highlightJson(props.text, options)
     : highlightPlain(props.text, options)
@@ -49,12 +65,6 @@ const countText = computed(() => {
   if (!matchCount.value) return '无匹配'
   return `${current.value + 1}/${matchCount.value}`
 })
-
-function fmtSize(n: number) {
-  if (n < 1024) return `${n} B`
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
-  return `${(n / 1024 / 1024).toFixed(1)} MB`
-}
 
 function cancelQueryTimer() {
   if (queryTimer) {
@@ -137,6 +147,10 @@ watch(
   () => {
     current.value = 0
     nextTick(() => {
+      if (chunked.value) {
+        largeRef.value?.scrollToTop()
+        return
+      }
       if (preEl.value) preEl.value.scrollTop = 0
     })
   },
@@ -144,7 +158,12 @@ watch(
 
 onBeforeUnmount(cancelQueryTimer)
 
-defineExpose({ openSearch, scrollToTop: () => preEl.value?.scrollTo({ top: 0 }) })
+function scrollToTop() {
+  if (chunked.value) largeRef.value?.scrollToTop()
+  else preEl.value?.scrollTo({ top: 0 })
+}
+
+defineExpose({ openSearch, scrollToTop })
 </script>
 
 <template>
@@ -176,11 +195,16 @@ defineExpose({ openSearch, scrollToTop: () => preEl.value?.scrollTo({ top: 0 }) 
       </a-button>
     </div>
 
-    <div v-if="tooLarge" class="resp-large-note">
-      正文较大（{{ fmtSize(text.length) }}），已关闭语法高亮与搜索
+    <div v-if="chunked" class="resp-large-note">
+      正文 {{ formatCharCount(text.length) }}，已关闭语法着色与搜索；内容分块展开，向下滚动继续加载
+    </div>
+    <div v-else-if="!colorized" class="resp-large-note">
+      正文 {{ formatCharCount(text.length) }}，已关闭语法着色以保持流畅；搜索仍可用
     </div>
 
-    <pre v-if="tooLarge" ref="preEl" class="resp-pre resp-pre-large">{{ text }}</pre>
+    <div v-if="chunked" class="resp-large-wrap">
+      <LargeTextViewer ref="largeRef" :text="text" />
+    </div>
     <pre v-else ref="preEl" class="resp-pre" v-html="html" @dblclick="onDblClick" />
   </div>
 </template>
@@ -219,6 +243,14 @@ defineExpose({ openSearch, scrollToTop: () => preEl.value?.scrollTo({ top: 0 }) 
   padding: 5px 14px;
   font-size: 11px;
   color: var(--fm-warning);
+}
+
+/* 大文本模式下滚动交给 LargeTextViewer，这里只负责把它撑满剩余高度 */
+.resp-large-wrap {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 .resp-pre {

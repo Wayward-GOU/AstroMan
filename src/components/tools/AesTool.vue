@@ -3,8 +3,13 @@ import { ref } from 'vue'
 import { message } from 'ant-design-vue'
 import { CopyOutlined, LockOutlined, UnlockOutlined } from '@ant-design/icons-vue'
 import CodeArea from '@/components/CodeArea.vue'
+import SplitLayoutSwitch from '@/components/split/SplitLayoutSwitch.vue'
+import SplitPane from '@/components/split/SplitPane.vue'
+import { useSplitLayout } from '@/composables/useSplitLayout'
 import { aesDecrypt, aesEncrypt } from '@/tools/crypto'
 import { copyToClipboard } from '@/utils/clipboard'
+
+const { direction, isVertical, setDirection, ratioKey } = useSplitLayout('astroman:tools:aes')
 
 const key = ref('')
 const mode = ref<'encrypt' | 'decrypt'>('encrypt')
@@ -69,20 +74,32 @@ function swap() {
       </a-button>
       <a-button size="small" :disabled="!output" @click="swap">结果转输入</a-button>
       <a-button size="small" :disabled="!output" @click="copyOutput"><CopyOutlined /> 复制</a-button>
+      <SplitLayoutSwitch :model-value="direction" @update:model-value="setDirection" />
     </div>
 
     <a-alert v-if="error" type="error" :message="error" show-icon />
 
-    <div class="aes-body">
-      <section class="aes-pane">
-        <header class="aes-head">{{ mode === 'encrypt' ? '明文' : '密文（IV:密文）' }}</header>
-        <CodeArea v-model="input" :rows="16" :placeholder="mode === 'encrypt' ? '输入需要加密的内容' : '粘贴 IV:密文（Base64）'" />
-      </section>
-      <section class="aes-pane">
-        <header class="aes-head">输出</header>
-        <CodeArea :model-value="output" :rows="16" readonly placeholder="结果会显示在这里" />
-      </section>
-    </div>
+    <SplitPane
+      class="aes-body"
+      :class="{ 'is-vertical': isVertical }"
+      :direction="direction"
+      :storage-key="ratioKey"
+      :min-first="isVertical ? 150 : 260"
+      :min-second="isVertical ? 150 : 260"
+    >
+      <template #first>
+        <section class="aes-pane">
+          <header class="aes-head">{{ mode === 'encrypt' ? '明文' : '密文（IV:密文）' }}</header>
+          <CodeArea v-model="input" fill :placeholder="mode === 'encrypt' ? '输入需要加密的内容' : '粘贴 IV:密文（Base64）'" />
+        </section>
+      </template>
+      <template #second>
+        <section class="aes-pane">
+          <header class="aes-head">输出</header>
+          <CodeArea :model-value="output" fill readonly placeholder="结果会显示在这里" />
+        </section>
+      </template>
+    </SplitPane>
 
     <p class="aes-tip">
       AES-256-CBC：密钥经 SHA-256 派生，每次加密随机生成 16 字节 IV，密文格式为
@@ -115,9 +132,12 @@ function swap() {
 }
 
 .aes-body {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 12px;
+  height: clamp(560px, 76vh, 1080px);
+  min-height: 0;
+}
+
+.aes-body.is-vertical {
+  height: clamp(620px, 82vh, 1200px);
 }
 
 .aes-pane {
@@ -125,6 +145,8 @@ function swap() {
   flex-direction: column;
   gap: 8px;
   min-width: 0;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .aes-head {
@@ -147,7 +169,11 @@ function swap() {
 
 @media (max-width: 1100px) {
   .aes-body {
-    grid-template-columns: minmax(0, 1fr);
+    height: clamp(520px, 74vh, 980px);
+  }
+
+  .aes-body.is-vertical {
+    height: clamp(560px, 84vh, 1080px);
   }
 }
 </style>

@@ -1032,6 +1032,48 @@ function clockText(node: ClusterNodeInfo): string {
   return `${offset}${uncertainty} ms`
 }
 
+/** 卡片里的紧凑写法：± 不确定度太长会把四列挤到省略号，完整值放 title */
+function clockShort(node: ClusterNodeInfo): string {
+  if (node.clockOffsetMs == null) return '—'
+  const offset = `${node.clockOffsetMs >= 0 ? '+' : ''}${fmt(node.clockOffsetMs)}`
+  return `${offset} ms`
+}
+
+/**
+ * 峰值行（灰度小字）：本次配对以来的 QPS / 并发 / 整机 CPU / 内存 / 网卡最高点。
+ * 卡片里所有「峰值」都收在这一行，实时值留在上面的仪表条与指标格里，口径统一。
+ */
+function peakLineText(node: ClusterNodeInfo): string {
+  const parts: string[] = []
+  if (node.peakQps > 0) parts.push(`QPS ${fmtInt(node.peakQps)}`)
+  if (node.peakConcurrent > 0) parts.push(`并发 ${fmtInt(node.peakConcurrent)}`)
+  if (node.peakHostCpuPercent != null) parts.push(`CPU ${Math.round(node.peakHostCpuPercent)}%`)
+  if (node.peakHostMemPercent != null) parts.push(`内存 ${Math.round(node.peakHostMemPercent)}%`)
+  if (node.peakNetKbps != null) parts.push(`网卡 ${fmt(node.peakNetKbps / 1024, 1)} MB/s`)
+  return parts.length ? `峰值 ${parts.join(' · ')}` : ''
+}
+
+/** hover 里补上「峰值 vs 当前」，避免只看到峰值却不知道距离多远 */
+function peakLineTitle(node: ClusterNodeInfo): string {
+  const rows: string[] = []
+  if (node.peakQps > 0) rows.push(`QPS 峰值 ${fmtInt(node.peakQps)}（当前 ${fmtInt(node.qps)}）`)
+  if (node.peakConcurrent > 0) {
+    rows.push(`并发峰值 ${fmtInt(node.peakConcurrent)}（当前 ${fmtInt(node.concurrent)}）`)
+  }
+  const pair = (label: string, peak: number | null | undefined, now: string) => {
+    if (peak == null) return
+    rows.push(`${label}峰值 ${Math.round(peak)}%（当前 ${now}）`)
+  }
+  pair('整机 CPU ', node.peakHostCpuPercent, `${Math.round(node.hostCpuPercent ?? 0)}%`)
+  pair('整机内存 ', node.peakHostMemPercent, `${Math.round(node.hostMemPercent ?? 0)}%`)
+  if (node.peakNetKbps != null) {
+    const now = (node.netRxKbps ?? 0) + (node.netTxKbps ?? 0)
+    rows.push(`网卡峰值 ${fmt(node.peakNetKbps / 1024, 1)} MB/s（当前 ${fmt(now / 1024, 1)} MB/s）`)
+  }
+  if (!rows.length) return ''
+  return `本次配对以来最高值\n${rows.join('\n')}`
+}
+
 /** 运行期漂移：每秒复测一次偏移，超过 50ms 说明两台机器的时钟在跑偏 */
 function driftText(node: ClusterNodeInfo): string {
   if (!node.clockRecheckAt || node.clockDriftMs == null) return ''
@@ -1193,6 +1235,42 @@ const nodeColumns = [
   },
   { title: '资源', key: 'resource', width: 150 },
 ]
+
+/** 节点展示形态：卡片看配置与资源，表格看 13 列密集对照；选择记住 */
+const NODE_VIEW_KEY = 'cluster.nodeView'
+const nodeView = ref<'card' | 'table'>(
+  (() => {
+    try {
+      return localStorage.getItem(NODE_VIEW_KEY) === 'table' ? 'table' : 'card'
+    } catch {
+      return 'card'
+    }
+  })(),
+)
+watch(nodeView, (value) => {
+  try {
+    localStorage.setItem(NODE_VIEW_KEY, value)
+  } catch {
+    /* 隐私模式下写不进去，忽略 */
+  }
+})
+const nodeViewOptions = [
+  { label: '卡片', value: 'card' },
+  { label: '表格', value: 'table' },
+]
+
+/** 卡片里的 CPU / 内存仪表：超过 70% 转警示色，超过 85% 转危险色 */
+function meterTone(value: number | null | undefined): string {
+  if (value == null) return ''
+  if (value >= 85) return 'bad'
+  if (value >= 70) return 'warn'
+  return ''
+}
+
+function meterWidth(value: number | null | undefined): string {
+  if (value == null) return '0%'
+  return `${Math.max(0, Math.min(100, Math.round(value)))}%`
+}
 
 /** 集群审批：接受 / 拒绝 / 自动接受 */
 const joinBusy = ref<string | null>(null)
@@ -2014,19 +2092,231 @@ onBeforeUnmount(() => {
                 <h3>节点</h3>
                 <span class="panel-sub">准备时按「{{ allocationModeText }}」拆分总并发</span>
               </div>
-              <div v-if="session.status === 'pairing'" class="panel-actions">
-                <a-select v-model:value="allocationMode" size="small" style="width: 150px">
-                  <a-select-option value="auto">能力分配</a-select-option>
-                  <a-select-option value="even">平均分配</a-select-option>
-                  <a-select-option value="custom">自定义权重</a-select-option>
-                </a-select>
-                <a-select v-model:value="varPolicy" size="small" style="width: 140px">
-                  <a-select-option value="master_wins">变量主节点优先</a-select-option>
-                  <a-select-option value="local_wins">变量本机优先</a-select-option>
-                </a-select>
+              <div class="panel-actions">
+                <a-segmented
+                  v-model:value="nodeView"
+                  size="small"
+                  :options="nodeViewOptions"
+                />
+                <template v-if="session.status === 'pairing'">
+                  <a-select v-model:value="allocationMode" size="small" style="width: 150px">
+                    <a-select-option value="auto">能力分配</a-select-option>
+                    <a-select-option value="even">平均分配</a-select-option>
+                    <a-select-option value="custom">自定义权重</a-select-option>
+                  </a-select>
+                  <a-select v-model:value="varPolicy" size="small" style="width: 140px">
+                    <a-select-option value="master_wins">变量主节点优先</a-select-option>
+                    <a-select-option value="local_wins">变量本机优先</a-select-option>
+                  </a-select>
+                </template>
               </div>
             </header>
+
+            <div v-if="nodeView === 'card' && nodeList.length" class="node-cards">
+              <article
+                v-for="record in nodeList"
+                :key="record.id"
+                class="node-card"
+                :class="[record.role, `tone-${nodeStatusTone(record.status)}`]"
+              >
+                <header class="nc-head">
+                  <span class="nc-avatar" aria-hidden="true">
+                    <svg viewBox="0 0 16 16" width="15" height="15" fill="none">
+                      <rect
+                        x="2.5"
+                        y="2.5"
+                        width="11"
+                        height="11"
+                        rx="2"
+                        stroke="currentColor"
+                        stroke-width="1.2"
+                      />
+                      <rect x="5.5" y="5.5" width="5" height="5" rx="1" fill="currentColor" />
+                      <path
+                        d="M5 1v1.5M8 1v1.5M11 1v1.5M5 13.5V15M8 13.5V15M11 13.5V15M1 5h1.5M1 8h1.5M1 11h1.5M13.5 5H15M13.5 8H15M13.5 11H15"
+                        stroke="currentColor"
+                        stroke-width="1.1"
+                        stroke-linecap="round"
+                      />
+                    </svg>
+                  </span>
+                  <div class="nc-title">
+                    <div class="node-name" :title="record.name">{{ record.name }}</div>
+                    <div class="node-addr mono" :title="record.addr || ''">
+                      {{ record.addr || '—' }}
+                    </div>
+                  </div>
+                  <div class="nc-pills">
+                    <span class="role-pill" :class="record.role">
+                      {{ record.role === 'master' ? '主节点' : '从节点' }}
+                    </span>
+                    <span
+                      class="st-pill"
+                      :class="nodeStatusTone(record.status)"
+                      :title="record.error || undefined"
+                    >
+                      <i class="pill-dot" />
+                      {{ nodeStatusText(record.status) }}
+                    </span>
+                  </div>
+                </header>
+
+                <div class="nc-specs">
+                  <div class="nc-spec">
+                    <span class="k">CPU</span>
+                    <span class="v">{{ record.capacity ? `${record.capacity.cores} 核` : '未上报' }}</span>
+                  </div>
+                  <div class="nc-spec">
+                    <span class="k">内存</span>
+                    <span class="v">{{ record.capacity ? `${record.capacity.memGb} GB` : '未上报' }}</span>
+                  </div>
+                  <div class="nc-spec">
+                    <span class="k">预算并发</span>
+                    <span class="v">{{ record.capacity ? fmtInt(record.capacity.machineLimit) : '未上报' }}</span>
+                  </div>
+                </div>
+
+                <div
+                  v-if="record.hostCpuPercent != null || record.hostMemPercent != null"
+                  class="nc-meters"
+                >
+                  <div v-if="record.hostCpuPercent != null" class="nc-meter">
+                    <div class="nc-meter-top">
+                      <span>整机 CPU</span>
+                      <span class="mono">{{ Math.round(record.hostCpuPercent) }}%</span>
+                    </div>
+                    <div class="nc-track">
+                      <i
+                        class="nc-fill"
+                        :class="meterTone(record.hostCpuPercent)"
+                        :style="{ width: meterWidth(record.hostCpuPercent) }"
+                      />
+                    </div>
+                  </div>
+                  <div v-if="record.hostMemPercent != null" class="nc-meter">
+                    <div class="nc-meter-top">
+                      <span>整机内存</span>
+                      <span class="mono">{{ Math.round(record.hostMemPercent) }}%</span>
+                    </div>
+                    <div class="nc-track">
+                      <i
+                        class="nc-fill"
+                        :class="meterTone(record.hostMemPercent)"
+                        :style="{ width: meterWidth(record.hostMemPercent) }"
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                <div class="nc-metrics">
+                  <div class="nc-metric">
+                    <span class="k">分配并发</span>
+                    <span v-if="session.status === 'pairing'" class="v mono planned-value">
+                      ≈ {{ fmtInt(plannedConcurrent[record.id]) }}
+                    </span>
+                    <span v-else class="v mono">{{ fmtInt(record.concurrent) }}</span>
+                  </div>
+                  <div class="nc-metric">
+                    <span class="k">QPS</span>
+                    <span class="v mono">{{ fmt(record.qps) }}</span>
+                  </div>
+                  <div class="nc-metric">
+                    <span class="k">时钟偏移</span>
+                    <span class="v mono" :title="clockText(record)">{{ clockShort(record) }}</span>
+                  </div>
+                </div>
+
+                <div v-if="peakLineText(record)" class="nc-peak" :title="peakLineTitle(record)">
+                  {{ peakLineText(record) }}
+                </div>
+
+                <div class="nc-foot">
+                  <!-- custom 模式下权重与范围就在卡片底部可编辑，这里不再重复展示 -->
+                  <span
+                    v-if="!(session.status === 'pairing' && allocationMode === 'custom')"
+                    class="nc-chip"
+                  >
+                    并发范围 {{ limitText(record) }}
+                  </span>
+                  <span v-if="record.netRxKbps != null || record.netTxKbps != null" class="nc-chip">
+                    ↓{{ fmt((record.netRxKbps ?? 0) / 1024, 1) }} ↑{{
+                      fmt((record.netTxKbps ?? 0) / 1024, 1)
+                    }}
+                    MB/s
+                  </span>
+                  <span v-if="record.threads != null" class="nc-chip">线程 {{ fmtInt(record.threads) }}</span>
+                  <span v-if="record.load1 != null" class="nc-chip">负载 {{ fmt(record.load1, 2) }}</span>
+                  <span
+                    class="st-pill"
+                    :class="healthTone(record)"
+                    :title="healthTitle(record)"
+                  >
+                    <i class="pill-dot" />
+                    {{ healthText(record) }}
+                  </span>
+                  <span
+                    v-if="record.role === 'slave'"
+                    class="st-pill"
+                    :class="record.poolColumns && record.envBundle ? 'ok' : 'warn'"
+                    :title="compatTitle(record)"
+                  >
+                    {{ nodeCompatText(record) }}
+                  </span>
+                </div>
+
+                <div
+                  v-if="session.status === 'pairing' && allocationMode === 'custom'"
+                  class="nc-edit"
+                >
+                  <span class="nc-edit-label">权重</span>
+                  <a-input-number
+                    :value="weights[record.id] ?? record.weight"
+                    :min="0.1"
+                    :max="10"
+                    :step="0.1"
+                    size="small"
+                    class="weight-input"
+                    @update:value="setWeight(record, $event)"
+                  />
+                  <span class="nc-edit-label">并发</span>
+                  <div class="limit-inputs">
+                    <a-input-number
+                      :value="nodeLimits[record.id]?.min ?? 1"
+                      :min="1"
+                      size="small"
+                      class="limit-input"
+                      @update:value="setLimit(record, 'min', $event)"
+                    />
+                    <span class="limit-sep">~</span>
+                    <a-input-number
+                      :value="nodeLimits[record.id]?.max ?? null"
+                      :min="1"
+                      placeholder="预算"
+                      size="small"
+                      class="limit-input"
+                      @update:value="setLimit(record, 'max', $event)"
+                    />
+                  </div>
+                </div>
+
+                <div v-if="record.poolSliceBytes != null" class="nc-foot">
+                  <span
+                    class="nc-chip"
+                    :class="{ over: record.poolSliceBytes >= poolSliceLimit * 0.8 }"
+                  >
+                    池切片 {{ fmtMb(record.poolSliceBytes) }} / {{ fmtMb(poolSliceLimit) }}
+                  </span>
+                </div>
+
+                <div v-if="record.error" class="node-error">{{ record.error }}</div>
+                <div v-if="driftText(record)" class="mono clock-drift" :class="driftTone(record)">
+                  {{ driftText(record) }}
+                </div>
+              </article>
+            </div>
+
             <a-table
+              v-if="nodeView === 'table'"
               :columns="nodeColumns"
               :data-source="nodeList"
               row-key="id"
@@ -3340,6 +3630,274 @@ onBeforeUnmount(() => {
   font-size: 11.5px;
   line-height: 1.5;
   color: var(--fm-danger);
+}
+
+/* ---------- 节点卡片（配置 + 资源一览） ---------- */
+.node-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(318px, 1fr));
+  gap: 12px;
+  padding: 14px 16px 4px;
+}
+
+.node-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+  padding: 13px 14px 12px;
+  border: 1px solid var(--fm-border);
+  border-radius: var(--fm-radius-card);
+  background: var(--fm-surface);
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease;
+}
+
+/* 顶部 2px 状态条：角色 + 状态双重编码，不靠颜色也能分辨（左上是文字徽标） */
+.node-card::before {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto;
+  height: 2px;
+  background: var(--fm-border-strong);
+}
+
+.node-card.master::before {
+  background: var(--fm-brass);
+}
+
+.node-card.tone-ok::before,
+.node-card.tone-live::before {
+  background: var(--fm-success);
+}
+
+.node-card.tone-warn::before {
+  background: var(--fm-warning);
+}
+
+.node-card.tone-bad::before {
+  background: var(--fm-danger);
+}
+
+.node-card:hover {
+  border-color: var(--fm-border-strong);
+}
+
+.nc-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+}
+
+.nc-avatar {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border: 1px solid var(--fm-border);
+  border-radius: var(--fm-radius-sm);
+  background: var(--fm-surface-alt);
+  color: var(--fm-muted);
+}
+
+.node-card.master .nc-avatar {
+  color: var(--fm-brass-text);
+  border-color: color-mix(in srgb, var(--fm-brass) 40%, transparent);
+  background: color-mix(in srgb, var(--fm-brass) 8%, transparent);
+}
+
+.nc-title {
+  flex: 1;
+  min-width: 0;
+}
+
+.nc-title .node-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fm-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nc-title .node-addr {
+  margin-top: 1px;
+  font-size: 11px;
+  color: var(--fm-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nc-pills {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+}
+
+/* 1px 间隙 + 底色露出：三格配置用发丝线分隔，比加边框干净 */
+.nc-specs {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px;
+  border: 1px solid var(--fm-border);
+  border-radius: var(--fm-radius-sm);
+  background: var(--fm-border);
+  overflow: hidden;
+}
+
+.nc-spec {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 7px 9px;
+  background: var(--fm-surface-alt);
+}
+
+.nc-spec .k {
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  color: var(--fm-muted);
+}
+
+.nc-spec .v {
+  font-family: var(--fm-font-mono);
+  font-size: 12px;
+  color: var(--fm-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nc-meters {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.nc-meter-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--fm-muted);
+}
+
+.nc-meter-top .mono {
+  color: var(--fm-text-2);
+}
+
+.nc-track {
+  height: 3px;
+  margin-top: 4px;
+  border-radius: 999px;
+  background: var(--fm-surface-alt);
+  overflow: hidden;
+}
+
+.nc-fill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--fm-primary);
+  transition: width 0.3s ease;
+}
+
+.nc-fill.warn {
+  background: var(--fm-warning);
+}
+
+.nc-fill.bad {
+  background: var(--fm-danger);
+}
+
+/* 峰值行：收在实时指标下方当脚注读；负 margin 抵消卡片 11px 的块间距 */
+.nc-peak {
+  margin-top: -4px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--fm-text-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.nc-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--fm-border);
+}
+
+.nc-metric {
+  min-width: 0;
+}
+
+.nc-metric .k {
+  display: block;
+  margin-bottom: 2px;
+  font-size: 10px;
+  color: var(--fm-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nc-metric .v {
+  display: block;
+  font-size: 12px;
+  color: var(--fm-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nc-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.nc-chip {
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 7px;
+  border: 1px solid var(--fm-border);
+  border-radius: 999px;
+  background: var(--fm-surface-alt);
+  font-family: var(--fm-font-mono);
+  font-size: 10px;
+  color: var(--fm-text-2);
+  white-space: nowrap;
+}
+
+.nc-chip.over {
+  color: var(--fm-warning);
+  border-color: color-mix(in srgb, var(--fm-warning) 40%, transparent);
+  background: color-mix(in srgb, var(--fm-warning) 8%, transparent);
+}
+
+.nc-edit {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding-top: 9px;
+  border-top: 1px dashed var(--fm-border);
+}
+
+.nc-edit-label {
+  font-size: 11px;
+  color: var(--fm-muted);
+}
+
+.node-card .clock-drift {
+  margin-top: 0;
 }
 
 .pool-slice {

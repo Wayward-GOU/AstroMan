@@ -3,7 +3,12 @@ import { computed, ref } from 'vue'
 import { message } from 'ant-design-vue'
 import { CopyOutlined, InboxOutlined } from '@ant-design/icons-vue'
 import CodeArea from '@/components/CodeArea.vue'
+import SplitLayoutSwitch from '@/components/split/SplitLayoutSwitch.vue'
+import SplitPane from '@/components/split/SplitPane.vue'
+import { useSplitLayout } from '@/composables/useSplitLayout'
 import { copyToClipboard } from '@/utils/clipboard'
+
+const { direction, isVertical, setDirection, ratioKey } = useSplitLayout('astroman:tools:image64')
 
 const mode = ref<'encode' | 'decode'>('encode')
 const dataUrl = ref('')
@@ -108,6 +113,12 @@ function clearAll() {
         ]"
       />
       <a-button size="small" @click="clearAll">清空</a-button>
+      <!-- 编码模式未选图时还没有分栏区，切换控件要跟着一起消失，否则点了没反应 -->
+      <SplitLayoutSwitch
+        v-if="mode === 'decode' || dataUrl"
+        :model-value="direction"
+        @update:model-value="setDirection"
+      />
       <span class="i64-hint">全部在本机读取，图片不会上传</span>
     </div>
 
@@ -125,57 +136,80 @@ function clearAll() {
         <span class="i64-sub">支持 PNG / JPG / GIF / WebP / SVG，单张不超过 20MB</span>
       </label>
 
-      <div v-if="dataUrl" class="i64-body">
-        <section class="i64-pane">
-          <header class="i64-head">
-            <span>预览</span>
-            <span class="i64-stat">{{ mime }} · {{ sizeText }}</span>
-          </header>
-          <div class="i64-preview">
-            <img :src="dataUrl" alt="预览" />
-          </div>
-        </section>
+      <SplitPane
+        v-if="dataUrl"
+        class="i64-body"
+        :class="{ 'is-vertical': isVertical }"
+        :direction="direction"
+        :storage-key="ratioKey"
+        :min-first="isVertical ? 150 : 260"
+        :min-second="isVertical ? 150 : 260"
+      >
+        <template #first>
+          <section class="i64-pane">
+            <header class="i64-head">
+              <span>预览</span>
+              <span class="i64-stat">{{ mime }} · {{ sizeText }}</span>
+            </header>
+            <div class="i64-preview">
+              <img :src="dataUrl" alt="预览" />
+            </div>
+          </section>
+        </template>
 
-        <section class="i64-pane">
-          <header class="i64-head">
-            <span>Data URL</span>
-            <span class="i64-stat">{{ pureBase64.length }} 字符 · 原始 {{ base64SizeText }}</span>
-            <a-button type="link" size="small" @click="copy(dataUrl, ' Data URL')">
-              <CopyOutlined /> 复制 Data URL
-            </a-button>
-            <a-button type="link" size="small" @click="copy(pureBase64, ' Base64')">
-              <CopyOutlined /> 仅 Base64
-            </a-button>
-          </header>
-          <CodeArea :model-value="dataUrl" :rows="18" readonly />
-        </section>
-      </div>
+        <template #second>
+          <section class="i64-pane">
+            <header class="i64-head">
+              <span>Data URL</span>
+              <span class="i64-stat">{{ pureBase64.length }} 字符 · 原始 {{ base64SizeText }}</span>
+              <a-button type="link" size="small" @click="copy(dataUrl, ' Data URL')">
+                <CopyOutlined /> 复制 Data URL
+              </a-button>
+              <a-button type="link" size="small" @click="copy(pureBase64, ' Base64')">
+                <CopyOutlined /> 仅 Base64
+              </a-button>
+            </header>
+            <CodeArea :model-value="dataUrl" fill readonly />
+          </section>
+        </template>
+      </SplitPane>
     </template>
 
     <template v-else>
-      <div class="i64-body">
-        <section class="i64-pane">
-          <header class="i64-head">
-            <span>Base64 内容（可带 data: 前缀）</span>
-            <a-button type="link" size="small" :disabled="!base64Input" @click="copy(base64Input, ' Base64')">
-              <CopyOutlined /> 复制
-            </a-button>
-          </header>
-          <CodeArea v-model="base64Input" :rows="18" placeholder="粘贴 data:image/png;base64,… 或纯 Base64 字符串" />
-        </section>
+      <SplitPane
+        class="i64-body"
+        :class="{ 'is-vertical': isVertical }"
+        :direction="direction"
+        :storage-key="ratioKey"
+        :min-first="isVertical ? 150 : 260"
+        :min-second="isVertical ? 150 : 260"
+      >
+        <template #first>
+          <section class="i64-pane">
+            <header class="i64-head">
+              <span>Base64 内容（可带 data: 前缀）</span>
+              <a-button type="link" size="small" :disabled="!base64Input" @click="copy(base64Input, ' Base64')">
+                <CopyOutlined /> 复制
+              </a-button>
+            </header>
+            <CodeArea v-model="base64Input" fill placeholder="粘贴 data:image/png;base64,… 或纯 Base64 字符串" />
+          </section>
+        </template>
 
-        <section class="i64-pane">
-          <header class="i64-head">
-            <span>图片预览</span>
-            <span v-if="base64Input" class="i64-stat">{{ previewSrc.length }} 字符</span>
-          </header>
-          <a-alert v-if="decodeError" type="error" :message="decodeError" show-icon />
-          <div v-if="previewSrc && !decodeError" class="i64-preview">
-            <img :src="previewSrc" alt="解析结果" @error="onImageError" />
-          </div>
-          <div v-else class="i64-empty">粘贴 Base64 后在此预览</div>
-        </section>
-      </div>
+        <template #second>
+          <section class="i64-pane">
+            <header class="i64-head">
+              <span>图片预览</span>
+              <span v-if="base64Input" class="i64-stat">{{ previewSrc.length }} 字符</span>
+            </header>
+            <a-alert v-if="decodeError" type="error" :message="decodeError" show-icon />
+            <div v-if="previewSrc && !decodeError" class="i64-preview">
+              <img :src="previewSrc" alt="解析结果" @error="onImageError" />
+            </div>
+            <div v-else class="i64-empty">粘贴 Base64 后在此预览</div>
+          </section>
+        </template>
+      </SplitPane>
     </template>
   </div>
 </template>
@@ -243,9 +277,12 @@ function clearAll() {
 }
 
 .i64-body {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 12px;
+  height: clamp(560px, 76vh, 1080px);
+  min-height: 0;
+}
+
+.i64-body.is-vertical {
+  height: clamp(620px, 82vh, 1200px);
 }
 
 .i64-pane {
@@ -253,6 +290,8 @@ function clearAll() {
   flex-direction: column;
   gap: 8px;
   min-width: 0;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .i64-head {
@@ -275,7 +314,10 @@ function clearAll() {
   display: flex;
   align-items: center;
   justify-content: center;
-  min-height: 260px;
+  /* 分栏容器里靠 flex 占位，固定 min-height 会在拖动后把区块顶出边界 */
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
   padding: 12px;
   background: var(--fm-surface);
   border: 1px solid var(--fm-border);
@@ -290,7 +332,7 @@ function clearAll() {
 
 .i64-preview img {
   max-width: 100%;
-  max-height: 420px;
+  max-height: 100%;
   object-fit: contain;
 }
 
@@ -298,7 +340,8 @@ function clearAll() {
   display: flex;
   align-items: center;
   justify-content: center;
-  min-height: 260px;
+  flex: 1;
+  min-height: 0;
   font-size: 12px;
   color: var(--fm-muted);
   border: 1px dashed var(--fm-border);
@@ -307,7 +350,11 @@ function clearAll() {
 
 @media (max-width: 1100px) {
   .i64-body {
-    grid-template-columns: minmax(0, 1fr);
+    height: clamp(520px, 74vh, 980px);
+  }
+
+  .i64-body.is-vertical {
+    height: clamp(560px, 84vh, 1080px);
   }
 }
 </style>

@@ -105,6 +105,12 @@ export interface ClusterNodeInfo {
   health: SampleHealth
   peakQps: number
   peakConcurrent: number
+  /** 本次配对以来整机 CPU 使用率峰值（%） */
+  peakHostCpuPercent?: number | null
+  /** 本次配对以来整机内存使用率峰值（%） */
+  peakHostMemPercent?: number | null
+  /** 本次配对以来网卡收发合计峰值（KB/s） */
+  peakNetKbps?: number | null
   vuStart: number
   vuCount: number
   /** 最近一次心跳回传的引擎累计计数 */

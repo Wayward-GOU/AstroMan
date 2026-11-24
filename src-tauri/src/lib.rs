@@ -232,6 +232,8 @@ pub fn run() {
                 .init();
             logging::install_panic_hook(&data_dir);
             log::info!("AstroMan 启动，数据目录：{}", data_dir.display());
+            // 句柄软上限必须先于并发预算计算：预算里的 by_fd 直接由它推导
+            state::raise_fd_limit();
 
             let state = state::AppState::new(app.handle())?;
             // 审计只追加不修改：启动时顺手清理过期记录，避免长期运行后无限膨胀

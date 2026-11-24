@@ -1,8 +1,13 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import CodeArea from '@/components/CodeArea.vue'
+import SplitLayoutSwitch from '@/components/split/SplitLayoutSwitch.vue'
+import SplitPane from '@/components/split/SplitPane.vue'
+import { useSplitLayout } from '@/composables/useSplitLayout'
 import { runRegex, type RegexResult } from '@/tools/crypto'
 import { htmlEscape } from '@/tools/transforms'
+
+const { direction, isVertical, setDirection, ratioKey } = useSplitLayout('astroman:tools:regex')
 
 const pattern = ref('(\\w+)@(\\w+)\\.com')
 const flags = ref('g')
@@ -83,24 +88,39 @@ const PRESETS = [
       <a-tag v-for="preset in PRESETS" :key="preset.label" class="rx-preset" @click="pattern = preset.value">
         {{ preset.label }}
       </a-tag>
+      <SplitLayoutSwitch
+        class="rx-layout"
+        :model-value="direction"
+        @update:model-value="setDirection"
+      />
     </div>
 
     <a-alert v-if="error" type="error" :message="error" show-icon />
 
-    <div class="rx-body">
-      <section class="rx-pane">
-        <header class="rx-head">测试文本</header>
-        <CodeArea v-model="text" :rows="12" placeholder="粘贴需要匹配的文本" />
-        <header class="rx-head">高亮预览</header>
-        <div class="rx-preview mono scroll-y" v-html="highlighted" />
-      </section>
+    <SplitPane
+      class="rx-body"
+      :class="{ 'is-vertical': isVertical }"
+      :direction="direction"
+      :storage-key="ratioKey"
+      :min-first="isVertical ? 150 : 260"
+      :min-second="isVertical ? 150 : 260"
+    >
+      <template #first>
+        <section class="rx-pane">
+          <header class="rx-head">测试文本</header>
+          <CodeArea v-model="text" fill placeholder="粘贴需要匹配的文本" />
+          <header class="rx-head">高亮预览</header>
+          <div class="rx-preview mono scroll-y" v-html="highlighted" />
+        </section>
+      </template>
 
-      <section class="rx-pane">
-        <header class="rx-head">
-          <span>匹配结果</span>
-          <a-tag v-if="result" color="blue">{{ result.matches.length }} 处</a-tag>
-        </header>
-        <div class="rx-result scroll-y">
+      <template #second>
+        <section class="rx-pane">
+          <header class="rx-head">
+            <span>匹配结果</span>
+            <a-tag v-if="result" color="blue">{{ result.matches.length }} 处</a-tag>
+          </header>
+          <div class="rx-result scroll-y">
           <template v-if="result && result.matches.length">
             <div v-for="(item, index) in result.matches" :key="index" class="rx-item">
               <div class="rx-item-head">
@@ -116,9 +136,10 @@ const PRESETS = [
             </div>
           </template>
           <div v-else class="empty-hint">{{ result ? '没有匹配到内容' : '输入正则与文本后实时展示匹配结果' }}</div>
-        </div>
-      </section>
-    </div>
+          </div>
+        </section>
+      </template>
+    </SplitPane>
   </div>
 </template>
 
@@ -186,9 +207,16 @@ const PRESETS = [
 }
 
 .rx-body {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 12px;
+  height: clamp(560px, 76vh, 1080px);
+  min-height: 0;
+}
+
+.rx-body.is-vertical {
+  height: clamp(620px, 82vh, 1200px);
+}
+
+.rx-layout {
+  margin-left: auto;
 }
 
 .rx-pane {
@@ -196,6 +224,8 @@ const PRESETS = [
   flex-direction: column;
   gap: 8px;
   min-width: 0;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .rx-head {
@@ -208,7 +238,9 @@ const PRESETS = [
 }
 
 .rx-preview {
-  height: 150px;
+  /* 左栏里与 CodeArea 分摊高度：编辑区弹性伸缩，预览固定占比不会把编辑区挤没 */
+  flex: 0 0 34%;
+  min-height: 100px;
   overflow: auto;
   padding: 10px 12px;
   background: var(--fm-code-bg);
@@ -228,7 +260,8 @@ const PRESETS = [
 }
 
 .rx-result {
-  max-height: 400px;
+  flex: 1;
+  min-height: 0;
   overflow: auto;
   border: 1px solid var(--fm-border);
   border-radius: var(--fm-radius-sm);
@@ -274,7 +307,11 @@ const PRESETS = [
 
 @media (max-width: 1100px) {
   .rx-body {
-    grid-template-columns: minmax(0, 1fr);
+    height: clamp(520px, 74vh, 980px);
+  }
+
+  .rx-body.is-vertical {
+    height: clamp(560px, 84vh, 1080px);
   }
 }
 </style>

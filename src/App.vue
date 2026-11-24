@@ -2,7 +2,6 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, type Component } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { theme as AntTheme } from 'ant-design-vue'
-import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import {
   ApiOutlined,
@@ -37,6 +36,7 @@ import { currentTheme, currentThemeId, setTheme, themes } from '@/stores/theme'
 import { staticTokens, type ColorKey } from '@/design/tokens'
 import { nightColors, paperColors } from '@/design/themes'
 import { canGoBack, previousEntry, stepBack } from '@/stores/navHistory'
+import { useZoom } from '@/composables/useZoom'
 import { isMac, shortcutText } from '@/utils/platform'
 import { checkForUpdates, isAutoUpdateEnabled } from '@/utils/updater'
 import { useNotesStore } from '@/stores/notes'
@@ -65,52 +65,19 @@ function goBackPage() {
   if (target) router.push(target)
 }
 
-const ZOOM_KEY = 'fm-zoom'
-const ZOOM_MIN = 0.5
-const ZOOM_MAX = 2
-const ZOOM_STEP = 0.1
-
-const zoom = ref(1)
-const zoomNotice = ref(false)
-let noticeTimer: number | undefined
-
-function normalizeZoom(value: number) {
-  return Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Math.round(value * 100) / 100))
-}
-
-function showZoomNotice() {
-  zoomNotice.value = true
-  if (noticeTimer) window.clearTimeout(noticeTimer)
-  noticeTimer = window.setTimeout(() => {
-    zoomNotice.value = false
-  }, 900)
-}
-
-async function applyZoom(value: number, persist = true) {
-  const next = normalizeZoom(value)
-  zoom.value = next
-  try {
-    await getCurrentWebview().setZoom(next)
-  } catch {
-    // 浏览器预览环境不支持 WebView 缩放，忽略即可
-  }
-  if (persist) {
-    localStorage.setItem(ZOOM_KEY, String(next))
-    showZoomNotice()
-  }
-}
-
-function zoomIn() {
-  applyZoom(zoom.value + ZOOM_STEP)
-}
-
-function zoomOut() {
-  applyZoom(zoom.value - ZOOM_STEP)
-}
-
-function resetZoom() {
-  applyZoom(1)
-}
+/* 缩放：与 Postman / Apifox 一致——没有常驻的加减按钮。
+   只保留快捷键、命令面板与设置页滑块。
+   刻意不接 Ctrl/⌘+滚轮：macOS 触控板双指捏合产生的正是带 ctrlKey 的 wheel 事件，
+   一次随手捏合就能把缩放连打十几档按到底，且会被持久化，下次打开界面只有一半。 */
+const {
+  zoomPercent,
+  noticeVisible: zoomNotice,
+  zoomIn,
+  zoomOut,
+  resetZoom,
+  setZoomPercent,
+  applyStoredZoom,
+} = useZoom()
 
 function onZoomHotkey(event: KeyboardEvent) {
   if (isBare.value) return
@@ -397,8 +364,7 @@ function groupPalette(items: PaletteItem[]) {
 onMounted(() => {
   applyMotionPreference()
   if (isBare.value) return
-  const stored = Number(localStorage.getItem(ZOOM_KEY) ?? '1')
-  applyZoom(Number.isFinite(stored) && stored > 0 ? stored : 1, false)
+  applyStoredZoom()
   syncSidebarWidth()
   window.addEventListener('resize', syncSidebarWidth)
   window.addEventListener('keydown', onZoomHotkey)
@@ -452,7 +418,6 @@ onBeforeUnmount(() => {
   window.removeEventListener('resize', syncSidebarWidth)
   window.removeEventListener('keydown', onZoomHotkey)
   window.removeEventListener('keydown', onGlobalHotkey)
-  if (noticeTimer) window.clearTimeout(noticeTimer)
 })
 
 const activeKey = computed(() => {
@@ -726,33 +691,32 @@ const theme = computed(() => {
           </div>
         </nav>
 
-        <div class="zoom-box">
-          <a-tooltip :title="`缩小 · ${shortcutText('-')}`" placement="top">
-            <button class="zoom-btn" type="button" @click="zoomOut">−</button>
-          </a-tooltip>
-          <a-tooltip :title="`恢复 100% · ${shortcutText('0')}`" placement="top">
-            <button
-              class="zoom-value"
-              :class="{ active: zoom !== 1 }"
-              type="button"
-              @click="resetZoom"
-            >
-              {{ Math.round(zoom * 100) }}%
-            </button>
-          </a-tooltip>
-          <a-tooltip :title="`放大 · ${shortcutText('+')}`" placement="top">
-            <button class="zoom-btn" type="button" @click="zoomIn">+</button>
-          </a-tooltip>
-        </div>
-
         <div class="sider-foot">
-          <a-tooltip title="展开侧边栏" placement="right" :disabled="!sidebarCollapsed">
-            <button class="sider-toggle" type="button" @click="toggleSidebar">
-              <MenuUnfoldOutlined v-if="sidebarCollapsed" />
-              <MenuFoldOutlined v-else />
-              <span v-if="!sidebarCollapsed" class="toggle-label">收起</span>
-            </button>
-          </a-tooltip>
+          <div class="foot-row">
+            <a-tooltip title="展开侧边栏" placement="right" :disabled="!sidebarCollapsed">
+              <button class="sider-toggle" type="button" @click="toggleSidebar">
+                <MenuUnfoldOutlined v-if="sidebarCollapsed" />
+                <MenuFoldOutlined v-else />
+                <span v-if="!sidebarCollapsed" class="toggle-label">收起</span>
+              </button>
+            </a-tooltip>
+            <!-- 只有缩放不是 100% 时才出现：默认状态下侧边栏保持干净；
+                 点一下直接回到 100%，任意档位在设置页用滑块调 -->
+            <a-tooltip
+              v-if="zoomPercent !== 100"
+              title="界面已缩放，点击恢复 100%"
+              placement="top"
+            >
+              <button
+                class="zoom-chip"
+                type="button"
+                :aria-label="`界面缩放 ${zoomPercent}%，点击恢复 100%`"
+                @click="resetZoom"
+              >
+                {{ zoomPercent }}%
+              </button>
+            </a-tooltip>
+          </div>
           <div class="local-card">
             <SafetyCertificateOutlined class="local-icon" />
             <div>
@@ -773,7 +737,7 @@ const theme = computed(() => {
       </main>
 
       <transition name="zoom-fade">
-        <div v-if="zoomNotice" class="zoom-notice">{{ Math.round(zoom * 100) }}%</div>
+        <div v-if="zoomNotice" class="zoom-notice">{{ zoomPercent }}%</div>
       </transition>
 
       <AstroBuddy v-if="!route.path.startsWith('/ai')" @open="go('/ai')" />
@@ -1300,111 +1264,49 @@ const theme = computed(() => {
   transform: scale(1.22);
 }
 
-/* ---------- 缩放控制：一条横向胶囊 ---------- */
-.zoom-box {
+/* ---------- 缩放控制：默认不占位置 ----------
+   参考 Postman（View → Zoom）与 Apifox（快捷键 / 设置页）：两者都没有常驻加减按钮。
+   这里只在缩放不是 100% 时，于「收起」同一行左侧显示一个百分比徽标，
+   点一下直接回到 100%，随后自己消失；任意档位在设置页用滑块调。 */
+.foot-row {
   display: flex;
   align-items: center;
-  gap: 2px;
-  margin: 2px 2px 8px;
-  padding: 3px;
-  border: 1px solid var(--fm-border);
-  border-radius: 9px;
-  background: var(--fm-surface);
+  justify-content: space-between;
+  gap: 6px;
 }
 
-.zoom-btn {
-  flex: 1;
-  height: 22px;
+.zoom-chip {
+  height: 20px;
+  padding: 0 6px;
   border: none;
-  border-radius: 6px;
+  border-radius: 5px;
   background: transparent;
-  color: var(--fm-sidebar-text);
-  font-size: 14px;
-  line-height: 1;
-  cursor: pointer;
-  transition: color 0.15s ease, background 0.15s ease;
-}
-
-.zoom-btn:hover {
   color: var(--fm-primary);
-  background: var(--fm-surface-alt);
-}
-
-.zoom-btn:active {
-  transform: scale(0.94);
-}
-
-.zoom-value {
-  flex: 1.5;
-  height: 22px;
-  border: none;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--fm-muted);
   font-size: 10.5px;
   font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  line-height: 20px;
   cursor: pointer;
-  padding: 0;
   transition: color 0.15s ease, background 0.15s ease;
 }
 
-.zoom-value:hover {
+.zoom-chip:hover {
   background: var(--fm-surface-alt);
 }
 
-.zoom-value.active {
-  color: var(--fm-primary);
-  font-weight: 600;
-}
-
-.sider.collapsed .zoom-box {
-  justify-content: center;
-  margin: 2px 0 6px;
-  padding: 2px;
-}
-
-.sider.collapsed .zoom-box .zoom-btn {
-  display: none;
-}
-
-.sider.collapsed .zoom-value {
-  flex: 1;
-}
-
-.sider.collapsed .local-card,
-.sider.collapsed .version {
-  display: none;
-}
-
-/* ---------- 收起 / 展开按钮 ---------- */
-.sider-toggle {
-  display: flex;
+.sider.collapsed .foot-row {
+  flex-direction: column;
   align-items: center;
-  gap: 7px;
-  width: 100%;
-  height: 28px;
-  padding: 0 8px;
-  border: 1px solid transparent;
-  border-radius: 7px;
-  background: transparent;
-  color: var(--fm-sidebar-text);
-  font-size: 11.5px;
-  cursor: pointer;
-  transition: color 0.15s ease, background 0.15s ease;
+  gap: 8px;
 }
 
-.sider-toggle:hover {
-  background: var(--fm-sidebar-hover);
-  color: var(--fm-sidebar-active-text);
-}
-
-.sider.collapsed .sider-toggle {
+.sider.collapsed .zoom-chip {
+  display: inline-flex;
+  align-items: center;
   justify-content: center;
-  width: 30px;
-  padding: 0;
-  margin: 0 auto;
 }
 
+/* ---------- 缩放提示浮层：只在 ⌘± 时短暂出现 ---------- */
 .zoom-notice {
   position: fixed;
   right: 26px;
@@ -1433,6 +1335,7 @@ const theme = computed(() => {
   transform: translateY(6px);
 }
 
+/* ---------- 侧栏底部：收起按钮 / 本地说明 / 版本号 ---------- */
 .sider-foot {
   flex-shrink: 0;
   padding-top: 8px;
@@ -1440,6 +1343,36 @@ const theme = computed(() => {
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+
+.sider-toggle {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: 1;
+  min-width: 0;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--fm-sidebar-text);
+  font-size: 11.5px;
+  cursor: pointer;
+  transition: color 0.15s ease, background 0.15s ease;
+}
+
+.sider-toggle:hover {
+  background: var(--fm-sidebar-hover);
+  color: var(--fm-sidebar-active-text);
+}
+
+.sider.collapsed .sider-toggle {
+  flex: none;
+  justify-content: center;
+  width: 30px;
+  padding: 0;
+  margin: 0 auto;
 }
 
 .local-card {
@@ -1451,17 +1384,6 @@ const theme = computed(() => {
   background: var(--fm-surface);
   border: 1px solid var(--fm-border);
   overflow: hidden;
-}
-
-.sider.collapsed .local-card {
-  justify-content: center;
-  padding: 8px;
-}
-
-.sider.collapsed .local-title,
-.sider.collapsed .local-desc,
-.sider.collapsed .version {
-  display: none;
 }
 
 .local-icon {
@@ -1490,6 +1412,20 @@ const theme = computed(() => {
   letter-spacing: 0.3px;
 }
 
+/* 折叠态只有 64px 宽：文字放不下，只留居中的盾牌图标；
+   「缩放百分比」必须留着——那是界面被误缩放后唯一的可见恢复入口。 */
+.sider.collapsed .local-card {
+  justify-content: center;
+  padding: 8px;
+}
+
+.sider.collapsed .local-title,
+.sider.collapsed .local-desc,
+.sider.collapsed .version {
+  display: none;
+}
+
+/* ---------- 主内容区 ---------- */
 .main {
   flex: 1;
   min-width: 0;

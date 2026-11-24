@@ -74,7 +74,8 @@ async function loadNotes() {
       notesList({ scope: 'today', limit: 5 }),
     ])
     noteCounts.value = nextCounts
-    notePreview.value = result.items
+    // 后端异常或旧接口可能不带 items：模板里直接 .length 会整页白屏
+    notePreview.value = Array.isArray(result?.items) ? result.items : []
   } catch {
     // 后端未就绪或浏览器预览时保持空态
   }
@@ -186,7 +187,7 @@ interface RecentProjectRow {
 const recentProjects = ref<RecentProjectRow[]>([])
 
 async function loadRecentProjects() {
-  const list = [...store.projects]
+  const list = [...(store.projects ?? [])]
     .sort((a, b) => b.updatedAt - a.updatedAt)
     .slice(0, 5)
   recentProjects.value = list.map((project) => ({
@@ -674,7 +675,9 @@ let stressTimer: number | null = null
 
 async function loadStressJobs() {
   try {
-    stressJobs.value = await api.stressJobs()
+    const list = await api.stressJobs()
+    // 返回 null 时保持空态，不能把 null 塞进 ref 让模板 .length 崩掉
+    stressJobs.value = Array.isArray(list) ? list : []
   } catch {
     stressJobs.value = []
   }
@@ -973,7 +976,8 @@ onMounted(async () => {
     captureRunning.value = cap.value.state === 'running'
   }
   if (providers.status === 'fulfilled') {
-    const list = providers.value
+    // 后端异常或旧版本可能给出 null，直接 .find 会让整个工作台白屏
+    const list = Array.isArray(providers.value) ? providers.value : []
     const target = list.find((item) => item.isDefault) ?? list[0]
     if (target) {
       modelLabel.value = `${target.model || target.name}${target.hasKey === false ? ' · 未配置密钥' : ' · 已配置'}`

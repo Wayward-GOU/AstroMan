@@ -98,11 +98,28 @@ function formPairs(body: string): string[] {
     })
 }
 
-function headerList(request: HttpRequestDetail): KeyValueItem[] {
-  const list = enabled(request.headers).map((item) => ({ ...item }))
+/** 请求头来源：手填 / 认证注入 / 工具自动补 */
+export type HeaderSource = 'user' | 'auth' | 'auto'
+
+export interface PreviewHeader {
+  key: string
+  value: string
+  source: HeaderSource
+}
+
+/**
+ * 组装最终会发出的请求头，并标注每一条的来源。
+ * buildCurl / buildHttpRaw / previewRequest 共用这一份逻辑，避免导出与实际不一致。
+ */
+function headerListAll(request: HttpRequestDetail): PreviewHeader[] {
+  const list: PreviewHeader[] = enabled(request.headers).map((item) => ({
+    key: item.key,
+    value: item.value ?? '',
+    source: 'user',
+  }))
   const added = authHeader(request)
   if (added && !list.some((item) => item.key.toLowerCase() === added.key.toLowerCase())) {
-    list.push(added)
+    list.push({ key: added.key, value: added.value ?? '', source: 'auth' })
   }
   const bodyType = request.bodyType ?? 'none'
   const body = (request.body ?? '').trim()
@@ -118,11 +135,15 @@ function headerList(request: HttpRequestDetail): KeyValueItem[] {
             : bodyType === 'binary'
               ? 'application/octet-stream'
               : 'application/json',
-        enabled: true,
+        source: 'auto',
       })
     }
   }
   return list
+}
+
+function headerList(request: HttpRequestDetail): KeyValueItem[] {
+  return headerListAll(request).map((item) => ({ key: item.key, value: item.value, enabled: true }))
 }
 
 function parseFormFields(body: string): { key: string; value: string; kind: string }[] {
@@ -318,6 +339,62 @@ export function buildSnippets(request: HttpRequestDetail, variables?: EnvVariabl
     { key: 'fetch', label: 'JavaScript', language: 'javascript', code: buildFetch(request, variables) },
     { key: 'python', label: 'Python', language: 'python', code: buildPython(request, variables) },
   ]
+}
+
+export interface RequestPreview {
+  method: string
+  /** 变量替换、Query 拼接后的最终地址 */
+  url: string
+  headers: PreviewHeader[]
+  /** 环境里找不到定义、会原样带 {{name}} 发出去的变量名 */
+  unresolved: string[]
+  /** 已定义但标记为敏感、故意不展开的变量名 */
+  secretVars: string[]
+  bodyType: string
+  /** 文本正文字节数；文件上传类为 0（内容不在这里展开） */
+  bodyBytes: number
+}
+
+/**
+ * 发送前预览：把「变量替换 + Query 拼接 + 认证头注入 + 默认 Content-Type」
+ * 都算一遍，口径与 cURL 导出完全一致。
+ *
+ * 注意：这不等同于抓包看到的原始报文。UA、Accept-Encoding、Host、
+ * Content-Length 等由 HTTP 客户端与网络层补齐，不会出现在这里。
+ */
+export function previewRequest(
+  request: HttpRequestDetail,
+  variables?: EnvVariable[],
+): RequestPreview {
+  const url = resolveVariables(buildUrl(request, variables), variables)
+  const headers = headerListAll(request).map((item) => ({
+    ...item,
+    value: resolveVariables(item.value, variables),
+  }))
+  const definitions = new Map((variables ?? []).map((item) => [item.key, item]))
+  const unresolved = new Set<string>()
+  const secretVars = new Set<string>()
+  for (const match of [url, ...headers.map((item) => item.value)].join('\n').matchAll(
+    /\{\{\s*([^}]+?)\s*\}\}/g,
+  )) {
+    const name = (match[1] ?? '').trim()
+    if (!name) continue
+    const hit = definitions.get(name)
+    if (!hit) unresolved.add(name)
+    else if (hit.isSecret) secretVars.add(name)
+  }
+  const bodyType = request.bodyType ?? 'none'
+  const body = (request.body ?? '').trim()
+  const countable = bodyType !== 'none' && bodyType !== 'binary' && bodyType !== 'multipart'
+  return {
+    method: (request.method || 'GET').toUpperCase(),
+    url,
+    headers,
+    unresolved: [...unresolved],
+    secretVars: [...secretVars],
+    bodyType,
+    bodyBytes: countable && body ? new TextEncoder().encode(body).length : 0,
+  }
 }
 
 function quoteJs(value: string): string {

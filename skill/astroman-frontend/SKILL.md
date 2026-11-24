@@ -13,7 +13,7 @@ description: AstroMan 前端开发规范（Vue 3 + Ant Design Vue + Pinia + 设�
 - 所有颜色/圆角/阴影只用 `main.css` 里的 `--fm-*` 变量，**不要写死 hex**
 - 主要 token：`--fm-primary` / `-dark` / `-soft`、`--fm-success|warning|danger|purple`（各有 `-soft`）、`--fm-bg`、`--fm-surface`、`--fm-surface-alt`、`--fm-border` / `-strong`、`--fm-text` / `-2` / `--fm-muted`、`--fm-radius-sm|`radius`|lg`、`--fm-shadow-sm|`shadow`|lg`、侧边栏一组 `--fm-sidebar-*`、代码区 `--fm-code-bg` / `--fm-gutter-bg`
 - 代码/JSON 专用色（每套主题都定义了同一批）：`--fm-json-key`（字段名）、`--fm-json-string`（字符串）、`--fm-json-number`（数字）、`--fm-json-bool`（布尔与 `{{变量}}`）、`--fm-json-punct`（括号、逗号、冒号）；不要在组件里为暗色主题单独写死颜色
-- 主题：`stores/theme.ts` 定义 `ThemeId`（**21 套**，14 浅 / 7 深），每套 `ThemeDefinition` 用同一批 35 个 `--fm-*` 颜色 / 阴影变量覆盖（HTTP 方法色与圆角沿用 `main.css`）；深色的 7 套是 `midnight` / `dusk` / `indigo` / `plum` / `pine` / `slate` / `aurora`。新增主题只加一个定义并追加到 `themes` 数组（顺序即设置页顺序），不要在组件里判断主题名
+- 主题：`stores/theme.ts` 定义 `ThemeId`（**23 套**，16 浅 / 7 深），每套 `ThemeDefinition` 用同一批 35 个 `--fm-*` 颜色 / 阴影变量覆盖（HTTP 方法色与圆角沿用 `main.css`）；深色的 7 套是 `midnight` / `dusk` / `indigo` / `plum` / `pine` / `slate` / `aurora`。新增主题只加一个定义并追加到 `themes` 数组（顺序即设置页顺序），不要在组件里判断主题名
 - 深色主题靠 `data-theme` + `applyTheme()` 统一换变量，需要针对性微调时用 `html[data-theme='<id>']` 选择器；颜色对比度与新增主题的完整流程见 skill `astroman-appearance`
 
 ## 页面骨架
@@ -22,6 +22,43 @@ description: AstroMan 前端开发规范（Vue 3 + Ant Design Vue + Pinia + 设�
 - 长内容分栏用 `a-row`/`a-col` 或自定义 flex，滚动区固定在内容列，不要让整页滚动
 - 表格、表单、弹窗全部用 Ant Design Vue 组件，反馈用 `message` / `Modal`（`import { message, Modal } from 'ant-design-vue'`）
 - 确认类操作用 `Modal.confirm`，危险操作文案写清后果（例如"将删除该项目的所有接口与历史"）
+
+## 分栏（`components/split/`）
+
+双栏页面一律用 `SplitPane`，不要再用 `a-row` / grid 手搓——v1.1.5 起它同时支持左右与上下两种方向：
+
+| 文件 | 职责 |
+|---|---|
+| `SplitPane.vue` | 渲染两侧内容 + 分隔条，`direction` 为 `horizontal`（左右）或 `vertical`（上下） |
+| `PaneDivider.vue` | 分隔条：拖动、双击复位、悬停高亮，键盘可调 |
+| `SplitLayoutSwitch.vue` | 方向切换按钮，自绘 SVG 方框图标（竖线切 = 左右，横线切 = 上下）；**不要用 antd 的 `ColumnWidth` / `ColumnHeight`**，形似字母 H / I 会被误读成「切换」 |
+
+约定（改分栏前先看这几条，都是踩过的坑）：
+
+- 比例状态走 `composables/useSplitLayout.ts`，键名 `xxx:dir` 与 `xxx:ratio:vertical` / `xxx:ratio:horizontal`；**比例按方向分键**，否则切方向时一半的宽度会被当成高度
+- 默认 `vertical`（上下），因为多数工具左右两栏都只需要半屏宽
+- 分栏容器**不要写死 `min-height` / `max-height`**：拖动后要么溢出要么撑不开。高度交给外层 `clamp()` 档位（左右 `clamp(560px, 76vh, 1080px)`、上下 `clamp(620px, 82vh, 1200px)`，`< 1200px` 用紧凑档），两侧内容用 `flex: 1` / `min-height: 0` 自适应
+- 已接入：JSON 工作台、代码格式化、AES、Markdown、Diff、正则、MyBatis、图片 Base64 共 8 个工具，以及请求编辑器；新增双栏工具照着接，不要新写一套拖拽
+- 视觉核验至少做「上下 → 左右 → 上下」三次切换，确认容器高度稳定且 `overflowX` 为 0
+
+## 大文本渲染（`components/ResponseBody.vue` + `LargeTextViewer.vue`）
+
+响应正文上限 5MB，整段塞进单个 `<pre>` 会让浏览器对全部字符做折行排版，主线程被占满（表现为打开响应即卡死几秒）。现在的分层：
+
+| 阈值 | 行为 |
+|---|---|
+| `colorMax = 128KB` | 超过即关语法着色，只保留搜索标记（实测 128KB 着色约 0.13s、512KB 约 1.7s、1MB 约 6.7s） |
+| `chunkMax = 1MB` | 超过改为分块渲染：首屏 96KB，之后每块 192KB，切点落在换行后；已渲染的块不再重排 |
+| 超过 1MB | 关闭搜索（跨块匹配成本与收益不成比例），顶部标注体积与降级原因 |
+
+- 分块逻辑在 `utils/textChunk.ts`（`DEFAULT_CHUNK_OPTIONS`），改阈值先看 `utils/__tests__/textChunk.spec.ts` 的边界用例
+- 不要为了「体验一致」把阈值调高：着色成本随体积超线性增长，128KB 是按低端机实测定的
+
+## 请求体体积
+
+- 上限常量前后端各一份且**必须一致**：`src/utils/bodySize.ts` 的 `REQUEST_BODY_MAX_BYTES` 与 `src-tauri/src/commands/http.rs` 的 `MAX_REQUEST_BODY_BYTES`（32MB）
+- 前端拦在触发前置脚本之前（脚本可能改大 body），后端兜住批量 / 套件 / AI / CLI 等不经过编辑器的入口
+- multipart 的本地文件与 Binary 正文不计入请求体上限；单文件另有 2GB 上限（`MAX_UPLOAD_FILE_BYTES`），先读元数据再决定是否读入内存
 
 ## 代码编辑器（`components/CodeArea.vue`）
 
@@ -60,6 +97,7 @@ description: AstroMan 前端开发规范（Vue 3 + Ant Design Vue + Pinia + 设�
 - 绑定行的列选择：`"*"` 表示全部列同名注入（隐藏目标输入），具体列默认把目标填成列名；同池多绑定只能选同一 mode
 - 开跑前统一走 `utils/poolGate.ts::ensurePoolPreview`，预览失败或用户取消都要阻止启动
 - 「本次变量」面板（v1.1.2）：池绑定区下方的折叠面板，数据来自 `api.stressVarSources(config)`（只读，不返回值、不拦启动）。每行按真实写法展示 `{{name}}` / `{{secret:name}}` / `{{os:name}}`，标注类型、来源与状态；`ok === false` 的排最前，有问题才自动展开，标题显示「N 个 · X 个待处理」。触发重算的时机：`request` 变化、`modalEnvId` 变化、池绑定变化（400ms 防抖），打开配置抽屉时也刷一次
+- 节点区默认「机器卡片」视图（v1.1.5）：面板头 `a-segmented` 切「卡片 / 表格」，选择存 `localStorage.cluster.nodeView`；卡片是 `auto-fit minmax(318px, 1fr)` 栅格，顶部 2px 色条按角色 + 状态着色，指标格只放实时值，所有峰值统一收在底部 `.nc-peak` 一行灰度小字（`peakLineText()` / `peakLineTitle()`）；表格视图保留原 13 列，两者数据同源，别把卡片做成另一套数据
 - 集群节点表有「兼容」列：`poolColumns` 与 `envBundle` 任意为假都是旧版；计划含自定义列绑定时禁用「下发配置」并给出原因
 - 切片体量：会话快照的 `poolEstimate` / `poolSliceLimitBytes` 用来显示「数据池体量」提示，节点 `poolSliceBytes` 显示在能力列，≥80% 变黄
 - 不要在集群页让用户给从节点单独配池或配刷新；池由主节点统一切片下发
@@ -84,6 +122,14 @@ v1.0.8 起大屏不在首页：`views/Dashboard.vue` 只剩总览 KPI、快捷�
 - 新响应或切换 Pretty / Raw 后把正文滚动回顶部（`watch([result, bodyView])`）
 - 标签栏溢出时 `revealActiveTab()` 把当前标签 `scrollIntoView({ inline: 'nearest' })`
 - 重命名后同步 `stores/tabs` 与快速打开下拉项，避免下拉里还是旧名字
+
+### 顶栏与页签
+
+- 顶栏是**图标按钮组**（历史 / 文档 / 代码 / Cookie / AI 发送选项 / 证书 / 删除），不要再加文字按钮；图标必须带 `title` 与 `aria-label`，证书关闭时用危险色底
+- 「实际请求」页签展示的是 `utils/curl.ts` 里 `previewRequest()` 的结果：最终 URL、带来源标记（用户 / 认证 / 自动）的请求头、未解析变量告警。它与 cURL 导出共用同一份 `headerListAll`，改渲染口径要两边一起改
+- Host / UA / Accept-Encoding / Content-Length 由底层 HTTP 客户端补齐，前端拿不到，页签底部必须保留这句说明，不要凭空编值
+- 页签尽量细线化（`gap: 14px`、`padding: 8px 0`、`font-size: 12px`），无意义徽标（认证「无」、Body「none」、计数 0）直接隐藏，否则 1440px 下 6 个页签会被 antd 折叠进省略号
+- 协议下拉最小宽度 96px、发送按钮定宽，否则 `HTTP/1.1` 会被截成 `HT…`
 
 ## 工具箱（`src/tools`）
 

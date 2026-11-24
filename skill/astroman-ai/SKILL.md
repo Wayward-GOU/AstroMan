@@ -55,7 +55,7 @@ description: AstroMan 内置 AI 助手「航仔」的开发与维护规范。接
 | `src/components/AiAssistDrawer.vue` | 全局右侧抽屉，`App.vue` 挂载，所有页面 AI 入口共用；打开后先停在「开始分析？」确认页（显示上下文体量），点按钮才真正调模型 |
 | `src/components/AiConfirmCard.vue` | 写操作结构化确认卡：任务 / 影响对象 / 计划 / 参数表 / 风险 / 预检；`labelMap` + `rowLabel()` 负责参数名中文化（`id` 按工具前缀标成测试套件 / 测试用例），布尔值显示「是 / 否」，`kind` 值走 `testCaseKindLabel()` |
 | `src/views/AiAssistant.vue` | 对话页：会话侧栏（搜索 / 置顶 / 导出）+ 消息操作 + 工具卡片 + 预算条 + 复盘时间线 + 模型服务抽屉 + 「自动执行工具」开关；工具调度（`ask` / `afterReply` / `runToolSegment`）与 `CONFIRM_TEXT` 文案表都在这里 |
-| `src/utils/__tests__/` | vitest：`aiProtocol` / `aiTools` / `contextBudget` / `untrusted` 四组纯函数用例（全量 35 spec / 322 条，见 `astroman-testing`） |
+| `src/utils/__tests__/` | vitest：`aiProtocol` / `aiTools` / `contextBudget` / `untrusted` 四组纯函数用例（全量 39 spec / 391 条，见 `astroman-testing`） |
 | `src/views/AiUsage.vue` | 用量统计独立页（`/ai/usage`）：6 张指标卡 + 每日 token 柱 + 调用记录 / 模型汇总 / 工具准确率三 Tab + 右侧抽屉 |
 | `src/views/AiToolLogs.vue` | 工具调用记录页（`/ai/logs`）：指标卡、趋势柱、表格、详情抽屉 |
 | `src/views/Settings.vue` | 设置页「AI 辅助（航仔）」卡片：已上线说明 + 「打开航仔」「用量统计」 |
@@ -694,7 +694,7 @@ node -e "const s=require('fs').readFileSync('src/utils/aiTools.ts','utf8');const
 ```powershell
 # 前端（根目录）
 npm.cmd run build            # vue-tsc --noEmit + vite build
-npm.cmd run test             # vitest：全量 35 spec / 322 条，AI 相关 4 组
+npm.cmd run test             # vitest：全量 39 spec / 391 条，AI 相关 4 组
 npx vitest run src/utils/__tests__/aiTools.spec.ts   # 只跑工具注册表（含 ratio / 参数校验）
 
 # 后端（src-tauri）

@@ -3,8 +3,13 @@ import { computed, ref } from 'vue'
 import { message } from 'ant-design-vue'
 import { CopyOutlined, EyeOutlined, FileTextOutlined, ThunderboltOutlined } from '@ant-design/icons-vue'
 import CodeArea from '@/components/CodeArea.vue'
+import SplitLayoutSwitch from '@/components/split/SplitLayoutSwitch.vue'
+import SplitPane from '@/components/split/SplitPane.vue'
+import { useSplitLayout } from '@/composables/useSplitLayout'
 import { renderMarkdown } from '@/utils/markdown'
 import { copyToClipboard } from '@/utils/clipboard'
+
+const { direction, isVertical, setDirection, ratioKey } = useSplitLayout('astroman:tools:markdown')
 
 const SAMPLE = `# AstroMan 工具箱
 
@@ -79,24 +84,36 @@ function loadSample() {
       <span class="md-stat">{{ stats }}</span>
       <a-button size="small" @click="loadSample"><ThunderboltOutlined /> 示例</a-button>
       <a-button size="small" @click="copy"><CopyOutlined /> 复制{{ view === 'html' ? ' HTML' : '原文' }}</a-button>
+      <SplitLayoutSwitch :model-value="direction" @update:model-value="setDirection" />
     </div>
 
-    <div class="md-body">
-      <section class="md-pane">
-        <header class="md-head"><FileTextOutlined /> Markdown 原文</header>
-        <CodeArea v-model="source" :rows="22" placeholder="在此输入 Markdown" />
-      </section>
+    <SplitPane
+      class="md-body"
+      :class="{ 'is-vertical': isVertical }"
+      :direction="direction"
+      :storage-key="ratioKey"
+      :min-first="isVertical ? 150 : 260"
+      :min-second="isVertical ? 150 : 260"
+    >
+      <template #first>
+        <section class="md-pane">
+          <header class="md-head"><FileTextOutlined /> Markdown 原文</header>
+          <CodeArea v-model="source" fill placeholder="在此输入 Markdown" />
+        </section>
+      </template>
 
-      <section class="md-pane">
-        <header class="md-head">
-          <EyeOutlined v-if="view === 'preview'" />
-          <FileTextOutlined v-else />
-          {{ view === 'preview' ? '渲染结果' : 'HTML 源码' }}
-        </header>
-        <div v-if="view === 'preview'" class="md-preview markdown-body" v-html="html" />
-        <CodeArea v-else :model-value="html" :rows="22" readonly />
-      </section>
-    </div>
+      <template #second>
+        <section class="md-pane">
+          <header class="md-head">
+            <EyeOutlined v-if="view === 'preview'" />
+            <FileTextOutlined v-else />
+            {{ view === 'preview' ? '渲染结果' : 'HTML 源码' }}
+          </header>
+          <div v-if="view === 'preview'" class="md-preview markdown-body scroll-y" v-html="html" />
+          <CodeArea v-else :model-value="html" fill readonly />
+        </section>
+      </template>
+    </SplitPane>
 
     <p class="md-tip">渲染使用与 AI 对话相同的 Markdown 引擎：原始 HTML 关闭、链接自动加 rel="noopener noreferrer"。</p>
   </div>
@@ -127,9 +144,12 @@ function loadSample() {
 }
 
 .md-body {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 12px;
+  height: clamp(560px, 76vh, 1080px);
+  min-height: 0;
+}
+
+.md-body.is-vertical {
+  height: clamp(620px, 82vh, 1200px);
 }
 
 .md-pane {
@@ -137,6 +157,8 @@ function loadSample() {
   flex-direction: column;
   gap: 8px;
   min-width: 0;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .md-head {
@@ -150,9 +172,8 @@ function loadSample() {
 }
 
 .md-preview {
-  height: 100%;
-  min-height: 420px;
-  max-height: 620px;
+  flex: 1;
+  min-height: 0;
   overflow: auto;
   padding: 16px 18px;
   background: var(--fm-surface);
@@ -259,7 +280,11 @@ function loadSample() {
 
 @media (max-width: 1100px) {
   .md-body {
-    grid-template-columns: minmax(0, 1fr);
+    height: clamp(520px, 74vh, 980px);
+  }
+
+  .md-body.is-vertical {
+    height: clamp(560px, 84vh, 1080px);
   }
 }
 </style>

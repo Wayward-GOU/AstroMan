@@ -174,6 +174,8 @@ const HELP: &str = "AstroMan CLI（无窗口执行测试套件）
 // ---------------------------------------------------------------------------
 
 pub fn main() -> i32 {
+    // CLI 也会跑测试套件与抓包，句柄上限同样要先抬，避免并发被 256 卡死
+    crate::state::raise_fd_limit();
     let tokens: Vec<String> = std::env::args().skip(1).collect();
     let args = match Args::parse(&tokens) {
         Ok(args) => args,

@@ -13,8 +13,8 @@ description: AstroMan 的打包、图标、托盘与发布流程。需要构建 
 | Windows 安装包 | `npm run build:win` | `AstroMan_<版本>_x64-setup.exe`（NSIS） |
 | macOS 安装包 | `npm run build:mac` | `AstroMan_<版本>_universal.dmg` |
 | 仅校验 Rust | `cd src-tauri && cargo check` | — |
-| 前端单测 | `npm run test` | vitest：35 spec / 322 条 |
-| Rust 单测 | `cd src-tauri && cargo test --lib` | 426 条（6 ignored） |
+| 前端单测 | `npm run test` | vitest：39 spec / 391 条 |
+| Rust 单测 | `cd src-tauri && cargo test --lib` | 475 条（8 ignored） |
 | 覆盖率（本地） | `cd src-tauri && cargo tarpaulin --config tarpaulin.toml --engine llvm` | `target/coverage/` |
 | 版本号 | `npm run version:check` / `npm run version:set 1.0.9` | 三处版本一致 |
 
@@ -58,7 +58,7 @@ Windows 下 `cargo check` 若报 `hit restricted ... D:\Software\Rust\cargo\.glo
 
 1. 同步版本号：`npm run version:set 1.0.9` 一次写入 `package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml` 三处；脚本**不动** lock 文件——`package-lock.json` 用 `npm install --package-lock-only` 跟上，`Cargo.lock` 跑一次 `cargo check` 会自动同步。`npm run version:check` 必须通过（CI 的 `frontend` job 第一步就是它）
 2. 提交前跑一遍与 CI 同源的门禁：`npm run test`、`npm run ui:check`（硬编码样式 + 23 套主题对比度）、`npm run build`、`cargo fmt --check --all`、`cargo clippy --lib --all-targets -- -D warnings`、`cargo test --lib`；覆盖率由 `src-tauri/tarpaulin.toml` 的 `fail-under`（当前 25%）判定，报告在 `target/coverage/`
-3. 提交后打 tag：`git tag v1.0.9 && git push origin v1.0.9`，同时把 `.github/workflows/release.yml` 里的 `releaseBody` 更新成本次版本说明（GitHub Release 直接用它）；版本说明追加到 `### 本次更新（x.y.z）` 段落。v1.0.9 的 release body 已包含抓包、抓包进阶、记事本 / 待办、92 工具、HAR 导入与认证加密
+3. 提交后打 tag：`git tag v1.0.9 && git push origin v1.0.9`，同时把 `.github/workflows/release.yml` 里的 `releaseBody` 更新成本次版本说明（GitHub Release 直接用它）；版本说明追加到 `### 本次更新（x.y.z）` 段落。v1.1.5 的 release body 已包含请求页交互重做、大响应分块渲染、请求体 / 上传体积上限、分栏拖拽与分布式节点机器卡片
 4. `.github/workflows/release.yml` 在 tag 推送时自动构建 Windows NSIS 与 macOS universal dmg，上传到 GitHub Release
 5. 应用内更新检查走 `commands/update.rs` 的 `RELEASE_API`（`https://api.github.com/repos/Wayward-GOU/AstroMan/releases/latest`），仓库地址已改为 AstroMan
 6. macOS 用户安装脚本 `scripts/install-macos.sh`（`REPO=Wayward-GOU/AstroMan`）从 Release 下载 dmg，并绕过未签名校验；README 中的安装命令同源

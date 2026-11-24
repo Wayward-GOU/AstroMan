@@ -3,6 +3,9 @@ import { computed, ref, watch } from 'vue'
 import { message } from 'ant-design-vue'
 import { CopyOutlined, DeleteOutlined, PlayCircleOutlined } from '@ant-design/icons-vue'
 import CodeArea from '@/components/CodeArea.vue'
+import SplitLayoutSwitch from '@/components/split/SplitLayoutSwitch.vue'
+import SplitPane from '@/components/split/SplitPane.vue'
+import { useSplitLayout } from '@/composables/useSplitLayout'
 import { copyToClipboard } from '@/utils/clipboard'
 import {
   fillLogSql,
@@ -14,6 +17,7 @@ import {
 } from '@/utils/mybatis'
 
 const source = ref<'template' | 'log'>('template')
+const { direction, isVertical, setDirection, ratioKey } = useSplitLayout('astroman:tools:mybatis')
 const logText = ref('')
 const logStatements = ref<LogStatement[]>([])
 const logIndex = ref(0)
@@ -201,16 +205,27 @@ async function copySql() {
       <a-button type="primary" size="small" @click="run">
         <PlayCircleOutlined /> {{ source === 'log' ? '解析并填充' : '生成 SQL' }}
       </a-button>
+      <SplitLayoutSwitch :model-value="direction" @update:model-value="setDirection" />
     </div>
 
     <a-alert v-if="error" type="error" :message="error" show-icon />
 
-    <div class="mb-body">
+    <SplitPane
+      class="mb-body"
+      :class="{ 'is-vertical': isVertical }"
+      :direction="direction"
+      :storage-key="ratioKey"
+      :min-first="isVertical ? 150 : 260"
+      :min-second="isVertical ? 150 : 260"
+    >
+      <template #first>
       <section v-if="source === 'template'" class="mb-pane">
         <header class="mb-head">Mapper 片段</header>
-        <CodeArea v-model="template" :rows="18" placeholder="粘贴 <select> / <update> 等动态 SQL 片段" />
+        <CodeArea v-model="template" fill placeholder="粘贴 <select> / <update> 等动态 SQL 片段" />
         <header class="mb-head">参数 JSON</header>
-        <CodeArea v-model="params" :rows="7" placeholder="{ &quot;username&quot;: &quot;zhang&quot; }" />
+        <div class="mb-param-block">
+          <CodeArea v-model="params" fill placeholder="{ &quot;username&quot;: &quot;zhang&quot; }" />
+        </div>
       </section>
 
       <section v-else class="mb-pane">
@@ -220,11 +235,13 @@ async function copySql() {
         </header>
         <CodeArea
           v-model="logText"
-          :rows="25"
+          fill
           placeholder="粘贴包含 ==> Preparing: 与 ==> Parameters: 的 DEBUG 日志"
         />
       </section>
+      </template>
 
+      <template #second>
       <section class="mb-pane">
         <header class="mb-head">
           <span>生成结果</span>
@@ -254,7 +271,7 @@ async function copySql() {
           </span>
         </div>
 
-        <CodeArea :model-value="sql" :rows="18" readonly placeholder="生成的 SQL 会显示在这里" />
+        <CodeArea :model-value="sql" fill readonly placeholder="生成的 SQL 会显示在这里" />
 
         <div v-if="warnings.length" class="mb-warnings">
           <a-alert v-for="(item, index) in warnings" :key="index" type="warning" :message="item" show-icon />
@@ -271,7 +288,8 @@ async function copySql() {
           </div>
         </div>
       </section>
-    </div>
+      </template>
+    </SplitPane>
   </div>
 </template>
 
@@ -294,15 +312,29 @@ async function copySql() {
 }
 
 .mb-body {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 12px;
+  height: clamp(560px, 76vh, 1080px);
+  min-height: 0;
+}
+
+.mb-body.is-vertical {
+  height: clamp(620px, 82vh, 1200px);
 }
 
 .mb-pane {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* 参数 JSON 固定占左栏下部约三成：给模板区留出足够的编辑高度 */
+.mb-param-block {
+  flex: 0 0 30%;
+  min-height: 90px;
+  display: flex;
+  flex-direction: column;
   min-width: 0;
 }
 
@@ -408,7 +440,11 @@ async function copySql() {
 
 @media (max-width: 1200px) {
   .mb-body {
-    grid-template-columns: minmax(0, 1fr);
+    height: clamp(520px, 74vh, 980px);
+  }
+
+  .mb-body.is-vertical {
+    height: clamp(560px, 84vh, 1080px);
   }
 }
 </style>

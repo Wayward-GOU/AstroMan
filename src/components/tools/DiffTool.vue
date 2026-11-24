@@ -3,8 +3,13 @@ import { computed, ref } from 'vue'
 import { message } from 'ant-design-vue'
 import { CopyOutlined, SwapOutlined } from '@ant-design/icons-vue'
 import CodeArea from '@/components/CodeArea.vue'
+import SplitLayoutSwitch from '@/components/split/SplitLayoutSwitch.vue'
+import SplitPane from '@/components/split/SplitPane.vue'
+import { useSplitLayout } from '@/composables/useSplitLayout'
 import { diffLines, diffAsText, type DiffResult } from '@/tools/analysis'
 import { copyToClipboard } from '@/utils/clipboard'
+
+const { direction, isVertical, setDirection, ratioKey } = useSplitLayout('astroman:tools:diff')
 
 const left = ref('')
 const right = ref('')
@@ -79,21 +84,33 @@ function clearAll() {
       <a-button size="small" @click="swap"><SwapOutlined /> 交换</a-button>
       <a-button size="small" :disabled="!result" @click="copyDiff"><CopyOutlined /> 复制差异</a-button>
       <a-button size="small" @click="clearAll">清空</a-button>
+      <SplitLayoutSwitch :model-value="direction" @update:model-value="setDirection" />
       <span class="diff-summary">{{ summary }}</span>
     </div>
 
     <a-alert v-if="error" type="error" :message="error" show-icon />
 
-    <div class="diff-body">
-      <section class="diff-pane">
-        <header class="diff-head">原文本</header>
-        <CodeArea v-model="left" :rows="16" placeholder="粘贴原始内容" />
-      </section>
-      <section class="diff-pane">
-        <header class="diff-head">新文本</header>
-        <CodeArea v-model="right" :rows="16" placeholder="粘贴修改后的内容" />
-      </section>
-    </div>
+    <SplitPane
+      class="diff-body"
+      :class="{ 'is-vertical': isVertical }"
+      :direction="direction"
+      :storage-key="ratioKey"
+      :min-first="isVertical ? 150 : 260"
+      :min-second="isVertical ? 150 : 260"
+    >
+      <template #first>
+        <section class="diff-pane">
+          <header class="diff-head">原文本</header>
+          <CodeArea v-model="left" fill placeholder="粘贴原始内容" />
+        </section>
+      </template>
+      <template #second>
+        <section class="diff-pane">
+          <header class="diff-head">新文本</header>
+          <CodeArea v-model="right" fill placeholder="粘贴修改后的内容" />
+        </section>
+      </template>
+    </SplitPane>
 
     <div class="diff-result">
       <div class="diff-toolbar">
@@ -143,9 +160,12 @@ function clearAll() {
 }
 
 .diff-body {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 12px;
+  height: clamp(560px, 76vh, 1080px);
+  min-height: 0;
+}
+
+.diff-body.is-vertical {
+  height: clamp(620px, 82vh, 1200px);
 }
 
 .diff-pane {
@@ -153,6 +173,8 @@ function clearAll() {
   flex-direction: column;
   gap: 8px;
   min-width: 0;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .diff-head {
@@ -240,7 +262,11 @@ function clearAll() {
 
 @media (max-width: 1100px) {
   .diff-body {
-    grid-template-columns: minmax(0, 1fr);
+    height: clamp(520px, 74vh, 980px);
+  }
+
+  .diff-body.is-vertical {
+    height: clamp(560px, 84vh, 1080px);
   }
 }
 </style>

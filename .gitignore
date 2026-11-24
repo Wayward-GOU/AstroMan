@@ -134,6 +134,8 @@ src-tauri/binaries/
 # Playwright 失败现场与报告（视觉基线 e2e/visual.spec.ts-snapshots 需要入库）
 test-results/
 playwright-report/
+# 调试截图（.screenshots 只用于本地核对，不入库）
+.screenshots/
 
 # 单元测试临时目录（util::test_dir 落在 target/test-tmp 下的残留）
 src-tauri/target/test-tmp/

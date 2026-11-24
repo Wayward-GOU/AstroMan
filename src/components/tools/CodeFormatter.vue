@@ -3,8 +3,13 @@ import { computed, ref, watch } from 'vue'
 import { message } from 'ant-design-vue'
 import { CopyOutlined, DeleteOutlined, PlayCircleOutlined } from '@ant-design/icons-vue'
 import CodeArea from '@/components/CodeArea.vue'
+import SplitLayoutSwitch from '@/components/split/SplitLayoutSwitch.vue'
+import SplitPane from '@/components/split/SplitPane.vue'
+import { useSplitLayout } from '@/composables/useSplitLayout'
 import { formatCodeByLanguage, type CodeLanguage, type FormatMode } from '@/tools/formatters'
 import { copyToClipboard } from '@/utils/clipboard'
+
+const { direction, isVertical, setDirection, ratioKey } = useSplitLayout('astroman:tools:codefmt')
 
 const language = ref<CodeLanguage>('js')
 const mode = ref<FormatMode>('pretty')
@@ -106,6 +111,7 @@ function clearAll() {
         </span>
       </div>
       <div class="fmt-actions">
+        <SplitLayoutSwitch :model-value="direction" @update:model-value="setDirection" />
         <a-button size="small" @click="loadSample">示例</a-button>
         <a-button size="small" @click="clearAll"><DeleteOutlined /> 清空</a-button>
         <a-button type="primary" size="small" @click="run"><PlayCircleOutlined /> 执行</a-button>
@@ -113,20 +119,31 @@ function clearAll() {
       </div>
     </div>
 
-    <div class="fmt-body">
-      <section class="fmt-pane">
-        <header class="fmt-head">源代码</header>
-        <CodeArea v-model="input" :rows="22" placeholder="粘贴需要格式化的代码" />
-      </section>
-      <section class="fmt-pane">
-        <header class="fmt-head">
-          <span>格式化结果</span>
-          <span class="fmt-stat">{{ stats }}</span>
-        </header>
-        <a-alert v-if="error" type="error" :message="error" show-icon class="fmt-error" />
-        <CodeArea :model-value="output" :rows="22" readonly placeholder="结果会显示在这里" />
-      </section>
-    </div>
+    <SplitPane
+      class="fmt-body"
+      :class="{ 'is-vertical': isVertical }"
+      :direction="direction"
+      :storage-key="ratioKey"
+      :min-first="isVertical ? 150 : 260"
+      :min-second="isVertical ? 150 : 260"
+    >
+      <template #first>
+        <section class="fmt-pane">
+          <header class="fmt-head">源代码</header>
+          <CodeArea v-model="input" fill placeholder="粘贴需要格式化的代码" />
+        </section>
+      </template>
+      <template #second>
+        <section class="fmt-pane">
+          <header class="fmt-head">
+            <span>格式化结果</span>
+            <span class="fmt-stat">{{ stats }}</span>
+          </header>
+          <a-alert v-if="error" type="error" :message="error" show-icon class="fmt-error" />
+          <CodeArea :model-value="output" fill readonly placeholder="结果会显示在这里" />
+        </section>
+      </template>
+    </SplitPane>
   </div>
 </template>
 
@@ -162,10 +179,14 @@ function clearAll() {
   color: var(--fm-muted);
 }
 
+/* 固定可用高度供分栏比例生效；上下分栏时两栏各分一半，容器再高一档 */
 .fmt-body {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 12px;
+  height: clamp(560px, 76vh, 1080px);
+  min-height: 0;
+}
+
+.fmt-body.is-vertical {
+  height: clamp(620px, 82vh, 1200px);
 }
 
 .fmt-pane {
@@ -173,6 +194,8 @@ function clearAll() {
   flex-direction: column;
   gap: 8px;
   min-width: 0;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .fmt-head {
@@ -196,7 +219,11 @@ function clearAll() {
 
 @media (max-width: 1200px) {
   .fmt-body {
-    grid-template-columns: minmax(0, 1fr);
+    height: clamp(520px, 74vh, 980px);
+  }
+
+  .fmt-body.is-vertical {
+    height: clamp(560px, 84vh, 1080px);
   }
 }
 </style>

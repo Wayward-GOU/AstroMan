@@ -624,6 +624,15 @@ pub struct ClusterNodeInfo {
     /// 本任务运行期该节点峰值
     pub peak_qps: f64,
     pub peak_concurrent: u32,
+    /// 本次配对以来整机 CPU 峰值（%）
+    #[serde(default)]
+    pub peak_host_cpu_percent: Option<f64>,
+    /// 本次配对以来整机内存峰值（%）
+    #[serde(default)]
+    pub peak_host_mem_percent: Option<f64>,
+    /// 本次配对以来网卡收发合计峰值（KB/s）
+    #[serde(default)]
+    pub peak_net_kbps: Option<f64>,
     /// 全局 VU 区间
     pub vu_start: u32,
     pub vu_count: u32,

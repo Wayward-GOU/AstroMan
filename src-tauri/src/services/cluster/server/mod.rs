@@ -208,6 +208,10 @@ struct NodeState {
     /// 运行期峰值
     peak_qps: f64,
     peak_concurrent: u32,
+    /// 资源峰值：配对以来整机 CPU% / 内存% / 网卡收发合计 KB/s
+    peak_host_cpu: Option<f64>,
+    peak_host_mem: Option<f64>,
+    peak_net_kbps: Option<f64>,
     /// 采集健康度
     first_sample_ms: Option<i64>,
     last_sample_ms: Option<i64>,
@@ -225,6 +229,17 @@ struct NodeState {
     pool_columns: bool,
     /// 本次下发的池切片字节数（prepare 时写入）
     pool_slice_bytes: Option<u64>,
+}
+
+/// 只升不降地记录峰值；非有限值（采集失败时的 NaN）直接丢弃，避免把峰值写成 NaN
+fn bump_peak(slot: &mut Option<f64>, value: f64) {
+    if !value.is_finite() {
+        return;
+    }
+    *slot = Some(match *slot {
+        Some(peak) if peak >= value => peak,
+        _ => value,
+    });
 }
 
 impl NodeState {
@@ -270,6 +285,9 @@ impl NodeState {
             vu_count: 0,
             peak_qps: 0.0,
             peak_concurrent: 0,
+            peak_host_cpu: None,
+            peak_host_mem: None,
+            peak_net_kbps: None,
             first_sample_ms: None,
             last_sample_ms: None,
             received_samples: 0,
@@ -314,6 +332,9 @@ impl NodeState {
             health: self.health(start_at_ms, now),
             peak_qps: self.peak_qps,
             peak_concurrent: self.peak_concurrent,
+            peak_host_cpu_percent: self.peak_host_cpu,
+            peak_host_mem_percent: self.peak_host_mem,
+            peak_net_kbps: self.peak_net_kbps,
             vu_start: self.vu_start,
             vu_count: self.vu_count,
             engine_stats: self.last_stats.clone(),
@@ -1167,6 +1188,9 @@ impl MasterSession {
                 vu_count: 0,
                 peak_qps: 0.0,
                 peak_concurrent: 0,
+                peak_host_cpu: None,
+                peak_host_mem: None,
+                peak_net_kbps: None,
                 first_sample_ms: None,
                 last_sample_ms: None,
                 received_samples: 0,
@@ -1317,6 +1341,9 @@ impl MasterSession {
                 vu_count: 0,
                 peak_qps: 0.0,
                 peak_concurrent: 0,
+                peak_host_cpu: None,
+                peak_host_mem: None,
+                peak_net_kbps: None,
                 first_sample_ms: None,
                 last_sample_ms: None,
                 received_samples: 0,
@@ -1795,6 +1822,10 @@ impl MasterSession {
                     node.node_threads = Some(host.threads);
                 }
                 node.load1 = Some(host.load1);
+                // 资源峰值：卡片上要和当前值对照，看「这台机子最吃紧到过什么程度」
+                bump_peak(&mut node.peak_host_cpu, host.host_cpu_percent);
+                bump_peak(&mut node.peak_host_mem, host.host_mem_percent);
+                bump_peak(&mut node.peak_net_kbps, host.net_rx_kbps + host.net_tx_kbps);
             }
             // 只保留最近 SAMPLE_RETAIN 秒：AI 诊断最多取 300 条，长任务不再无限增长
             if node.samples.len() >= SAMPLE_RETAIN {

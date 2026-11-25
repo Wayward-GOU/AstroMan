@@ -58,10 +58,20 @@ Windows 下 `cargo check` 若报 `hit restricted ... D:\Software\Rust\cargo\.glo
 
 1. 同步版本号：`npm run version:set 1.0.9` 一次写入 `package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml` 三处；脚本**不动** lock 文件——`package-lock.json` 用 `npm install --package-lock-only` 跟上，`Cargo.lock` 跑一次 `cargo check` 会自动同步。`npm run version:check` 必须通过（CI 的 `frontend` job 第一步就是它）
 2. 提交前跑一遍与 CI 同源的门禁：`npm run test`、`npm run ui:check`（硬编码样式 + 23 套主题对比度）、`npm run build`、`cargo fmt --check --all`、`cargo clippy --lib --all-targets -- -D warnings`、`cargo test --lib`；覆盖率由 `src-tauri/tarpaulin.toml` 的 `fail-under`（当前 25%）判定，报告在 `target/coverage/`
-3. 提交后打 tag：`git tag v1.0.9 && git push origin v1.0.9`，同时把 `.github/workflows/release.yml` 里的 `releaseBody` 更新成本次版本说明（GitHub Release 直接用它）；版本说明追加到 `### 本次更新（x.y.z）` 段落。v1.1.5 的 release body 已包含请求页交互重做、大响应分块渲染、请求体 / 上传体积上限、分栏拖拽与分布式节点机器卡片
+3. 提交后打 tag：`git tag v1.0.9 && git push origin v1.0.9`，同时把 `.github/workflows/release.yml` 里的 `releaseBody` 更新成本次版本说明（GitHub Release 直接用它）；版本说明追加到 `### 本次更新（x.y.z）` 段落。v1.1.5 的 release body 已包含请求页交互重做、请求体解析容错、大响应分块渲染、请求体 / 上传体积上限、分栏拖拽与分布式节点机器卡片
 4. `.github/workflows/release.yml` 在 tag 推送时自动构建 Windows NSIS 与 macOS universal dmg，上传到 GitHub Release
 5. 应用内更新检查走 `commands/update.rs` 的 `RELEASE_API`（`https://api.github.com/repos/Wayward-GOU/AstroMan/releases/latest`），仓库地址已改为 AstroMan
 6. macOS 用户安装脚本 `scripts/install-macos.sh`（`REPO=Wayward-GOU/AstroMan`）从 Release 下载 dmg，并绕过未签名校验；README 中的安装命令同源
+
+### 覆盖重发（同一版本号替换安装包）
+
+只适用于「已发布的版本有硬伤、必须立刻换包且不打算跳版本号」的情况。v1.1.5 走过一次（补请求体解析容错），代价与顺序都要清楚：
+
+1. **先删 Release，再动 tag**：`tauri-action` 遇到已存在的 Release 时会上传同名资产并因命名冲突失败。用 API 删除：`curl -X DELETE -H "Authorization: Bearer $TOKEN" https://api.github.com/repos/Wayward-GOU/AstroMan/releases/<id>`（`<id>` 从 `releases?per_page=5` 的返回里取，不是 tag 名）。本机没装 `gh`，也没有 PAT 时需要用户提供一次，别把 token 写进仓库或脚本。
+2. **强制移动标签**：`git tag -f v1.1.5 <新提交> && git push origin v1.1.5 --force`。轻量标签直接覆盖；带注解的标签要 `git tag -f -a` 并补一次 `--force`。推送已存在的标签必须带 `--force`，否则被拒。
+3. **同一版本号不会触发自动更新**：`update.rs` 比对的是版本号，不会因为同版本号换了构建而提示。必须在 release body 与发布说明里写清「重新下载安装包覆盖安装」。
+4. **资产名带版本号**（`AstroMan_1.1.5_universal.dmg`），新旧包同名，下载链接不变；正因如此才必须先删旧 Release，否则用户拿到的可能是旧缓存资产。
+5. 事后把 CHANGELOG 与 `docs/release-x.y.z.md` 的日期改成重发日期，并补一段「重发说明」，说明版本号未变、改了什么、怎么升级。
 
 ### macOS universal 与 sidecar（externalBin）
 

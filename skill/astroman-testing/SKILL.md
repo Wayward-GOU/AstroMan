@@ -9,7 +9,7 @@ description: AstroMan 的测试体系与质量门禁：vitest 前端纯函数用
 
 | 层 | 命令 | 规模（2026-11-24 实测） | 位置 |
 |---|---|---|---|
-| 前端纯函数 | `npm run test` | 39 spec / 391 条 | `src/**/*.spec.ts` |
+| 前端纯函数 | `npm run test` | 43 spec / 447 条 | `src/**/*.spec.ts` |
 | Rust lib | `cd src-tauri && cargo test --lib` | 475 条 / 8 ignored | 模块内 `#[cfg(test)]` |
 | Rust 覆盖率 | `cargo tarpaulin --config tarpaulin.toml` | 门槛 25%（防倒退） | `src-tauri/tarpaulin.toml` |
 | 类型 / 构建 | `npm run build` | `vue-tsc --noEmit` + `vite build` | — |
@@ -81,6 +81,8 @@ cargo test --lib capture::
 ```
 
 - 前端记事本纯函数各有一份 spec：`notesGrouping.spec.ts` / `notesImage.spec.ts` / `notesQuickParse.spec.ts` / `notesTags.spec.ts`；改解析语法或标签配色先补这里
+
+- 请求体解析四件套各有 spec：`looseJson.spec.ts`（单引号 / 尾逗号 / 全角 / BOM / 大整数）、`formBody.spec.ts`（多行粘贴 / `key: value` 行式 / 全角分隔符）、`xmlFormat.spec.ts`（混合内容单行 / 幂等 / 属性不重排）、`bodyContentType.spec.ts`（与后端推断对齐）。这几处的价值在「不报错但发错数据」的回归，改解析先补用例再动实现
 
 - 受限环境（沙箱 / 只读盘）会集中报 `attempt to write a readonly database`，一批用例同时失败；这是环境不是代码。单独重跑、把临时目录换到可写盘，或在关闭沙箱的模式下执行
 

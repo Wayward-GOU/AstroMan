@@ -72,6 +72,23 @@ description: AstroMan 的 Rust/Tauri 后端开发规范。改数据库 schema、
 - `sent_body` 必须用剥离后的内容：`request_runs.body`、压测报告的请求明细、运行历史里展示的都应是**实际发出的字节**
 - 前端不要提前删注释，否则用户切回编辑器时原文丢失；编辑器里的注释由 `CodeArea` 的 `Ctrl / ⌘ + /` 维护
 
+## 请求体处理（Content-Type 推断）
+
+`build_body_plan` 里未手写 `Content-Type` 时按 `body_type` 与内容自动补，规则**必须与前端 `src/utils/bodyContentType.ts::inferBodyContentType` 一致**，否则「实际请求」页签展示的头和真正发出去的不一样（v1.1.5 修过一次这类偏差）。
+
+| `body_type` | 补的头 |
+|---|---|
+| `json` / `graphql` | `application/json` |
+| `form` | `application/x-www-form-urlencoded` |
+| `binary` | `application/octet-stream` |
+| `raw` / `none`（默认分支） | 空正文 → `text/plain; charset=utf-8`；`looks_like_xml` → `application/xml; charset=utf-8`；`looks_like_json` → `application/json`；否则 `text/plain; charset=utf-8` |
+
+- `looks_like_json` 只认严格 JSON（`serde_json` 能解析），但判断前先用 `mask_template_vars` 把 `{{...}}` 换成 `0`，否则 Raw 里的 JSON 模板会被降级成纯文本
+- 只认严格 JSON 是刻意的：`{'a':1}` 这类宽松写法会原样发出，标成 `application/json` 反而误导排查
+- `looks_like_xml` 不引正则库，按首字符与标签名规则扫描；改判定时同步前端 `xmlFormat.ts::looksLikeXml`
+- 用户手写过 `Content-Type`（`has_content_type == true`）时一律不覆盖；multipart 的头仍由 reqwest 生成 boundary
+- `_ =>` 分支现在覆盖 `raw`、`none` 与未知类型，新增 body 类型时先想清楚它该落哪一档
+
 ## 数据库
 
 - 连接：`app.pool.get().map_err(err)?`，用完即释放（drop），不要在命令里长期持有

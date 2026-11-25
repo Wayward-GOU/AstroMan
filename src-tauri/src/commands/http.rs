@@ -684,17 +684,14 @@ fn build_body_plan(
             Ok(PlannedBody::File(bytes))
         }
         _ => {
+            let raw = payload.body.as_deref().unwrap_or("");
             if !*has_content_type {
-                let content_type = match body_type {
-                    "json" => "application/json",
-                    "graphql" => "application/json",
-                    "form" => "application/x-www-form-urlencoded",
-                    _ => "text/plain; charset=utf-8",
-                };
-                headers.push(("Content-Type".to_string(), content_type.to_string()));
+                headers.push((
+                    "Content-Type".to_string(),
+                    infer_content_type(body_type, raw).to_string(),
+                ));
                 *has_content_type = true;
             }
-            let raw = payload.body.as_deref().unwrap_or("");
             // JSON 允许写注释（Postman 的 raw/JSON 编辑器同样如此），发送前去掉
             let source = if body_type == "json" {
                 strip_json_comments(raw)
@@ -706,6 +703,84 @@ fn build_body_plan(
             ))
         }
     }
+}
+
+/// 自动补的 Content-Type；必须与前端 `utils/bodyContentType.ts` 保持一致，
+/// 否则「实际请求」页签展示的头会和真正发出去的不一样。
+///
+/// Raw 类型按内容猜 JSON / XML，猜不中退回 text/plain。
+fn infer_content_type(body_type: &str, body: &str) -> &'static str {
+    match body_type {
+        "json" | "graphql" => "application/json",
+        "form" => "application/x-www-form-urlencoded",
+        "binary" => "application/octet-stream",
+        _ => {
+            let text = body.trim();
+            if text.is_empty() {
+                return "text/plain; charset=utf-8";
+            }
+            if looks_like_xml(text) {
+                return "application/xml; charset=utf-8";
+            }
+            if looks_like_json(text) {
+                return "application/json";
+            }
+            "text/plain; charset=utf-8"
+        }
+    }
+}
+
+/// 只认严格 JSON：内容会原样发出，标成 application/json 却解析不了反而误导排查
+fn looks_like_json(text: &str) -> bool {
+    if !matches!(text.as_bytes().first(), Some(b'{') | Some(b'[') | Some(b'"')) {
+        return false;
+    }
+    // 请求模板里的 {{变量}} 不是合法 JSON；换成 0 再判断，
+    // 否则 Raw 里写 JSON 模板会被标成 text/plain，服务端按文本处理
+    let probe = mask_template_vars(text);
+    serde_json::from_str::<serde_json::Value>(&probe).is_ok()
+}
+
+/// 把 `{{...}}` 换成数字占位；与前端 `bodyContentType.ts` 的正则替换保持同一语义
+fn mask_template_vars(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("{{") {
+        let Some(end) = rest[start + 2..].find("}}") else {
+            break;
+        };
+        out.push_str(&rest[..start]);
+        out.push('0');
+        rest = &rest[start + 2 + end + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn looks_like_xml(text: &str) -> bool {
+    let Some(rest) = text.strip_prefix('<') else {
+        return false;
+    };
+    if rest.starts_with("?xml") || rest.starts_with("!--") || rest.starts_with('!') {
+        return true;
+    }
+    let after = rest.strip_prefix('/').unwrap_or(rest);
+    let mut chars = after.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_alphabetic() || first == '_' || first == ':') {
+        return false;
+    }
+    for c in chars {
+        if c.is_whitespace() || c == '>' || c == '/' {
+            return true;
+        }
+        if !(c.is_alphanumeric() || matches!(c, '-' | '.' | '_' | ':')) {
+            return false;
+        }
+    }
+    false
 }
 
 fn apply_body(

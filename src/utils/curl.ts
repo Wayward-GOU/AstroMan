@@ -1,5 +1,7 @@
 import type { EnvVariable, HttpRequestDetail, KeyValueItem } from '@/types/models'
 import { base64Encode } from '@/tools/transforms'
+import { parseLooseJson } from '@/utils/looseJson'
+import { inferBodyContentType } from '@/utils/bodyContentType'
 
 export interface Snippet {
   key: string
@@ -122,19 +124,15 @@ function headerListAll(request: HttpRequestDetail): PreviewHeader[] {
     list.push({ key: added.key, value: added.value ?? '', source: 'auth' })
   }
   const bodyType = request.bodyType ?? 'none'
-  const body = (request.body ?? '').trim()
-  // multipart 的 Content-Type 必须由工具自动生成 boundary，不能手写
-  if (body && bodyType !== 'none' && bodyType !== 'multipart') {
+  // multipart 的 Content-Type 必须由工具自动生成 boundary，不能手写。
+  // 其余类型无论正文是否为空都要补（后端 build_body_plan 同样无条件补），
+  // 否则「实际请求」页签和真正发出的请求会对不上。
+  if (bodyType !== 'none' && bodyType !== 'multipart') {
     const hasContentType = list.some((item) => item.key.toLowerCase() === 'content-type')
     if (!hasContentType) {
       list.push({
         key: 'Content-Type',
-        value:
-          bodyType === 'form'
-            ? 'application/x-www-form-urlencoded'
-            : bodyType === 'binary'
-              ? 'application/octet-stream'
-              : 'application/json',
+        value: inferBodyContentType(bodyType, request.body ?? ''),
         source: 'auto',
       })
     }
@@ -147,19 +145,27 @@ function headerList(request: HttpRequestDetail): KeyValueItem[] {
 }
 
 function parseFormFields(body: string): { key: string; value: string; kind: string }[] {
+  const text = (body || '').trim()
+  if (!text) return []
+  let parsed: unknown
   try {
-    const parsed = JSON.parse(body || '[]')
-    if (!Array.isArray(parsed)) return []
-    return parsed
-      .filter((item) => item && item.enabled !== false && String(item.key ?? '').trim())
-      .map((item) => ({
-        key: String(item.key).trim(),
-        value: String(item.value ?? ''),
-        kind: item.kind === 'file' ? 'file' : 'text',
-      }))
+    parsed = JSON.parse(text)
   } catch {
-    return []
+    // 字段列表被手改成单引号 / 尾逗号时也要能生成 curl，否则会导出成空 multipart
+    try {
+      parsed = parseLooseJson(text).value
+    } catch {
+      return []
+    }
   }
+  if (!Array.isArray(parsed)) return []
+  return parsed
+    .filter((item) => item && item.enabled !== false && String(item.key ?? '').trim())
+    .map((item) => ({
+      key: String(item.key).trim(),
+      value: String(item.value ?? ''),
+      kind: item.kind === 'file' ? 'file' : 'text',
+    }))
 }
 
 /** Basic 认证用 curl -u 表达，避免把占位符提前 base64 后无法再替换 */

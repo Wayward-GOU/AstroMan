@@ -78,11 +78,35 @@ description: AstroMan 前端开发规范（Vue 3 + Ant Design Vue + Pinia + 设�
 - 注释只用于编辑态：发送前由 Rust 的 `util::strip_json_comments` 剥离（见 `astroman-backend`），前端不负责删注释
 - 格式化走 `utils/formatJson.ts`：`formatJsonAsync` 在 Worker 里解析，Worker 不可用时退回主线程；不要在大 Body 上直接 `JSON.parse`
 
-## JSON 模板格式化（`utils/formatJson.ts`）
+## 请求体解析（Body 六种类型）
 
-- `formatJsonTemplateAsync(text)` 专供请求 Body：先把 `{{...}}` 换成哨兵（字符串内只换文本、裸值补引号），格式化后按编号还原，`"ts": {{timestamp}}` 这类数值占位也能格式化且引号不变
-- 请求编辑器「格式化 JSON」必须用它，不要换回 `formatJsonAsync`；普通 JSON 行为保持不变
-- 用例在 `src/utils/__tests__/formatJson.spec.ts`（裸值 / 字符串内 / 数组 / 普通 JSON 四种）
+请求体的解析链路全部在 `src/utils/`，页面里不要再写 `JSON.parse` 兜底，也不要把「宽松」逻辑复制到别处。
+
+| 文件 | 职责 | 关键点 |
+|---|---|---|
+| `utils/formatJson.ts` | 格式化入口 + `{{变量}}` 掩码 + 发送前体检 | `formatJsonLooseAsync` / `formatJsonTemplateLooseAsync` 返回 `{ text, repairs }`；`checkJsonTemplate` 返回 `null \| { kind: 'loose' } \| { kind: 'invalid', message }` |
+| `utils/looseJson.ts` | 宽松 JSON 解析（手写递归下降，无依赖） | `parseLooseJson` 返回 `{ value, repairs }`；`describeLooseRepairs` 把 `LooseRepair[]` 翻成中文标签 |
+| `utils/formBody.ts` | urlencoded 表单解析与编码 | `parseFormBody` / `encodeFormPart` / `decodeFormPart` |
+| `utils/xmlFormat.ts` | XML 格式化 + `looksLikeXml` | Raw 类型格式化与 Content-Type 推断共用 |
+| `utils/bodyContentType.ts` | 自动补 Content-Type | 必须与后端 `http.rs::infer_content_type` 一致 |
+
+规则：
+
+- **JSON 走「先严格、后宽松」**：`JSON.parse` 成功就用标准结果，失败才用 `parseLooseJson`。宽松项包括单引号、尾逗号、无引号属性名、`//` 与 `/* */` 注释、全角标点、BOM、尾随分号；`bigNumber` 不是「已修复」而是提醒（裸写超出安全整数会丢精度）。
+- **改了字节就必须提示**：格式化会改写正文（单引号→双引号、全角→半角、去尾逗号），`RequestEditor.vue::notifyJsonFormatResult` 统一负责 `message.warning`，不要静默替换。
+- **占位符掩码要认引号类型**：`maskJsonTemplateVars` 区分「字符串内」和「裸值」，字符串内只换文本、裸值补引号。单引号串里的 `{{id}}` 不能补引号，否则会拼出嵌套引号。
+- **发送前只拦 `json` 类型**：`send()` 里先 `checkJsonTemplate`，不合规弹 `Modal.confirm`（仍然发送 / 返回修改），不擅自改写正文。`raw` 表达「原样发送」，不校验。
+- **GraphQL Variables 与 Form-Data 字段列表都要宽松兜底**：GraphQL 变量用单引号时此前会静默按 `{}` 发送；字段列表手改坏时此前会发空表单 / 导出空 multipart。两者现在都先严格后宽松。
+- **XML 格式化保持混合内容单行**：`<p>见 <b>x</b> 结束</p>` 不能被拆成多行，插入的换行会进文本节点改变渲染语义；注释 / CDATA / DOCTYPE 原样保留，标签内部不重排，必须幂等。
+- **Content-Type 前后端同一套规则**：Raw 按内容猜 JSON / XML / 纯文本（判断前先把 `{{变量}}` 掩成 `0`，否则 JSON 模板会退成 `text/plain`），空正文也补头，用户手写过一律不覆盖。改规则时 `bodyContentType.ts` 与 `http.rs::infer_content_type` 一起改，否则「实际请求」页签会与实际发送不一致。
+
+用例：`looseJson.spec.ts`、`formBody.spec.ts`、`xmlFormat.spec.ts`、`bodyContentType.spec.ts`、`formatJson.spec.ts`。改解析行为先补用例，尤其是「不报错但发错数据」那几条（多行表单、GraphQL 单引号变量）。
+
+### 请求体模板（`{{变量}}`）
+
+- `formatJsonTemplateLooseAsync(text)` 专供请求 Body：先把 `{{...}}` 换成哨兵（字符串内只换文本、裸值补引号），格式化后按编号还原，`"ts": {{timestamp}}` 这类数值占位也能格式化且引号不变
+- 请求编辑器「格式化 JSON」必须用它，不要换回 `formatJsonAsync`；普通 JSON 行为保持不变（`repairs` 为空时提示「已格式化」，非空时列出修正项）
+- 发送前体检用 `checkJsonTemplate`（同一套掩码），不要直接用 `checkJsonBody`，否则模板写法每次发送都会误报
 
 ## 数据池页（`views/DataPools.vue`）
 
@@ -126,7 +150,7 @@ v1.0.8 起大屏不在首页：`views/Dashboard.vue` 只剩总览 KPI、快捷�
 ### 顶栏与页签
 
 - 顶栏是**图标按钮组**（历史 / 文档 / 代码 / Cookie / AI 发送选项 / 证书 / 删除），不要再加文字按钮；图标必须带 `title` 与 `aria-label`，证书关闭时用危险色底
-- 「实际请求」页签展示的是 `utils/curl.ts` 里 `previewRequest()` 的结果：最终 URL、带来源标记（用户 / 认证 / 自动）的请求头、未解析变量告警。它与 cURL 导出共用同一份 `headerListAll`，改渲染口径要两边一起改
+- 「实际请求」页签展示的是 `utils/curl.ts` 里 `previewRequest()` 的结果：最终 URL、带来源标记（用户 / 认证 / 自动）的请求头、未解析变量告警。它与 cURL 导出共用同一份 `headerListAll`，改渲染口径要两边一起改；自动补的 `Content-Type` 来自 `utils/bodyContentType.ts`，与后端同一套规则
 - Host / UA / Accept-Encoding / Content-Length 由底层 HTTP 客户端补齐，前端拿不到，页签底部必须保留这句说明，不要凭空编值
 - 页签尽量细线化（`gap: 14px`、`padding: 8px 0`、`font-size: 12px`），无意义徽标（认证「无」、Body「none」、计数 0）直接隐藏，否则 1440px 下 6 个页签会被 antd 折叠进省略号
 - 协议下拉最小宽度 96px、发送按钮定宽，否则 `HTTP/1.1` 会被截成 `HT…`

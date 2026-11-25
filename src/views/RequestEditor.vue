@@ -48,7 +48,10 @@ import { useWorkspaceStore, type RequestTurnState, type RequestWorkspaceSnapshot
 import { setHandoff } from '@/stores/handoff'
 import { formatDateTime } from '@/utils/datetime'
 import { buildSnippets, previewRequest, type Snippet } from '@/utils/curl'
-import { formatJsonTemplateAsync } from '@/utils/formatJson'
+import { checkJsonTemplate, formatJsonTemplateLooseAsync } from '@/utils/formatJson'
+import { describeLooseRepairs, parseLooseJson, type LooseRepair } from '@/utils/looseJson'
+import { encodeFormPart, parseFormBody } from '@/utils/formBody'
+import { formatXml, looksLikeXml } from '@/utils/xmlFormat'
 import { findMatches } from '@/utils/jsonHighlight'
 import { replaceAllLiteral } from '@/utils/bodyReplace'
 import {
@@ -1039,15 +1042,27 @@ function bodyMetaFor(type: string): string {
 }
 
 /* ---------- multipart / binary / GraphQL ---------- */
-const multipartFields = computed<FormField[]>({
-  get() {
-    if (form.value.bodyType !== 'multipart') return []
+/** multipart 的字段列表存在 Body 里（JSON 数组）；手改成单引号 / 尾逗号也要能读回来 */
+function readMultipartFields(body: string): FormField[] {
+  const text = (body ?? '').trim()
+  if (!text) return []
+  try {
+    const parsed = JSON.parse(text)
+    return Array.isArray(parsed) ? (parsed as FormField[]) : []
+  } catch {
     try {
-      const parsed = JSON.parse(form.value.body || '[]')
-      return Array.isArray(parsed) ? (parsed as FormField[]) : []
+      const loose = parseLooseJson(text)
+      return Array.isArray(loose.value) ? (loose.value as FormField[]) : []
     } catch {
       return []
     }
+  }
+}
+
+const multipartFields = computed<FormField[]>({
+  get() {
+    if (form.value.bodyType !== 'multipart') return []
+    return readMultipartFields(form.value.body)
   },
   set(fields) {
     form.value.body = JSON.stringify(fields)
@@ -1090,34 +1105,10 @@ async function pickBinaryFile() {
 }
 
 /* ---------- urlencoded 表单（表格编辑，存储仍为 a=b&c=d） ---------- */
-function decodeFormPart(part: string): string {
-  try {
-    return decodeURIComponent(part.replace(/\+/g, ' '))
-  } catch {
-    return part
-  }
-}
-
-function encodeFormPart(part: string): string {
-  // {{变量}} 保持原样，避免被编码后无法在发送时替换
-  return part
-    .split(/(\{\{[^{}]*\}\})/)
-    .map((segment) => (/^\{\{[^{}]*\}\}$/.test(segment) ? segment : encodeURIComponent(segment)))
-    .join('')
-}
-
 const formFields = computed<KeyValueItem[]>({
   get() {
     if (form.value.bodyType !== 'form') return []
-    return (form.value.body || '')
-      .split('&')
-      .filter((chunk) => chunk.trim())
-      .map((chunk) => {
-        const index = chunk.indexOf('=')
-        const rawKey = index >= 0 ? chunk.slice(0, index) : chunk
-        const rawValue = index >= 0 ? chunk.slice(index + 1) : ''
-        return { key: decodeFormPart(rawKey), value: decodeFormPart(rawValue), enabled: true }
-      })
+    return parseFormBody(form.value.body || '').map((pair) => ({ ...pair, enabled: true }))
   },
   set(fields) {
     form.value.body = fields
@@ -1151,22 +1142,37 @@ function loadGraphqlBody() {
   }
 }
 
+/**
+ * 解析 GraphQL 变量输入框。
+ *
+ * 变量区是用户手写的，单引号 / 尾逗号 / 全角标点很常见：严格 JSON 失败后按宽松规则再试一次，
+ * 两种都失败才提示并按空对象发送（此前只要不是严格 JSON 就静默清空变量，容易发出错误请求而不自知）。
+ */
+function readGqlVariables(text: string): { value: Record<string, unknown> | null; error: string } {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    try {
+      parsed = parseLooseJson(text).value
+    } catch {
+      return { value: null, error: '变量不是合法 JSON，已按空对象发送' }
+    }
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { value: null, error: '变量需为 JSON 对象，已按空对象发送' }
+  }
+  return { value: parsed as Record<string, unknown>, error: '' }
+}
+
 function applyGraphqlBody() {
   if (gqlSyncing || form.value.bodyType !== 'graphql') return
   let variables: Record<string, unknown> = {}
   const text = gqlVarsText.value.trim()
   if (text) {
-    try {
-      const parsed = JSON.parse(text)
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        variables = parsed as Record<string, unknown>
-        gqlVarsError.value = ''
-      } else {
-        gqlVarsError.value = '变量需为 JSON 对象，已按空对象发送'
-      }
-    } catch {
-      gqlVarsError.value = '变量不是合法 JSON，已按空对象发送'
-    }
+    const parsed = readGqlVariables(text)
+    gqlVarsError.value = parsed.error
+    if (parsed.value) variables = parsed.value
   } else {
     gqlVarsError.value = ''
   }
@@ -1713,6 +1719,28 @@ async function send() {
       `请求体 ${fmtSize(plannedBytes)} 超过 ${fmtSize(REQUEST_BODY_MAX_BYTES)} 上限，未发送；请改用文件上传或拆分请求`,
     )
     return
+  }
+  // JSON 正文不合规范时先确认：发出去大概率被服务端 400，但确实有人要发原始文本
+  if (form.value.bodyType === 'json' && form.value.body.trim()) {
+    const issue = checkJsonTemplate(form.value.body)
+    if (issue) {
+      const detail =
+        issue.kind === 'loose'
+          ? `当前正文不是标准 JSON（${describeLooseRepairs(issue.repairs)}），可用「格式化 JSON」先修正`
+          : `JSON 语法错误：${issue.message}`
+      const go = await new Promise<boolean>((resolve) => {
+        Modal.confirm({
+          title: 'JSON 格式有误，仍要发送？',
+          content: `${detail}。服务端大概率返回 400。`,
+          okText: '仍然发送',
+          okType: 'danger',
+          cancelText: '返回修改',
+          onOk: () => resolve(true),
+          onCancel: () => resolve(false),
+        })
+      })
+      if (!go) return
+    }
   }
   // 记住发起时的接口与关键配置：中途切标签后，后台请求仍按发起时的口径完成
   const ownerId = form.value.id
@@ -2576,6 +2604,48 @@ const projectName = computed(
 /** 超过该字符数时格式化前先确认：大文本解析和回填会占用几百毫秒 */
 const FORMAT_CONFIRM_MAX = 2 * 1024 * 1024
 
+/** 格式化结果的提示：既要说清改了什么（会改变发送字节），也要单独提醒大整数精度 */
+function notifyJsonFormatResult(result: { repairs: LooseRepair[] }) {
+  const fixed = result.repairs.filter((item) => item !== 'bigNumber')
+  if (result.repairs.includes('bigNumber')) {
+    // 大整数无法"修复"，只能提醒：JSON 只有双精度浮点，超出安全范围就丢精度
+    message.warning(
+      '正文里有超出安全范围的整数，已按浮点数处理，末尾几位可能变化；需要原样传输请写成字符串',
+      6,
+    )
+  }
+  if (fixed.length) {
+    // 宽松模式会改写正文字节（单引号→双引号、全角→半角、去掉尾逗号），必须让用户知道
+    message.warning(
+      `已按宽松模式格式化：修正了${describeLooseRepairs(fixed)}，发送时将使用规范化后的 JSON`,
+      5,
+    )
+    return
+  }
+  if (!result.repairs.length) message.success('已格式化')
+}
+
+/** Raw 正文：先按 JSON 试，再按 XML 试，都不是就明确说清支持范围 */
+async function formatRawBody(text: string) {
+  const issue = checkJsonTemplate(text)
+  if (!issue || issue.kind === 'loose') {
+    const result = await formatJsonTemplateLooseAsync(text)
+    form.value.body = result.text
+    notifyJsonFormatResult(result)
+    return
+  }
+  if (looksLikeXml(text)) {
+    try {
+      form.value.body = formatXml(text)
+      message.success('已格式化为 XML')
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : 'XML 解析失败')
+    }
+    return
+  }
+  message.warning('Raw 目前支持 JSON 与 XML 格式化，当前内容未识别为这两种格式')
+}
+
 async function formatBody() {
   const text = form.value.body
   if (!text.trim()) return
@@ -2592,12 +2662,18 @@ async function formatBody() {
     })
     if (!confirmed) return
   }
-  const hide = message.loading('正在格式化…', 0)
+  const isRaw = form.value.bodyType === 'raw'
+  const hide = message.loading(isRaw ? '正在识别内容…' : '正在格式化…', 0)
   try {
-    form.value.body = await formatJsonTemplateAsync(text)
-    message.success('已格式化')
+    if (isRaw) {
+      await formatRawBody(text)
+      return
+    }
+    const result = await formatJsonTemplateLooseAsync(text)
+    form.value.body = result.text
+    notifyJsonFormatResult(result)
   } catch {
-    message.error('JSON 解析失败，请检查格式')
+    message.error(isRaw ? '格式化失败，请检查内容' : 'JSON 解析失败，请检查格式')
   } finally {
     hide()
   }
@@ -3269,13 +3345,14 @@ function copyResponseHeaders() {
                     </a-radio-button>
                   </a-radio-group>
                   <a-button
-                    v-if="form.bodyType === 'json'"
+                    v-if="form.bodyType === 'json' || form.bodyType === 'raw'"
                     size="small"
                     type="link"
                     :disabled="!form.body.trim()"
+                    :title="form.bodyType === 'raw' ? 'Raw 内容按 JSON / XML 自动识别并格式化' : ''"
                     @click="formatBody"
                   >
-                    格式化 JSON
+                    {{ form.bodyType === 'json' ? '格式化 JSON' : '格式化' }}
                   </a-button>
                   <a-button
                     v-if="form.bodyType === 'json' || form.bodyType === 'raw'"
@@ -3947,7 +4024,8 @@ function copyResponseHeaders() {
                   </div>
 
                   <div class="sent-note">
-                    Host、User-Agent、Accept-Encoding、Content-Length 等由 HTTP 客户端与网络层补齐，不在此列出{{
+                    Host、User-Agent、Accept-Encoding、Content-Length 等由 HTTP 客户端与网络层补齐，不在此列出；
+                    Form-Data 的 Content-Type（含 boundary）也由客户端生成，此处不展示{{
                       sentPreview.secretVars.length
                         ? '；敏感变量只保留占位符，不显示实际值'
                         : ''

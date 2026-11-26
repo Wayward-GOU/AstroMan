@@ -732,7 +732,10 @@ fn infer_content_type(body_type: &str, body: &str) -> &'static str {
 
 /// 只认严格 JSON：内容会原样发出，标成 application/json 却解析不了反而误导排查
 fn looks_like_json(text: &str) -> bool {
-    if !matches!(text.as_bytes().first(), Some(b'{') | Some(b'[') | Some(b'"')) {
+    if !matches!(
+        text.as_bytes().first(),
+        Some(b'{') | Some(b'[') | Some(b'"')
+    ) {
         return false;
     }
     // 请求模板里的 {{变量}} 不是合法 JSON；换成 0 再判断，

@@ -244,8 +244,8 @@ describe('阶段四：工具生态', () => {
     expect(TOOL_CATALOG).not.toContain('把 JSON 转成 Java')
     // 目录整体保持精简（v1.0.9 新增抓包 7 + 测试 10 + 批量创建 1 个长尾工具，
     // W5 列表工具补 offset / limit 参数；v1.1.2 新增 cluster_* / pool_* 只进名字清单，
-    // 上限随清单放宽，仍以 ratio ≤ 0.7 约束提示词占比）
-    expect(TOOL_CATALOG.length).toBeLessThan(5200)
+    // v1.1.6 压测 / 报告工具补多接口说明；上限随清单放宽，仍以 ratio ≤ 0.7 约束提示词占比）
+    expect(TOOL_CATALOG.length).toBeLessThan(5400)
     // 验收：注入字符数相比全量目录下降 ≥30%
     const stats = toolCatalogStats()
     expect(stats.ratio).toBeLessThanOrEqual(0.7)

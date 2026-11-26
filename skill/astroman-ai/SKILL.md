@@ -348,6 +348,9 @@ node -e "const s=require('fs').readFileSync('src/utils/aiTools.ts','utf8');const
 - `plan_save` 生成的结构必须与「压测」页 `currentPlanConfig()` 完全一致（`settings` / `stages` / `envId`），否则载入后参数会丢
 - `settings.stages` 只在 `mode === 'stages'` 时写入，`slaEnabled` 由是否传 SLA 决定；`stress_start` 同样支持 `stages` 与 `slaP95/P99/ErrorRate/MinRps`
 - 顺序固定：读接口 → 用文字给完整计划 → 用户确认 → `plan_save` → 再单独问是否 `stress_start`
+- 多接口合并压测：`plan_save` / `stress_start` 用 `requestIds`（去重、最多 20 个）+ `requestWeights`（按顺序对应，缺省或 0 交给后端平均分配）；各接口保留自身的 Headers / Params / Body / 认证，共享计划级 Token 池与参数池（`poolBindings`），最终只产出一份合并报告。确认方案时列出接口清单与权重，**不要**为每个接口分别 `stress_start`
+- `report_get` 对多接口报告额外返回「按接口汇总」（接口 / 方法 / 权重 / 请求数 / 成功数 / 失败数 / 成功率 / 平均响应 / 最长响应），报告目标显示「全部接口（共 N 个）」；回答各接口表现时优先引用该字段，不要按 URL 自行猜测
+- `report_export` 的 `format` 支持 `html` 与 `classic`（经典版式，封面 / 目录 / KPI 卡片 / 完整时间轴）
 
 ### 自动化测试域（22 个 `test_*` 工具）
 
@@ -535,7 +538,7 @@ node -e "const s=require('fs').readFileSync('src/utils/aiTools.ts','utf8');const
 - **费用估算**：`src/utils/aiPricing.ts` 按模型名正则匹配厂商公开单价（USD/1M tokens），匹配不到走默认价并在 UI 标注「默认估算」；导出 `estimateCost / fmtUsd / fmtCny / fmtUnit`，汇率常量 `USD_TO_CNY`
 - `ai_tool_log_stats` 的 `LIMIT 60`：工具准确率覆盖全部常见工具；`ai_usage_logs` 支持 `ok` 参数筛选成功/失败
 - 列表类工具统一 `summarizeList()` 返回 `{ total, shown, truncated, items }`（明细限 50），模型引用 `total` 而非数条目；界面用 `summary` + 截断标签展示
-- **报告里的 QPS 字段**：`report_get` 只返回后端聚合的 `平均QPS` / `最高QPS`，以及最近 30 个采样点；90% 分布、单并发、目标达成率是前端 `qpsOverview()` 派生的，**不在工具返回值里**。需要让模型解释这三个值时，走页面内「AI 解读」（`reportReviewPrompt` 已带上），不要让模型自己拿采样点口算后编一个数
+- **报告里的 QPS 字段**：`report_get` 只返回后端聚合的 `平均QPS` / `最高QPS`，以及最近 30 个采样点；90% 分布、单并发、目标达成率是前端 `qpsOverview()` 派生的，**不在工具返回值里**。需要让模型解释这三个值时，走页面内「AI 解读」（`reportReviewPrompt` 已带上），不要让模型自己拿采样点口算后编一个数。多接口报告还会返回「按接口汇总」，逐接口指标直接取这里，别再按 URL 统计行手动累加
 - **工具输出先中文化再回灌**：`report_list` / `report_get` 由 `reportRows()` / `reportDigest()` 把 status（completed→已完成）、mode（fixed→固定并发）、bodyType（json→JSON）、errorType（TIMEOUT→请求超时）映射成中文，`requestId` / `envId` 解析成请求名 / 项目名 / 环境名，时间统一 `YYYY-MM-DD HH:MM:SS`；`history_list` 由 `historyRows()` 把 projectId 换成项目名。映射表是 `REPORT_STATUS_LABELS` / `STRESS_MODE_LABELS` / `BODY_TYPE_LABELS` / `ERROR_TYPE_LABELS`，新增枚举值时先补表
 - **其余查询类工具的取值规范**：`project_list` / `request_list` / `request_search` / `request_options` / `plan_list` 统一把 `updatedAt` 换成 `fmtTime` 本地时间；`env_list` 用中文键并给 `isSecret` 变量打码（明文密钥禁止进入模型上下文）；`workspace_stats` 走 `workspaceDigest()`、`dashboard_metrics` 走 `dashboardDigest()`，`topRequests.successRate` / `Reports.errorRate` 后端已是 **0–100**，不要再乘 100；`send_request` 的 `formatHttpResult` 用 `HTTP_STATUS_CN` 输出「200 成功」并把耗时/体积换成毫秒/KB
 - **空态自我介绍**：会话为空时显示 hero（头像 + 一段定位说明）、4 张能力卡（调接口 / 做工程 / 查数据 / 有留痕，数据来自 script 里的 `capabilities`）、敏感操作提示、以及 6 个可点击填充的 `suggestions`；改能力清单只改 `capabilities`，不用动模板

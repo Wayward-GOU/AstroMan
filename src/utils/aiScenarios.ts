@@ -218,12 +218,51 @@ export function reportReviewPrompt(detail: ReportDetail): string {
   const urlStats = (detail.urlStats ?? []).slice(0, 10)
   const errorUrls = (detail.urlStats ?? []).filter((item) => item.errorCount > 0).slice(0, 10)
   const loadGenerators = detail.loadGenerators ?? []
+  // 多接口合并压测：按接口归并 URL 统计，提示词里直接给出「每个接口各跑得怎么样」
+  const requestTargets = (config?.requests ?? []).filter(
+    (item) => item && (item.url || item.name),
+  )
+  const multiTarget = requestTargets.length > 1
+  const urlKeyOf = (method: string, url: string) => {
+    try {
+      const parsed = new URL(url)
+      return `${(method || '').toUpperCase()} ${parsed.origin}${parsed.pathname}`
+    } catch {
+      return `${(method || '').toUpperCase()} ${String(url).split('?')[0]}`
+    }
+  }
+  const interfaceSummary = multiTarget
+    ? requestTargets.map((item) => {
+        const key = urlKeyOf(item.method ?? '', item.url ?? '')
+        const rows = (detail.urlStats ?? []).filter(
+          (row) => urlKeyOf(row.method, row.url) === key,
+        )
+        const requests = rows.reduce((sum, row) => sum + row.requests, 0)
+        const success = rows.reduce((sum, row) => sum + row.successCount, 0)
+        const sumMs = rows.reduce((sum, row) => sum + row.avgMs * row.requests, 0)
+        const maxMs = rows.reduce((sum, row) => Math.max(sum, row.maxMs), 0)
+        return {
+          接口: item.name || item.url || '未命名接口',
+          方法: item.method ?? '',
+          权重: item.weight && item.weight > 0 ? `${(item.weight * 100).toFixed(1)}%` : '平均',
+          请求数: requests,
+          成功率: requests > 0 ? `${((success / requests) * 100).toFixed(2)}%` : '—',
+          平均耗时: `${(requests > 0 ? sumMs / requests : 0).toFixed(1)}ms`,
+          最长耗时: `${maxMs.toFixed(1)}ms`,
+        }
+      })
+    : []
   return `请解读这份压测报告并给出结论。
 
 【压测基本信息】
 标题：${title}
 计划：${report.planName}
 状态：${report.status}
+接口：${
+    multiTarget
+      ? `全部接口（共 ${requestTargets.length} 个，共享同一 Token / 参数池）`
+      : '单接口'
+  }
 并发：${report.concurrency}
 目标 QPS：${qps.target || '未设置'}
 总请求：${report.totalRequests}，成功 ${report.successCount}，失败 ${report.errorCount}
@@ -246,6 +285,16 @@ TTFB 平均：${report.ttfbAvg.toFixed(1)}ms，TTFB P95：${report.ttfbP95.toFix
 【配置与 SLA】
 ${block(config, 3000)}
 
+${
+  multiTarget
+    ? `【按接口汇总（多接口合并压测）】
+${block(interfaceSummary, 3000)}
+
+请按接口对比表现：指出哪个接口最慢 / 错误最多、权重分配是否合理，并分别给出优化建议。
+
+`
+    : ''
+}
 【URL 统计（按方法 + 地址 + 状态码聚合，最多 10 个）】
 ${
   urlStats.length
@@ -392,7 +441,7 @@ SLA：${settings.slaEnabled ? `P95 ≤ ${settings.slaP95}ms，P99 ≤ ${settings
 
 请输出：
 1. 压测目标与前置条件（环境、数据准备、是否可压线上）；
-2. 推荐参数：模式（固定并发 / 梯度）、并发、时长、爬坡、思考时间、目标 QPS、SLA 阈值，并说明依据；
+2. 推荐参数：模式（固定并发 / 梯度）、并发、时长、爬坡、思考时间、目标 QPS、SLA 阈值，并说明依据；若需要多接口合并压测，再列出接口清单、权重占比（合计 100%）与共享 Token / 参数池建议；
 3. 风险与止损策略（错误率、超时、下游依赖）；
 4. 观察指标与判定标准；
 5. 最后给出一段可直接使用的参数（JSON，字段名用 concurrent / durationSec / rampUpSec / thinkTimeMs / targetRps / stages / sla）。`

@@ -40,6 +40,7 @@ import {
   loadGeneratorsForReport,
   REPORT_DISCLAIMER,
 } from '@/utils/reportExport'
+import { buildClassicReportHtml } from '@/utils/reportClassic'
 import { detectKnee, qpsOverview, reportPeaks, scoreReport, selfCheck } from '@/utils/reportAnalytics'
 import { buildFindings, cdfPoints, gradeReport, latencyDrift, type Finding } from '@/utils/reportNarrative'
 import { copyToClipboard } from '@/utils/clipboard'
@@ -230,6 +231,47 @@ const urlStatsComplete = computed(
 )
 /** 错误地址：只展示存在失败请求的 URL */
 const errorUrls = computed(() => urlStats.value.filter((item) => item.errorCount > 0))
+
+/** 接口匹配键：忽略查询串差异（URL 统计会脱敏敏感参数） */
+function requestUrlKey(method: string, url: string): string {
+  let path = url
+  try {
+    const parsed = new URL(url)
+    path = `${parsed.origin}${parsed.pathname}`
+  } catch {
+    path = url.split('?')[0]
+  }
+  return `${(method || '').toUpperCase()} ${path}`
+}
+
+/** 多接口报告：把 URL 统计按接口名称归并，回答「每个接口各跑得怎么样」 */
+const requestSummaries = computed(() => {
+  const targets = config.value?.requests ?? []
+  if (targets.length < 2) return []
+  return targets.map((target) => {
+    const key = requestUrlKey(target.method ?? '', target.url ?? '')
+    const rows = urlStats.value.filter(
+      (row) => requestUrlKey(row.method, row.url) === key,
+    )
+    const requests = rows.reduce((sum, row) => sum + row.requests, 0)
+    const success = rows.reduce((sum, row) => sum + row.successCount, 0)
+    const errors = rows.reduce((sum, row) => sum + row.errorCount, 0)
+    const sumMs = rows.reduce((sum, row) => sum + row.avgMs * row.requests, 0)
+    const maxMs = rows.reduce((sum, row) => Math.max(sum, row.maxMs), 0)
+    return {
+      name: target.name || target.url || '未命名接口',
+      method: target.method ?? '',
+      url: target.url ?? target.urlTemplate ?? '',
+      weight: target.weight ?? 0,
+      requests,
+      success,
+      errors,
+      successRate: requests > 0 ? (success / requests) * 100 : 0,
+      avgMs: requests > 0 ? sumMs / requests : 0,
+      maxMs,
+    }
+  })
+})
 
 function urlSuccessRate(row: UrlStat) {
   return row.requests > 0 ? (row.successCount / row.requests) * 100 : 0
@@ -471,6 +513,15 @@ const capacityUsage = computed(() => {
 /* ---------- 目标地址兜底（3.5.2） ---------- */
 const targetUrlInfo = computed(() => {
   const cfg = config.value
+  const count = cfg?.requestCount ?? cfg?.requests?.length ?? 0
+  // 多接口报告不展示首个地址，直接标注「全部接口」，明细见「按接口汇总」
+  if (count > 1) {
+    return {
+      url: '',
+      source: 'multi' as const,
+      note: `全部接口（共 ${count} 个）`,
+    }
+  }
   const raw = cfg?.url?.trim() ?? ''
   const resolved = cfg?.target?.resolvedUrl?.trim() ?? ''
   const isUnresolved = (text: string) => !text || text.includes('{{')
@@ -1168,11 +1219,12 @@ function codeTone(code: number) {
   return 'ok'
 }
 
-type ExportFormat = 'json' | 'html' | 'excel' | 'csv-requests' | 'csv-errors'
+type ExportFormat = 'json' | 'html' | 'classic-html' | 'excel' | 'csv-requests' | 'csv-errors'
 
 const EXPORT_META: Record<ExportFormat, { extension: string; filterName: string; label: string }> = {
   json: { extension: 'json', filterName: 'AstroMan 压测报告', label: 'JSON 归档' },
   html: { extension: 'html', filterName: 'HTML 报告', label: 'HTML 报告' },
+  'classic-html': { extension: 'html', filterName: 'HTML 报告', label: '经典报告' },
   excel: { extension: 'xlsx', filterName: 'Excel 工作簿', label: 'Excel 表格' },
   'csv-requests': { extension: 'csv', filterName: 'CSV 明细', label: '请求明细 CSV' },
   'csv-errors': { extension: 'csv', filterName: 'CSV 明细', label: '错误明细 CSV' },
@@ -1188,7 +1240,7 @@ async function exportReport(format: ExportFormat) {
   try {
     const path = await save({
       title: `导出压测报告（${meta.label}）`,
-      defaultPath: `${safeName}-report.${meta.extension}`,
+      defaultPath: `${safeName}${format === 'classic-html' ? '-经典报告' : '-report'}.${meta.extension}`,
       filters: [{ name: meta.filterName, extensions: [meta.extension] }],
     })
     if (!path) return
@@ -1205,7 +1257,7 @@ async function exportReport(format: ExportFormat) {
     } else {
       // HTML 报告只用到首屏明细兜底目标地址与 Top10 慢请求；
       // Excel 的请求明细改由后端直接查库写入，前端同样只需要一条地址兜底。
-      const htmlMode = format === 'html'
+      const htmlMode = format === 'html' || format === 'classic-html'
       const recordLimit = htmlMode
         ? (data.slowRequests?.length ?? 0) > 0
           ? 200
@@ -1230,6 +1282,9 @@ async function exportReport(format: ExportFormat) {
             baseline: baselineDetail,
           }),
         )
+        await api.reportWriteFile(target, Array.from(bytes))
+      } else if (format === 'classic-html') {
+        const bytes = new TextEncoder().encode(buildClassicReportHtml(data, records.items))
         await api.reportWriteFile(target, Array.from(bytes))
       } else {
         const sheets = buildReportSheets(data, records.items, {
@@ -1318,6 +1373,7 @@ function remove() {
             <a-menu-divider />
             <a-menu-item key="json">JSON 归档（完整数据）</a-menu-item>
             <a-menu-item key="html">HTML 报告（可视化）</a-menu-item>
+            <a-menu-item key="classic-html">经典报告</a-menu-item>
             <a-menu-item key="excel">Excel 表格（多工作表）</a-menu-item>
             <a-menu-divider />
             <a-menu-item key="csv-requests">请求明细 CSV（全量流式导出）</a-menu-item>
@@ -1357,7 +1413,9 @@ function remove() {
               <span v-if="qps?.attainment != null">达成 {{ fmtNum(qps.attainment, 0) }}%</span>
             </div>
             <div v-if="targetUrlInfo.url || targetUrlInfo.note" class="target-line">
-              <span class="method-chip">{{ config?.method || 'GET' }}</span>
+              <span v-if="targetUrlInfo.source !== 'multi'" class="method-chip">{{
+                config?.method || 'GET'
+              }}</span>
               <span
                 v-if="targetUrlInfo.url"
                 class="target-url mono"
@@ -1373,7 +1431,7 @@ function remove() {
               >
                 <CopyOutlined />
               </span>
-              <span v-else class="target-url missing">{{ targetUrlInfo.note }}</span>
+              <span v-else class="target-url multi-target">{{ targetUrlInfo.note }}</span>
               <span v-if="targetUrlInfo.url && targetUrlInfo.note" class="target-note">
                 {{ targetUrlInfo.note }}
               </span>
@@ -2522,6 +2580,60 @@ function remove() {
           </div>
         </div>
 
+        <template v-if="requestSummaries.length">
+          <div class="section-head">
+            <div>
+              <h2 class="section-title">按接口汇总</h2>
+              <div class="section-desc">
+                本次压测共 {{ requestSummaries.length }} 个接口，共享同一 Token / 参数池；整体 KPI 为全接口合并口径。
+              </div>
+            </div>
+          </div>
+          <div class="fm-card request-card">
+            <div class="data-table request-table">
+              <table>
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>接口</th>
+                    <th>方法</th>
+                    <th>权重</th>
+                    <th>请求数</th>
+                    <th>成功 / 失败</th>
+                    <th>成功率</th>
+                    <th>平均耗时</th>
+                    <th>最长耗时</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="(row, index) in requestSummaries" :key="`${row.method}-${row.url}`">
+                    <td class="mono">{{ index + 1 }}</td>
+                    <td class="req-url-col" :title="row.url">
+                      <div>{{ row.name }}</div>
+                      <div class="mono target-note">{{ row.url }}</div>
+                    </td>
+                    <td class="req-method-col">
+                      <span class="req-method">{{ row.method }}</span>
+                    </td>
+                    <td class="mono">{{ (row.weight * 100).toFixed(1) }}%</td>
+                    <td class="mono">{{ fmtNum(row.requests, 0) }}</td>
+                    <td class="mono">
+                      <span>{{ fmtNum(row.success, 0) }}</span>
+                      /
+                      <span :class="{ bad: row.errors > 0 }">{{ fmtNum(row.errors, 0) }}</span>
+                    </td>
+                    <td class="mono" :class="{ bad: row.errors > 0 }">
+                      {{ row.successRate.toFixed(2) }}%
+                    </td>
+                    <td class="mono">{{ fmtNum(row.avgMs, 0) }} ms</td>
+                    <td class="mono">{{ fmtNum(row.maxMs, 0) }} ms</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </template>
+
         <div class="section-head">
           <div>
             <h2 class="section-title">URL 统计</h2>
@@ -2967,7 +3079,24 @@ function remove() {
   align-items: center;
   justify-content: space-between;
   gap: 20px;
-  padding: 20px 22px;
+  padding: 22px 24px;
+  position: relative;
+  overflow: hidden;
+}
+
+/* 顶部主题色细条：和导出报告的封面呼应，快速区分「概览区」 */
+.overview::before {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto;
+  height: 3px;
+  background: linear-gradient(90deg, var(--fm-primary), var(--fm-chart-2));
+  opacity: 0.85;
+}
+
+.overview-main {
+  flex: 1;
+  min-width: 0;
 }
 
 .title-row {
@@ -2989,10 +3118,12 @@ function remove() {
 }
 
 .report-name {
-  font-size: 18px;
+  font-size: 19px;
   font-weight: 700;
   margin: 0;
   letter-spacing: -0.2px;
+  line-height: 1.35;
+  word-break: break-word;
 }
 
 .status-pill {
@@ -3073,6 +3204,29 @@ function remove() {
   color: var(--fm-primary);
 }
 
+/* 多接口报告：主目标后补充「共 N 个接口」的说明 */
+.target-note {
+  flex-shrink: 0;
+  align-self: center;
+  font-size: 10.5px;
+  color: var(--fm-muted);
+  white-space: nowrap;
+}
+
+.target-url.missing {
+  color: var(--fm-muted);
+  cursor: default;
+  font-size: 12px;
+}
+
+/* 多接口：目标直接写「全部接口（共 N 个）」 */
+.target-url.multi-target {
+  color: var(--fm-text-2);
+  cursor: default;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
 .verdict {
   display: flex;
   align-items: center;
@@ -3116,16 +3270,22 @@ function remove() {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 10px;
-  margin-top: 16px;
+  margin-top: 18px;
 }
 
 .metric-card {
-  padding: 12px 14px;
+  padding: 14px 15px 13px;
   display: flex;
   flex-direction: column;
-  gap: 5px;
+  gap: 6px;
   position: relative;
   overflow: hidden;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.metric-card:hover {
+  border-color: var(--fm-border-strong);
+  box-shadow: 0 2px 10px -4px var(--fm-border-strong);
 }
 
 /* 指标顶部语义色条：吞吐主色、峰值蓝、成功率/APDEX 按结果取色、延迟警示色 */
@@ -3176,14 +3336,15 @@ function remove() {
 
 .m-label {
   font-size: 10px;
+  letter-spacing: 0.02em;
   color: var(--fm-muted);
 }
 
 .m-value {
-  font-size: 16px;
+  font-size: 18px;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
-  line-height: 1.3;
+  line-height: 1.25;
   white-space: nowrap;
 }
 
@@ -3330,7 +3491,7 @@ function remove() {
 .two-col {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 14px;
+  gap: 16px;
   margin-top: 16px;
 }
 
@@ -3541,7 +3702,7 @@ function remove() {
 .charts {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 14px;
+  gap: 16px;
   margin-top: 16px;
 }
 
@@ -4151,18 +4312,36 @@ function remove() {
   display: flex;
   align-items: flex-end;
   justify-content: space-between;
-  margin: 20px 2px 10px;
+  gap: 12px;
+  margin: 28px 2px 12px;
+  padding-bottom: 9px;
+  border-bottom: 1px solid var(--fm-border);
 }
 
 .section-title {
-  font-size: 14px;
+  position: relative;
+  font-size: 15px;
   font-weight: 700;
   margin: 0;
+  padding-left: 11px;
+  letter-spacing: 0.01em;
+}
+
+.section-title::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 3px;
+  bottom: 3px;
+  width: 3px;
+  border-radius: var(--fm-radius-pill);
+  background: linear-gradient(180deg, var(--fm-primary), var(--fm-chart-2));
 }
 
 .section-desc {
-  margin-top: 4px;
+  margin-top: 5px;
   font-size: 11px;
+  line-height: 1.65;
   color: var(--fm-muted);
 }
 
@@ -4407,7 +4586,8 @@ function remove() {
 
 /* ---------- 关键发现 ---------- */
 .findings-card {
-  margin-top: 12px;
+  margin-top: 14px;
+  padding: 16px 18px;
 }
 .grade-badge {
   font-size: 11px;
@@ -4559,7 +4739,8 @@ function remove() {
 
 /* ---------- 施压端能力 ---------- */
 .capacity-card {
-  margin-top: 12px;
+  margin-top: 14px;
+  padding: 16px 18px;
 }
 .capacity-badge {
   font-size: 11px;
@@ -4611,7 +4792,8 @@ function remove() {
 
 /* ---------- 基线对比 ---------- */
 .baseline-card {
-  margin-top: 12px;
+  margin-top: 14px;
+  padding: 16px 18px;
 }
 .baseline-head {
   display: flex;

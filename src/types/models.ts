@@ -347,6 +347,18 @@ export interface PlanTargetSnapshot {
   capturedAt?: number | null
 }
 
+/** 报告中的单个接口目标（config_json.requests[]） */
+export interface ReportTargetSnapshot {
+  requestId?: number | null
+  name?: string
+  method?: string
+  /** 解析后的完整地址 */
+  url?: string
+  urlTemplate?: string
+  /** 流量权重（0-1，已归一） */
+  weight?: number
+}
+
 export interface PlanImportMatch {
   planName: string
   requestId?: number | null
@@ -975,6 +987,23 @@ export interface StressConfig {
   longRunAck?: boolean
   /** 参数池 / Token 池绑定（v1.1.2） */
   poolBindings?: PoolBinding[]
+  /** 多接口压测：按权重分发请求，共享上方池绑定 */
+  requests?: StressRequestDef[]
+}
+
+/** 多接口压测中的单个接口定义 */
+export interface StressRequestDef {
+  requestId?: number | null
+  name: string
+  method: string
+  url: string
+  headers: KeyValueItem[]
+  params: KeyValueItem[]
+  bodyType: string
+  body?: string | null
+  auth?: RequestAuth | null
+  /** 流量权重；缺省或全部为 0 时按平均分配 */
+  weight?: number | null
 }
 
 /** capacity：容量模式；locate：定位模式；auto：沿用 recordDetail 并自动降档 */
@@ -1317,6 +1346,10 @@ export interface ReportConfigSnapshot {
   url?: string
   /** URL 模板原文（可能含 {{变量}}） */
   urlTemplate?: string
+  /** 多接口压测的接口数量 */
+  requestCount?: number
+  /** 多接口压测的接口清单（含解析后地址与权重） */
+  requests?: ReportTargetSnapshot[]
   /** 目标快照（3.5.1 双存地址） */
   target?: PlanTargetSnapshot | null
   headers?: number

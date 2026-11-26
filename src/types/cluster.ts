@@ -216,7 +216,72 @@ export interface ClusterMasterSnapshot {
   poolEstimate?: PoolSizeEstimate | null
   /** 单节点池切片字节上限 */
   poolSliceLimitBytes: number
+  /** 本任务发出的设备邀请 */
+  invites?: MasterInvite[]
   createdAt: number
+}
+
+/** 在线设备（UDP 17803 在场广播） */
+export interface DiscoveredPeer {
+  deviceId: string
+  name: string
+  host: string
+  invitePort: number
+  addr: string
+  version: string
+  os: string
+  arch: string
+  cores: number
+  memGb: number
+  budget: number
+  /** idle / busy / running */
+  state: string
+  joinable: boolean
+  allowInvite: boolean
+  lastSeenMs: number
+  latencyMs: number
+  isSelf: boolean
+}
+
+/** 设备发现状态 */
+export interface PresenceStatus {
+  running: boolean
+  deviceId: string
+  deviceName: string
+  discoverable: boolean
+  /** ask / auto / off */
+  invitePolicy: string
+  udpPort: number
+  invitePort: number
+  peerCount: number
+  pendingCount: number
+  state: string
+  error?: string | null
+}
+
+/** 主节点发出的邀请 */
+export interface MasterInvite {
+  requestId: string
+  jobId: number
+  peerDeviceId?: string | null
+  peerName: string
+  peerAddr: string
+  /** pending / accepted / expired / failed */
+  status: string
+  message?: string | null
+  createdAt: number
+  expiresAt: number
+}
+
+/** 收到邀请时的弹窗内容 */
+export interface InviteNotice {
+  requestId: string
+  masterName: string
+  masterAddr: string
+  jobName: string
+  expectedConcurrency: number
+  expiresAt: number
+  receivedAt: number
 }
 
 /** 从节点会话快照 */

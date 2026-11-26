@@ -126,7 +126,10 @@ import type {
   ClusterSlaveHistoryItem,
   ClusterSlaveSnapshot,
   DiscoveredMaster,
+  DiscoveredPeer,
   DiscoveryStatus,
+  MasterInvite,
+  PresenceStatus,
   StressBudget,
   VarAuditReport,
 } from '@/types/cluster'
@@ -559,9 +562,32 @@ export const clusterJoinDiscovered = (masterAddr: string, nodeName?: string | nu
     nodeName: nodeName ?? null,
   })
 
+/* ---------- 设备在场发现与邀请（17803） ---------- */
+export const clusterPresenceStart = () => invoke<PresenceStatus>('cluster_presence_start')
+export const clusterPresenceStop = () => invoke<PresenceStatus>('cluster_presence_stop')
+export const clusterPresenceStatus = () => invoke<PresenceStatus>('cluster_presence_status')
+export const clusterPresenceList = () => invoke<DiscoveredPeer[]>('cluster_presence_list')
+
+/** 主节点邀请在线设备加入当前任务 */
+export const clusterInviteSend = (
+  jobId: number,
+  host: string,
+  port: number,
+  deviceId?: string | null,
+) =>
+  invoke<MasterInvite>('cluster_invite_send', {
+    jobId,
+    host,
+    port,
+    deviceId: deviceId ?? null,
+  })
+
+/** 被邀请方接受 / 拒绝邀请 */
+export const clusterInviteRespond = (requestId: string, accept: boolean) =>
+  invoke<ClusterSlaveSnapshot>('cluster_invite_respond', { requestId, accept })
+
 /** 本机并发预算（自动探测 / 手动） */
 export const stressBudgetGet = () => invoke<StressBudget>('stress_budget_get')
-
 export const stressBudgetSet = (mode: 'auto' | 'manual', manualLimit?: number | null) =>
   invoke<StressBudget>('stress_budget_set', {
     mode,

@@ -163,7 +163,9 @@ CREATE TABLE IF NOT EXISTS report_samples (
     body_p95      REAL DEFAULT 0,
     bytes         INTEGER DEFAULT 0,
     success_count INTEGER DEFAULT 0,
-    error_count   INTEGER DEFAULT 0
+    error_count   INTEGER DEFAULT 0,
+    -- 有响应的请求数：Body / TTFB 均值权重，v16
+    response_count INTEGER DEFAULT 0
 );
 
 -- 报告错误明细（最多保留前 500 条）

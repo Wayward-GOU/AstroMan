@@ -405,7 +405,8 @@ fn load_detail(conn: &rusqlite::Connection, id: i64) -> Result<ReportDetail, Str
     let mut sample_stmt = conn
         .prepare(
             "SELECT elapsed_sec, concurrent, qps, avg_rt, p50_rt, p95_rt, p99_rt,
-                    ttfb_avg, body_avg, body_p95, bytes, success_count, error_count
+                    ttfb_avg, body_avg, body_p95, bytes, success_count, error_count,
+                    response_count
              FROM report_samples WHERE report_id = ?1 ORDER BY elapsed_sec ASC",
         )
         .map_err(err)?;
@@ -425,6 +426,7 @@ fn load_detail(conn: &rusqlite::Connection, id: i64) -> Result<ReportDetail, Str
                 bytes: row.get::<_, i64>(10)?.max(0) as u64,
                 success_count: row.get::<_, i64>(11)?.max(0) as u64,
                 error_count: row.get::<_, i64>(12)?.max(0) as u64,
+                response_count: row.get::<_, i64>(13)?.max(0) as u64,
             })
         })
         .map_err(err)?
@@ -1124,7 +1126,8 @@ fn write_sample_sheet(
     let mut stmt = conn
         .prepare(
             "SELECT elapsed_sec, concurrent, qps, avg_rt, p50_rt, p95_rt, p99_rt,
-                    ttfb_avg, body_avg, body_p95, bytes, success_count, error_count
+                    ttfb_avg, body_avg, body_p95, bytes, success_count, error_count,
+                    response_count
              FROM report_samples WHERE report_id = ?1 ORDER BY elapsed_sec ASC",
         )
         .map_err(err)?;
@@ -1628,14 +1631,14 @@ mod tests {
                  p50_rt REAL DEFAULT 0, p95_rt REAL DEFAULT 0, p99_rt REAL DEFAULT 0,
                  ttfb_avg REAL DEFAULT 0, body_avg REAL DEFAULT 0, body_p95 REAL DEFAULT 0,
                  bytes INTEGER DEFAULT 0, success_count INTEGER DEFAULT 0,
-                 error_count INTEGER DEFAULT 0
+                 error_count INTEGER DEFAULT 0, response_count INTEGER DEFAULT 0
              );
              INSERT INTO test_reports (id) VALUES (1);
              INSERT INTO report_samples
                  (report_id, elapsed_sec, concurrent, qps, avg_rt, p50_rt, p95_rt, p99_rt,
-                  ttfb_avg, body_avg, body_p95, bytes, success_count, error_count)
-             VALUES (1, 1, 10, 100, 20, 18, 40, 80, 12, 8, 10, 1024, 100, 1),
-                    (1, 2, 10, 110, 21, 19, 41, 81, 13, 9, 11, 2048, 110, 0);",
+                  ttfb_avg, body_avg, body_p95, bytes, success_count, error_count, response_count)
+             VALUES (1, 1, 10, 100, 20, 18, 40, 80, 12, 8, 10, 1024, 100, 1, 100),
+                    (1, 2, 10, 110, 21, 19, 41, 81, 13, 9, 11, 2048, 110, 0, 110);",
         )
         .unwrap();
 

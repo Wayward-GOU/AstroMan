@@ -128,9 +128,12 @@ pub struct HelloPayload {
     #[serde(default)]
     pub pair_code: String,
     pub node_name: String,
-    /// 加入方式：code（配对码）/ request（发现后申请，需主节点审批）
+    /// 加入方式：code（配对码）/ request（发现后申请，需主节点审批）/ invite（主节点邀请）
     #[serde(default)]
     pub join_mode: Option<String>,
+    /// 邀请令牌：joinMode=invite 时携带，主节点校验后直接放行
+    #[serde(default)]
+    pub invite_token: Option<String>,
     /// 设备指纹：用于审批展示与白名单
     #[serde(default)]
     pub device_id: Option<String>,
@@ -448,12 +451,22 @@ pub struct SamplePayload {
     pub bytes: u64,
     pub success_count: u64,
     pub error_count: u64,
+    /// 本秒有响应的请求数（TTFB / 响应体均值分母）；旧节点为 0
+    #[serde(default)]
+    pub response_count: u64,
     /// 本秒总耗时累加，用于跨节点加权平均
     pub sum_rt_ms: u64,
     /// 本秒 TTFB 累加：节点失联时没有 done，只能用每秒累加还原 TTFB 均值
     #[serde(default)]
     pub sum_ttfb_ms: u64,
+    /// 本秒响应体耗时累加（仅响应请求）
+    #[serde(default)]
+    pub sum_body_ms: u64,
     pub latency_buckets: SparseBuckets,
+    /// 本秒响应体耗时的稀疏桶：主节点据此重算逐秒 Body P95；
+    /// 旧节点为空，合并时该字段按 0 处理
+    #[serde(default)]
+    pub body_buckets: SparseBuckets,
     /// 本机资源快照；旧节点为 None
     #[serde(default)]
     pub host: Option<HostSample>,
@@ -469,10 +482,24 @@ pub struct DonePayload {
     pub total: u64,
     pub success: u64,
     pub errors: u64,
+    /// 有响应的请求数；旧节点为 0，合并时回退到桶计数
+    #[serde(default)]
+    pub responses: u64,
     pub bytes: u64,
     pub bytes_sent: u64,
     pub sum_rt_ms: u64,
     pub sum_ttfb_ms: u64,
+    /// 仅响应请求的响应体耗时累加；旧节点为 0
+    #[serde(default)]
+    pub sum_body_ms: u64,
+    /// 指标口径版本：2 = 响应数 / Body 累加 / APDEX 分子均已上报
+    #[serde(default)]
+    pub metrics_version: u32,
+    /// APDEX 分子计数（只含成功请求）；旧节点为 0
+    #[serde(default)]
+    pub apdex_satisfied: u64,
+    #[serde(default)]
+    pub apdex_tolerating: u64,
     pub min_rt: f64,
     pub max_rt: f64,
     pub latency_buckets: SparseBuckets,
@@ -736,6 +763,9 @@ pub struct ClusterMasterSnapshot {
     /// 单节点池切片字节上限（前端按它显示占用比例）
     #[serde(default)]
     pub pool_slice_limit_bytes: u64,
+    /// 本任务发出的设备邀请（等待对方确认 / 已接受 / 已过期）
+    #[serde(default)]
+    pub invites: Vec<super::presence::MasterInvite>,
     pub created_at: i64,
 }
 
@@ -987,10 +1017,15 @@ mod tests {
             total: 3,
             success: 2,
             errors: 1,
+            responses: 3,
             bytes: 4,
             bytes_sent: 5,
             sum_rt_ms: 6,
             sum_ttfb_ms: 7,
+            sum_body_ms: 2,
+            metrics_version: 2,
+            apdex_satisfied: 2,
+            apdex_tolerating: 0,
             min_rt: 1.0,
             max_rt: 9.0,
             latency_buckets: vec![(1, 2), (9, 1)],

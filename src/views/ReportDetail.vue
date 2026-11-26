@@ -1079,7 +1079,11 @@ const avgBody = computed<number | null>(() => {
   let sum = 0
   let weight = 0
   for (const sample of samples.value) {
-    const count = sample.successCount + sample.errorCount
+    // Body 只对拿到响应的请求有值，旧报告没有 responseCount 时退回成功+失败数
+    const count =
+      sample.responseCount && sample.responseCount > 0
+        ? sample.responseCount
+        : sample.successCount + sample.errorCount
     sum += (sample.bodyAvg || 0) * count
     weight += count
   }

@@ -127,6 +127,9 @@ const network = reactive<AppSettings>({
   stressMaxJobs: 0,
   stressOsEnvAllow: '',
   clusterDiscoveryEnabled: true,
+  clusterDeviceName: '',
+  clusterPresenceEnabled: true,
+  clusterInvitePolicy: 'ask',
 })
 const networkLoading = ref(false)
 
@@ -1692,6 +1695,55 @@ async function openReleasePage() {
               </div>
               <div class="row-control wide">
                 <a-switch v-model:checked="network.clusterDiscoveryEnabled" size="small" />
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="row-label">
+                <div class="row-title">设备发现（17803）</div>
+                <div class="row-desc">
+                  广播本机在线状态，让局域网内其他 AstroMan 发现并可邀请本机加入分布式压测；邀请必须经你确认
+                </div>
+              </div>
+              <div class="row-control wide">
+                <a-switch v-model:checked="network.clusterPresenceEnabled" size="small" />
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="row-label">
+                <div class="row-title">设备名称</div>
+                <div class="row-desc">其他电脑在「在线设备」里看到的名称；留空使用计算机名</div>
+              </div>
+              <div class="row-control wide">
+                <a-input
+                  v-model:value="network.clusterDeviceName"
+                  size="small"
+                  style="width: 240px"
+                  :maxlength="64"
+                  placeholder="例如：压测机-A"
+                />
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="row-label">
+                <div class="row-title">收到邀请时</div>
+                <div class="row-desc">
+                  ask：弹窗由你决定；auto：自动接受（仅建议在专用压测机使用）；off：拒绝所有邀请
+                </div>
+              </div>
+              <div class="row-control wide">
+                <a-select
+                  v-model:value="network.clusterInvitePolicy"
+                  size="small"
+                  style="width: 180px"
+                  :options="[
+                    { value: 'ask', label: '弹窗确认（推荐）' },
+                    { value: 'auto', label: '自动接受' },
+                    { value: 'off', label: '拒绝所有邀请' },
+                  ]"
+                />
               </div>
             </div>
           </div>

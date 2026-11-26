@@ -71,7 +71,7 @@ Windows 下 `cargo check` 若报 `hit restricted ... D:\Software\Rust\cargo\.glo
    "
    ```
 
-   余量低于 2000 就先把历史版本段摘出去再写新内容。瘦身后当前为 4289 字符 / 8426 字节
+   余量低于 2000 就先把历史版本段摘出去再写新内容。v1.1.6 瘦身后当前为 3975 字符 / 7590 字节（余量约 13,400 字节）
 5. `.github/workflows/release.yml` 在 tag 推送时自动构建 Windows NSIS 与 macOS universal dmg，上传到 GitHub Release
 6. 应用内更新检查走 `commands/update.rs` 的 `RELEASE_API`（`https://api.github.com/repos/Wayward-GOU/AstroMan/releases/latest`），仓库地址已改为 AstroMan
 7. macOS 用户安装脚本 `scripts/install-macos.sh`（`REPO=Wayward-GOU/AstroMan`）从 Release 下载 dmg，并绕过未签名校验；README 中的安装命令同源

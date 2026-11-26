@@ -203,6 +203,7 @@ async fn pair_cluster(
         master_addr: format!("127.0.0.1:{}", snapshot.port),
         pair_code,
         join_mode: Some("code".to_string()),
+        invite_token: None,
         node_name: Some("从-验收".to_string()),
     };
     slave

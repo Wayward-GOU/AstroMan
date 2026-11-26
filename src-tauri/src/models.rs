@@ -818,6 +818,9 @@ pub struct ReportSample {
     pub bytes: u64,
     pub success_count: u64,
     pub error_count: u64,
+    /// 本采样区间有响应的请求数：Body / TTFB 均值的精确权重
+    #[serde(default)]
+    pub response_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]

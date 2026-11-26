@@ -15,6 +15,7 @@ pub mod history;
 pub mod host;
 pub mod merge;
 pub mod pool_refresh;
+pub mod presence;
 pub mod protocol;
 pub mod server;
 

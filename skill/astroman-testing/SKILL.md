@@ -10,7 +10,7 @@ description: AstroMan 的测试体系与质量门禁：vitest 前端纯函数用
 | 层 | 命令 | 规模（2026-11-24 实测） | 位置 |
 |---|---|---|---|
 | 前端纯函数 | `npm run test` | 43 spec / 447 条 | `src/**/*.spec.ts` |
-| Rust lib | `cd src-tauri && cargo test --lib` | 475 条 / 8 ignored | 模块内 `#[cfg(test)]` |
+| Rust lib | `cd src-tauri && cargo test --lib` | 483 条 / 8 ignored | 模块内 `#[cfg(test)]` |
 | Rust 覆盖率 | `cargo tarpaulin --config tarpaulin.toml` | 门槛 25%（防倒退） | `src-tauri/tarpaulin.toml` |
 | 类型 / 构建 | `npm run build` | `vue-tsc --noEmit` + `vite build` | — |
 

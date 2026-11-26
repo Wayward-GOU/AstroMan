@@ -1127,7 +1127,11 @@ function bodyLatencyStats(detail: ReportDetail): { avg: number | null; p95: numb
   let sum = 0
   let weight = 0
   for (const sample of samples) {
-    const count = sample.successCount + sample.errorCount
+    // Body 只统计拿到响应的请求；旧报告没有 responseCount 时退回成功+失败数
+    const count =
+      sample.responseCount && sample.responseCount > 0
+        ? sample.responseCount
+        : sample.successCount + sample.errorCount
     sum += (sample.bodyAvg || 0) * count
     weight += count
   }

@@ -83,26 +83,44 @@ struct SecondAccumulator {
     concurrent: u32,
     success: u64,
     errors: u64,
+    /// 有响应的请求数（TTFB / 响应体均值分母）
+    responses: u64,
     bytes: u64,
     sum_rt: u64,
     sum_ttfb: u64,
-    body_weighted: f64,
+    sum_body: u64,
     latency: BTreeMap<u32, u64>,
+    /// 本秒响应体耗时桶：用于合并后重算逐秒 Body P95（旧节点为空）
+    body: BTreeMap<u32, u64>,
 }
 
 impl SecondAccumulator {
     fn absorb(&mut self, sample: &SamplePayload) {
         let count = sample.success_count + sample.error_count;
+        let responses = if sample.response_count > 0 {
+            sample.response_count
+        } else {
+            count
+        };
         self.qps += sample.qps;
         self.concurrent = self.concurrent.saturating_add(sample.concurrent);
         self.success += sample.success_count;
         self.errors += sample.error_count;
+        self.responses += responses;
         self.bytes += sample.bytes;
         self.sum_rt += sample.sum_rt_ms;
         self.sum_ttfb += sample.sum_ttfb_ms;
-        self.body_weighted += sample.body_avg * count as f64;
+        // 新节点直接给响应体耗时累加；旧节点没有该字段，用区间均值 × 响应数回退
+        self.sum_body += if sample.sum_body_ms > 0 {
+            sample.sum_body_ms
+        } else {
+            (sample.body_avg * responses as f64).round() as u64
+        };
         for (ms, count) in &sample.latency_buckets {
             *self.latency.entry(*ms).or_insert(0) += *count;
+        }
+        for (ms, count) in &sample.body_buckets {
+            *self.body.entry(*ms).or_insert(0) += *count;
         }
     }
 
@@ -125,12 +143,18 @@ pub(crate) fn merge(request: MergeRequest) -> MergedReport {
     let mut total = 0u64;
     let mut success = 0u64;
     let mut errors = 0u64;
+    let mut responses = 0u64;
     let mut bytes = 0u64;
     let mut bytes_sent = 0u64;
     let mut errors_dropped = 0u64;
     let mut records_dropped = 0u64;
     let mut sum_rt = 0u64;
     let mut sum_ttfb = 0u64;
+    let mut apdex_sat = 0u64;
+    let mut apdex_tol = 0u64;
+    let mut nodes_lost = false;
+    let mut done_nodes = 0u64;
+    let mut metrics_ready_nodes = 0u64;
     let mut cpu_peak = 0.0f64;
     let mut mem_peak = 0u64;
     let mut stopped = false;
@@ -169,12 +193,26 @@ pub(crate) fn merge(request: MergeRequest) -> MergedReport {
             total += done.total;
             success += done.success;
             errors += done.errors;
+            // 旧节点的 responses / sum_body 为 0：TTFB 桶本身只含响应请求，
+            // 响应体耗时用桶值还原，保证新旧版本合并口径一致
+            responses += if done.responses > 0 {
+                done.responses
+            } else {
+                done.ttfb_buckets.iter().map(|(_, count)| *count).sum()
+            };
             bytes += done.bytes;
             bytes_sent += done.bytes_sent;
             errors_dropped += done.errors_dropped;
             records_dropped += done.records_dropped;
             sum_rt += done.sum_rt_ms;
             sum_ttfb += done.sum_ttfb_ms;
+            // 新节点直接给出 APDEX 分子：失败请求天然落入失望档
+            apdex_sat += done.apdex_satisfied;
+            apdex_tol += done.apdex_tolerating;
+            done_nodes += 1;
+            if done.metrics_version >= 2 {
+                metrics_ready_nodes += 1;
+            }
             for (ms, count) in &done.latency_buckets {
                 *latency.entry(*ms).or_insert(0) += *count;
             }
@@ -212,12 +250,18 @@ pub(crate) fn merge(request: MergeRequest) -> MergedReport {
             ended = Some(ended.map_or(done.end_ms, |value| value.max(done.end_ms)));
         } else if trusted {
             // 失联节点：只统计到最后一个上报的采样
+            nodes_lost = true;
             let mut node_total = 0u64;
             for sample in &node.samples {
                 node_total += sample.sum_rt_ms;
                 total += sample.success_count + sample.error_count;
                 success += sample.success_count;
                 errors += sample.error_count;
+                responses += if sample.response_count > 0 {
+                    sample.response_count
+                } else {
+                    sample.success_count + sample.error_count
+                };
                 bytes += sample.bytes;
                 sum_ttfb += sample.sum_ttfb_ms;
                 for (ms, count) in &sample.latency_buckets {
@@ -315,6 +359,8 @@ pub(crate) fn merge(request: MergeRequest) -> MergedReport {
         .into_iter()
         .map(|(elapsed_sec, second)| {
             let count = second.count();
+            // Body 桶只含拿到响应的请求；旧节点没有该字段时桶为空，按 0 展示
+            let body_total: u64 = second.body.values().sum();
             ReportSample {
                 elapsed_sec,
                 concurrent: second.concurrent,
@@ -323,17 +369,13 @@ pub(crate) fn merge(request: MergeRequest) -> MergedReport {
                 p50_rt: percentile(&second.latency, count, 0.5),
                 p95_rt: percentile(&second.latency, count, 0.95),
                 p99_rt: percentile(&second.latency, count, 0.99),
-                ttfb_avg: ratio(second.sum_ttfb, count),
-                body_avg: if count > 0 {
-                    second.body_weighted / count as f64
-                } else {
-                    0.0
-                },
-                // 从节点每秒只上报总耗时桶：逐秒 body P95 无数据，用 0 占位
-                body_p95: 0.0,
+                ttfb_avg: ratio(second.sum_ttfb, second.responses),
+                body_avg: ratio(second.sum_body, second.responses),
+                body_p95: percentile(&second.body, body_total, 0.95),
                 bytes: second.bytes,
                 success_count: second.success,
                 error_count: second.errors,
+                response_count: second.responses,
             }
         })
         .collect::<Vec<_>>();
@@ -343,7 +385,8 @@ pub(crate) fn merge(request: MergeRequest) -> MergedReport {
     let elapsed_sec = ((end_ms - start_ms) as f64 / 1000.0).max(0.001);
     let max_qps = samples.iter().map(|sample| sample.qps).fold(0.0, f64::max);
     let avg_rt = ratio(sum_rt, total);
-    let ttfb_avg = ratio(sum_ttfb, total);
+    // TTFB / 响应体只统计拿到响应的请求，错误请求不能按 0 拉低均值
+    let ttfb_avg = ratio(sum_ttfb, responses);
     let min_rt = latency
         .keys()
         .next()
@@ -377,8 +420,13 @@ pub(crate) fn merge(request: MergeRequest) -> MergedReport {
         p999_rt: percentile(&latency, total, 0.999),
         stddev_rt: stddev(&latency, total, avg_rt),
         ttfb_avg,
-        ttfb_p95: percentile(&ttfb, total, 0.95),
-        apdex: apdex(&latency, total),
+        ttfb_p95: percentile(&ttfb, responses.max(1), 0.95),
+        apdex: if !nodes_lost && done_nodes > 0 && metrics_ready_nodes == done_nodes {
+            ((apdex_sat as f64 + apdex_tol as f64 / 2.0) / total.max(1) as f64).clamp(0.0, 1.0)
+        } else {
+            // 有失联节点或旧版本节点：退回按延迟桶估算
+            apdex(&latency, total)
+        },
         bytes_total: bytes as i64,
         max_qps,
         avg_qps: total as f64 / elapsed_sec,
@@ -671,10 +719,15 @@ pub(crate) fn done_from_outcome(outcome: &EngineOutcome) -> DonePayload {
         total: outcome.sparse.total,
         success: outcome.sparse.success,
         errors: outcome.sparse.errors,
+        responses: outcome.sparse.responses,
         bytes: outcome.sparse.bytes,
         bytes_sent: outcome.sparse.bytes_sent,
         sum_rt_ms: outcome.sparse.sum_rt_ms,
         sum_ttfb_ms: outcome.sparse.sum_ttfb_ms,
+        sum_body_ms: outcome.sparse.sum_body_ms,
+        metrics_version: 2,
+        apdex_satisfied: outcome.sparse.apdex_satisfied,
+        apdex_tolerating: outcome.sparse.apdex_tolerating,
         min_rt: outcome.sparse.min_rt,
         max_rt: outcome.sparse.max_rt,
         latency_buckets: outcome.sparse.latency.clone(),
@@ -1038,9 +1091,15 @@ fn percentile(buckets: &BTreeMap<u32, u64>, total: u64, p: f64) -> f64 {
     let target = ((total as f64) * p).ceil() as u64;
     let mut acc = 0u64;
     for (ms, count) in buckets {
+        if *count == 0 {
+            continue;
+        }
+        let before = acc;
         acc += count;
         if acc >= target {
-            return *ms as f64;
+            // 与单机引擎一致：桶内取目标名次的中点，避免固定偏低半个桶
+            let rank = target.saturating_sub(before) as f64;
+            return *ms as f64 + ((rank - 0.5) / *count as f64).clamp(0.0, 1.0);
         }
     }
     buckets
@@ -1119,9 +1178,12 @@ mod tests {
             bytes: count * 100,
             success_count: count,
             error_count: 0,
+            response_count: count,
             sum_rt_ms: count * 20,
             sum_ttfb_ms: count * 10,
+            sum_body_ms: count * 5,
             latency_buckets: latency,
+            body_buckets: Vec::new(),
             host: None,
         }
     }
@@ -1133,10 +1195,15 @@ mod tests {
             total,
             success: total,
             errors: 0,
+            responses: total,
             bytes: total * 100,
             bytes_sent: total * 10,
             sum_rt_ms: total * 20,
             sum_ttfb_ms: total * 10,
+            sum_body_ms: total * 5,
+            metrics_version: 0,
+            apdex_satisfied: 0,
+            apdex_tolerating: 0,
             min_rt: 1.0,
             max_rt: 100.0,
             latency_buckets: buckets,
@@ -1200,9 +1267,10 @@ mod tests {
         assert_eq!(merged.report.total_requests, 1_000);
         // 均值按请求数加权，而不是两个节点均值的简单平均
         assert!((merged.report.avg_rt - 20.0).abs() < 0.01);
-        // 合并后 P50/P95 都落在 20ms：两个节点各自 P95 是 10 和 20，取平均会得到 15
-        assert_eq!(merged.report.p50_rt, 20.0);
-        assert_eq!(merged.report.p95_rt, 20.0);
+        // 合并后 P50/P95 都落在 20ms 桶内：两个节点各自 P95 是 10 和 20，取平均会得到 15。
+        // 桶内线性插值后是 20.x（真实值落在 [20,21)），不再固定返回桶下界。
+        assert!((20.0..21.0).contains(&merged.report.p50_rt));
+        assert!((20.0..21.0).contains(&merged.report.p95_rt));
         // 第一秒 QPS 相加
         assert_eq!(merged.samples.len(), 1);
         assert!((merged.samples[0].qps - 40.0).abs() < 0.01);
@@ -1212,6 +1280,20 @@ mod tests {
         assert_eq!(config["mode"], "cluster");
         assert_eq!(config["cluster"]["totalConcurrent"], 16);
         assert_eq!(merged.meta.nodes.len(), 2);
+    }
+
+    #[test]
+    fn merged_sample_body_p95_comes_from_body_buckets() {
+        let mut first = sample(1, 10.0, 10, vec![(10, 10)]);
+        first.body_buckets = vec![(40, 9), (400, 1)];
+        let mut second = sample(1, 10.0, 10, vec![(10, 10)]);
+        second.body_buckets = vec![(40, 10)];
+        let merged = merge(request(vec![
+            node("a", vec![first], Some(done(10, vec![(10, 10)]))),
+            node("b", vec![second], Some(done(10, vec![(10, 10)]))),
+        ]));
+        // 合并后 Body 桶共 20 个样本，P95 落在 40ms 桶内（插值后 40.x）
+        assert!((40.0..41.0).contains(&merged.samples[0].body_p95));
     }
 
     #[test]
@@ -1500,10 +1582,14 @@ mod tests {
                 total: 10,
                 success: 9,
                 errors: 1,
+                responses: 10,
                 bytes: 1000,
                 bytes_sent: 100,
                 sum_rt_ms: 200,
                 sum_ttfb_ms: 100,
+                sum_body_ms: 50,
+                apdex_satisfied: 9,
+                apdex_tolerating: 0,
                 min_rt: 1.0,
                 max_rt: 100.0,
                 latency: vec![(10, 10)],
@@ -1544,6 +1630,7 @@ mod tests {
             bytes: 1_000,
             success_count: 10,
             error_count: 0,
+            response_count: 10,
         };
         let samples = vec![
             sample(1, 10.0, 10),
@@ -1647,9 +1734,12 @@ mod perf_tests {
                         bytes: 10_000,
                         success_count: 100,
                         error_count: 0,
+                        response_count: 100,
                         sum_rt_ms: 2_000,
                         sum_ttfb_ms: 1_000,
+                        sum_body_ms: 500,
                         latency_buckets: Vec::new(),
+                        body_buckets: Vec::new(),
                         host: None,
                     })
                     .collect(),

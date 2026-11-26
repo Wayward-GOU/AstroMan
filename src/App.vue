@@ -31,6 +31,7 @@ import AstroBuddyIcon from '@/components/AstroBuddyIcon.vue'
 import AiAssistDrawer from '@/components/AiAssistDrawer.vue'
 import ErrorDialog from '@/components/ErrorDialog.vue'
 import NotesReminderHost from '@/components/notes/NotesReminderHost.vue'
+import InviteModalHost from '@/components/cluster/InviteModalHost.vue'
 import HangzaiTaskDock from '@/components/HangzaiTaskDock.vue'
 import { currentTheme, currentThemeId, setTheme, themes } from '@/stores/theme'
 import { staticTokens, type ColorKey } from '@/design/tokens'
@@ -785,6 +786,7 @@ const theme = computed(() => {
       </a-modal>
 
       <NotesReminderHost />
+      <InviteModalHost />
       <AiAssistDrawer />
       <ErrorDialog />
     </div>

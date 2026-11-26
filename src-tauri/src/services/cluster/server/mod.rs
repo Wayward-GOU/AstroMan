@@ -955,6 +955,7 @@ impl MasterSession {
             discovery: self.discovery,
             pool_estimate: self.pool_estimate.clone(),
             pool_slice_limit_bytes: MAX_POOL_SLICE_BYTES as u64,
+            invites: super::presence::master_invites_for(self.job_id),
             created_at: self.created_at,
         }
     }
@@ -1069,7 +1070,10 @@ impl MasterSession {
             ));
         }
         if hello.join_mode.as_deref() == Some("request") {
-            return self.register_request(peer, hello, tx);
+            return self.register_request(peer, hello, tx, false);
+        }
+        if hello.join_mode.as_deref() == Some("invite") {
+            return self.register_invite(peer, hello, tx);
         }
         let now = now_ms();
         let ttl_sec = self.pair_code_ttl_sec;
@@ -1238,12 +1242,56 @@ impl MasterSession {
         Ok(node_id)
     }
 
+    /// 邀请模式加入：校验一次性令牌后直接放行，不再走待审批
+    ///
+    /// 邀请是主节点用户主动发出的，对方也在本机点了「接受」，
+    /// 因此这里不再要求配对码，也不需要第二次人工审批。
+    fn register_invite(
+        &self,
+        peer: SocketAddr,
+        hello: HelloPayload,
+        tx: mpsc::UnboundedSender<ClusterMessage>,
+    ) -> Result<String, String> {
+        if hello.version != PROTOCOL_VERSION {
+            return Err(format!(
+                "协议版本不一致：主节点 v{}，从节点 v{}，请升级后重试",
+                PROTOCOL_VERSION, hello.version
+            ));
+        }
+        let token = hello
+            .invite_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| "邀请令牌缺失，请在主节点重新邀请".to_string())?;
+        // 复用审批模式的登记流程：它已经包含名称校验、限流与待接受上限检查。
+        // 先登记再消费令牌：登记失败（例如节点名冲突）时令牌仍可重试。
+        let node_id = self.register_request(peer, hello, tx, true)?;
+        if let Err(error) = super::presence::consume_invite_token(&token, self.job_id) {
+            self.remove_pending(&node_id);
+            return Err(error);
+        }
+        let still_pending = {
+            let state = self.state.lock();
+            state
+                .nodes
+                .iter()
+                .any(|node| node.id == node_id && node.status == "pending")
+        };
+        if still_pending {
+            self.approve_join(&node_id)?;
+        }
+        Ok(node_id)
+    }
+
     /// 审批模式加入：登记待接受申请，接受后仍走同一套时钟对齐
     fn register_request(
         &self,
         peer: SocketAddr,
         hello: HelloPayload,
         tx: mpsc::UnboundedSender<ClusterMessage>,
+        invited: bool,
     ) -> Result<String, String> {
         let now = now_ms();
         let peer_public_key = match hello.public_key.as_deref() {
@@ -1270,12 +1318,15 @@ impl MasterSession {
                 return Err("任务已开始或已结束，不能再加入节点".to_string());
             }
             let ip = peer.ip().to_string();
-            if let Some(last) = state.join_requests.get(&ip) {
-                if now - *last < JOIN_RATE_MS {
-                    return Err("加入申请过于频繁，请 5 秒后重试".to_string());
+            // 邀请已由主节点用户主动发出，不再受「申请频率 / 待处理上限」限制
+            if !invited {
+                if let Some(last) = state.join_requests.get(&ip) {
+                    if now - *last < JOIN_RATE_MS {
+                        return Err("加入申请过于频繁，请 5 秒后重试".to_string());
+                    }
                 }
+                state.join_requests.insert(ip.clone(), now);
             }
-            state.join_requests.insert(ip.clone(), now);
             // 限流表只保留最近 1 分钟，避免长期任务无限增长
             state.join_requests.retain(|_, at| now - *at <= 60_000);
             let pending = state
@@ -1283,7 +1334,7 @@ impl MasterSession {
                 .iter()
                 .filter(|node| node.role == "slave" && node.status == "pending")
                 .count();
-            if pending >= MAX_PENDING_JOINS {
+            if !invited && pending >= MAX_PENDING_JOINS {
                 return Err("待接受申请过多，请先在主节点处理".to_string());
             }
             let live = state

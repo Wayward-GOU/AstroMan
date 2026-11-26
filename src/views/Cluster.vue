@@ -29,6 +29,9 @@ import type {
   ClusterSlaveHistoryItem,
   ClusterSlaveSnapshot,
   DiscoveredMaster,
+  DiscoveredPeer,
+  MasterInvite,
+  PresenceStatus,
   VarAuditReport,
 } from '@/types/cluster'
 import type {
@@ -1617,6 +1620,75 @@ async function joinDiscovered(item: DiscoveredMaster) {
   }
 }
 
+/* ---------- 设备发现与邀请（17803） ---------- */
+const peers = ref<DiscoveredPeer[]>([])
+const presence = ref<PresenceStatus | null>(null)
+const inviteBusy = ref('')
+let presenceTimer: number | undefined
+
+async function refreshPresence() {
+  try {
+    presence.value = await api.clusterPresenceStatus()
+    peers.value = (await api.clusterPresenceList()).filter((item) => !item.isSelf)
+  } catch {
+    /* 端口被占用等错误由设置页展示 */
+  }
+}
+
+async function startPresence() {
+  try {
+    presence.value = await api.clusterPresenceStart()
+    await refreshPresence()
+  } catch (error) {
+    message.error(String(error))
+  }
+}
+
+const visiblePeers = computed(() =>
+  peers.value.filter((item) => item.deviceId !== presence.value?.deviceId),
+)
+
+const pendingInvites = computed<MasterInvite[]>(() =>
+  (session.value?.invites ?? []).filter((item) => item.status === 'pending'),
+)
+
+const finishedInvites = computed<MasterInvite[]>(() =>
+  (session.value?.invites ?? [])
+    .filter((item) => item.status !== 'pending')
+    .slice(0, 5),
+)
+
+function peerStateText(peer: DiscoveredPeer) {
+  if (peer.isSelf) return '本机'
+  if (peer.state === 'running') return '压测中'
+  if (peer.state === 'busy') return '忙碌'
+  return peer.joinable ? '空闲' : '不可邀请'
+}
+
+async function invitePeer(peer: DiscoveredPeer) {
+  const current = session.value
+  if (!current) return
+  inviteBusy.value = peer.deviceId
+  try {
+    await api.clusterInviteSend(current.jobId, peer.host, peer.invitePort, peer.deviceId)
+    message.success(`已向「${peer.name}」发出邀请，等待对方确认`)
+    await refreshSession()
+  } catch (error) {
+    message.error(String(error))
+  } finally {
+    inviteBusy.value = ''
+  }
+}
+
+onMounted(() => {
+  void refreshPresence()
+  presenceTimer = window.setInterval(() => void refreshPresence(), 2000)
+})
+
+onBeforeUnmount(() => {
+  if (presenceTimer) window.clearInterval(presenceTimer)
+})
+
 onMounted(async () => {
   loadSlaveCache()
   try {
@@ -2060,6 +2132,74 @@ onBeforeUnmount(() => {
                   >
                     拒绝
                   </a-button>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section v-if="session.status === 'pairing'" class="fm-card panel">
+            <header class="panel-head">
+              <div class="panel-title">
+                <h3>在线设备</h3>
+                <span class="panel-sub">
+                  自动发现局域网内已安装 AstroMan 的电脑；邀请后需对方在本机点击接受
+                </span>
+              </div>
+              <div class="panel-actions">
+                <span v-if="presence" class="hint">
+                  {{ presence.running ? `发现已开启 · ${visiblePeers.length} 台在线` : '发现未开启' }}
+                </span>
+                <a-button v-if="!presence?.running" size="small" @click="startPresence">
+                  开启发现
+                </a-button>
+              </div>
+            </header>
+            <div class="panel-body">
+              <div v-if="presence?.error" class="invite-status">
+                <div class="join-meta">设备发现异常：{{ presence.error }}</div>
+              </div>
+              <div v-if="!presence?.running" class="inline-empty">
+                设备发现未开启。开启后本机会广播在场信息，并允许你邀请其他在线电脑加入本次压测。
+              </div>
+              <div v-else-if="!visiblePeers.length" class="inline-empty">
+                正在搜索局域网内的 AstroMan 设备…
+              </div>
+              <div v-for="peer in visiblePeers" :key="peer.deviceId" class="join-row">
+                <div class="join-main">
+                  <div class="join-name">
+                    {{ peer.name }}
+                    <span class="peer-state" :class="`is-${peer.state}`">
+                      {{ peerStateText(peer) }}
+                    </span>
+                  </div>
+                  <div class="join-meta mono">
+                    {{ peer.addr }} · {{ peer.cores }} 核 · {{ Math.round(peer.memGb) }} GB · 预算
+                    {{ peer.budget }} · v{{ peer.version }}
+                  </div>
+                </div>
+                <div class="join-actions">
+                  <a-button
+                    size="small"
+                    type="primary"
+                    :disabled="!peer.joinable || !peer.allowInvite"
+                    :loading="inviteBusy === peer.deviceId"
+                    @click="invitePeer(peer)"
+                  >
+                    邀请加入
+                  </a-button>
+                </div>
+              </div>
+              <div v-if="pendingInvites.length" class="invite-status">
+                <div class="invite-status-title">等待对方确认</div>
+                <div v-for="item in pendingInvites" :key="item.requestId" class="join-meta mono">
+                  {{ item.peerName }} · {{ item.peerAddr }} · 剩余
+                  {{ Math.max(0, Math.ceil((item.expiresAt - nowTick) / 1000)) }} 秒
+                </div>
+              </div>
+              <div v-if="finishedInvites.length" class="invite-status">
+                <div class="invite-status-title">最近邀请</div>
+                <div v-for="item in finishedInvites" :key="item.requestId" class="join-meta mono">
+                  {{ item.peerName }} · {{ item.status }} · {{ item.message || '' }}
                 </div>
               </div>
             </div>
@@ -3598,6 +3738,41 @@ onBeforeUnmount(() => {
   display: flex;
   gap: 8px;
   flex: none;
+}
+
+.peer-state {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: 8px;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--fm-muted);
+  border: 1px solid var(--fm-border);
+}
+
+.peer-state.is-idle {
+  color: var(--fm-ok, #389e0d);
+  border-color: color-mix(in srgb, var(--fm-ok, #389e0d) 40%, transparent);
+}
+
+.peer-state.is-running,
+.peer-state.is-busy {
+  color: var(--fm-warn, #d48806);
+  border-color: color-mix(in srgb, var(--fm-warn, #d48806) 40%, transparent);
+}
+
+.invite-status {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--fm-border);
+}
+
+.invite-status-title {
+  margin-bottom: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fm-muted);
 }
 
 .discover-head {

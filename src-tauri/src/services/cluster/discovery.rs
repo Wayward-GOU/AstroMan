@@ -137,6 +137,15 @@ pub fn start_listener() -> Result<(), String> {
                         error.kind(),
                         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                     ) => {}
+                // Windows 的 UDP 会把 ICMP port unreachable 报告成 ConnectionReset；
+                // 与 EINTR 一样属于瞬时事件，处理掉继续收包，不能退出监听线程
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::Interrupted
+                    ) => {}
                 Err(error) => {
                     listener().lock().error = Some(format!("读取发现数据失败：{error}"));
                     break;

@@ -204,13 +204,16 @@ export function reportReviewPrompt(detail: ReportDetail): string {
       : 0
   const bytesSent = config?.metrics?.bytesSent ?? 0
   const bodySamples = detail.samples.filter((item) => item.bodyAvg > 0)
-  const bodyCount = bodySamples.reduce((sum, item) => sum + item.successCount + item.errorCount, 0)
+  // 有响应数时用它做权重：网络失败请求没有响应体，不能拉低 Body 平均
+  const bodyWeight = (item: (typeof detail.samples)[number]) =>
+    item.responseCount && item.responseCount > 0
+      ? item.responseCount
+      : item.successCount + item.errorCount
+  const bodyCount = bodySamples.reduce((sum, item) => sum + bodyWeight(item), 0)
   const bodyAvg =
     bodyCount > 0
-      ? bodySamples.reduce(
-          (sum, item) => sum + item.bodyAvg * (item.successCount + item.errorCount),
-          0,
-        ) / bodyCount
+      ? bodySamples.reduce((sum, item) => sum + item.bodyAvg * bodyWeight(item), 0) /
+        bodyCount
       : null
   const urlStats = (detail.urlStats ?? []).slice(0, 10)
   const errorUrls = (detail.urlStats ?? []).filter((item) => item.errorCount > 0).slice(0, 10)

@@ -284,6 +284,8 @@ const COLUMN_MIGRATIONS: &[(&str, &str, &str)] = &[
     ("test_reports", "slow_requests_json", "TEXT"),
     ("report_samples", "body_avg", "REAL DEFAULT 0"),
     ("report_samples", "body_p95", "REAL DEFAULT 0"),
+    // v16：按响应数加权，修正失败请求对 Body / TTFB 均值的稀释
+    ("report_samples", "response_count", "INTEGER DEFAULT 0"),
     // v18：池条目健康度（管理页状态筛选 / 刷新健康度）
     (
         "data_pool_items",

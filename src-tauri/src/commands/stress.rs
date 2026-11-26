@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -31,8 +31,10 @@ use crate::util::{err, now_ms, render, strip_json_comments};
 const MAX_CONCURRENT: u32 = 100_000;
 /// 延迟直方图上限（毫秒），超出的请求计入最后一个桶
 const MAX_RT_MS: usize = 60_000;
-/// 首字节时间直方图上限
-const MAX_TTFB_MS: usize = 10_000;
+/// 首字节时间直方图上限：与总耗时对齐，避免慢服务 TTFB 被 10s 截断
+const MAX_TTFB_MS: usize = MAX_RT_MS;
+/// 状态码计数的分片数：每请求都要更新，单锁会成为高 QPS 下的争用点
+const CODES_SHARDS: usize = 8;
 /// 报告中最多保留的错误明细条数
 const MAX_ERRORS: usize = 500;
 /// 报告中最多保留的逐请求明细条数
@@ -288,8 +290,14 @@ struct Metrics {
     total: AtomicU64,
     success: AtomicU64,
     errors: AtomicU64,
+    /// 真正拿到 HTTP 响应的请求数：TTFB / 响应体统计的分母
+    responses: AtomicU64,
     sum_ms: AtomicU64,
+    /// 延迟平方和：用精确值算标准差，避免直方图桶中值近似
+    sum_sq_ms: AtomicU64,
     sum_ttfb: AtomicU64,
+    /// 仅响应请求的响应体耗时累加（latency − ttfb）
+    sum_body: AtomicU64,
     bytes: AtomicU64,
     /// 发送方向字节（请求行 + 头 + 体），启动时算出的单请求静态字节 × 请求数
     bytes_sent: AtomicU64,
@@ -297,14 +305,19 @@ struct Metrics {
     errors_dropped: AtomicU64,
     /// 请求明细因超出上限被丢弃的条数
     records_dropped: AtomicU64,
+    /// 慢请求明细因队列满被丢弃的条数
+    slow_dropped: AtomicU64,
     min_ms: AtomicU64,
+    /// APDEX 分子计数：只统计成功请求，失败请求自动落入「失望」
+    apdex_satisfied: AtomicU64,
+    apdex_tolerating: AtomicU64,
     max_ms: AtomicU64,
     concurrent: AtomicU32,
     buckets: Vec<AtomicU64>,
     ttfb_buckets: Vec<AtomicU64>,
     /// 响应体读取耗时（latency − ttfb）直方图：均值/分位数都从这里算
     body_buckets: Vec<AtomicU64>,
-    codes: Mutex<HashMap<u16, u64>>,
+    codes: Vec<Mutex<HashMap<u16, u64>>>,
     error_kinds: Mutex<HashMap<String, i64>>,
     /// 按 URL 聚合的分片锁：与 recordDetail 无关，off 模式也统计
     url_shards: Vec<Mutex<HashMap<UrlKey, UrlAgg>>>,
@@ -325,19 +338,27 @@ impl Metrics {
             total: AtomicU64::new(0),
             success: AtomicU64::new(0),
             errors: AtomicU64::new(0),
+            responses: AtomicU64::new(0),
             sum_ms: AtomicU64::new(0),
+            sum_sq_ms: AtomicU64::new(0),
             sum_ttfb: AtomicU64::new(0),
+            sum_body: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
             bytes_sent: AtomicU64::new(0),
             errors_dropped: AtomicU64::new(0),
             records_dropped: AtomicU64::new(0),
+            slow_dropped: AtomicU64::new(0),
             min_ms: AtomicU64::new(u64::MAX),
+            apdex_satisfied: AtomicU64::new(0),
+            apdex_tolerating: AtomicU64::new(0),
             max_ms: AtomicU64::new(0),
             concurrent: AtomicU32::new(0),
             buckets: (0..=MAX_RT_MS).map(|_| AtomicU64::new(0)).collect(),
             ttfb_buckets: (0..=MAX_TTFB_MS).map(|_| AtomicU64::new(0)).collect(),
             body_buckets: (0..=MAX_RT_MS).map(|_| AtomicU64::new(0)).collect(),
-            codes: Mutex::new(HashMap::new()),
+            codes: (0..CODES_SHARDS)
+                .map(|_| Mutex::new(HashMap::new()))
+                .collect(),
             error_kinds: Mutex::new(HashMap::new()),
             url_shards: (0..URL_STATS_SHARDS)
                 .map(|_| Mutex::new(HashMap::new()))
@@ -366,6 +387,7 @@ impl Metrics {
         elapsed_ms: i64,
         latency_ms: u64,
         ttfb_ms: u64,
+        body_ms: u64,
         status: u16,
         bytes: u64,
         sent_bytes: u64,
@@ -379,21 +401,34 @@ impl Metrics {
             self.errors.fetch_add(1, Ordering::Relaxed);
         }
         self.sum_ms.fetch_add(latency_ms, Ordering::Relaxed);
-        self.sum_ttfb.fetch_add(ttfb_ms, Ordering::Relaxed);
+        self.sum_sq_ms
+            .fetch_add(latency_ms.saturating_mul(latency_ms), Ordering::Relaxed);
         self.bytes.fetch_add(bytes, Ordering::Relaxed);
         self.bytes_sent.fetch_add(sent_bytes, Ordering::Relaxed);
         self.min_ms.fetch_min(latency_ms, Ordering::Relaxed);
         self.max_ms.fetch_max(latency_ms, Ordering::Relaxed);
         let index = latency_ms.min(MAX_RT_MS as u64) as usize;
         self.buckets[index].fetch_add(1, Ordering::Relaxed);
-        let ttfb_index = ttfb_ms.min(MAX_TTFB_MS as u64) as usize;
-        self.ttfb_buckets[ttfb_index].fetch_add(1, Ordering::Relaxed);
-        // body = 总耗时 − 首字节；分位数必须来自独立直方图，不能两个分位数相减
-        let body_ms = latency_ms.saturating_sub(ttfb_ms);
-        let body_index = body_ms.min(MAX_RT_MS as u64) as usize;
-        self.body_buckets[body_index].fetch_add(1, Ordering::Relaxed);
+        // 没拿到响应（连接失败 / 超时）的请求没有 TTFB 和响应体，
+        // 不能按 0 计入，否则 TTFB 均值会被网络错误拉低、响应体耗时被拉高
+        if ok {
+            if (latency_ms as f64) < APDEX_T {
+                self.apdex_satisfied.fetch_add(1, Ordering::Relaxed);
+            } else if (latency_ms as f64) < APDEX_T * 4.0 {
+                self.apdex_tolerating.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         if status > 0 {
-            if let Ok(mut map) = self.codes.lock() {
+            self.responses.fetch_add(1, Ordering::Relaxed);
+            self.sum_ttfb.fetch_add(ttfb_ms, Ordering::Relaxed);
+            let ttfb_index = ttfb_ms.min(MAX_TTFB_MS as u64) as usize;
+            self.ttfb_buckets[ttfb_index].fetch_add(1, Ordering::Relaxed);
+            // body 在 send_once 内单独测量，重试时不会把第一次请求算进来
+            self.sum_body.fetch_add(body_ms, Ordering::Relaxed);
+            let body_index = body_ms.min(MAX_RT_MS as u64) as usize;
+            self.body_buckets[body_index].fetch_add(1, Ordering::Relaxed);
+            let shard = status as usize % CODES_SHARDS;
+            if let Ok(mut map) = self.codes[shard].lock() {
                 *map.entry(status).or_insert(0) += 1;
             }
         }
@@ -577,11 +612,11 @@ impl Metrics {
     }
 
     fn ttfb_avg(&self) -> f64 {
-        let total = self.count();
-        if total == 0 {
+        let responses = self.responses.load(Ordering::Relaxed);
+        if responses == 0 {
             0.0
         } else {
-            self.sum_ttfb.load(Ordering::Relaxed) as f64 / total as f64
+            self.sum_ttfb.load(Ordering::Relaxed) as f64 / responses as f64
         }
     }
 
@@ -604,12 +639,21 @@ impl Metrics {
         let target = ((total as f64) * p).ceil() as u64;
         let mut acc = 0u64;
         for (index, bucket) in buckets.iter().enumerate() {
-            acc += bucket.load(Ordering::Relaxed);
+            let count = bucket.load(Ordering::Relaxed);
+            if count == 0 {
+                continue;
+            }
+            let before = acc;
+            acc += count;
             if acc >= target {
-                return index as f64;
+                // 桶内按线性插值：取目标名次在桶内的中点，避免固定返回桶下界；
+                // 除以 count 后减 0.5 保证结果不会越过桶上界
+                let rank = target.saturating_sub(before) as f64;
+                let offset = ((rank - 0.5) / count as f64).clamp(0.0, 1.0);
+                return index as f64 + offset;
             }
         }
-        buckets.len() as f64 - 1.0
+        buckets.len().saturating_sub(1) as f64
     }
 
     fn percentile(&self, p: f64) -> f64 {
@@ -617,27 +661,11 @@ impl Metrics {
     }
 
     fn ttfb_percentile(&self, p: f64) -> f64 {
-        Self::percentile_in(&self.ttfb_buckets, self.count(), p)
-    }
-
-    fn body_percentile(&self, p: f64) -> f64 {
-        Self::percentile_in(&self.body_buckets, self.count(), p)
-    }
-
-    /// 响应体读取耗时均值：直接从 body 直方图按桶值加权，避免再维护一个累加器
-    fn body_avg(&self) -> f64 {
-        let total = self.count();
-        if total == 0 {
-            return 0.0;
-        }
-        let mut sum = 0u64;
-        for (index, bucket) in self.body_buckets.iter().enumerate() {
-            let count = bucket.load(Ordering::Relaxed);
-            if count > 0 {
-                sum = sum.saturating_add(index as u64 * count);
-            }
-        }
-        sum as f64 / total as f64
+        Self::percentile_in(
+            &self.ttfb_buckets,
+            self.responses.load(Ordering::Relaxed),
+            p,
+        )
     }
 
     /// 由直方图计算总体标准差（按毫秒桶中值）
@@ -646,51 +674,44 @@ impl Metrics {
         if total < 2 {
             return 0.0;
         }
-        let mean = self.avg();
-        let mut acc = 0.0;
-        for (index, bucket) in self.buckets.iter().enumerate() {
-            let count = bucket.load(Ordering::Relaxed) as f64;
-            if count > 0.0 {
-                let diff = index as f64 - mean;
-                acc += count * diff * diff;
-            }
-        }
-        (acc / (total - 1) as f64).sqrt()
+        // 用精确的延迟平方和计算样本标准差；直方图桶中值会引入 ±0.5ms 的系统误差
+        let n = total as f64;
+        let sum = self.sum_ms.load(Ordering::Relaxed) as f64;
+        let sum_sq = self.sum_sq_ms.load(Ordering::Relaxed) as f64;
+        let mean = sum / n;
+        let variance = ((sum_sq - n * mean * mean) / (n - 1.0)).max(0.0);
+        variance.sqrt()
     }
 
     /// APDEX：满意 (<T)、可容忍 (<4T)、失望 三档打分
+    ///
+    /// 失败请求直接计入分母（失望），不再按耗时刻度误判为「满意」。
     fn apdex(&self) -> f64 {
         let total = self.count();
         if total == 0 {
             return 0.0;
         }
-        let mut satisfied = 0u64;
-        let mut tolerating = 0u64;
-        for (index, bucket) in self.buckets.iter().enumerate() {
-            let value = index as f64;
-            let count = bucket.load(Ordering::Relaxed);
-            if value <= APDEX_T {
-                satisfied += count;
-            } else if value <= APDEX_T * 4.0 {
-                tolerating += count;
-            }
-        }
-        (satisfied as f64 + tolerating as f64 / 2.0) / total as f64
+        let satisfied = self.apdex_satisfied.load(Ordering::Relaxed) as f64;
+        let tolerating = self.apdex_tolerating.load(Ordering::Relaxed) as f64;
+        ((satisfied + tolerating / 2.0) / total as f64).clamp(0.0, 1.0)
     }
 
     fn status_codes(&self) -> Vec<StatusCount> {
-        let mut items: Vec<StatusCount> = self
-            .codes
-            .lock()
-            .map(|map| {
-                map.iter()
-                    .map(|(code, count)| StatusCount {
-                        code: *code as i64,
-                        count: *count as i64,
-                    })
-                    .collect()
+        let mut merged: HashMap<u16, u64> = HashMap::new();
+        for shard in &self.codes {
+            if let Ok(map) = shard.lock() {
+                for (code, count) in map.iter() {
+                    *merged.entry(*code).or_insert(0) += *count;
+                }
+            }
+        }
+        let mut items: Vec<StatusCount> = merged
+            .into_iter()
+            .map(|(code, count)| StatusCount {
+                code: code as i64,
+                count: count as i64,
             })
-            .unwrap_or_default();
+            .collect();
         items.sort_by(|a, b| b.count.cmp(&a.count).then(a.code.cmp(&b.code)));
         items
     }
@@ -782,6 +803,10 @@ struct Control {
     rate: AtomicU32,
     tokens: AtomicU64,
     stage: std::sync::atomic::AtomicI64,
+    /// 阶梯切换唤醒：未进入生效区间的 worker 不再每 50ms 轮询
+    wake: tokio::sync::Notify,
+    /// 令牌补充唤醒：限速时等待中的 worker 不再毫秒级空转
+    token_wake: tokio::sync::Notify,
 }
 
 impl Control {
@@ -791,6 +816,8 @@ impl Control {
             rate: AtomicU32::new(rate),
             tokens: AtomicU64::new(rate as u64),
             stage: std::sync::atomic::AtomicI64::new(0),
+            wake: tokio::sync::Notify::new(),
+            token_wake: tokio::sync::Notify::new(),
         }
     }
 }
@@ -1596,8 +1623,8 @@ struct RunCtx {
     cancel: Arc<AtomicBool>,
     errors: mpsc::Sender<ReportError>,
     records: mpsc::UnboundedSender<ReportRequestRecord>,
-    /// TopN 慢请求：轻量字段，不复制请求/响应内容
-    slow_tx: mpsc::UnboundedSender<SlowRequest>,
+    /// TopN 慢请求：轻量字段，不复制请求/响应内容；有界队列，满即丢弃
+    slow_tx: mpsc::Sender<SlowRequest>,
     /// 保留的慢请求条数上限（0 = 不采集）
     slow_limit: usize,
     /// 只记录慢于该阈值的请求（0 = 不设阈值）
@@ -1615,6 +1642,8 @@ struct Attempt {
     error: Option<String>,
     snippet: String,
     ttfb_ms: u64,
+    /// 响应体读取耗时（毫秒）；重试场景只算最后一次响应
+    body_ms: u64,
     bytes: u64,
     body: Option<String>,
     /// 查询参数（query string）
@@ -1773,6 +1802,7 @@ async fn send_once(ctx: &RunCtx, capture: Capture, vu: u32) -> Attempt {
                 error: Some(error),
                 snippet: String::new(),
                 ttfb_ms: 0,
+                body_ms: 0,
                 bytes: 0,
                 body: None,
                 params: String::new(),
@@ -1925,6 +1955,9 @@ async fn send_once(ctx: &RunCtx, capture: Capture, vu: u32) -> Attempt {
                 },
             )
             .await;
+            // 响应体耗时在单次请求内部测量：重试时总耗时包含两次请求，
+            // 不能用总耗时减 TTFB，否则响应体时间会把第一次请求也算进去
+            let body_ms = (started.elapsed().as_millis() as u64).saturating_sub(ttfb_ms);
             let snippet = clip(&text, SNIPPET_LIMIT);
             let response_body = if text.trim().is_empty() {
                 None
@@ -1944,6 +1977,7 @@ async fn send_once(ctx: &RunCtx, capture: Capture, vu: u32) -> Attempt {
                 },
                 snippet,
                 ttfb_ms,
+                body_ms,
                 bytes,
                 body: request_body,
                 params: query,
@@ -1964,6 +1998,7 @@ async fn send_once(ctx: &RunCtx, capture: Capture, vu: u32) -> Attempt {
             error: Some(error.to_string()),
             snippet: String::new(),
             ttfb_ms: 0,
+            body_ms: 0,
             bytes: 0,
             body: request_body,
             params: query,
@@ -2116,7 +2151,13 @@ async fn take_token(ctx: &RunCtx) -> bool {
             }
             continue;
         }
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        // 先登记唤醒再复查：避免「复查后刚好补令牌」导致错过通知
+        let notified = ctx.control.token_wake.notified();
+        if ctx.control.tokens.load(Ordering::Relaxed) > 0 {
+            continue;
+        }
+        // 20ms 兜底：即使错过一次通知，也不会让限速请求多等一整秒
+        let _ = tokio::time::timeout(Duration::from_millis(20), notified).await;
     }
 }
 
@@ -2269,9 +2310,14 @@ async fn worker(ctx: Arc<RunCtx>, index: u32, workers: u32) {
             break;
         }
 
-        // 阶梯加压：未进入生效区间的 worker 等待
+        // 阶梯加压：未进入生效区间的 worker 等待。先建 notified() 再复查，
+        // 避免「检查完刚好切换并发」时白等一整秒；1 秒兜底只是防御。
         if index >= ctx.control.active.load(Ordering::Relaxed) {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            let notified = ctx.control.wake.notified();
+            if index < ctx.control.active.load(Ordering::Relaxed) {
+                continue;
+            }
+            let _ = tokio::time::timeout(Duration::from_secs(1), notified).await;
             continue;
         }
 
@@ -2284,6 +2330,10 @@ async fn worker(ctx: Arc<RunCtx>, index: u32, workers: u32) {
         ctx.metrics.concurrent.fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
         let mut attempt = send_once(&ctx, capture, index).await;
+        // 401/403 刷新后重试：两次请求都产生流量与耗时，
+        // 报告里要把第一次的响应字节和发送字节补回来，否则流量统计偏小
+        let mut retried_bytes = 0u64;
+        let mut sent_factor = 1u64;
         // Token 池：401/403 时先尝试刷新（或切下一条 token），再重试一次
         if matches!(attempt.status, 401 | 403) && !attempt.picks.is_empty() {
             if let Some(pools) = ctx.pools.as_ref() {
@@ -2292,6 +2342,8 @@ async fn worker(ctx: Arc<RunCtx>, index: u32, workers: u32) {
                     .refresh_after_unauthorized(&ctx.client, &ctx.vars, &attempt.picks)
                     .await
                 {
+                    retried_bytes = attempt.bytes;
+                    sent_factor = 2;
                     attempt = send_once(&ctx, capture, index).await;
                 } else if refreshable {
                     ctx.metrics
@@ -2307,9 +2359,10 @@ async fn worker(ctx: Arc<RunCtx>, index: u32, workers: u32) {
             ctx.start.elapsed().as_millis() as i64,
             latency_ms,
             attempt.ttfb_ms.min(latency_ms),
+            attempt.body_ms,
             attempt.status,
-            attempt.bytes,
-            ctx.req_bytes,
+            attempt.bytes.saturating_add(retried_bytes),
+            ctx.req_bytes.saturating_mul(sent_factor),
             attempt.ok,
             attempt.error.as_deref(),
         );
@@ -2331,16 +2384,21 @@ async fn worker(ctx: Arc<RunCtx>, index: u32, workers: u32) {
         // 慢请求 TopN：与逐请求明细解耦，定位模式下只保留轻量字段
         if ctx.slow_limit > 0 {
             let ttfb_ms = attempt.ttfb_ms.min(latency_ms);
-            if ctx.slow_threshold_ms == 0 || latency_ms >= ctx.slow_threshold_ms {
-                let _ = ctx.slow_tx.send(SlowRequest {
-                    elapsed_ms: ctx.start.elapsed().as_millis() as i64,
-                    method: ctx.method.as_str().to_string(),
-                    url: attempt.url.clone(),
-                    status: attempt.status as i64,
-                    latency_ms: latency_ms as i64,
-                    ttfb_ms: ttfb_ms as i64,
-                    body_ms: latency_ms.saturating_sub(ttfb_ms) as i64,
-                });
+            if (ctx.slow_threshold_ms == 0 || latency_ms >= ctx.slow_threshold_ms)
+                && ctx
+                    .slow_tx
+                    .try_send(SlowRequest {
+                        elapsed_ms: ctx.start.elapsed().as_millis() as i64,
+                        method: ctx.method.as_str().to_string(),
+                        url: attempt.url.clone(),
+                        status: attempt.status as i64,
+                        latency_ms: latency_ms as i64,
+                        ttfb_ms: ttfb_ms as i64,
+                        body_ms: latency_ms.saturating_sub(ttfb_ms) as i64,
+                    })
+                    .is_err()
+            {
+                ctx.metrics.slow_dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
         if should_record {
@@ -2429,7 +2487,7 @@ pub(crate) struct PreparedStress {
     pub(crate) target_key: String,
     errors_rx: mpsc::Receiver<ReportError>,
     records_rx: mpsc::UnboundedReceiver<ReportRequestRecord>,
-    slow_rx: mpsc::UnboundedReceiver<SlowRequest>,
+    slow_rx: mpsc::Receiver<SlowRequest>,
 }
 
 impl PreparedStress {
@@ -3237,7 +3295,9 @@ pub(crate) fn prepare_stress_with_relay(
 
     let (errors_tx, errors_rx) = mpsc::channel::<ReportError>(1024);
     let (records_tx, records_rx) = mpsc::unbounded_channel::<ReportRequestRecord>();
-    let (slow_tx, slow_rx) = mpsc::unbounded_channel::<SlowRequest>();
+    // 慢请求队列有界：阈值=0 且高 QPS 时，消费端每秒才取一次，
+    // 无界队列会把整段压测的慢请求全堆在内存里
+    let (slow_tx, slow_rx) = mpsc::channel::<SlowRequest>(4096);
     let slow_threshold_ms = config.slow_threshold_ms.unwrap_or(0);
 
     let config_snapshot = json!({
@@ -3390,10 +3450,17 @@ pub(crate) struct EngineSparseMetrics {
     pub total: u64,
     pub success: u64,
     pub errors: u64,
+    /// 有响应的请求数（TTFB / 响应体统计分母）
+    pub responses: u64,
     pub bytes: u64,
     pub bytes_sent: u64,
     pub sum_rt_ms: u64,
     pub sum_ttfb_ms: u64,
+    /// 仅响应请求的响应体耗时累加
+    pub sum_body_ms: u64,
+    /// APDEX 分子计数：只含成功请求
+    pub apdex_satisfied: u64,
+    pub apdex_tolerating: u64,
     pub min_rt: f64,
     pub max_rt: f64,
     pub latency: Vec<(u32, u64)>,
@@ -3486,6 +3553,49 @@ pub(crate) async fn run_engine(
     let metrics = ctx.metrics.clone();
     let control = ctx.control.clone();
 
+    // 限速令牌按 100ms 平滑补充：原先每秒一次性补满会让请求在秒初扎堆，
+    // 高 QPS 时形成明显锯齿；上限 1.5 秒量，避免进程卡顿后一次性爆发。
+    let mut refill_task = if rate > 0 {
+        let control = control.clone();
+        let cancel = cancel.clone();
+        Some(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_millis(100));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await;
+            let mut last = Instant::now();
+            // 小数令牌累计：rate=10.5 时不能每 tick 都向下取整成 10
+            let mut carry = 0.0f64;
+            let cap = (rate as f64 * 1.5).max(1.0);
+            loop {
+                ticker.tick().await;
+                if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                    break;
+                }
+                let now = Instant::now();
+                let dt = now.duration_since(last).as_secs_f64().clamp(0.001, 1.0);
+                last = now;
+                let want = rate as f64 * dt + carry;
+                let whole = want.floor();
+                carry = want - whole;
+                if whole >= 1.0 {
+                    let add = whole as u64;
+                    // 新版工具链把 fetch_update 标记为 deprecated，旧版没有 try_update，
+                    // 这里保留兼容名并在语句级别忽略告警
+                    #[allow(deprecated)]
+                    let _ = control.tokens.fetch_update(
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        |current| Some(((current as f64 + add as f64).min(cap)) as u64),
+                    );
+                    // 唤醒在 take_token 里等待的 worker
+                    control.token_wake.notify_waiters();
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
     let mut tasks = JoinSet::new();
     for index in 0..peak {
         tasks.spawn(worker(ctx.clone(), index, peak));
@@ -3506,7 +3616,14 @@ pub(crate) async fn run_engine(
     // 集群采样外送：累计耗时与逐毫秒桶都需要按采样间隔取增量
     let mut prev_sum_rt = 0u64;
     let mut prev_sum_ttfb = 0u64;
+    let mut prev_sum_body = 0u64;
+    let mut prev_responses = 0u64;
     let mut prev_latency = vec![0u64; metrics.buckets.len()];
+    let mut prev_body = vec![0u64; metrics.body_buckets.len()];
+    // 阶梯汇总：按阶段累积精确的请求数、总耗时与延迟直方图
+    let mut stage_accums: Vec<StageAccum> =
+        (0..stages.len()).map(|_| StageAccum::default()).collect();
+    let mut last_stage_index = -1i64;
     let mut left_sec = total_sec;
     let mut auto_stop: Option<String> = None;
     // 已下发到前端的采样点数量（进度事件只发增量）
@@ -3571,64 +3688,115 @@ pub(crate) async fn run_engine(
         let failure = metrics.errors.load(Ordering::Relaxed);
         let bytes = metrics.bytes.load(Ordering::Relaxed);
 
-        // 阶梯加压：按时间切换生效并发
+        // 阶梯加压：按时间切换生效并发；变化时唤醒等待中的 worker
         let (active, stage_index) = stage_at(&stages, elapsed, peak);
-        control.active.store(active, Ordering::Relaxed);
+        let previous_active = control.active.swap(active, Ordering::Relaxed);
         control.stage.store(stage_index, Ordering::Relaxed);
-        // 限速：每秒补满令牌
-        if rate > 0 {
-            control.tokens.store(rate as u64, Ordering::Relaxed);
+        if previous_active != active {
+            control.wake.notify_waiters();
         }
 
         monitor.sample();
 
-        if elapsed > 0 && elapsed.saturating_sub(last_sample_sec) >= sample_step {
+        let stage_changed = stage_index != last_stage_index;
+        // 阶梯切换时强制补一个采样点：否则 2s/5s 降频采样会把跨阶段的一整段
+        // 请求全部算到下一个阶段，阶段报告的 QPS / P95 就会串档
+        if elapsed > 0 && (elapsed.saturating_sub(last_sample_sec) >= sample_step || stage_changed)
+        {
             // QPS 按真实采样间隔归一：高负载下 ticker 会漂移，直接取相邻计数差会高估
             let now_sample = Instant::now();
             let dt = now_sample
                 .duration_since(last_sample_at)
                 .as_secs_f64()
                 .clamp(0.001, 60.0);
+            // 本段请求实际发生在 [上次采样, 本次采样) 之间，按区间起点归属阶段
+            let acc_stage_index = stage_at(&stages, last_sample_sec, peak).1;
             last_sample_at = now_sample;
             last_sample_sec = elapsed;
-            let qps = total.saturating_sub(prev_total) as f64 / dt;
+
+            let delta_total = total.saturating_sub(prev_total);
+            let delta_success = success.saturating_sub(prev_success);
+            let delta_errors = failure.saturating_sub(prev_errors);
+            let delta_bytes = bytes.saturating_sub(prev_bytes);
+            let sum_rt = metrics.sum_ms.load(Ordering::Relaxed);
+            let delta_rt = sum_rt.saturating_sub(prev_sum_rt);
+            prev_sum_rt = sum_rt;
+            let sum_ttfb = metrics.sum_ttfb.load(Ordering::Relaxed);
+            let delta_ttfb = sum_ttfb.saturating_sub(prev_sum_ttfb);
+            prev_sum_ttfb = sum_ttfb;
+            let sum_body = metrics.sum_body.load(Ordering::Relaxed);
+            let delta_body = sum_body.saturating_sub(prev_sum_body);
+            prev_sum_body = sum_body;
+            let responses = metrics.responses.load(Ordering::Relaxed);
+            let delta_responses = responses.saturating_sub(prev_responses);
+            prev_responses = responses;
+
+            let latency_buckets = bucket_delta(&metrics.buckets, &mut prev_latency);
+            let body_buckets = bucket_delta(&metrics.body_buckets, &mut prev_body);
+
+            let qps = delta_total as f64 / dt;
+            // 曲线按「本采样区间」统计，而不是启动以来的累计值：
+            // 累计值画出来只会是一条收敛曲线，阶梯压测的阶段对比会完全失真
+            let avg_rt = if delta_total > 0 {
+                delta_rt as f64 / delta_total as f64
+            } else {
+                0.0
+            };
+            let ttfb_avg = if delta_responses > 0 {
+                delta_ttfb as f64 / delta_responses as f64
+            } else {
+                0.0
+            };
+            let body_avg = if delta_responses > 0 {
+                delta_body as f64 / delta_responses as f64
+            } else {
+                0.0
+            };
             samples.push(ReportSample {
                 elapsed_sec: elapsed,
                 concurrent: metrics.concurrent.load(Ordering::Relaxed),
                 qps,
-                avg_rt: metrics.avg(),
-                p50_rt: metrics.percentile(0.5),
-                p95_rt: metrics.percentile(0.95),
-                p99_rt: metrics.percentile(0.99),
-                ttfb_avg: metrics.ttfb_avg(),
-                body_avg: metrics.body_avg(),
-                body_p95: metrics.body_percentile(0.95),
-                bytes: bytes.saturating_sub(prev_bytes),
-                success_count: success.saturating_sub(prev_success),
-                error_count: failure.saturating_sub(prev_errors),
+                avg_rt,
+                p50_rt: percentile_sparse(&latency_buckets, delta_total, 0.5),
+                p95_rt: percentile_sparse(&latency_buckets, delta_total, 0.95),
+                p99_rt: percentile_sparse(&latency_buckets, delta_total, 0.99),
+                ttfb_avg,
+                body_avg,
+                body_p95: percentile_sparse(&body_buckets, delta_responses, 0.95),
+                bytes: delta_bytes,
+                success_count: delta_success,
+                error_count: delta_errors,
+                response_count: delta_responses,
             });
+
+            // 阶梯汇总：用区间增量累加到所属阶段，阶段内 P95 由真实直方图重算
+            if let Some(accum) = stage_accums.get_mut(acc_stage_index.max(0) as usize) {
+                accum.requests += delta_total;
+                accum.errors += delta_errors;
+                accum.sum_rt += delta_rt;
+                for &(index, count) in &latency_buckets {
+                    *accum.latency.entry(index).or_insert(0) += count;
+                }
+            }
 
             // 集群模式外送本秒增量：QPS / 计数 / 耗时累加 / 稀疏直方图
             if let Some(sink) = &sink {
-                let sum_rt = metrics.sum_ms.load(Ordering::Relaxed);
-                let delta_rt = sum_rt.saturating_sub(prev_sum_rt);
-                prev_sum_rt = sum_rt;
-                let sum_ttfb = metrics.sum_ttfb.load(Ordering::Relaxed);
-                let delta_ttfb = sum_ttfb.saturating_sub(prev_sum_ttfb);
-                prev_sum_ttfb = sum_ttfb;
                 sink(ClusterSamplePayload {
                     elapsed_sec: elapsed,
                     concurrent: metrics.concurrent.load(Ordering::Relaxed),
                     qps,
-                    avg_rt: metrics.avg(),
-                    ttfb_avg: metrics.ttfb_avg(),
-                    body_avg: metrics.body_avg(),
-                    bytes: bytes.saturating_sub(prev_bytes),
-                    success_count: success.saturating_sub(prev_success),
-                    error_count: failure.saturating_sub(prev_errors),
+                    avg_rt,
+                    ttfb_avg,
+                    body_avg,
+                    bytes: delta_bytes,
+                    success_count: delta_success,
+                    error_count: delta_errors,
                     sum_rt_ms: delta_rt,
                     sum_ttfb_ms: delta_ttfb,
-                    latency_buckets: bucket_delta(&metrics.buckets, &mut prev_latency),
+                    response_count: delta_responses,
+                    sum_body_ms: delta_body,
+                    latency_buckets,
+                    body_buckets,
                     // 本机资源由调用方（从节点 sink）补齐，单机路径与主节点引擎保持 None
                     host: None,
                 });
@@ -3674,6 +3842,7 @@ pub(crate) async fn run_engine(
                 qps_window.clear();
             }
         }
+        last_stage_index = stage_index;
 
         if let Some(sink) = progress {
             // 只下发增量采样点，避免长压测下每秒 clone 全量序列
@@ -3729,6 +3898,15 @@ pub(crate) async fn run_engine(
         }
     }
 
+    // 报告时长按「停止发压的时刻」计算，不把等待在途请求的 drain 时间算进去，
+    // 否则固定 60s 的压测可能显示成 63-65s，平均 QPS 也会被稀释
+    let run_end = Instant::now();
+    let run_end_ms = now_ms();
+
+    if let Some(task) = refill_task.take() {
+        task.abort();
+    }
+
     // 等待在途请求结束，最多等 5 秒
     let wait_all = async { while tasks.join_next().await.is_some() {} };
     if tokio::time::timeout(Duration::from_secs(5), wait_all)
@@ -3757,7 +3935,7 @@ pub(crate) async fn run_engine(
     slow_requests.sort_by_key(|item| std::cmp::Reverse(item.latency_ms));
     slow_requests.truncate(ctx.slow_limit);
 
-    let elapsed = start.elapsed().as_secs_f64().max(0.001);
+    let elapsed = run_end.duration_since(start).as_secs_f64().max(0.001);
     let total = metrics.count();
     let success = metrics.success.load(Ordering::Relaxed);
     let failure = metrics.errors.load(Ordering::Relaxed);
@@ -3766,14 +3944,23 @@ pub(crate) async fn run_engine(
     } else {
         "completed"
     };
-    let end_time = now_ms();
+    let end_time = run_end_ms;
     let start_time = end_time - (elapsed * 1000.0) as i64;
-    let max_qps = samples.iter().map(|s| s.qps).fold(0.0, f64::max);
+    // 极短压测（<1s）还没有采样点时用总量/耗时兜底，避免峰值 QPS 显示 0
+    let max_qps = samples
+        .iter()
+        .map(|s| s.qps)
+        .fold(0.0, f64::max)
+        .max(if total > 0 {
+            total as f64 / elapsed
+        } else {
+            0.0
+        });
 
     let histogram = metrics.histogram();
     let body_histogram = metrics.body_histogram();
     let status_codes = metrics.status_codes();
-    let stage_summaries = summarize_stages(&stages, &samples);
+    let stage_summaries = summarize_stages(&stages, &samples, &stage_accums);
     let error_types = metrics.error_types();
     // URL 聚合与明细采集解耦：这里拿到最终（已脱敏）的逐地址统计
     let (url_stats, url_stats_complete) = metrics.url_stats();
@@ -3785,6 +3972,7 @@ pub(crate) async fn run_engine(
             "bytesSent": metrics.bytes_sent.load(Ordering::Relaxed),
             "errorsDropped": metrics.errors_dropped.load(Ordering::Relaxed),
             "recordsDropped": metrics.records_dropped.load(Ordering::Relaxed),
+            "slowDropped": metrics.slow_dropped.load(Ordering::Relaxed),
             // URL 键溢出时页面与导出要标注「统计不完整」
             "urlStatsComplete": url_stats_complete,
             "recordMode": Capture::from_u8(ctx.capture.load(Ordering::Relaxed)).label(),
@@ -3850,10 +4038,14 @@ pub(crate) async fn run_engine(
         total,
         success,
         errors: failure,
+        responses: metrics.responses.load(Ordering::Relaxed),
         bytes: metrics.bytes.load(Ordering::Relaxed),
         bytes_sent: metrics.bytes_sent.load(Ordering::Relaxed),
         sum_rt_ms: metrics.sum_ms.load(Ordering::Relaxed),
         sum_ttfb_ms: metrics.sum_ttfb.load(Ordering::Relaxed),
+        sum_body_ms: metrics.sum_body.load(Ordering::Relaxed),
+        apdex_satisfied: metrics.apdex_satisfied.load(Ordering::Relaxed),
+        apdex_tolerating: metrics.apdex_tolerating.load(Ordering::Relaxed),
         min_rt: metrics.min(),
         max_rt: metrics.max(),
         latency: sparse_buckets(&metrics.buckets),
@@ -4049,8 +4241,56 @@ pub async fn run_stress_case(
     Ok(outcome)
 }
 
-/// 按阶段把每秒采样归并成阶段性汇总
-fn summarize_stages(stages: &[StressStage], samples: &[ReportSample]) -> Vec<StageSummary> {
+/// 阶梯阶段的精确累加器：请求数、错误数、总耗时与延迟直方图
+#[derive(Default)]
+struct StageAccum {
+    requests: u64,
+    errors: u64,
+    sum_rt: u64,
+    latency: BTreeMap<u32, u64>,
+}
+
+/// 从稀疏桶计算分位数（桶内线性插值）
+fn percentile_from_iter(items: impl Iterator<Item = (u32, u64)>, total: u64, p: f64) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    let target = ((total as f64) * p).ceil() as u64;
+    let mut acc = 0u64;
+    let mut last = 0u32;
+    for (index, count) in items {
+        if count == 0 {
+            continue;
+        }
+        last = index;
+        let before = acc;
+        acc += count;
+        if acc >= target {
+            let rank = target.saturating_sub(before) as f64;
+            let offset = ((rank - 0.5) / count as f64).clamp(0.0, 1.0);
+            return index as f64 + offset;
+        }
+    }
+    last as f64
+}
+
+fn percentile_sparse(items: &[(u32, u64)], total: u64, p: f64) -> f64 {
+    percentile_from_iter(
+        items.iter().map(|(index, count)| (*index, *count)),
+        total,
+        p,
+    )
+}
+
+/// 按阶段把采样归并成阶段性汇总
+///
+/// 优先使用引擎内按阶段累积的真实直方图（P95 精确、QPS 按阶段实际覆盖秒数）；
+/// 没有累积数据时退回采样窗口估算，保证旧报告仍可展示。
+fn summarize_stages(
+    stages: &[StressStage],
+    samples: &[ReportSample],
+    accums: &[StageAccum],
+) -> Vec<StageSummary> {
     if stages.is_empty() {
         return Vec::new();
     }
@@ -4062,29 +4302,53 @@ fn summarize_stages(stages: &[StressStage], samples: &[ReportSample]) -> Vec<Sta
             .iter()
             .filter(|s| s.elapsed_sec > start_sec && s.elapsed_sec <= end_sec)
             .collect();
-        let requests: i64 = window
+        let covered_sec = window
             .iter()
-            .map(|s| (s.success_count + s.error_count) as i64)
-            .sum();
-        let errors: i64 = window.iter().map(|s| s.error_count as i64).sum();
-        let avg_qps = if window.is_empty() {
-            0.0
-        } else {
-            requests as f64 / window.len() as f64
+            .map(|s| s.elapsed_sec)
+            .max()
+            .unwrap_or(end_sec)
+            .min(end_sec)
+            .saturating_sub(start_sec)
+            .max(1);
+        let (requests, errors, avg_rt, p95_rt) = match accums.get(index) {
+            Some(accum) if accum.requests > 0 => (
+                accum.requests as i64,
+                accum.errors as i64,
+                accum.sum_rt as f64 / accum.requests as f64,
+                percentile_from_iter(
+                    accum.latency.iter().map(|(key, count)| (*key, *count)),
+                    accum.requests,
+                    0.95,
+                ),
+            ),
+            _ => {
+                let requests: i64 = window
+                    .iter()
+                    .map(|s| (s.success_count + s.error_count) as i64)
+                    .sum();
+                let errors: i64 = window.iter().map(|s| s.error_count as i64).sum();
+                let avg_rt = if window.is_empty() {
+                    0.0
+                } else {
+                    window.iter().map(|s| s.avg_rt).sum::<f64>() / window.len() as f64
+                };
+                (
+                    requests,
+                    errors,
+                    avg_rt,
+                    window.iter().map(|s| s.p95_rt).fold(0.0, f64::max),
+                )
+            }
         };
-        let avg_rt = if window.is_empty() {
-            0.0
-        } else {
-            window.iter().map(|s| s.avg_rt).sum::<f64>() / window.len() as f64
-        };
-        let p95_rt = window.iter().map(|s| s.p95_rt).fold(0.0, f64::max);
         result.push(StageSummary {
             index: index as i64,
             concurrent: stage.concurrent as i64,
             duration_sec: stage.duration_sec as i64,
             requests,
             errors,
-            avg_qps,
+            // 分母是阶段实际覆盖的秒数，不是采样点个数：
+            // 2s/5s 降频采样时用采样点数会把 QPS 放大 2/5 倍
+            avg_qps: requests as f64 / covered_sec as f64,
             avg_rt,
             p95_rt,
         });
@@ -4273,6 +4537,38 @@ pub(crate) struct ReportPayload<'a> {
     pub config: &'a str,
 }
 
+/// 批量插入：SQLite 单条语句变量数有上限，按 500 行一组生成多值 VALUES
+///
+/// 逐条 execute 在事务里虽然能复用语句，但长压测的请求明细可达 5 万行，
+/// 单行往返仍会明显拖长报告落库时间；多值插入把往返次数降到百分之一。
+fn batch_insert(
+    tx: &rusqlite::Transaction<'_>,
+    prefix: &str,
+    columns: usize,
+    rows: &[Vec<rusqlite::types::Value>],
+) -> Result<(), String> {
+    const BATCH_ROWS: usize = 500;
+    let row_sql = format!(
+        "({})",
+        std::iter::repeat_n("?", columns)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    for chunk in rows.chunks(BATCH_ROWS) {
+        let placeholders = std::iter::repeat_n(row_sql.as_str(), chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("{prefix} VALUES {placeholders}");
+        let mut flat = Vec::with_capacity(chunk.len() * columns);
+        for row in chunk {
+            flat.extend(row.iter().cloned());
+        }
+        tx.execute(&sql, rusqlite::params_from_iter(flat.iter()))
+            .map_err(err)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn save_report(pool: &DbPool, payload: ReportPayload<'_>) -> Result<i64, String> {
     let report = payload.report;
     let mut conn = pool.get().map_err(err)?;
@@ -4343,55 +4639,67 @@ pub(crate) fn save_report(pool: &DbPool, payload: ReportPayload<'_>) -> Result<i
     let report_id = tx.last_insert_rowid();
 
     {
-        let mut stmt = tx
-            .prepare(
-                "INSERT INTO report_samples
-                    (report_id, elapsed_sec, concurrent, qps, avg_rt, p50_rt, p95_rt, p99_rt,
-                     ttfb_avg, body_avg, body_p95, bytes, success_count, error_count)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-            )
-            .map_err(err)?;
-        for sample in payload.samples {
-            stmt.execute(params![
-                report_id,
-                sample.elapsed_sec as i64,
-                sample.concurrent as i64,
-                sample.qps,
-                sample.avg_rt,
-                sample.p50_rt,
-                sample.p95_rt,
-                sample.p99_rt,
-                sample.ttfb_avg,
-                sample.body_avg,
-                sample.body_p95,
-                sample.bytes as i64,
-                sample.success_count as i64,
-                sample.error_count as i64,
-            ])
-            .map_err(err)?;
-        }
+        use rusqlite::types::Value as SqlValue;
+        let rows: Vec<Vec<SqlValue>> = payload
+            .samples
+            .iter()
+            .map(|sample| {
+                vec![
+                    SqlValue::Integer(report_id),
+                    SqlValue::Integer(sample.elapsed_sec as i64),
+                    SqlValue::Integer(sample.concurrent as i64),
+                    SqlValue::Real(sample.qps),
+                    SqlValue::Real(sample.avg_rt),
+                    SqlValue::Real(sample.p50_rt),
+                    SqlValue::Real(sample.p95_rt),
+                    SqlValue::Real(sample.p99_rt),
+                    SqlValue::Real(sample.ttfb_avg),
+                    SqlValue::Real(sample.body_avg),
+                    SqlValue::Real(sample.body_p95),
+                    SqlValue::Integer(sample.bytes as i64),
+                    SqlValue::Integer(sample.success_count as i64),
+                    SqlValue::Integer(sample.error_count as i64),
+                    SqlValue::Integer(sample.response_count as i64),
+                ]
+            })
+            .collect();
+        batch_insert(
+            &tx,
+            "INSERT INTO report_samples
+                (report_id, elapsed_sec, concurrent, qps, avg_rt, p50_rt, p95_rt, p99_rt,
+                 ttfb_avg, body_avg, body_p95, bytes, success_count, error_count, response_count)",
+            15,
+            &rows,
+        )?;
     }
 
     {
-        let mut stmt = tx
-            .prepare(
-                "INSERT INTO report_errors
-                    (report_id, elapsed_sec, error_type, error_message, request_url, response_status, response_body)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            )
-            .map_err(err)?;
-        for item in payload.errors {
-            stmt.execute(params![
-                report_id,
-                item.elapsed_sec,
-                item.error_type,
-                item.error_message,
-                item.request_url,
-                item.response_status,
-                item.response_body,
-            ])
-            .map_err(err)?;
-        }
+        use rusqlite::types::Value as SqlValue;
+        let rows: Vec<Vec<SqlValue>> = payload
+            .errors
+            .iter()
+            .map(|item| {
+                vec![
+                    SqlValue::Integer(report_id),
+                    SqlValue::Integer(item.elapsed_sec),
+                    SqlValue::Text(item.error_type.clone()),
+                    SqlValue::Text(item.error_message.clone()),
+                    SqlValue::Text(item.request_url.clone()),
+                    item.response_status
+                        .map(SqlValue::Integer)
+                        .unwrap_or(SqlValue::Null),
+                    SqlValue::Text(item.response_body.clone()),
+                ]
+            })
+            .collect();
+        batch_insert(
+            &tx,
+            "INSERT INTO report_errors
+                (report_id, elapsed_sec, error_type, error_message, request_url,
+                 response_status, response_body)",
+            7,
+            &rows,
+        )?;
     }
 
     // 兼容旧库：逐请求明细表可能尚未创建，缺失时在此补建，避免整份报告保存失败
@@ -4420,41 +4728,49 @@ pub(crate) fn save_report(pool: &DbPool, payload: ReportPayload<'_>) -> Result<i
     );
 
     let _ = tx.execute_batch("SAVEPOINT req_rows");
-    let detail_result = (|| -> Result<(), String> {
-        let mut stmt = tx
-            .prepare(
-                "INSERT INTO report_requests
-                    (report_id, elapsed_ms, time_ms, method, url, status, latency_ms, ttfb_ms,
-                     bytes, success, body, params, req_headers, res_headers, res_body,
-                     error_type, error_message)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                         ?15, ?16, ?17)",
-            )
-            .map_err(err)?;
-        for item in payload.requests {
-            stmt.execute(params![
-                report_id,
-                item.elapsed_ms,
-                item.time_ms,
-                item.method,
-                item.url,
-                item.status,
-                item.latency_ms,
-                item.ttfb_ms,
-                item.bytes,
-                item.success as i64,
-                item.body,
-                item.params,
-                item.headers,
-                item.response_headers,
-                item.response_body,
-                item.error_type,
-                item.error_message,
-            ])
-            .map_err(err)?;
-        }
-        Ok(())
-    })();
+    let detail_result = {
+        use rusqlite::types::Value as SqlValue;
+        let text = |value: &Option<String>| {
+            value
+                .as_ref()
+                .map(|item| SqlValue::Text(item.clone()))
+                .unwrap_or(SqlValue::Null)
+        };
+        let rows: Vec<Vec<SqlValue>> = payload
+            .requests
+            .iter()
+            .map(|item| {
+                vec![
+                    SqlValue::Integer(report_id),
+                    SqlValue::Integer(item.elapsed_ms),
+                    SqlValue::Integer(item.time_ms),
+                    SqlValue::Text(item.method.clone()),
+                    SqlValue::Text(item.url.clone()),
+                    SqlValue::Integer(item.status),
+                    SqlValue::Integer(item.latency_ms),
+                    SqlValue::Integer(item.ttfb_ms),
+                    SqlValue::Integer(item.bytes),
+                    SqlValue::Integer(item.success as i64),
+                    text(&item.body),
+                    text(&item.params),
+                    text(&item.headers),
+                    text(&item.response_headers),
+                    text(&item.response_body),
+                    text(&item.error_type),
+                    text(&item.error_message),
+                ]
+            })
+            .collect();
+        batch_insert(
+            &tx,
+            "INSERT INTO report_requests
+                (report_id, elapsed_ms, time_ms, method, url, status, latency_ms, ttfb_ms,
+                 bytes, success, body, params, req_headers, res_headers, res_body,
+                 error_type, error_message)",
+            17,
+            &rows,
+        )
+    };
     // 明细写入失败只回滚这一段，报告主体照常提交
     if detail_result.is_ok() {
         let _ = tx.execute_batch("RELEASE req_rows");
@@ -4485,35 +4801,46 @@ pub(crate) fn save_report(pool: &DbPool, payload: ReportPayload<'_>) -> Result<i
             ON report_url_stats(report_id, status_code);",
     );
     let _ = tx.execute_batch("SAVEPOINT url_rows");
-    let url_result = (|| -> Result<(), String> {
-        let mut stmt = tx
-            .prepare(
-                "INSERT INTO report_url_stats
-                    (report_id, method, url, status_code, requests, success_count, error_count,
-                     sum_ms, max_ms, max_at_ms, bytes, error_message, max_request_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-            )
-            .map_err(err)?;
-        for item in payload.url_stats {
-            stmt.execute(params![
-                report_id,
-                item.method,
-                item.url,
-                item.status_code,
-                item.requests,
-                item.success_count,
-                item.error_count,
-                item.sum_ms,
-                item.max_ms,
-                item.max_at_ms,
-                item.bytes,
-                item.error_message,
-                item.max_request_id,
-            ])
-            .map_err(err)?;
-        }
-        Ok(())
-    })();
+    let url_result = {
+        use rusqlite::types::Value as SqlValue;
+        let text = |value: &Option<String>| {
+            value
+                .as_ref()
+                .map(|item| SqlValue::Text(item.clone()))
+                .unwrap_or(SqlValue::Null)
+        };
+        let rows: Vec<Vec<SqlValue>> = payload
+            .url_stats
+            .iter()
+            .map(|item| {
+                vec![
+                    SqlValue::Integer(report_id),
+                    SqlValue::Text(item.method.clone()),
+                    SqlValue::Text(item.url.clone()),
+                    SqlValue::Integer(item.status_code),
+                    SqlValue::Integer(item.requests),
+                    SqlValue::Integer(item.success_count),
+                    SqlValue::Integer(item.error_count),
+                    SqlValue::Real(item.sum_ms),
+                    SqlValue::Real(item.max_ms),
+                    item.max_at_ms
+                        .map(SqlValue::Integer)
+                        .unwrap_or(SqlValue::Null),
+                    SqlValue::Integer(item.bytes),
+                    text(&item.error_message),
+                    text(&item.max_request_id),
+                ]
+            })
+            .collect();
+        batch_insert(
+            &tx,
+            "INSERT INTO report_url_stats
+                (report_id, method, url, status_code, requests, success_count, error_count,
+                 sum_ms, max_ms, max_at_ms, bytes, error_message, max_request_id)",
+            13,
+            &rows,
+        )
+    };
     if url_result.is_ok() {
         let _ = tx.execute_batch("RELEASE url_rows");
     } else {
@@ -4917,6 +5244,7 @@ mod tests {
             100,
             10,
             5,
+            5,
             200,
             100,
             10,
@@ -4929,6 +5257,7 @@ mod tests {
             300,
             30,
             12,
+            18,
             200,
             50,
             10,
@@ -4941,6 +5270,7 @@ mod tests {
             500,
             50,
             20,
+            30,
             500,
             20,
             10,
@@ -5003,7 +5333,19 @@ mod tests {
         metrics
             .url_keys
             .store(URL_STATS_MAX_KEYS as u64, Ordering::Relaxed);
-        metrics.record("GET", "https://a.test/new", 10, 1, 0, 200, 1, 1, true, None);
+        metrics.record(
+            "GET",
+            "https://a.test/new",
+            10,
+            1,
+            0,
+            1,
+            200,
+            1,
+            1,
+            true,
+            None,
+        );
         let (rows, complete) = metrics.url_stats();
         assert!(!complete);
         assert!(rows.iter().any(|row| row.url == URL_OTHER));
@@ -5013,10 +5355,91 @@ mod tests {
     fn url_stats_truncates_long_url() {
         let metrics = Metrics::new();
         let url = format!("https://a.test/{}", "x".repeat(MAX_URL_LEN + 100));
-        metrics.record("GET", &url, 10, 1, 0, 200, 1, 1, true, None);
+        metrics.record("GET", &url, 10, 1, 0, 1, 200, 1, 1, true, None);
         let (rows, _) = metrics.url_stats();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].url.chars().count(), MAX_URL_LEN);
+    }
+
+    #[test]
+    fn metrics_exclude_failed_requests_from_ttfb_and_body() {
+        let metrics = Metrics::new();
+        // 成功响应：100ms 总耗时，其中 TTFB 60ms、响应体 40ms
+        metrics.record(
+            "GET",
+            "https://a.test/ok",
+            0,
+            100,
+            60,
+            40,
+            200,
+            1024,
+            10,
+            true,
+            None,
+        );
+        // 连接失败：没有响应，不能按 0 计入 TTFB，也不能把 50ms 全算成响应体
+        metrics.record(
+            "GET",
+            "https://a.test/fail",
+            0,
+            50,
+            0,
+            0,
+            0,
+            0,
+            10,
+            false,
+            Some("timeout"),
+        );
+        assert_eq!(metrics.count(), 2);
+        assert_eq!(metrics.responses.load(Ordering::Relaxed), 1);
+        assert!((metrics.ttfb_avg() - 60.0).abs() < 1e-9);
+        assert_eq!(metrics.sum_body.load(Ordering::Relaxed), 40);
+        // 延迟统计仍然包含失败请求的真实耗时
+        assert!((metrics.avg() - 75.0).abs() < 1e-9);
+        assert_eq!(metrics.status_codes().len(), 1);
+    }
+
+    #[test]
+    fn percentile_interpolates_inside_bucket() {
+        let items = vec![(10u32, 10u64), (20u32, 10u64)];
+        // 前 10 个落在 10ms 桶：P50 位于桶内，应返回 10.x 而不是 10.0 / 11.0
+        let p50 = percentile_sparse(&items, 20, 0.5);
+        assert!((10.0..11.0).contains(&p50), "p50={p50}");
+        let p95 = percentile_sparse(&items, 20, 0.95);
+        assert!((20.0..21.0).contains(&p95), "p95={p95}");
+    }
+
+    #[test]
+    fn stage_summary_uses_exact_accumulator() {
+        let stages = vec![
+            StressStage {
+                concurrent: 10,
+                duration_sec: 10,
+            },
+            StressStage {
+                concurrent: 20,
+                duration_sec: 10,
+            },
+        ];
+        let mut accums = vec![StageAccum::default(), StageAccum::default()];
+        accums[0].requests = 100;
+        accums[0].errors = 2;
+        accums[0].sum_rt = 2_000;
+        accums[0].latency.insert(20, 90);
+        accums[0].latency.insert(40, 10);
+        let summaries = summarize_stages(&stages, &[], &accums);
+        assert_eq!(summaries.len(), 2);
+        // 100 个请求 / 10 秒 = 10 QPS，而不是按采样点个数算
+        assert!((summaries[0].avg_qps - 10.0).abs() < 1e-9);
+        assert!((summaries[0].avg_rt - 20.0).abs() < 1e-9);
+        assert_eq!(summaries[0].requests, 100);
+        assert_eq!(summaries[0].errors, 2);
+        // 95 分位落在 40ms 桶内（90 < 95 ≤ 100）
+        assert!((40.0..41.0).contains(&summaries[0].p95_rt));
+        assert_eq!(summaries[1].requests, 0);
+        assert_eq!(summaries[1].avg_qps, 0.0);
     }
 }
 
@@ -5176,7 +5599,19 @@ mod perf_tests {
         let measure = |metrics: &Metrics| {
             let started = Instant::now();
             for index in 0..ITERATIONS {
-                metrics.record("GET", url, index as i64, 20, 10, 200, 1024, 500, true, None);
+                metrics.record(
+                    "GET",
+                    url,
+                    index as i64,
+                    20,
+                    10,
+                    10,
+                    200,
+                    1024,
+                    500,
+                    true,
+                    None,
+                );
             }
             started.elapsed().as_nanos() as f64 / ITERATIONS as f64
         };
@@ -5212,7 +5647,7 @@ mod perf_tests {
             .expect("构建压测客户端失败");
         let (errors_tx, _errors_rx) = mpsc::channel::<ReportError>(1024);
         let (records_tx, _records_rx) = mpsc::unbounded_channel::<ReportRequestRecord>();
-        let (slow_tx, _slow_rx) = mpsc::unbounded_channel::<SlowRequest>();
+        let (slow_tx, _slow_rx) = mpsc::channel::<SlowRequest>(4096);
         let start = Instant::now();
         let ctx = RunCtx {
             client,

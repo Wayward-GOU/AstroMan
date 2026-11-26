@@ -1,5 +1,5 @@
 use crate::state::{AppSettings, AppState};
-use tauri::State;
+use tauri::{AppHandle, State};
 
 #[tauri::command]
 pub fn settings_get(state: State<'_, AppState>) -> AppSettings {
@@ -22,10 +22,32 @@ pub fn performance_profile(state: State<'_, AppState>) -> serde_json::Value {
 /// 保存网络与安全设置，同时重建 HTTP 客户端
 #[tauri::command]
 pub fn settings_set(
+    app: AppHandle,
     state: State<'_, AppState>,
     settings: AppSettings,
 ) -> Result<AppSettings, String> {
-    state.update_settings(settings)
+    let saved = state.update_settings(settings)?;
+    // 设备发现开关 / 名称 / 邀请策略跟随设置即时生效，不要求重启
+    if saved.cluster_presence_enabled {
+        if let Err(error) = crate::services::cluster::presence::start(
+            &app,
+            &state.data_dir,
+            &saved.cluster_device_name,
+            true,
+            &saved.cluster_invite_policy,
+        ) {
+            // 端口被占用时不要让「保存设置」整体失败：设置页单独展示发现错误
+            log::warn!("启动设备发现失败：{error}");
+        }
+        crate::services::cluster::presence::update_identity(
+            &saved.cluster_device_name,
+            true,
+            &saved.cluster_invite_policy,
+        );
+    } else {
+        crate::services::cluster::presence::stop();
+    }
+    Ok(saved)
 }
 
 /// 企业策略：当前生效值、文件位置与解析错误。界面只读展示，由管理员改文件。

@@ -223,6 +223,12 @@ export interface AppSettings {
   stressOsEnvAllow?: string
   /** 是否广播/监听局域网发现 */
   clusterDiscoveryEnabled?: boolean
+  /** 本机在局域网中的显示名（空 = 计算机名） */
+  clusterDeviceName?: string
+  /** 是否广播在场信息并接受设备邀请（UDP/TCP 17803） */
+  clusterPresenceEnabled?: boolean
+  /** 收到邀请时：ask（弹窗确认）/ auto（自动接受）/ off（拒绝） */
+  clusterInvitePolicy?: string
 }
 
 /** 企业策略（policy.json / W4-2） */
@@ -1181,6 +1187,8 @@ export interface ReportSample {
   bytes: number
   successCount: number
   errorCount: number
+  /** 有响应的请求数：Body / TTFB 均值的精确权重；旧报告为 0 */
+  responseCount?: number
 }
 
 export interface ReportError {

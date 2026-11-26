@@ -63,6 +63,12 @@ pub struct AppSettings {
     pub stress_os_env_allow: String,
     /// 是否允许局域网自动发现（UDP 17802）
     pub cluster_discovery_enabled: bool,
+    /// 本机在局域网中的显示名（空 = 计算机名）
+    pub cluster_device_name: String,
+    /// 是否广播在场信息并接受设备邀请（UDP/TCP 17803）
+    pub cluster_presence_enabled: bool,
+    /// 收到邀请时的处理策略：ask（弹窗确认）/ auto（自动接受）/ off（拒绝邀请）
+    pub cluster_invite_policy: String,
 }
 
 impl Default for AppSettings {
@@ -87,6 +93,9 @@ impl Default for AppSettings {
             stress_max_jobs: 0,
             stress_os_env_allow: String::new(),
             cluster_discovery_enabled: true,
+            cluster_device_name: String::new(),
+            cluster_presence_enabled: true,
+            cluster_invite_policy: "ask".to_string(),
         }
     }
 }
@@ -894,6 +903,8 @@ impl AppState {
         }
         next.stress_max_concurrent = next.stress_max_concurrent.clamp(1, 100_000);
         next.stress_max_jobs = next.stress_max_jobs.max(0);
+        next.cluster_invite_policy =
+            crate::services::cluster::presence::normalize_policy(&next.cluster_invite_policy);
         let mut seen = std::collections::HashSet::new();
         next.ai_fallback_ids = next
             .ai_fallback_ids
@@ -1005,6 +1016,16 @@ struct AutoBudget {
     limited_by: &'static str,
 }
 
+/// 每个 CPU 核折算的并发预算
+const BUDGET_PER_CORE: u32 = 512;
+/// 每 GB 内存折算的并发预算
+const BUDGET_PER_GB: f64 = 384.0;
+/// 文件句柄上限折算成并发预算的比例
+const BUDGET_FD_RATIO: f64 = 0.75;
+/// Windows 没有 rlimit：按每个进程可用的句柄/端口资源给一个保守上限
+#[cfg(not(unix))]
+const WINDOWS_FD_BUDGET: u64 = 16_384;
+
 /// 按 CPU / 句柄 / 内存推导本机并发预算
 ///
 /// 抽成纯函数是为了能覆盖「句柄软上限只有 256」这类本机复现不了的组合。
@@ -1014,11 +1035,14 @@ fn auto_budget(
     fd_limit: u64,
     probe_saturation: Option<u32>,
 ) -> AutoBudget {
-    let by_cpu = cores.saturating_mul(512);
+    let by_cpu = cores.saturating_mul(BUDGET_PER_CORE);
     // 每个在途连接占 1 个 fd，另要给 SQLite / 日志 / WebView / 抓包留余量，
-    // 所以只把句柄上限的 60% 折算成并发预算（原先 80% 会让并发几乎吃满句柄）
-    let by_fd = (fd_limit as f64 * 0.6) as u32;
-    let by_mem = (mem_gb * 256.0) as u32;
+    // 所以只把句柄上限的 75% 折算成并发预算（100% 会让并发几乎吃满句柄，
+    // 60% 则把 macOS 抬高上限后的收益又还了回去）
+    let by_fd = (fd_limit as f64 * BUDGET_FD_RATIO) as u32;
+    // 每个并发连接约 1MB 内存（TLS 缓冲 + 请求/响应），另给应用本体留足空间；
+    // 32GB 机器约 12.3k 并发，与 12 线程 CPU 项 6.1k 相比不会成为瓶颈
+    let by_mem = (mem_gb * BUDGET_PER_GB) as u32;
     let candidate = by_cpu.max(probe_saturation.unwrap_or(0));
     let upper = by_fd.min(by_mem).min(100_000);
     let limit = candidate.max(1000).min(upper.max(1));
@@ -1085,7 +1109,7 @@ pub fn raise_fd_limit() {
                 log::warn!(
                     "RLIMIT_NOFILE 软上限 {soft} 已达硬上限（{hard}），无法提升；\
                      压测并发预算将被限制在约 {} 并发",
-                    (soft as f64 * 0.6) as u32
+                    (soft as f64 * BUDGET_FD_RATIO) as u32
                 );
             }
             return;
@@ -1109,7 +1133,7 @@ pub fn raise_fd_limit() {
 #[cfg(not(unix))]
 pub fn raise_fd_limit() {}
 
-/// 进程可打开文件数上限；Windows 没有 fd 概念，按 8192 兜底
+/// 进程可打开文件数上限；Windows 没有 fd 概念，按 16384 兜底
 fn fd_limit() -> u64 {
     #[cfg(unix)]
     {
@@ -1131,7 +1155,9 @@ fn fd_limit() -> u64 {
     }
     #[cfg(not(unix))]
     {
-        8192
+        // Windows 没有 RLIMIT_NOFILE：按每个进程可用的句柄预算兜底。
+        // 之前用 8192 会让 12 线程机器只剩 4915 并发，白白浪费 CPU 预算。
+        WINDOWS_FD_BUDGET
     }
 }
 
@@ -1378,22 +1404,30 @@ fn build_client_full(
 ) -> Result<reqwest::Client, String> {
     /// 默认空闲连接上限，与历史行为保持一致
     const DEFAULT_POOL_MAX_IDLE: usize = 32;
+    // 压测客户端（传了 pool_max_idle）按峰值并发放开空闲连接；普通客户端保持默认。
+    // 上限从 4096 提到 10 万：12 线程机器预算 6144，4096 会把连接池变成新瓶颈。
+    let stress_client = pool_max_idle.is_some();
+    let idle_limit = pool_max_idle
+        .unwrap_or(DEFAULT_POOL_MAX_IDLE)
+        .clamp(1, 100_000);
     let mut builder = reqwest::Client::builder()
         .user_agent(concat!("AstroMan/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_millis(
             connect_timeout_ms.clamp(500, 120_000),
         ))
-        .pool_max_idle_per_host(
-            pool_max_idle
-                .unwrap_or(DEFAULT_POOL_MAX_IDLE)
-                .clamp(1, 4096),
-        )
+        .pool_max_idle_per_host(idle_limit)
         .danger_accept_invalid_certs(insecure)
         .redirect(if follow_redirects {
             reqwest::redirect::Policy::limited(10)
         } else {
             reqwest::redirect::Policy::none()
         });
+
+    if stress_client {
+        // 压测的并发请求都是小包，Nagle 会把多个请求攒成 40ms 的延迟：
+        // 高并发下这直接表现为 QPS 上不去、P99 抖动。仅压测客户端开启。
+        builder = builder.tcp_nodelay(true);
+    }
 
     if http1_only {
         builder = builder.http1_only();
@@ -1623,32 +1657,32 @@ mod tests {
 
     #[test]
     fn auto_budget_is_capped_by_fd_ratio() {
-        // 10 核 / 32GB / 句柄 10240：CPU 5120、句柄 6144、内存 8192 → CPU 先到顶，
+        // 10 核 / 32GB / 句柄 10240：CPU 5120、句柄 7680、内存 12288 → CPU 先到顶，
         // 但句柄项必须算对，否则低配机器上会误判瓶颈归属
         let budget = auto_budget(10, 32.0, 10240, None);
         assert_eq!(budget.by_cpu, 5120);
-        assert_eq!(budget.by_fd, 6144);
-        assert_eq!(budget.by_mem, 8192);
+        assert_eq!(budget.by_fd, 7680);
+        assert_eq!(budget.by_mem, 12288);
         assert_eq!(budget.limit, 5120);
         assert_eq!(budget.limited_by, "cpu");
     }
 
     #[test]
     fn auto_budget_flags_small_fd_limit_instead_of_silently_shrinking() {
-        // macOS GUI 进程若继承到 256 的软上限：预算只能是 153，且必须报 fd，
+        // macOS GUI 进程若继承到 256 的软上限：预算只能是 192，且必须报 fd，
         // 用户才看得出「为什么这台机器只能跑一百多并发」
         let budget = auto_budget(10, 32.0, 256, None);
-        assert_eq!(budget.by_fd, 153);
-        assert_eq!(budget.limit, 153);
+        assert_eq!(budget.by_fd, 192);
+        assert_eq!(budget.limit, 192);
         assert_eq!(budget.limited_by, "fd");
     }
 
     #[test]
     fn auto_budget_prefers_memory_when_fd_is_plentiful() {
-        // 句柄抬到 10 万后，64 核 / 32GB 机器的瓶颈回到内存（8192）
+        // 句柄抬到 10 万后，64 核 / 32GB 机器的瓶颈回到内存（12288）
         let budget = auto_budget(64, 32.0, 100_000, None);
-        assert_eq!(budget.by_mem, 8192);
-        assert_eq!(budget.limit, 8192);
+        assert_eq!(budget.by_mem, 12288);
+        assert_eq!(budget.limit, 12288);
         assert_eq!(budget.limited_by, "mem");
     }
 
@@ -1679,7 +1713,7 @@ mod tests {
         assert_eq!(fd_limit(), raised, "重复调用应保持幂等");
         // 抬高后预算的 fd 项必须跟着变大或持平，不能在 256 上原地不动
         let budget = auto_budget(10, 32.0, raised, None);
-        assert!(budget.by_fd >= (before as f64 * 0.6) as u32);
+        assert!(budget.by_fd >= (before as f64 * BUDGET_FD_RATIO) as u32);
     }
 
     /// 复现 macOS GUI 的真实处境：软上限 256、硬上限更高

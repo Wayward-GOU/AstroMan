@@ -245,6 +245,22 @@ pub fn run() {
                 }
             }
             app.manage(state);
+            // 设备发现默认开启：端口被占用时只记日志，不影响应用启动
+            {
+                let state = app.state::<state::AppState>();
+                let settings = state.settings();
+                if settings.cluster_presence_enabled {
+                    if let Err(error) = services::cluster::presence::start(
+                        app.handle(),
+                        &state.data_dir,
+                        &settings.cluster_device_name,
+                        true,
+                        &settings.cluster_invite_policy,
+                    ) {
+                        log::warn!("启动设备发现失败：{error}");
+                    }
+                }
+            }
             // CLI 通过 gui.pid 判断 GUI 是否在运行（单实例只能挡 GUI 多开）
             let pid_file = app.state::<state::AppState>().data_dir.join("gui.pid");
             if let Err(error) = std::fs::write(&pid_file, std::process::id().to_string()) {
@@ -578,6 +594,12 @@ pub fn run() {
             commands::cluster::cluster_discovery_status,
             commands::cluster::cluster_discovery_list,
             commands::cluster::cluster_join_discovered,
+            commands::cluster::cluster_presence_start,
+            commands::cluster::cluster_presence_stop,
+            commands::cluster::cluster_presence_status,
+            commands::cluster::cluster_presence_list,
+            commands::cluster::cluster_invite_send,
+            commands::cluster::cluster_invite_respond,
             commands::cluster::cluster_slave_connect,
             commands::cluster::cluster_slave_snapshot,
             commands::cluster::cluster_slave_disconnect,

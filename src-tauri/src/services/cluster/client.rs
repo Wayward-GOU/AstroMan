@@ -62,9 +62,12 @@ pub struct ClusterSlaveConnectPayload {
     /// 6 位单次配对码：审批模式可留空
     #[serde(default)]
     pub pair_code: String,
-    /// 加入方式：code（配对码）/ request（发现后申请，需主节点审批）
+    /// 加入方式：code（配对码）/ request（发现后申请，需主节点审批）/ invite（接受主节点邀请）
     #[serde(default)]
     pub join_mode: Option<String>,
+    /// 邀请令牌：joinMode=invite 时必填
+    #[serde(default)]
+    pub invite_token: Option<String>,
     /// 节点名：缺省取本机计算机名
     #[serde(default)]
     pub node_name: Option<String>,
@@ -484,11 +487,21 @@ impl ClusterSlave {
             .join_mode
             .as_deref()
             .map(|value| value.trim().to_ascii_lowercase())
-            .filter(|value| value == "request")
+            .filter(|value| matches!(value.as_str(), "request" | "invite"))
             .unwrap_or_else(|| "code".to_string());
         let pair_code = payload.pair_code.trim().to_string();
+        let invite_token = payload
+            .invite_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("")
+            .to_string();
         if join_mode == "code" && pair_code.is_empty() {
             return Err("请输入主节点显示的配对码".to_string());
+        }
+        if join_mode == "invite" && invite_token.is_empty() {
+            return Err("邀请令牌缺失，请让主节点重新邀请".to_string());
         }
         let node_name = payload
             .node_name
@@ -528,6 +541,7 @@ impl ClusterSlave {
                     node_name,
                     pair_code,
                     join_mode,
+                    invite_token,
                     task_abort,
                     task_notify,
                     state_for_task,
@@ -618,6 +632,7 @@ async fn run_slave(
     node_name: String,
     pair_code: String,
     join_mode: String,
+    invite_token: String,
     abort: Arc<AtomicBool>,
     notify: Arc<Notify>,
     state: Arc<Mutex<SlaveState>>,
@@ -716,6 +731,7 @@ async fn run_slave(
         pair_code,
         node_name: node_name.clone(),
         join_mode: Some(join_mode.clone()),
+        invite_token: (!invite_token.is_empty()).then_some(invite_token),
         device_id: Some(node_name.clone()),
         capacity_concurrent: capacity,
         node_capacity,
@@ -1574,10 +1590,15 @@ fn done_payload(outcome: &EngineOutcome, offset_ms: f64) -> DonePayload {
         total: outcome.sparse.total,
         success: outcome.sparse.success,
         errors: outcome.sparse.errors,
+        responses: outcome.sparse.responses,
         bytes: outcome.sparse.bytes,
         bytes_sent: outcome.sparse.bytes_sent,
         sum_rt_ms: outcome.sparse.sum_rt_ms,
         sum_ttfb_ms: outcome.sparse.sum_ttfb_ms,
+        sum_body_ms: outcome.sparse.sum_body_ms,
+        metrics_version: 2,
+        apdex_satisfied: outcome.sparse.apdex_satisfied,
+        apdex_tolerating: outcome.sparse.apdex_tolerating,
         min_rt: outcome.sparse.min_rt,
         max_rt: outcome.sparse.max_rt,
         latency_buckets: outcome.sparse.latency.clone(),

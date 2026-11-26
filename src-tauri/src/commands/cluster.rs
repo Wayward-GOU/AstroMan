@@ -10,6 +10,7 @@ use crate::services::cluster::discovery::{self, DiscoveredMaster, DiscoveryStatu
 use crate::services::cluster::history::{
     self, ClusterJobDetail, ClusterJobPage, ClusterSlaveHistoryItem,
 };
+use crate::services::cluster::presence::{self, DiscoveredPeer, MasterInvite, PresenceStatus};
 use crate::services::cluster::protocol::{
     ClusterMasterSnapshot, ClusterProtocolInfo, ClusterSlaveSnapshot,
 };
@@ -187,6 +188,7 @@ pub fn cluster_join_discovered(
             master_addr,
             pair_code: String::new(),
             join_mode: Some("request".to_string()),
+            invite_token: None,
             node_name,
         },
     )
@@ -216,6 +218,66 @@ pub fn cluster_slave_snapshot(state: State<'_, AppState>) -> ClusterSlaveSnapsho
 #[tauri::command]
 pub fn cluster_slave_disconnect(state: State<'_, AppState>) -> Result<(), String> {
     state.cluster_slave.disconnect()
+}
+
+/* ---------- 设备在场发现与邀请 ---------- */
+
+/// 启动设备发现与邀请监听（端口 17803；名称 / 策略取自设置）
+#[tauri::command]
+pub fn cluster_presence_start(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<PresenceStatus, String> {
+    let settings = state.settings();
+    presence::start(
+        &app,
+        &state.data_dir,
+        &settings.cluster_device_name,
+        settings.cluster_presence_enabled,
+        &settings.cluster_invite_policy,
+    )?;
+    Ok(presence::status())
+}
+
+/// 停止设备发现：不再广播，也不再接受邀请
+#[tauri::command]
+pub fn cluster_presence_stop() -> PresenceStatus {
+    presence::stop();
+    presence::status()
+}
+
+/// 在场状态：是否运行、本机身份、在线设备数、错误
+#[tauri::command]
+pub fn cluster_presence_status() -> PresenceStatus {
+    presence::status()
+}
+
+/// 当前在线设备（按可邀请与最近活跃排序）
+#[tauri::command]
+pub fn cluster_presence_list() -> Vec<DiscoveredPeer> {
+    presence::list_peers()
+}
+
+/// 主节点向在线设备发起邀请，等待对方在本机确认
+#[tauri::command]
+pub async fn cluster_invite_send(
+    state: State<'_, AppState>,
+    job_id: i64,
+    host: String,
+    port: u16,
+    device_id: Option<String>,
+) -> Result<MasterInvite, String> {
+    presence::send_invite(&state, job_id, &host, port, device_id).await
+}
+
+/// 被邀请方处理邀请：接受后立即反向连接主节点
+#[tauri::command]
+pub fn cluster_invite_respond(
+    app: AppHandle,
+    request_id: String,
+    accept: bool,
+) -> Result<crate::services::cluster::protocol::ClusterSlaveSnapshot, String> {
+    presence::respond(&app, &request_id, accept)
 }
 
 /* ---------- 历史记录 ---------- */

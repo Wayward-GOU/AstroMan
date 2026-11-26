@@ -1600,16 +1600,16 @@ async function reportDigest(detail: ReportDetail) {
       : 0
   const bytesSent = config?.metrics?.bytesSent ?? 0
   const bodySamples = detail.samples.filter((item) => item.bodyAvg > 0)
-  const bodyCount = bodySamples.reduce(
-    (sum, item) => sum + item.successCount + item.errorCount,
-    0,
-  )
+  // Body 只对「拿到响应」的请求有值：用 responseCount 加权，
+  // 否则连接失败/超时的请求会把 Body 平均拉低
+  const bodyWeight = (item: (typeof bodySamples)[number]) =>
+    item.responseCount && item.responseCount > 0
+      ? item.responseCount
+      : item.successCount + item.errorCount
+  const bodyCount = bodySamples.reduce((sum, item) => sum + bodyWeight(item), 0)
   const bodyAvg =
     bodyCount > 0
-      ? bodySamples.reduce(
-          (sum, item) => sum + item.bodyAvg * (item.successCount + item.errorCount),
-          0,
-        ) / bodyCount
+      ? bodySamples.reduce((sum, item) => sum + item.bodyAvg * bodyWeight(item), 0) / bodyCount
       : null
 
   const recentErrors = detail.errors.slice(0, 10).map((item) => ({

@@ -75,13 +75,21 @@ const loading = ref(true)
 /* ---------- 新建压测弹窗 ---------- */
 const configOpen = ref(false)
 const targetProjectId = ref<number | null>(null)
-const targetRequestId = ref<number | null>(null)
+/** 多接口压测：选中的接口 id 列表，第一个作为报告主目标 */
+const targetRequestIds = ref<number[]>([])
+/** 每个接口的流量权重；留空或 0 由后端按平均分配归一 */
+const requestWeights = reactive<Record<number, number>>({})
+/** 开始压测时按 id 取到的完整接口定义（Headers/Body/Auth 随接口各自保留） */
+const selectedDetails = ref<HttpRequestDetail[]>([])
 const choices = ref<RequestSearchHit[]>([])
 const choicesLoading = ref(false)
 const preparing = ref(false)
 const activeProjectId = ref<number | null>(null)
 const modalEnvironments = ref<Environment[]>([])
 const modalEnvId = ref<number | null>(null)
+
+/** 兼容旧逻辑：主目标取选中列表的第一个 */
+const targetRequestId = computed(() => targetRequestIds.value[0] ?? null)
 
 /** 当前选中环境的非敏感变量值，用于把 {{base_url}}/xxx 渲染成完整路径 */
 const plainVars = ref<Record<string, string>>({})
@@ -107,10 +115,14 @@ function renderPreviewUrl(text: string): string {
 
 /** 预览里仍未解析的变量名：环境未确定或有缺失时不允许开始（4.6） */
 const unresolvedVars = computed(() => {
-  const source = selectedChoice.value?.url ?? request.value?.url ?? ''
+  const sources = selectedChoices.value.length
+    ? selectedChoices.value.map((item) => item.url)
+    : [request.value?.url ?? '']
   const names = new Set<string>()
-  for (const match of renderPreviewUrl(source).matchAll(/\{\{\s*([\w.-]+)\s*\}\}/g)) {
-    names.add(match[1])
+  for (const source of sources) {
+    for (const match of renderPreviewUrl(source).matchAll(/\{\{\s*([\w.-]+)\s*\}\}/g)) {
+      names.add(match[1])
+    }
   }
   return [...names]
 })
@@ -143,10 +155,43 @@ const requestSelectOptions = computed(() =>
   })),
 )
 
-const selectedChoice = computed(() => {
-  const raw = choices.value.find((item) => item.id === targetRequestId.value)
-  if (!raw) return null
-  return { ...raw, url: renderPreviewUrl(raw.url) }
+interface SelectedChoice extends RequestSearchHit {
+  /** 渲染后的完整路径 */
+  url: string
+}
+
+const selectedChoices = computed<SelectedChoice[]>(() =>
+  targetRequestIds.value
+    .map((id) => {
+      const raw = choices.value.find((item) => item.id === id)
+      return raw ? { ...raw, url: renderPreviewUrl(raw.url) } : null
+    })
+    .filter((item): item is SelectedChoice => item !== null),
+)
+
+const selectedChoice = computed(() => selectedChoices.value[0] ?? null)
+
+/** 权重输入：0 / 空 = 平均分配（后端统一归一） */
+function requestWeight(id: number): number {
+  return requestWeights[id] || 0
+}
+
+function setRequestWeight(id: number, value: number | string | null) {
+  const next = Number(value)
+  requestWeights[id] = Number.isFinite(next) && next > 0 ? next : 0
+}
+
+/** 清空多接口选择相关的临时状态 */
+function clearRequestWeights() {
+  for (const key of Object.keys(requestWeights)) delete requestWeights[Number(key)]
+  selectedDetails.value = []
+}
+
+/** 多接口时提示权重口径 */
+const weightHint = computed(() => {
+  if (selectedChoices.value.length < 2) return ''
+  const total = targetRequestIds.value.reduce((sum, id) => sum + (requestWeights[id] || 1), 0)
+  return `合计权重 ${total}，按占比把请求分发给各接口；留空表示平均分配`
 })
 
 const currentProject = computed(
@@ -222,14 +267,16 @@ async function openConfig() {
     }
   }
   targetProjectId.value = projectStore.projects[0]?.id ?? null
-  targetRequestId.value = null
+  targetRequestIds.value = []
+  clearRequestWeights()
   configOpen.value = true
   // 打开抽屉即刷新变量来源，避免沿用上次打开时的旧状态
   void loadVarSources()
 }
 
 watch(targetProjectId, async (id) => {
-  targetRequestId.value = null
+  targetRequestIds.value = []
+  clearRequestWeights()
   choices.value = []
   modalEnvironments.value = []
   modalEnvId.value = null
@@ -277,6 +324,11 @@ function currentPlanConfig() {
     settings: { ...settings },
     stages: stages.value.map((item) => ({ ...item })),
     envId: modalEnvId.value,
+    // 多接口：只存请求 id 与权重，运行时再从请求库读取最新定义
+    requests: targetRequestIds.value.map((id) => ({
+      requestId: id,
+      weight: requestWeights[id] || 0,
+    })),
   }
 }
 
@@ -292,6 +344,7 @@ async function applyPlan(id: number | null) {
       settings?: Record<string, unknown>
       stages?: StressStage[]
       envId?: number | null
+      requests?: { requestId?: number | null; weight?: number | null }[]
     } | null
     if (config?.settings) Object.assign(settings, config.settings)
     if (Array.isArray(config?.stages) && config.stages.length) {
@@ -301,7 +354,19 @@ async function applyPlan(id: number | null) {
       }))
     }
     if (config?.envId !== undefined) modalEnvId.value = config.envId ?? null
-    if (plan.requestId) targetRequestId.value = plan.requestId
+    if (Array.isArray(config?.requests) && config.requests.length) {
+      clearRequestWeights()
+      targetRequestIds.value = config.requests
+        .map((item) => Number(item.requestId) || 0)
+        .filter((value) => value > 0)
+      for (const item of config.requests) {
+        const requestId = Number(item.requestId) || 0
+        const weight = Number(item.weight) || 0
+        if (requestId > 0 && weight > 0) requestWeights[requestId] = weight
+      }
+    } else if (plan.requestId) {
+      targetRequestIds.value = [plan.requestId]
+    }
     activePlanId.value = plan.id
     planName.value = plan.name
     message.success(`已载入计划「${plan.name}」`)
@@ -357,18 +422,23 @@ async function startFromConfig() {
     message.warning('请先选择项目')
     return
   }
-  if (!targetRequestId.value) {
+  if (!targetRequestIds.value.length) {
     message.warning('请选择要压测的接口')
     return
   }
   preparing.value = true
   try {
-    const detail = await api.requestGet(targetRequestId.value)
-    if (!detail.url.trim()) {
-      message.warning('该接口还没有填写 URL，请先到请求编辑器补全')
+    // 多接口：逐个取完整定义，各自保留 method / headers / body，池在计划级共享
+    const details = await Promise.all(
+      targetRequestIds.value.map((id) => api.requestGet(id)),
+    )
+    const empty = details.find((item) => !item.url.trim())
+    if (empty) {
+      message.warning(`接口「${empty.name}」还没有填写 URL，请先到请求编辑器补全`)
       return
     }
-    request.value = detail
+    selectedDetails.value = details
+    request.value = details[0]
     activeProjectId.value = targetProjectId.value
     environments.value = modalEnvironments.value
     envId.value = modalEnvId.value
@@ -1004,6 +1074,7 @@ async function openPlan(planIdValue: number) {
     captureMode?: CapturePreset
     topN?: number
     slowThresholdMs?: number
+    requests?: { requestId?: number | null; weight?: number | null }[]
   } | null
   if (config?.settings) Object.assign(settings, config.settings)
   if (config?.captureMode) settings.captureMode = config.captureMode
@@ -1021,8 +1092,25 @@ async function openPlan(planIdValue: number) {
   await loadPlainVars(envId.value)
   activePlanId.value = plan.id
   planName.value = plan.name
-  if (plan.requestId) {
-    targetRequestId.value = plan.requestId
+  if (Array.isArray(config?.requests) && config.requests.length) {
+    clearRequestWeights()
+    targetRequestIds.value = config.requests
+      .map((item) => Number(item.requestId) || 0)
+      .filter((value) => value > 0)
+    for (const item of config.requests) {
+      const requestId = Number(item.requestId) || 0
+      const weight = Number(item.weight) || 0
+      if (requestId > 0 && weight > 0) requestWeights[requestId] = weight
+    }
+    if (targetRequestId.value) {
+      // 多接口计划：一次取齐全部接口定义，直接点「开始压测」也能按多接口运行
+      selectedDetails.value = await Promise.all(
+        targetRequestIds.value.map((id) => api.requestGet(id)),
+      )
+      request.value = selectedDetails.value[0] ?? null
+    }
+  } else if (plan.requestId) {
+    targetRequestIds.value = [plan.requestId]
     request.value = await api.requestGet(plan.requestId)
   }
 }
@@ -1086,13 +1174,35 @@ async function openReport(reportIdValue: number) {
 
   if (detail.report.requestId) {
     // 复用请求定义（请求头 / 体 / 参数），再用报告快照覆盖目标地址与压测参数
-    targetRequestId.value = detail.report.requestId
+    const snapshotRequests = Array.isArray(config?.requests) ? config.requests : []
+    if (snapshotRequests.length > 1) {
+      // 多接口报告：恢复接口清单与权重，运行时再取各接口最新定义
+      clearRequestWeights()
+      targetRequestIds.value = snapshotRequests
+        .map((item) => Number(item.requestId) || 0)
+        .filter((value) => value > 0)
+      for (const item of snapshotRequests) {
+        const requestId = Number(item.requestId) || 0
+        const weight = Number(item.weight) || 0
+        if (requestId > 0 && weight > 0) requestWeights[requestId] = weight
+      }
+    } else {
+      targetRequestIds.value = [detail.report.requestId]
+    }
     try {
-      request.value = await api.requestGet(detail.report.requestId)
+      if (targetRequestIds.value.length > 1) {
+        selectedDetails.value = await Promise.all(
+          targetRequestIds.value.map((id) => api.requestGet(id)),
+        )
+        request.value = selectedDetails.value[0] ?? null
+      } else {
+        request.value = await api.requestGet(detail.report.requestId)
+      }
     } catch {
       // 请求已被删除：回退到配置快照，不阻断「再次运行」
       request.value = null
-      targetRequestId.value = null
+      targetRequestIds.value = []
+      selectedDetails.value = []
       message.warning('关联请求已不存在，已按报告配置快照回填')
     }
     if (request.value) {
@@ -1336,6 +1446,22 @@ async function start() {
       params: request.value.params,
       bodyType: request.value.bodyType,
       body: request.value.body,
+      // 多接口：各自保留请求定义，按权重共享同一 Token / 参数池，汇总成一份报告
+      requests:
+        selectedDetails.value.length > 1
+          ? selectedDetails.value.map((item) => ({
+              requestId: item.id ?? null,
+              name: item.name,
+              method: item.method,
+              url: item.url,
+              headers: item.headers,
+              params: item.params,
+              bodyType: item.bodyType,
+              body: item.body,
+              auth: item.auth ?? null,
+              weight: requestWeights[item.id ?? 0] || 0,
+            }))
+          : undefined,
       envId: envId.value,
       insecure: settings.insecure,
       timeoutMs: settings.timeoutMs,
@@ -2164,15 +2290,17 @@ function backToRequest() {
             <div class="field field-request">
               <div class="label">
                 接口
-                <span class="label-hint">选中后自动带入 Headers、Params、Body 与变量</span>
+                <span class="label-hint">可多选：各接口保留自己的 Headers、Params、Body，共享同一 Token / 参数池</span>
               </div>
               <a-select
-                v-model:value="targetRequestId"
+                v-model:value="targetRequestIds"
+                mode="multiple"
                 :loading="choicesLoading"
-                placeholder="选择要压测的接口"
+                placeholder="选择一个或多个接口一起压测"
                 show-search
                 option-filter-prop="label"
                 option-label-prop="label"
+                :max-tag-count="3"
                 popup-class-name="stress-select-dropdown stress-req-dropdown"
                 :not-found-content="choicesLoading ? '加载中…' : '该项目下暂无接口'"
               >
@@ -2193,23 +2321,43 @@ function backToRequest() {
               </a-select>
             </div>
           </div>
-          <div v-if="selectedChoice" class="target-card">
+          <div v-if="selectedChoices.length" class="target-card">
             <div class="target-card-head">
-              <span class="target-card-badge">已选目标</span>
-              <span class="method-tag" :class="`method-${selectedChoice.method}`">{{ selectedChoice.method }}</span>
-              <span class="target-card-name" :title="selectedChoice.name">{{ selectedChoice.name }}</span>
-              <span class="target-card-collection" :title="selectedChoice.collectionName">
-                {{ selectedChoice.collectionName }}
+              <span class="target-card-badge">
+                {{ selectedChoices.length > 1 ? `已选 ${selectedChoices.length} 个接口` : '已选目标' }}
               </span>
             </div>
-            <div class="target-card-url mono" :title="selectedChoice.url">{{ selectedChoice.url }}</div>
-            <div
-              v-if="previewUrl && previewUrl !== selectedChoice.url"
-              class="target-card-url resolved mono"
-              :title="previewUrl"
-            >
-              解析后：{{ previewUrl }}
+            <div v-for="(item, index) in selectedChoices" :key="item.id" class="target-item">
+              <div class="target-item-main">
+                <span class="target-item-index">{{ index + 1 }}</span>
+                <span class="method-tag" :class="`method-${item.method}`">{{ item.method }}</span>
+                <span class="target-card-name" :title="item.name">{{ item.name }}</span>
+                <span class="target-card-collection" :title="item.collectionName">
+                  {{ item.collectionName }}
+                </span>
+                <span v-if="selectedChoices.length > 1" class="target-weight">
+                  <span class="target-weight-label">权重</span>
+                  <a-input-number
+                    size="small"
+                    :value="requestWeight(item.id)"
+                    :min="0"
+                    :max="1000"
+                    :precision="0"
+                    placeholder="平均"
+                    @change="(value: number | string | null) => setRequestWeight(item.id, value)"
+                  />
+                </span>
+              </div>
+              <div class="target-card-url mono" :title="item.url">{{ item.url }}</div>
+              <div
+                v-if="index === 0 && previewUrl && previewUrl !== item.url"
+                class="target-card-url resolved mono"
+                :title="previewUrl"
+              >
+                解析后：{{ previewUrl }}
+              </div>
             </div>
+            <div v-if="weightHint" class="hint">{{ weightHint }}</div>
           </div>
           <div v-else-if="currentProject" class="hint">
             {{ currentProject.name }} · 共 {{ choices.length }} 个接口
@@ -3865,6 +4013,50 @@ function backToRequest() {
   margin-top: 4px;
   border-style: dashed;
   color: var(--fm-primary);
+}
+
+/* 多接口：每个接口一行，权重就地配置 */
+.target-item {
+  padding: 8px 0;
+  border-bottom: 1px dashed var(--fm-border);
+}
+
+.target-item:last-of-type {
+  border-bottom: none;
+}
+
+.target-item-main {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+
+.target-item-index {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--fm-primary) 14%, transparent);
+  color: var(--fm-primary);
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 18px;
+  text-align: center;
+}
+
+.target-weight {
+  margin-left: 9px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--fm-muted);
+}
+
+.target-weight :deep(.ant-input-number) {
+  width: 76px;
 }
 
 .capacity-hint {

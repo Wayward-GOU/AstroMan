@@ -653,11 +653,44 @@ impl CapturePreset {
     }
 }
 
+/// 多接口压测中的单个接口定义
+///
+/// 同一轮压测里每个接口保留自己的 method / headers / params / body / auth，
+/// 但共享计划级的 Token 池与参数池（`StressConfig.pool_bindings`）。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StressRequestDef {
+    #[serde(default)]
+    pub request_id: Option<i64>,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default = "default_method")]
+    pub method: String,
+    pub url: String,
+    #[serde(default)]
+    pub headers: Vec<KeyValueItem>,
+    #[serde(default)]
+    pub params: Vec<KeyValueItem>,
+    #[serde(default = "default_body_type")]
+    pub body_type: String,
+    #[serde(default)]
+    pub body: Option<String>,
+    /// 认证配置，与手工请求一致
+    #[serde(default)]
+    pub auth: Option<RequestAuth>,
+    /// 流量权重：按占比分配请求数，缺省或全部为 0 时平均分配
+    #[serde(default)]
+    pub weight: Option<f64>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StressConfig {
     #[serde(default)]
     pub request_id: Option<i64>,
+    /// 多接口压测：非空时按权重在接口间分发请求，共享下方池绑定
+    #[serde(default)]
+    pub requests: Vec<StressRequestDef>,
     /// 所属项目：环境变量回退与计划保存用
     #[serde(default)]
     pub project_id: Option<i64>,

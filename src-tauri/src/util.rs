@@ -529,6 +529,35 @@ pub fn config_texts(config: &crate::models::StressConfig) -> Vec<String> {
             texts.push(value.clone());
         }
     }
+    // 多接口：每个接口的 URL / Query / Header / Body / 认证都可能引用变量
+    for request in &config.requests {
+        texts.push(request.url.trim().to_string());
+        for item in request.params.iter().chain(request.headers.iter()) {
+            if !item.enabled {
+                continue;
+            }
+            texts.push(item.key.trim().to_string());
+            texts.push(item.value.clone());
+        }
+        if let Some(body) = &request.body {
+            texts.push(body.clone());
+        }
+        if let Some(auth) = &request.auth {
+            for value in [
+                &auth.token,
+                &auth.username,
+                &auth.password,
+                &auth.key,
+                &auth.value,
+                &auth.token_url,
+                &auth.client_id,
+                &auth.client_secret,
+                &auth.scope,
+            ] {
+                texts.push(value.clone());
+            }
+        }
+    }
     texts
 }
 

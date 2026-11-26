@@ -15,9 +15,10 @@ use tokio::task::JoinSet;
 
 use crate::commands::http::base64_encode;
 use crate::models::{
-    CapturePreset, ErrorTypeCount, HistogramBucket, PoolBinding, RecordDetailMode, ReportError,
-    ReportRequestRecord, ReportSample, RequestAuth, SlowRequest, StageSummary, StatusCount,
-    StressConfig, StressDone, StressProgress, StressReport, StressStage, UrlStatRow,
+    CapturePreset, ErrorTypeCount, HistogramBucket, KeyValueItem, PoolBinding, RecordDetailMode,
+    ReportError, ReportRequestRecord, ReportSample, RequestAuth, SlowRequest, StageSummary,
+    StatusCount, StressConfig, StressDone, StressProgress, StressReport, StressRequestDef,
+    StressStage, UrlStatRow,
 };
 use crate::services::cluster::protocol::PoolItem;
 use crate::services::cluster::protocol::SamplePayload as ClusterSamplePayload;
@@ -1605,17 +1606,78 @@ fn json_path<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_j
     Some(current)
 }
 
+/// 启动时收齐的单个接口：模板已渲染、Cookie 已预取、发送字节已估算
+struct PreparedRequest {
+    request_id: Option<i64>,
+    name: String,
+    method: reqwest::Method,
+    /// URL 模板原文：报告里保留「用户配置的目标」
+    url_template: String,
+    /// 渲染后的完整地址（含 Query 与 API Key），错误回显与兜底展示用
+    url_text: String,
+    headers: Vec<KeyValueItem>,
+    params: Vec<KeyValueItem>,
+    body_type: String,
+    body: Option<String>,
+    /// 池命中后需要按运行期变量重新渲染的认证原始配置
+    raw_auth: Option<RequestAuth>,
+    /// 启动时渲染好的认证配置
+    auth: RequestAuth,
+    /// 启动时按目标 URL 预取的本机 Cookie
+    cookie: Option<String>,
+    /// 单请求发送字节（请求行 + 头 + 体）
+    req_bytes: u64,
+    /// 流量权重（已归一为 > 0）
+    weight: f64,
+}
+
+/// 生效的接口列表：多接口配置为空时，把单接口字段归一成一条，兼容旧计划。
+fn effective_requests(config: &StressConfig) -> Vec<StressRequestDef> {
+    if !config.requests.is_empty() {
+        return config.requests.clone();
+    }
+    vec![StressRequestDef {
+        request_id: config.request_id,
+        name: config.name.clone().unwrap_or_default(),
+        method: config.method.clone(),
+        url: config.url.clone(),
+        headers: config.headers.clone(),
+        params: config.params.clone(),
+        body_type: config.body_type.clone(),
+        body: config.body.clone(),
+        auth: config.auth.clone(),
+        weight: Some(1.0),
+    }]
+}
+
+/// 权重归一：非正数视为「未设置」，只要有一个正权重就按 1 参与分配；
+/// 全部未设置时平均分配。返回值之和为 1。
+fn normalize_request_weights(raw: &[f64]) -> Vec<f64> {
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    let any_positive = raw.iter().any(|value| *value > 0.0);
+    let weights: Vec<f64> = if any_positive {
+        raw.iter()
+            .map(|value| if *value > 0.0 { *value } else { 1.0 })
+            .collect()
+    } else {
+        vec![1.0; raw.len()]
+    };
+    let sum: f64 = weights.iter().sum();
+    weights.into_iter().map(|value| value / sum).collect()
+}
+
 struct RunCtx {
     client: reqwest::Client,
-    method: reqwest::Method,
     config: StressConfig,
     vars: HashMap<String, String>,
     /// 参数/Token 池运行期状态；无池时为 None
     pools: Option<Arc<PoolRuntime>>,
-    /// 启动时渲染好的认证配置（模板变量已替换）
-    auth: RequestAuth,
-    /// 启动时按目标 URL 预取的本机 Cookie（未启用或用户自建 Cookie 头时为空）
-    cookie: Option<String>,
+    /// 本次压测的接口列表：单接口时长度为 1
+    requests: Vec<PreparedRequest>,
+    /// 权重总和，按权重抽样时避免每次求和
+    total_weight: f64,
     metrics: Arc<Metrics>,
     control: Arc<Control>,
     start: Instant,
@@ -1631,8 +1693,6 @@ struct RunCtx {
     slow_threshold_ms: u64,
     /// 明细采集开关，auto 降档时会运行期修改
     capture: Arc<AtomicU8>,
-    /// 单请求发送字节（请求行 + 头 + 体），压测期间请求内容静态，启动时算一次
-    req_bytes: u64,
 }
 
 struct Attempt {
@@ -1682,12 +1742,14 @@ fn render_auth(auth: &RequestAuth, vars: &HashMap<String, String>) -> RequestAut
     }
 }
 
-fn build_url(
-    config: &StressConfig,
+/// 按 URL 模板与参数表渲染目标地址：多接口场景每个接口各调一次
+fn build_url_for(
+    url_template: &str,
+    params: &[KeyValueItem],
     vars: &HashMap<String, String>,
     auth: &RequestAuth,
 ) -> Result<reqwest::Url, String> {
-    let mut raw = render(config.url.trim(), vars).trim().to_string();
+    let mut raw = render(url_template.trim(), vars).trim().to_string();
     if raw.is_empty() {
         return Err("URL 不能为空".to_string());
     }
@@ -1701,9 +1763,9 @@ fn build_url(
         raw = format!("http://{raw}");
     }
     let mut url = reqwest::Url::parse(&raw).map_err(|e| format!("URL 无法解析：{e}"))?;
-    if !config.params.is_empty() {
+    if !params.is_empty() {
         let mut pairs = url.query_pairs_mut();
-        for item in &config.params {
+        for item in params {
             if !item.enabled {
                 continue;
             }
@@ -1766,7 +1828,7 @@ async fn read_body(mut response: reqwest::Response, keep: Option<usize>) -> (Str
     (String::from_utf8_lossy(&buffer).into_owned(), bytes)
 }
 
-async fn send_once(ctx: &RunCtx, capture: Capture, vu: u32) -> Attempt {
+async fn send_once(ctx: &RunCtx, req: &PreparedRequest, capture: Capture, vu: u32) -> Attempt {
     // 是否需要为明细采集请求/响应内容
     let keep_detail = capture != Capture::Off;
     // 池覆盖层：per_vu 时同一 VU 固定同一条，per_request 时逐请求轮换；
@@ -1784,21 +1846,20 @@ async fn send_once(ctx: &RunCtx, capture: Capture, vu: u32) -> Attempt {
         .map(|item| item.picks.clone())
         .unwrap_or_default();
     let auth = if pool_overlay.is_some() {
-        ctx.config
-            .auth
+        req.raw_auth
             .clone()
             .map(|item| render_auth(&item, vars))
             .unwrap_or_default()
     } else {
-        ctx.auth.clone()
+        req.auth.clone()
     };
-    let url = match build_url(&ctx.config, vars, &auth) {
+    let url = match build_url_for(&req.url_template, &req.params, vars, &auth) {
         Ok(url) => url,
         Err(error) => {
             return Attempt {
                 status: 0,
                 ok: false,
-                url: ctx.config.url.clone(),
+                url: req.url_template.clone(),
                 error: Some(error),
                 snippet: String::new(),
                 ttfb_ms: 0,
@@ -1822,7 +1883,7 @@ async fn send_once(ctx: &RunCtx, capture: Capture, vu: u32) -> Attempt {
 
     let mut builder = ctx
         .client
-        .request(ctx.method.clone(), url)
+        .request(req.method.clone(), url)
         .timeout(Duration::from_millis(ctx.config.timeout_ms.max(500)));
 
     // 只有需要落明细时才组装 header 快照，off 模式省掉这些分配
@@ -1830,7 +1891,7 @@ async fn send_once(ctx: &RunCtx, capture: Capture, vu: u32) -> Attempt {
     let mut has_content_type = false;
     let mut has_authorization = false;
     let mut has_cookie = false;
-    for item in &ctx.config.headers {
+    for item in &req.headers {
         if !item.enabled {
             continue;
         }
@@ -1884,7 +1945,7 @@ async fn send_once(ctx: &RunCtx, capture: Capture, vu: u32) -> Attempt {
 
     // 自动携带本机 Cookie（启动时已按目标 URL 预取）
     if !has_cookie {
-        if let Some(cookie) = &ctx.cookie {
+        if let Some(cookie) = &req.cookie {
             if keep_detail {
                 header_pairs.push(("Cookie".to_string(), cookie.clone()));
             }
@@ -1892,7 +1953,7 @@ async fn send_once(ctx: &RunCtx, capture: Capture, vu: u32) -> Attempt {
         }
     }
 
-    let body_type = ctx.config.body_type.as_str();
+    let body_type = req.body_type.as_str();
     let mut request_body: Option<String> = None;
     if !body_type.is_empty() && body_type != "none" {
         if !has_content_type {
@@ -1906,7 +1967,7 @@ async fn send_once(ctx: &RunCtx, capture: Capture, vu: u32) -> Attempt {
                 header_pairs.push(("Content-Type".to_string(), content_type.to_string()));
             }
         }
-        let raw_body = ctx.config.body.as_deref().unwrap_or("");
+        let raw_body = req.body.as_deref().unwrap_or("");
         // JSON 请求体里的注释在发送前去掉，与 Postman 行为一致
         let source = if body_type == "json" {
             strip_json_comments(raw_body)
@@ -2038,14 +2099,25 @@ fn classify_error(message: &str) -> &'static str {
 ///
 /// 压测期间请求内容静态，启动时算一次，逐请求只做一次加法。
 /// 头部按实际配置的 key/value 累加，另加 40 字节估算 Host/UA/Accept 等栈自动补充的头。
+#[cfg(test)]
 fn estimate_request_bytes(config: &StressConfig, method: &reqwest::Method) -> u64 {
-    let mut total = method.as_str().len() + config.url.trim().len() + " HTTP/1.1\r\n".len() + 40;
-    for item in &config.headers {
+    estimate_request_bytes_for(&config.url, &config.headers, config.body.as_deref(), method)
+}
+
+/// 多接口版本：按单个接口的 URL / 头 / 体估算发送字节
+fn estimate_request_bytes_for(
+    url: &str,
+    headers: &[KeyValueItem],
+    body: Option<&str>,
+    method: &reqwest::Method,
+) -> u64 {
+    let mut total = method.as_str().len() + url.trim().len() + " HTTP/1.1\r\n".len() + 40;
+    for item in headers {
         if item.enabled && !item.key.trim().is_empty() {
             total += item.key.len() + item.value.len() + ": \r\n".len();
         }
     }
-    total += config.body.as_deref().map(|body| body.len()).unwrap_or(0);
+    total += body.map(|body| body.len()).unwrap_or(0);
     total as u64
 }
 
@@ -2282,6 +2354,28 @@ fn think_delay(config: &StressConfig, rng: &mut Rng) -> Option<Duration> {
     }
 }
 
+/// 按权重随机选一个接口：单接口直接返回 0，避免无意义抽样
+fn pick_request(ctx: &RunCtx, rng: &mut Rng) -> usize {
+    if ctx.requests.len() <= 1 {
+        return 0;
+    }
+    let mut point = rng.next_f64() * ctx.total_weight;
+    for (index, req) in ctx.requests.iter().enumerate() {
+        if req.weight <= 0.0 {
+            continue;
+        }
+        point -= req.weight;
+        if point < 0.0 {
+            return index;
+        }
+    }
+    // 浮点误差兜底：取最后一个有权重的接口
+    ctx.requests
+        .iter()
+        .rposition(|req| req.weight > 0.0)
+        .unwrap_or(0)
+}
+
 async fn worker(ctx: Arc<RunCtx>, index: u32, workers: u32) {
     let mut rng = Rng::new(
         (index as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)
@@ -2327,9 +2421,12 @@ async fn worker(ctx: Arc<RunCtx>, index: u32, workers: u32) {
 
         // 采集开关每请求读一次，auto 降档后立即生效
         let capture = Capture::from_u8(ctx.capture.load(Ordering::Relaxed));
+        // 多接口按权重分发：每个 VU 每轮独立抽样，长稳压测下占比收敛到配置值
+        let req_index = pick_request(&ctx, &mut rng);
+        let req = &ctx.requests[req_index];
         ctx.metrics.concurrent.fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
-        let mut attempt = send_once(&ctx, capture, index).await;
+        let mut attempt = send_once(&ctx, req, capture, index).await;
         // 401/403 刷新后重试：两次请求都产生流量与耗时，
         // 报告里要把第一次的响应字节和发送字节补回来，否则流量统计偏小
         let mut retried_bytes = 0u64;
@@ -2344,7 +2441,7 @@ async fn worker(ctx: Arc<RunCtx>, index: u32, workers: u32) {
                 {
                     retried_bytes = attempt.bytes;
                     sent_factor = 2;
-                    attempt = send_once(&ctx, capture, index).await;
+                    attempt = send_once(&ctx, req, capture, index).await;
                 } else if refreshable {
                     ctx.metrics
                         .bump_error_type(crate::services::pool::E_POOL_REFRESH_FAILED);
@@ -2354,7 +2451,7 @@ async fn worker(ctx: Arc<RunCtx>, index: u32, workers: u32) {
         let latency_ms = started.elapsed().as_millis() as u64;
         ctx.metrics.concurrent.fetch_sub(1, Ordering::Relaxed);
         ctx.metrics.record(
-            ctx.method.as_str(),
+            req.method.as_str(),
             &attempt.url,
             ctx.start.elapsed().as_millis() as i64,
             latency_ms,
@@ -2362,7 +2459,7 @@ async fn worker(ctx: Arc<RunCtx>, index: u32, workers: u32) {
             attempt.body_ms,
             attempt.status,
             attempt.bytes.saturating_add(retried_bytes),
-            ctx.req_bytes.saturating_mul(sent_factor),
+            req.req_bytes.saturating_mul(sent_factor),
             attempt.ok,
             attempt.error.as_deref(),
         );
@@ -2389,7 +2486,7 @@ async fn worker(ctx: Arc<RunCtx>, index: u32, workers: u32) {
                     .slow_tx
                     .try_send(SlowRequest {
                         elapsed_ms: ctx.start.elapsed().as_millis() as i64,
-                        method: ctx.method.as_str().to_string(),
+                        method: req.method.as_str().to_string(),
                         url: attempt.url.clone(),
                         status: attempt.status as i64,
                         latency_ms: latency_ms as i64,
@@ -2406,7 +2503,7 @@ async fn worker(ctx: Arc<RunCtx>, index: u32, workers: u32) {
             let _ = ctx.records.send(ReportRequestRecord {
                 elapsed_ms: ctx.start.elapsed().as_millis() as i64,
                 time_ms: now_ms() - latency_ms as i64,
-                method: ctx.method.as_str().to_string(),
+                method: req.method.as_str().to_string(),
                 url: attempt.url.clone(),
                 status: attempt.status as i64,
                 latency_ms: latency_ms as i64,
@@ -2690,37 +2787,39 @@ fn check_unresolved(
     env_name: Option<&str>,
 ) -> Result<(), String> {
     let mut missing: Vec<String> = Vec::new();
-    collect_unresolved_into(&mut missing, &render(config.url.trim(), vars));
-    for item in &config.params {
-        if !item.enabled {
-            continue;
+    for request in effective_requests(config) {
+        collect_unresolved_into(&mut missing, &render(request.url.trim(), vars));
+        for item in &request.params {
+            if !item.enabled {
+                continue;
+            }
+            collect_unresolved_into(&mut missing, &render(item.key.trim(), vars));
+            collect_unresolved_into(&mut missing, &render(&item.value, vars));
         }
-        collect_unresolved_into(&mut missing, &render(item.key.trim(), vars));
-        collect_unresolved_into(&mut missing, &render(&item.value, vars));
-    }
-    for item in &config.headers {
-        if !item.enabled {
-            continue;
+        for item in &request.headers {
+            if !item.enabled {
+                continue;
+            }
+            collect_unresolved_into(&mut missing, &render(item.key.trim(), vars));
+            collect_unresolved_into(&mut missing, &render(&item.value, vars));
         }
-        collect_unresolved_into(&mut missing, &render(item.key.trim(), vars));
-        collect_unresolved_into(&mut missing, &render(&item.value, vars));
-    }
-    if let Some(body) = &config.body {
-        collect_unresolved_into(&mut missing, &render(body, vars));
-    }
-    if let Some(auth) = &config.auth {
-        for value in [
-            &auth.token,
-            &auth.username,
-            &auth.password,
-            &auth.key,
-            &auth.value,
-            &auth.token_url,
-            &auth.client_id,
-            &auth.client_secret,
-            &auth.scope,
-        ] {
-            collect_unresolved_into(&mut missing, &render(value, vars));
+        if let Some(body) = &request.body {
+            collect_unresolved_into(&mut missing, &render(body, vars));
+        }
+        if let Some(auth) = &request.auth {
+            for value in [
+                &auth.token,
+                &auth.username,
+                &auth.password,
+                &auth.key,
+                &auth.value,
+                &auth.token_url,
+                &auth.client_id,
+                &auth.client_secret,
+                &auth.scope,
+            ] {
+                collect_unresolved_into(&mut missing, &render(value, vars));
+            }
         }
     }
     // 池运行期注入的变量（自动列 + 显式 target）不应在启动前被判定为缺失
@@ -3156,38 +3255,75 @@ pub(crate) fn prepare_stress_with_relay(
     // 变量未解析时直接阻止启动，避免整轮压测全是同一个错误（4.4 / 4.5）
     check_unresolved(&config, &vars, &provided, resolved_env.name.as_deref())?;
 
-    let method = reqwest::Method::from_bytes(config.method.trim().to_uppercase().as_bytes())
-        .map_err(|_| format!("不支持的请求方法：{}", config.method))?;
-
-    let auth = config
-        .auth
-        .clone()
-        .map(|auth| render_auth(&auth, &vars))
-        .unwrap_or_default();
-
-    let prepared_url = build_url(&config, &vars, &auth)?;
-
     // Cookie 只按目标 URL 取一次：压测过程中不写回 Cookie 库，避免高并发下的写竞争
     let cookie_enabled = config.cookie_enabled.unwrap_or(true);
-    let user_has_cookie = config
-        .headers
+
+    // 多接口归一：未配置 requests 时退回单接口字段（旧计划兼容）
+    let defs = effective_requests(&config);
+    let raw_weights: Vec<f64> = defs
         .iter()
-        .any(|item| item.enabled && item.key.trim().eq_ignore_ascii_case("cookie"));
-    let cookie = if cookie_enabled && !user_has_cookie {
-        state
-            .pool
-            .get()
-            .ok()
-            .map(|conn| crate::commands::cookie::cookies_for_url(&conn, &prepared_url))
-            .filter(|items| !items.is_empty())
-            .map(|items| items.join("; "))
-    } else {
-        None
-    };
+        .map(|item| item.weight.unwrap_or(0.0))
+        .collect();
+    let normalized_weights = normalize_request_weights(&raw_weights);
+    let mut requests: Vec<PreparedRequest> = Vec::with_capacity(defs.len());
+    for (index, def) in defs.iter().enumerate() {
+        let method = reqwest::Method::from_bytes(def.method.trim().to_uppercase().as_bytes())
+            .map_err(|_| format!("不支持的请求方法：{}", def.method))?;
+        let auth = def
+            .auth
+            .clone()
+            .map(|auth| render_auth(&auth, &vars))
+            .unwrap_or_default();
+        let prepared_url = build_url_for(&def.url, &def.params, &vars, &auth)?;
+        let user_has_cookie = def
+            .headers
+            .iter()
+            .any(|item| item.enabled && item.key.trim().eq_ignore_ascii_case("cookie"));
+        let cookie = if cookie_enabled && !user_has_cookie {
+            state
+                .pool
+                .get()
+                .ok()
+                .map(|conn| crate::commands::cookie::cookies_for_url(&conn, &prepared_url))
+                .filter(|items| !items.is_empty())
+                .map(|items| items.join("; "))
+        } else {
+            None
+        };
+        let req_bytes =
+            estimate_request_bytes_for(&def.url, &def.headers, def.body.as_deref(), &method);
+        let weight = normalized_weights.get(index).copied().unwrap_or(0.0);
+        let mut name = def.name.trim().to_string();
+        if name.is_empty() {
+            name = def.url.clone();
+        }
+        requests.push(PreparedRequest {
+            request_id: def.request_id,
+            name,
+            method,
+            url_template: def.url.clone(),
+            url_text: prepared_url.to_string(),
+            headers: def.headers.clone(),
+            params: def.params.clone(),
+            body_type: def.body_type.clone(),
+            body: def.body.clone(),
+            raw_auth: def.auth.clone(),
+            auth,
+            cookie,
+            req_bytes,
+            weight,
+        });
+    }
+    let total_weight: f64 = requests.iter().map(|item| item.weight).sum();
+    let primary = requests
+        .first()
+        .ok_or_else(|| "没有可压测的接口".to_string())?;
+    let primary_url = reqwest::Url::parse(&primary.url_text)
+        .map_err(|_| format!("URL 无法解析：{}", primary.url_text))?;
 
     // 固定并发或阶梯加压
     let (stages, peak, total_sec) = plan_run(&config);
-    let target_key = target_key_of(&config.method, &prepared_url);
+    let target_key = target_key_of(primary.method.as_str(), &primary_url);
     // 同主机不同路径的并发压测只警告不拦截（1.3.2）：同机施压会争抢连接与带宽
     let same_host_warning = {
         let others = state.stress_jobs.same_host_others(&target_key);
@@ -3234,11 +3370,18 @@ pub(crate) fn prepare_stress_with_relay(
         ));
     }
 
+    // 多接口轮次没有单一名称：优先用户命名，其次用「首个接口 + N 个接口」表达
     let name = config
         .name
         .clone()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| config.url.clone());
+        .unwrap_or_else(|| {
+            if requests.len() > 1 {
+                format!("{} 等 {} 个接口", primary.name, requests.len())
+            } else {
+                primary.url_template.clone()
+            }
+        });
     let rate = config
         .target_rps
         .map(|value| value.max(0.0).round() as u32)
@@ -3268,7 +3411,6 @@ pub(crate) fn prepare_stress_with_relay(
         }
     };
     let capture = Arc::new(AtomicU8::new(capture_mode as u8));
-    let req_bytes = estimate_request_bytes(&config, &method);
 
     let metrics = Arc::new(Metrics::new());
     let control = Arc::new(Control::new(
@@ -3300,31 +3442,47 @@ pub(crate) fn prepare_stress_with_relay(
     let (slow_tx, slow_rx) = mpsc::channel::<SlowRequest>(4096);
     let slow_threshold_ms = config.slow_threshold_ms.unwrap_or(0);
 
+    // 报告记录每个接口的最终目标与权重：前端据此把 URL 汇总「翻译」成接口视图
+    let request_targets = requests
+        .iter()
+        .map(|item| {
+            json!({
+                "requestId": item.request_id,
+                "name": item.name,
+                "method": item.method.as_str(),
+                "url": item.url_text,
+                "urlTemplate": item.url_template,
+                "weight": item.weight,
+            })
+        })
+        .collect::<Vec<_>>();
+
     let config_snapshot = json!({
         "mode": if stages.is_empty() { "fixed" } else { "stages" },
-        "method": config.method.clone(),
+        "method": primary.method.as_str(),
         // 报告要展示「实际压测的目标」：存渲染后的完整 URL（含变量替换与拼接的查询参数），
         // 而不是 {{base_url}}/xxx 这样的模板原文；模板原文单独存 urlTemplate（3.5.1）
-        "url": prepared_url.as_str().to_string(),
-        "urlTemplate": config.url.clone(),
+        "url": primary.url_text.clone(),
+        "urlTemplate": primary.url_template.clone(),
+        "requestCount": requests.len(),
         "target": {
-            "requestId": config.request_id,
-            "method": config.method.clone(),
-            "urlTemplate": config.url.clone(),
-            "resolvedUrl": prepared_url.as_str().to_string(),
+            "requestId": primary.request_id,
+            "method": primary.method.as_str(),
+            "urlTemplate": primary.url_template.clone(),
+            "resolvedUrl": primary.url_text.clone(),
             "capturedAt": now_ms(),
         },
-        "headers": config.headers.iter().filter(|h| h.enabled && !h.key.trim().is_empty()).count(),
-        "params": config.params.iter().filter(|p| p.enabled && !p.key.trim().is_empty()).count(),
-        "bodyType": config.body_type.clone(),
+        "headers": primary.headers.iter().filter(|h| h.enabled && !h.key.trim().is_empty()).count(),
+        "params": primary.params.iter().filter(|p| p.enabled && !p.key.trim().is_empty()).count(),
+        "bodyType": primary.body_type.clone(),
         // 解析后的环境与名称：换机器/换库后仍能看出当时用的是哪个环境（2.6.3）
         "envId": resolved_env.id,
         "envName": resolved_env.name.clone(),
         "projectId": config.project_id,
         "planId": config.plan_id,
         // 只记录认证方式与开关，绝不写入密钥值
-        "authKind": if auth.kind.trim().is_empty() { "none" } else { auth.kind.as_str() },
-        "apiKeyIn": auth.add_to.clone(),
+        "authKind": if primary.auth.kind.trim().is_empty() { "none" } else { primary.auth.kind.as_str() },
+        "apiKeyIn": primary.auth.add_to.clone(),
         "cookieEnabled": cookie_enabled,
         "runtimeVars": config.vars.len(),
         "timeoutMs": config.timeout_ms,
@@ -3361,19 +3519,24 @@ pub(crate) fn prepare_stress_with_relay(
     if let Some(map) = config_snapshot.as_object_mut() {
         map.insert("schemaVersion".to_string(), json!(2));
         map.insert("runGroupId".to_string(), json!(config.run_group_id));
+        // 嵌套层数已接近 json! 递归上限，接口清单单独插入
+        map.insert("requests".to_string(), json!(request_targets));
     }
     let config_snapshot = config_snapshot.to_string();
 
-    let url_text = prepared_url.to_string();
+    let url_text = if requests.len() > 1 {
+        format!("{} 等 {} 个接口", primary.url_text, requests.len())
+    } else {
+        primary.url_text.clone()
+    };
 
     let ctx = RunCtx {
         client,
-        method,
         config,
         vars,
         pools,
-        auth,
-        cookie,
+        requests,
+        total_weight,
         metrics,
         control,
         start,
@@ -3385,7 +3548,6 @@ pub(crate) fn prepare_stress_with_relay(
         slow_limit: top_n as usize,
         slow_threshold_ms,
         capture,
-        req_bytes,
     };
 
     Ok(PreparedStress {
@@ -4866,6 +5028,47 @@ mod tests {
     }
 
     #[test]
+    fn normalize_request_weights_handles_blank_and_zero() {
+        // 全部未设置：平均分配
+        let equal = normalize_request_weights(&[0.0, 0.0]);
+        assert_eq!(equal, vec![0.5, 0.5]);
+        // 有正权重：未设置按 1 参与，总和为 1
+        let mixed = normalize_request_weights(&[3.0, 0.0]);
+        assert_eq!(mixed, vec![0.75, 0.25]);
+        // 空列表不 panic
+        assert!(normalize_request_weights(&[]).is_empty());
+    }
+
+    #[test]
+    fn effective_requests_falls_back_to_single_definition() {
+        let config: StressConfig =
+            serde_json::from_str(r#"{"url":"http://127.0.0.1/x","method":"POST"}"#).unwrap();
+        let defs = effective_requests(&config);
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].url, "http://127.0.0.1/x");
+        assert_eq!(defs[0].method, "POST");
+        assert_eq!(defs[0].weight, Some(1.0));
+    }
+
+    #[test]
+    fn effective_requests_keeps_multi_definition() {
+        let config: StressConfig = serde_json::from_str(
+            r#"{
+                "url": "http://127.0.0.1/a",
+                "requests": [
+                    {"name": "a", "method": "GET", "url": "http://127.0.0.1/a", "weight": 3},
+                    {"name": "b", "method": "POST", "url": "http://127.0.0.1/b"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let defs = effective_requests(&config);
+        assert_eq!(defs.len(), 2);
+        assert_eq!(defs[1].method, "POST");
+        assert_eq!(defs[0].weight, Some(3.0));
+    }
+
+    #[test]
     fn ramp_curve_modes_shape_delay() {
         let mut config: StressConfig =
             serde_json::from_str(r#"{"url":"http://127.0.0.1/x","rampUpSec":10}"#).unwrap();
@@ -5649,14 +5852,30 @@ mod perf_tests {
         let (records_tx, _records_rx) = mpsc::unbounded_channel::<ReportRequestRecord>();
         let (slow_tx, _slow_rx) = mpsc::channel::<SlowRequest>(4096);
         let start = Instant::now();
-        let ctx = RunCtx {
-            client,
+        let config = perf_config(addr);
+        let requests = vec![PreparedRequest {
+            request_id: config.request_id,
+            name: config.name.clone().unwrap_or_default(),
             method: reqwest::Method::GET,
-            config: perf_config(addr),
-            vars,
-            pools: None,
+            url_template: config.url.clone(),
+            url_text: config.url.clone(),
+            headers: config.headers.clone(),
+            params: config.params.clone(),
+            body_type: config.body_type.clone(),
+            body: config.body.clone(),
+            raw_auth: config.auth.clone(),
             auth: RequestAuth::default(),
             cookie: None,
+            req_bytes: 0,
+            weight: 1.0,
+        }];
+        let ctx = RunCtx {
+            client,
+            config,
+            vars,
+            pools: None,
+            requests,
+            total_weight: 1.0,
             metrics: Arc::new(Metrics::new()),
             control: Arc::new(Control::new(WORKERS as u32, 0)),
             start,
@@ -5668,7 +5887,6 @@ mod perf_tests {
             slow_limit: 0,
             slow_threshold_ms: 0,
             capture: Arc::new(AtomicU8::new(Capture::Off as u8)),
-            req_bytes: 0,
         };
         let ctx = Arc::new(ctx);
         let stop = Arc::new(AtomicBool::new(false));
@@ -5681,7 +5899,7 @@ mod perf_tests {
             let success = success.clone();
             workers.push(tokio::spawn(async move {
                 while !stop.load(Ordering::Relaxed) {
-                    let attempt = send_once(&ctx, Capture::Off, 0).await;
+                    let attempt = send_once(&ctx, &ctx.requests[0], Capture::Off, 0).await;
                     if attempt.ok {
                         success.fetch_add(1, Ordering::Relaxed);
                     }

@@ -130,6 +130,7 @@ import type {
   SlaTargets,
   StressConfig,
   StressReport,
+  StressRequestDef,
   StressStage,
   TestCase,
   TestCasePayload,
@@ -481,6 +482,8 @@ const SCHEMAS: Record<string, Record<string, ArgRule>> = {
   plan_save: {
     projectId: { kind: 'number', required: true },
     requestId: { kind: 'number' },
+    requestIds: { kind: 'array', item: 'number', min: 1 },
+    requestWeights: { kind: 'array' },
     name: { kind: 'string', required: true },
     mode: { kind: 'string', enum: ['fixed', 'stages'] },
     concurrent: { kind: 'number', min: 1, max: 5000 },
@@ -502,6 +505,8 @@ const SCHEMAS: Record<string, Record<string, ArgRule>> = {
   },
   stress_start: {
     requestId: { kind: 'number' },
+    requestIds: { kind: 'array', item: 'number', min: 1 },
+    requestWeights: { kind: 'array' },
     url: { kind: 'string' },
     method: { kind: 'string', enum: METHODS },
     name: { kind: 'string' },
@@ -559,6 +564,7 @@ const SCHEMAS: Record<string, Record<string, ArgRule>> = {
   report_export: {
     id: { kind: 'number', required: true },
     path: { kind: 'string', required: true, pattern: ABS_PATH },
+    format: { kind: 'string', enum: ['html', 'classic'] },
   },
   workspace_stats: {},
   dashboard_metrics: {},
@@ -1631,6 +1637,43 @@ async function reportDigest(detail: ReportDetail) {
     失败数: item.errorCount,
   }))
 
+  // 多接口合并压测：把 URL 统计按接口归并，模型才能回答「每个接口各跑得怎么样」
+  const requestTargets = (config?.requests ?? []).filter(
+    (item) => item && (item.url || item.name),
+  )
+  const multiTarget = requestTargets.length > 1
+  const urlKeyOf = (method: string, url: string) => {
+    try {
+      const parsed = new URL(url)
+      return `${(method || '').toUpperCase()} ${parsed.origin}${parsed.pathname}`
+    } catch {
+      return `${(method || '').toUpperCase()} ${String(url).split('?')[0]}`
+    }
+  }
+  const interfaceSummary = multiTarget
+    ? requestTargets.map((item) => {
+        const key = urlKeyOf(item.method ?? '', item.url ?? '')
+        const rows = (detail.urlStats ?? []).filter(
+          (row) => urlKeyOf(row.method, row.url) === key,
+        )
+        const requests = rows.reduce((sum, row) => sum + row.requests, 0)
+        const success = rows.reduce((sum, row) => sum + row.successCount, 0)
+        const sumMs = rows.reduce((sum, row) => sum + row.avgMs * row.requests, 0)
+        const maxMs = rows.reduce((sum, row) => Math.max(sum, row.maxMs), 0)
+        return {
+          接口: item.name || item.url || '未命名接口',
+          方法: item.method ?? '',
+          权重: item.weight && item.weight > 0 ? `${(item.weight * 100).toFixed(1)}%` : '平均',
+          请求数: requests,
+          成功数: success,
+          失败数: requests - success,
+          成功率: pct(success, requests),
+          平均响应: `${(requests > 0 ? sumMs / requests : 0).toFixed(1)} 毫秒`,
+          最长响应: `${maxMs.toFixed(1)} 毫秒`,
+        }
+      })
+    : undefined
+
   return {
     报告编号: report.id,
     报告标题: report.title?.trim() || report.planName || target.request || '未命名报告',
@@ -1638,7 +1681,9 @@ async function reportDigest(detail: ReportDetail) {
     状态: cnLabel(REPORT_STATUS_LABELS, report.status, '未知'),
     压测目标: {
       项目: target.project || '未关联项目',
-      请求: target.request || '未关联请求',
+      请求: multiTarget
+        ? `全部接口（共 ${requestTargets.length} 个）`
+        : target.request || '未关联请求',
       环境: target.environment || '未指定环境',
     },
     时间: {
@@ -1693,6 +1738,7 @@ async function reportDigest(detail: ReportDetail) {
       发送流量: bytesSent > 0 ? fmtBytes(bytesSent) : '未记录',
     },
     URL统计: urlStats.length ? urlStats : '未记录（旧报告或未采集）',
+    ...(interfaceSummary ? { 按接口汇总: interfaceSummary } : {}),
     错误地址: errorUrls.length
       ? errorUrls
       : urlStats.length
@@ -2025,6 +2071,25 @@ function toStages(value: unknown): StressStage[] {
       concurrent: Math.min(500, Math.max(1, Math.round(optionalNum(stage.concurrent) ?? 1))),
       durationSec: Math.min(3600, Math.max(1, Math.round(optionalNum(stage.durationSec) ?? 30))),
     }
+  })
+}
+
+/** 多接口压测：请求 id 列表（去重、最多 20 个） */
+function toRequestIds(value: unknown): number[] {
+  if (!Array.isArray(value)) return []
+  const ids = value
+    .map((item) => optionalNum(item))
+    .filter((item): item is number => item !== undefined && item > 0)
+    .map((item) => Math.round(item))
+  return [...new Set(ids)].slice(0, 20)
+}
+
+/** 权重：与 requestIds 顺序对齐；缺省 / 0 交给后端按平均分配 */
+function toRequestWeights(value: unknown, size: number): number[] {
+  const raw = Array.isArray(value) ? value : []
+  return Array.from({ length: size }, (_, index) => {
+    const weight = optionalNum(raw[index])
+    return weight !== undefined && weight > 0 ? weight : 0
   })
 }
 
@@ -3913,12 +3978,18 @@ const SPECS: ToolSpec[] = [
   },
   {
     name: 'plan_save',
-    desc: '保存压测计划到项目（固定并发或梯度阶段，可带 SLA），保存后可在「压测」页直接载入执行；poolBindings 每项支持 column：\'*\' 为全部列按列名自动注入，具体列名则把该列注入 target',
+    desc: '保存压测计划到项目（固定并发或梯度阶段，可带 SLA）；多接口合并压测用 requestIds + requestWeights（按顺序对应权重，缺省平均），共享同一 Token/参数池；保存后可在「压测」页直接载入执行；poolBindings 每项支持 column：\'*\' 为全部列按列名自动注入，具体列名则把该列注入 target',
     handler: async (args) => {
       const projectId = needNum(args.projectId, 'projectId')
       const name = str(args.name).trim()
       if (!name) throw new Error('参数 name 不能为空')
-      const requestId = args.requestId === null || args.requestId === undefined ? null : needNum(args.requestId, 'requestId')
+      const requestIds = toRequestIds(args.requestIds)
+      const requestId = requestIds.length
+        ? requestIds[0]
+        : args.requestId === null || args.requestId === undefined
+          ? null
+          : needNum(args.requestId, 'requestId')
+      const requestWeights = toRequestWeights(args.requestWeights, requestIds.length)
       const mode = args.mode === 'stages' ? 'stages' : 'fixed'
       const stages = toStages(args.stages)
       if (mode === 'stages' && !stages.length) throw new Error('梯度模式需要提供 stages 数组')
@@ -3957,28 +4028,69 @@ const SPECS: ToolSpec[] = [
         },
         stages: mode === 'stages' ? stages : [],
         envId: optionalNum(args.envId) ?? null,
+        // 多接口：只存 id 与权重，执行时再从请求库读取最新定义
+        requests:
+          requestIds.length > 1
+            ? requestIds.map((id, index) => ({
+                requestId: id,
+                weight: requestWeights[index] ?? 0,
+              }))
+            : undefined,
       }
 
       const saved = await planSave({ projectId, requestId, name, config })
-      const summary =
+      const shape =
         mode === 'stages'
           ? `${stages.length} 个阶段：${stages.map((item) => `${item.concurrent} 并发 × ${item.durationSec}s`).join(' → ')}`
           : `${concurrent} 并发 × ${durationSec}s`
+      const summary = requestIds.length > 1 ? `${requestIds.length} 个接口合并，${shape}` : shape
       const slaText = sla
         ? `，SLA：P95 ≤ ${sla.p95Ms ?? '-'}ms、P99 ≤ ${sla.p99Ms ?? '-'}ms、错误率 ≤ ${sla.errorRate ?? '-'}%`
         : ''
-      return `压测计划「${saved.name}」已保存（${summary}${slaText}）。到「压测」页选择该项目和接口后，在计划下拉里载入即可执行`
+      const poolText =
+        requestIds.length > 1 ? '，各接口共享同一 Token / 参数池' : ''
+      return `压测计划「${saved.name}」已保存（${summary}${slaText}${poolText}）。到「压测」页选择该项目和接口后，在计划下拉里载入即可执行`
     },
   },
   {
     name: 'stress_start',
-    desc: '启动压测：按已保存请求（requestId）或直接给 URL；默认 10 并发 × 30 秒，支持梯度阶段与 SLA；poolBindings 每项支持 column：\'*\' 为全部列按列名自动注入，具体列名则把该列注入 target',
+    desc: '启动压测：按已保存请求（requestId）或直接给 URL；多接口合并压测用 requestIds（可选 requestWeights 按顺序配权重，缺省平均），各接口保留自己的 Headers/Params/Body，共享同一 Token/参数池；默认 10 并发 × 30 秒，支持梯度阶段与 SLA；poolBindings 每项支持 column：\'*\' 为全部列按列名自动注入，具体列名则把该列注入 target',
     danger: true,
     handler: async (args) => {
-      const requestId = optionalNum(args.requestId)
+      const requestIds = toRequestIds(args.requestIds)
+      const requestWeights = toRequestWeights(args.requestWeights, requestIds.length)
+      const requestId = requestIds.length ? requestIds[0] : optionalNum(args.requestId)
       type StressBase = Omit<StressConfig, 'concurrent' | 'durationSec' | 'rampUpSec' | 'thinkTimeMs'>
       let base: StressBase
-      if (requestId) {
+      let multiRequests: StressRequestDef[] | undefined
+      if (requestIds.length > 1) {
+        // 多接口：逐个取完整定义，各自保留请求内容，仅共享计划级池绑定
+        const details = await Promise.all(requestIds.map((id) => requestGet(id)))
+        const first = details[0]
+        base = {
+          requestId: first.id ?? requestIds[0],
+          name: str(args.name, `${details.length} 个接口合并压测`),
+          method: str(args.method, first.method).toUpperCase(),
+          url: first.url,
+          headers: first.headers,
+          params: first.params,
+          bodyType: first.bodyType,
+          body: first.body,
+          envId: optionalNum(args.envId) ?? null,
+        }
+        multiRequests = details.map((item, index) => ({
+          requestId: item.id ?? requestIds[index],
+          name: item.name,
+          method: item.method,
+          url: item.url,
+          headers: item.headers,
+          params: item.params,
+          bodyType: item.bodyType,
+          body: item.body,
+          auth: item.auth ?? null,
+          weight: requestWeights[index] ?? 0,
+        }))
+      } else if (requestId) {
         const detail = await requestGet(requestId)
         base = {
           requestId,
@@ -4043,13 +4155,17 @@ const SPECS: ToolSpec[] = [
         runGroupId: optionalNum(args.runGroupId) ?? null,
         longRunAck: args.longRunAck === true,
         poolBindings: poolBindings ?? [],
+        requests: multiRequests,
       })
       const shape = stages.length
         ? `${stages.length} 个阶段（峰值 ${concurrent} 并发，累计 ${durationSec}s）`
         : `${concurrent} 并发 × ${durationSec}s`
-      return `已启动压测：${base.name}（${base.method} ${base.url}）${shape}${
+      const targetText = multiRequests
+        ? `全部接口（${multiRequests.length} 个，共享同一 Token / 参数池）`
+        : `${base.method} ${base.url}`
+      return `已启动压测：${base.name}（${targetText}）${shape}${
         rampUpSec ? `，爬坡 ${rampUpSec}s` : ''
-      }${sla ? '，已启用 SLA 校验' : ''}；结束后可用 report_list 取最新报告，再用 report_get 查看详情`
+      }${sla ? '，已启用 SLA 校验' : ''}；结束后可用 report_list 取最新报告，再用 report_get 查看详情（多接口报告含「按接口汇总」）`
     },
   },
   {
@@ -4766,20 +4882,22 @@ const SPECS: ToolSpec[] = [
   },
   {
     name: 'report_export',
-    desc: '把压测报告导出为 HTML（会写入用户给出的路径，必要时自动补 .html 后缀）',
+    desc: '把压测报告导出为 HTML（format=html 现代版 / classic 经典版），会写入用户给出的路径，必要时自动补 .html 后缀',
     danger: true,
     handler: async (args) => {
       const id = needNum(args.id, 'id')
       const path = needPath(args.path)
+      const classic = args.format === 'classic'
       const detail = await reportGet(id)
       // HTML 报告只用到首屏明细兜底目标地址与 Top10 慢请求，避免把几万条明细拉进内存
       const pageSize = (detail.slowRequests?.length ?? 0) > 0 ? 200 : 2000
       const page = await reportRequests(id, 1, pageSize, null).catch(() => null)
-      const { buildReportHtml } = await import('./reportExport')
-      const html = buildReportHtml(detail, page?.items ?? [])
+      const html = classic
+        ? (await import('./reportClassic')).buildClassicReportHtml(detail, page?.items ?? [])
+        : (await import('./reportExport')).buildReportHtml(detail, page?.items ?? [])
       const target = path.toLowerCase().endsWith('.html') ? path : `${path}.html`
       await reportWriteFile(target, Array.from(new TextEncoder().encode(html)))
-      return `已导出报告「${detail.report.planName}」为 HTML：${target}`
+      return `已导出报告「${detail.report.planName}」为${classic ? '经典版' : 'HTML'}：${target}`
     },
   },
   {
@@ -5294,7 +5412,7 @@ const TOOL_KEYWORDS: Array<{ words: string[]; tools: string[] }> = [
   { words: ['脚本', 'script'], tools: ['request_script_save', 'env_script_save'] },
   { words: ['导入', 'import'], tools: ['_import'] },
   { words: ['导出', 'export'], tools: ['_export'] },
-  { words: ['计划', '压测'], tools: ['plan_', 'stress_'] },
+  { words: ['计划', '压测', '多接口', '合并压测'], tools: ['plan_', 'stress_'] },
   { words: ['测试', '套件', '用例', '回归'], tools: ['test_'] },
   { words: ['运行', '执行', '报告'], tools: ['test_run_', 'test_report_'] },
   { words: ['抓包', '录制', '流量', 'har'], tools: ['capture_'] },

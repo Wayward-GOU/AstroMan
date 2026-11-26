@@ -102,6 +102,14 @@ lipo -archs src-tauri/target/universal-apple-darwin/release/astroman-cli
 
 `release.yml` 里的 `Verify macOS universal CLI` 步骤会在 Rust 编译前就做这两项断言，省掉 3 分钟白等。
 
+## 依赖审计（cargo audit）
+
+`cargo audit` 审的是整个 `Cargo.lock`，包含只给 Linux 用的传递依赖（如 webkit2gtk → glib 0.18）。处理顺序：
+
+1. 能升小版本修复的优先 `cargo update -p <crate> --precise <patched>`（如 cookie 0.18.2 → 0.18.3 修 RUSTSEC-2026-0594）
+2. 发布产物中不可达的（仅 Linux 传递依赖、未使用的 API）写进 `src-tauri/.cargo/audit.toml` 的 `[advisories] ignore` 并注明原因，**不要**跳过整步审计
+3. 本地复现：装 `cargo-audit` 预编译包后加 `--db <离线 advisory-db> -n --stale`（沙箱里 `git clone` advisory-db 会被拦截，直接下 tarball 再 `git init` + `git commit` 成仓库）
+
 ## 构建排错
 
 | 现象 | 原因 / 处理 |

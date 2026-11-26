@@ -38,6 +38,11 @@
 - Windows 的 UDP `ConnectionReset`（ICMP port unreachable）与 TCP `accept` 的 `ConnectionAborted` 不再终止发现 / 邀请线程，只按瞬时事件跳过。
 - 复核 `rlimit` / `libc` 平台分支；打包矩阵覆盖 Windows x64 / x86 与 macOS universal。
 
+### 安全与依赖
+
+- `cookie` 0.18.2 → 0.18.3，修复 RUSTSEC-2026-0594（`PrivateJar` 在 fork 后可能复用 AES-GCM nonce；本应用不使用该 API 也不 fork，实际不可达）
+- 新增 `src-tauri/.cargo/audit.toml`：仅忽略 Linux-only 依赖 glib 的 RUSTSEC-2024-0429 并写明原因，`cargo audit` 恢复 0 漏洞通过
+
 ### 修复
 
 - 修复 macOS 继承 256 句柄上限时并发预算被压到 153 的问题。

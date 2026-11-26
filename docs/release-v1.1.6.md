@@ -52,6 +52,12 @@ v1.1.6 的主线是**把压测中心的「并发上限、指标口径、多机�
 - Windows 的 UDP 会把 ICMP port unreachable 报告成下一次 `recv` 的 `ConnectionReset`，原先会直接终止发现线程导致设备发现永久停摆；现在 `ConnectionReset / ConnectionAborted / Interrupted` 只当作瞬时事件跳过。TCP `accept` 在对方提前断开时（Windows 常见 `ConnectionAborted`）也不再写入常驻错误。
 - 平台分支复核：`rlimit` / `libc` 全部在 `cfg(unix)` 内，Windows 走句柄预算；打包矩阵覆盖 Windows x64 / x86（NSIS + 离线包 + 便携版）与 macOS universal dmg。
 
+## 安全与依赖
+
+- `cookie` 0.18.2 → 0.18.3，修复 RUSTSEC-2026-0594（`PrivateJar` 在 fork 后可能复用 AES-GCM nonce）。本应用不使用 `PrivateJar` 也不 fork，实际不可达，仍按补丁版本升级。
+- `src-tauri/.cargo/audit.toml` 记录唯一一条忽略项 RUSTSEC-2024-0429（glib 0.18 的 unsound）：该依赖只由 Linux 端 webkit2gtk / gtk 传递引入，本项目不发布 Linux 产物，且上游 tauri 2 尚未提供升级路径。
+- CI 的 `cargo audit` 现已通过（0 漏洞），此前的失败来自新发布的 cookie 公告，与本版功能改动无关。
+
 ## 兼容性说明
 
 - 数据库结构版本仍为 v23：本版只新增 `report_samples.response_count` 一列，由增量迁移自动补齐，无需手动处理；旧报告该列为 0，前端按「成功 + 失败」回退。

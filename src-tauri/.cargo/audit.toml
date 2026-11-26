@@ -1,0 +1,11 @@
+# cargo audit 配置
+#
+# 只忽略在发布产物中不可达的 advisory；每条都必须写清原因，并在上游修复后移除。
+[advisories]
+ignore = [
+  # RUSTSEC-2024-0429：glib < 0.20.0 的 VariantStrIter 存在 unsound。
+  # glib 0.18 由 Linux 端 webkit2gtk / gtk 传递引入，本项目只发布 macOS 与
+  # Windows 产物，该代码路径在发布二进制中不可达；上游 tauri 2 仍依赖 gtk 0.18，
+  # 目前没有可用的升级路径。等 tauri / wry 切到 gtk 0.20 后删除本项。
+  "RUSTSEC-2024-0429",
+]

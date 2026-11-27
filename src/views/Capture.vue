@@ -29,6 +29,7 @@ import {
 } from '@ant-design/icons-vue'
 import * as api from '@/api/capture'
 import type {
+  AutoCaptureView,
   CaptureBody,
   CaptureCaInfo,
   CaptureFlow,
@@ -80,6 +81,23 @@ interface RepeatForm {
 }
 
 const status = ref<CaptureStatus>(emptyStatus())
+// 自动捕获：启动应用就接管系统代理，用户不用来这一页点「录制」
+const autoCapture = ref<AutoCaptureView | null>(null)
+const autoBusy = ref(false)
+const autoVia = computed(
+  () => Boolean(autoCapture.value?.running && autoCapture.value?.upstreamProxy),
+)
+
+const autoHint = computed(() => {
+  if (!autoCapture.value) return '正在读取自动捕获状态'
+  if (!autoCapture.value.enabled) return '已关闭：只有手动点「录制」时才抓流量'
+  if (autoVia.value) {
+    return `经上游代理 ${autoCapture.value.upstreamProxy} 转发：抓得到流量，出口仍沿用你原来的代理，不抢它的分流规则`
+  }
+  return autoCapture.value.scope === 'all'
+    ? '开启中：全部流量经本机代理（退出自动还原）'
+    : '开启中：只把大模型接口域名指到本机，浏览器等流量直连（退出自动还原）'
+})
 const ca = ref<CaptureCaInfo>(emptyCa())
 // 流量与详情都是整块替换，用 shallowRef 避免每次轮询为上千条记录创建深层响应式代理
 const flows = shallowRef<CaptureFlow[]>([])
@@ -717,8 +735,34 @@ async function refreshStatus() {
   }
 }
 
-/** `force` 用于主动刷新（首次进入、重发、清空后），轮询时流量数没变就跳过 */
-async function refreshFlows(force = false) {
+function onAutoChange(checked: boolean | string | number) {
+  void toggleAuto(Boolean(checked))
+}
+
+async function refreshAuto() {  try {
+    autoCapture.value = await api.captureAutoGet()
+  } catch {
+    // 后端还没就绪时保持上一次的值
+  }
+}
+
+/** 开关自动捕获：后端会立即启停代理并接管/还原系统代理 */
+async function toggleAuto(next: boolean) {
+  if (autoBusy.value) return
+  autoBusy.value = true
+  try {
+    autoCapture.value = await api.captureAutoSet(next, autoCapture.value?.scope)
+    await refreshStatus()
+    message.success(next ? '自动捕获已开启，重启应用后依然生效' : '自动捕获已关闭')
+  } catch (error) {
+    message.error(String(error))
+    await refreshAuto()
+  } finally {
+    autoBusy.value = false
+  }
+}
+
+/** `force` 用于主动刷新（首次进入、重发、清空后），轮询时流量数没变就跳过 */async function refreshFlows(force = false) {
   if (!force && flows.value.length > 0 && status.value.flowCount === lastFlowCount) return
   try {
     const next = await api.captureFlows(1000)
@@ -888,8 +932,15 @@ async function stop() {
   stopping.value = true
   try {
     status.value = await api.captureStop()
+    // 自动捕获开着时点「停止」，说明这次不想抓了：顺带关掉开关，
+    // 否则下次启动又悄悄接管，用户会觉得「明明停了怎么又开了」
+    if (autoCapture.value?.enabled) {
+      autoCapture.value = await api.captureAutoSet(false, autoCapture.value.scope)
+      message.success('已停止录制，自动捕获一并关闭')
+    } else {
+      message.success('已停止录制，端口已释放')
+    }
     void refreshIntercept()
-    message.success('已停止录制，端口已释放')
   } catch (error) {
     message.error(String(error))
   } finally {
@@ -1238,6 +1289,7 @@ onMounted(async () => {
     refreshFlows(true),
     refreshLanIps(),
     refreshIntercept(),
+    refreshAuto(),
   ])
   timer = window.setInterval(() => {
     void tick()
@@ -1288,6 +1340,18 @@ watch(settingsOpen, (open) => {
           清空
         </a-button>
         <a-divider type="vertical" class="toolbar-divider" />
+        <a-tooltip :title="autoHint">
+          <label class="auto-chip" :class="{ 'is-on': autoCapture?.enabled }">
+            <a-switch
+              size="small"
+              :checked="Boolean(autoCapture?.enabled)"
+              :loading="autoBusy"
+              @change="onAutoChange"
+            />
+            <span class="auto-label">自动捕获</span>
+            <span v-if="autoVia" class="auto-hold">经上游</span>
+          </label>
+        </a-tooltip>
         <a-tag :color="stateColor" class="state-pill">
           <span class="state-dot" :class="status.state" />
           {{ stateText }}
@@ -2372,6 +2436,37 @@ watch(settingsOpen, (open) => {
   align-items: center;
   gap: 6px;
   margin: 0;
+}
+
+/* 自动捕获开关：紧挨状态标签，开启时用主色描边，避免和「录制」按钮的红色语义混在一起 */
+.auto-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  height: 24px;
+  border: 1px solid var(--fm-border);
+  border-radius: var(--fm-radius-sm);
+  font-size: 12px;
+  color: var(--fm-muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+.auto-chip.is-on {
+  color: var(--fm-fg, var(--fm-muted));
+  border-color: var(--fm-primary);
+  background: var(--fm-primary-soft);
+}
+
+/* 经上游：抓包代理把原来的系统代理当出口，用警示色提示「不是直连」 */
+.auto-hold {
+  padding: 0 4px;
+  border-radius: var(--fm-radius-sm);
+  background: var(--fm-brass);
+  color: var(--fm-brass-text);
+  font-size: 9.5px;
+  line-height: 14px;
 }
 
 .state-dot {

@@ -1,10 +1,62 @@
 # Changelog
 
+## 1.1.7 — 2026-11-27
+
+本版在 1.1.6 基础上补齐「按接口看吞吐」：多接口压测报告现在能按接口查看每秒 QPS 曲线，单机与分布式同口径，报告详情页、标准 HTML / Excel 与经典 HTML 三处导出一致。数据库从 v23 升到 v24（新增 `report_interface_samples` 表，启动自动迁移）；集群协议仍为 v2（`SamplePayload` 仅新增可选 `interfaces` 字段，旧节点照常参与，只是接口曲线标记不完整）。
+
+### 按接口 QPS 曲线
+
+- 引擎按配置 `requests` 下标维护独立计数器，每秒采样同时产出全局与各接口的 QPS / 成功 / 失败 / 平均耗时增量；单接口报告行为与之前完全一致。
+- 分布式：从节点随每秒采样上报各接口增量，主节点按 `(秒, 接口下标)` 把 QPS 与计数相加、平均耗时按请求数加权；旧节点未上报时报告写入 `interfaceSamplesComplete=false`。
+- 存储：新增 `report_interface_samples(report_id, elapsed_sec, interface_index, qps, success_count, error_count, avg_rt)` 与索引，`DB_VERSION` 24；旧库缺表时报告照常打开，接口曲线显示为空。
+- 报告详情页「统计分析」新增「接口 QPS」卡片，可在「全部接口（汇总）」与单个接口之间切换；单接口或旧报告不显示切换器。
+- 标准 HTML 报告新增「接口 QPS 趋势」多线图；Excel 新增「接口采样」工作表（秒 / 接口 / QPS / 成功数 / 失败数 / 平均耗时）；经典 HTML 在成功 QPS 图下方新增同口径多线图，接口多时图例自动换行。
+- 接口曲线按每接口最多 2 万点抽稀，长压测不会把报告表撑爆。
+
 ## 1.1.6 — 2026-11-27
 
 > 2026-11-27 覆盖重发：同一版本号下的安装包已替换为本次构建，新增「多接口合并压测 / 报告改版 / 航仔多接口能力」等内容。数据库仍为 v23、主从协议仍为 v2，无破坏性变化，直接覆盖安装即可。
 
 本版围绕「并发上限、指标口径、多机协作」三件事交付：局域网内装了 AstroMan 的机器会自动出现在在线设备列表，主节点可一键邀请、对方在本机接受或拒绝；并发预算改为按 CPU / 内存 / 句柄推导的纯函数，macOS 启动时自动抬高句柄软上限、Windows 用独立句柄预算兜底；压测指标口径全面校正（采样改区间增量、阶段汇总用真实直方图、TTFB 与响应体只统计有响应的请求、APDEX 失败计入失望、报告时长不含 drain），分布式合并补齐响应数 / Body 桶 / APDEX 分子并在新旧节点混跑时回退标注。数据库仍为 v23（仅新增 `report_samples.response_count` 一列），主从协议仍为 v2（仅新增可选字段）。
+
+### 本机 Token 用量看板（新增页面）
+
+- 侧栏「智能」组新增「Token 看板」（`/token-usage`）：解析本机 WorkBuddy / Codex / Claude 写在盘上的 `*.jsonl` 日志，只读真实 usage 字段（`providerData.usage` / `type=token_usage_record`），不做估算、不上传。
+- 六个 KPI（合计 token、请求数、会话 / 活跃天、缓存命中率、官方积分、主力模型）+ 数据源体检 + 日期 × 小时热力图 + 工作空间分布 + 单次请求大小分布（p50 / p90 / p99）+ 模型小时堆叠图 + 逐日模型明细表；支持今日 / 近 7 天 / 近 30 天 / 全部与按来源过滤，30 秒增量轮询 + 手动全量重扫。
+- Rust 侧新增 `commands/token_usage.rs`：按文件字节偏移增量解析（截断自动重解析）、按 `messageId` / `response_id` 去重（精确记录优先于 Codex `token_count` 汇总）、目录体积走 `du`、在访达 / 资源管理器中显示。实测本机 18 个文件 / 3,301 条记录全量扫描约 1 秒，增量扫描结果与首次完全一致。
+- 读不到的客户端（Cursor / Trae / Windsurf / Zed / Claude 桌面版等）标注为「读不到」并给出本地数据体积；浏览器网页版、第三方中转、手机等无法被本机日志覆盖的调用方式单独列出，不用体积或次数估算冒充用量。
+- 新增「清透」亮色主题（第 24 套）：白卡、14px 圆角、极轻投影、冷调画布与明度更高的图表色板。`BasePalette` 增加可选的 `shadow` / `radius`，只有显式定义的主题才启用 antd 浮层投影，其余 23 套观感与硬编码基线均不变。
+- 新增「CC Switch 代理」数据源：只读 `~/.cc-switch/cc-switch.db` 的 `proxy_request_logs`，只取 `data_source=proxy` 且 `app_type` 不属于 WorkBuddy / Codex / Claude 的行（避免与自己解析的会话日志重复计数），把原本「读不到」的 Claude 桌面版补齐（实测本机 519 次 / 1.036 亿 token）。
+- 新增费用口径：代理流水直接用 CC Switch 记账的 `total_cost_usd`（账面），本地日志按同一份 `model_pricing` 价目表估算（输入 / 输出 / 缓存读 / 缓存写分别计价），无价目的记录单独计数不计入；KPI 与逐日明细同时给出美元与按固定汇率 7.10 折算的人民币，页面标注「估算 / 非实时」。
+- 新增「供应商 / 中转」切面：卡片 2 可在「工作空间 / 供应商」之间切换，看 token 流向哪个通道；本地日志来源没有供应商字段时按客户端名归组，脚注写明。
+- 新增「抓包观测」数据源（第五来源）：抓包录制期间对流式响应做旁路，从 `*/v1/messages`（Anthropic `message_start` / `message_delta`）、`*/chat/completions`（末包 `usage`）、`*/responses`（`response.completed`）抽真实 token 与模型，一条 assistant 消息写一行 `<数据目录>/capture/llm-usage.jsonl`；只记数字不落正文、不改写客户端字节、不缓冲整段响应。桌面版直连别家中转（不经任何代理后台）时不再只有金额估算，KPI 与明细都能看到输入 / 输出 / 缓存读 / 缓存写。与 CC Switch 代理流水按「总量 + 输出 + 一分钟内」判重，费用走同一份价目表估算。
+- 新增 8 个 Rust 单测（ISO 时间解析、Anthropic 口径补缓存、Codex 精确 / 汇总记录、工作空间取末段）与 11 个聚合单测；`npm run test`（465 例）、`npm run ui:check`（24 套对比度 + 硬编码基线）、`npm run build` 全绿。
+- 文档口径校正：`skill/astroman-appearance` 的主题表按 `PALETTES` 实际顺序重写为 24 套（16 浅 / 8 深，此前误记为 23 套 / 7 深且缺 `paper` / `night`），新增主题流程改为「`THEME_IDS` + 11 个基色 + 派生 24 个令牌」，并补上 `radius` 需同步 `tokens.css` 的注意事项；README、`docs/features.md`、`docs/development.md` 的主题数量一并校正。
+
+### 抓包支持上游代理（Clash / Surge 等）
+
+- 之前 `CaptureConfig.upstream_proxy` 只是契约字段，`proxy.rs` 根本没实现；用户开着 Clash 时自动捕获若接管 PAC，会把本该出海的接口变成直连，等于替用户改了网络策略。
+- 现在补上真正的链式转发：`proxy::run_via_upstream` 用 hyper-util 的 `Tunnel` 建 CONNECT 隧道，再用 hyper-rustls 在隧道上做 TLS，出口仍是用户原来的代理。直连路径保持原样（仍走 hudsucker 自带的 rustls 连接器），所以没有上游时行为零变化。
+- 自动捕获启动时探测系统代理（`sysproxy::current_http_proxy`：macOS 读 `-getsecurewebproxy` / `-getwebproxy`，Windows 读 `ProxyEnable` + `ProxyServer`），命中就把它设为上游；抓包页开关旁显示「经上游」标签，鼠标悬停说明出口未改变。
+- 参数过多的 clippy 告警用 `ProxyParts` 结构体收口，`run` / `run_via_upstream` 都只收一份零件 + 上游 + shutdown。
+- 新增端到端测试 `upstream_proxy_carries_traffic_and_keeps_accounting`：真起一个只会 CONNECT 的上游代理 + SSE 目标，断言流量确实经上游隧道（命中计数 ≥ 1）且 usage 记账仍是 21 / 700 / 9。
+
+### Token 看板：补齐趋势、构成与占比
+
+- 新增「每日用量趋势」折线（`TokenTrend.vue`）：Token / 请求数 / 费用 / 缓存命中率四个指标一键切换，按日历天补 0 让折线不断，宽度跟卡片自适应（ResizeObserver），下方给合计 / 日均 / 峰值 / 有调用的天数。
+- 新增「Token 构成」（`TokenComposition.vue`）：新输入 / 缓存读 / 缓存写 / 输出四项 100% 堆叠条 + 明细。`input` 字段本身含缓存读取，这里拆开算，避免「输入」被重复统计；顺带给出缓存命中率与推理 token。
+- 新增「模型占比」环形图（`TokenDonut.vue`）：Top 模型 + 其他，环与图例同色，中心放总量；用 `stroke-dasharray` 手绘，不引入图表库。
+- 「用量分布」增加第三个切面「来源」：工作空间 / 供应商 / 来源三段切换，看每个客户端各占多少 token。
+- 卡片重排为 1–8，数据源体检提到图前；聚合层新增 `daily` / `composition` / `sources` 三个切面与 4 个单测（日历天补 0、按天缓存率不为 NaN、构成四项相加守恒、来源按中文名聚合）。
+
+### 自动捕获：打开就在抓（PAC 分流）
+
+- 应用启动即自动拉起代理并接管系统代理，不用先去抓包页点「录制」；抓包页工具栏新增「自动捕获」开关，默认开启，关掉后恢复纯手动。
+- 接管方式换成 PAC 分流：`capture/pac.rs` 生成脚本，只把 DeepSeek / OpenAI / Anthropic / OpenRouter / 硅基流动 / 智谱 / 月之暗面等模型接口域名指向 `127.0.0.1:端口`，浏览器、iCloud、系统更新等流量直连，不再被全局 MITM。脚本末尾是 `PROXY ...; DIRECT`，代理进程被强杀时客户端自动回落直连，不会出现「系统代理指向死端口导致全机断网」。
+- PAC 由内置的极小 HTTP 服务提供（`http://127.0.0.1:<随机端口>/proxy.pac`，独立线程 + 单线程 runtime），不落盘、不占固定端口；`sysproxy.rs` 增加 PAC 模式的备份 / 接管 / 还原，与原有全局代理模式互斥切换，退出、停止录制、下次启动三条路径都会按备份还原。
+- 实测校正：macOS 上管理员组用户执行 `networksetup -setwebproxy / -setautoproxyurl` 免密直接生效，不再必然弹管理员授权；文档里「需要一次管理员授权」的说法改为「失败时才弹」。
+- 配置存 `<数据目录>/capture/auto.json`（`enabled` + `scope: llm / all`），新增 `capture_auto_get` / `capture_auto_set` 两个命令，切换后立即启停；手动点「停止」会同时关闭自动捕获，避免下次启动又悄悄接管。
+- 新增 8 个单测（PAC 脚本内容与 DIRECT 兜底、PAC HTTP 服务 200/404、`-getautoproxyurl` 解析、还原顺序、配置读写、真机接管往返）；`cargo test` 515 例、clippy `-D warnings`、fmt 0 diff、`npm test` 467 例、`npm run ui:check` 全绿。
 
 ### 局域网设备发现在线 + 邀请加入（17803）
 

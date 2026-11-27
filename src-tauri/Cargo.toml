@@ -1,6 +1,6 @@
 [package]
 name = "astroman"
-version = "1.1.6"
+version = "1.1.7"
 description = "AstroMan - 本地 API 调试与压测工具"
 edition = "2021"
 # 新增 astroman-cli 后仍让 `cargo run`（tauri dev 使用）默认启动桌面端
@@ -72,6 +72,12 @@ hudsucker = { version = "0.25", default-features = false, features = [
   "http2", "rcgen-ca", "rustls-client", "decoder"
 ] }
 http-body-util = "0.1"
+# 抓包走上游代理（Clash / Surge 等）时用 hyper-util 的 CONNECT 隧道连接器
+hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy"] }
+# 版本与 hudsucker 对齐，复用同一份 rustls，避免带进第二套 TLS 栈
+hyper-rustls = { version = "0.27", default-features = false, features = [
+  "http1", "http2", "tls12", "webpki-tokio"
+] }
 bytes = "1"
 # 抓包 ZIP 导出：只启用 deflate，避免带入 bzip2 / zstd 等未用压缩器
 zip = { version = "9", default-features = false, features = ["deflate"] }

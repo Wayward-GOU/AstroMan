@@ -33,6 +33,7 @@ const router = createRouter({
     },
     { path: '/ai/logs', name: 'ai-logs', component: () => import('@/views/AiToolLogs.vue') },
     { path: '/ai/usage', name: 'ai-usage', component: () => import('@/views/AiUsage.vue') },
+    { path: '/token-usage', name: 'token-usage', component: () => import('@/views/TokenUsage.vue') },
     { path: '/reports/:id', name: 'report-detail', component: () => import('@/views/ReportDetail.vue') },
     { path: '/tools', name: 'tools', component: () => import('@/views/Tools.vue') },
     { path: '/monitor', name: 'monitor', component: () => import('@/views/SystemMonitor.vue') },

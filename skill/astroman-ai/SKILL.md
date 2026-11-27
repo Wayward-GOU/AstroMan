@@ -349,7 +349,7 @@ node -e "const s=require('fs').readFileSync('src/utils/aiTools.ts','utf8');const
 - `settings.stages` 只在 `mode === 'stages'` 时写入，`slaEnabled` 由是否传 SLA 决定；`stress_start` 同样支持 `stages` 与 `slaP95/P99/ErrorRate/MinRps`
 - 顺序固定：读接口 → 用文字给完整计划 → 用户确认 → `plan_save` → 再单独问是否 `stress_start`
 - 多接口合并压测：`plan_save` / `stress_start` 用 `requestIds`（去重、最多 20 个）+ `requestWeights`（按顺序对应，缺省或 0 交给后端平均分配）；各接口保留自身的 Headers / Params / Body / 认证，共享计划级 Token 池与参数池（`poolBindings`），最终只产出一份合并报告。确认方案时列出接口清单与权重，**不要**为每个接口分别 `stress_start`
-- `report_get` 对多接口报告额外返回「按接口汇总」（接口 / 方法 / 权重 / 请求数 / 成功数 / 失败数 / 成功率 / 平均响应 / 最长响应），报告目标显示「全部接口（共 N 个）」；回答各接口表现时优先引用该字段，不要按 URL 自行猜测
+- `report_get` 对多接口报告额外返回「按接口汇总」（接口 / 方法 / 权重 / 请求数 / 成功数 / 失败数 / 成功率 / 平均响应 / 最长响应），报告目标显示「全部接口（共 N 个）」；回答各接口表现时优先引用该字段，不要按 URL 自行猜测。同一响应还包含 `interfaceSamples`（按接口每秒 QPS 曲线，`index` 对应 `config.requests` 下标），回答单接口吞吐 / 抖动时直接引用；`interfaceSamplesComplete=false` 表示有旧节点未上报，需说明曲线可能偏低
 - `report_export` 的 `format` 支持 `html` 与 `classic`（经典版式，封面 / 目录 / KPI 卡片 / 完整时间轴）
 
 ### 自动化测试域（22 个 `test_*` 工具）

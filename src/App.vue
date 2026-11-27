@@ -9,6 +9,7 @@ import {
   ClusterOutlined,
   ExperimentOutlined,
   FolderOpenOutlined,
+  FundOutlined,
   HistoryOutlined,
   SettingOutlined,
   SafetyCertificateOutlined,
@@ -120,6 +121,7 @@ const navs: NavItem[] = [
   { key: 'notes', label: '记事本', hint: '待办 · 提醒 · 截图生成', to: '/notes', icon: ScheduleOutlined, group: '智能' },
   { key: 'ai', label: '航仔', hint: 'AI 助手 · 自动建请求并分析', to: '/ai', icon: AstroBuddyIcon, group: '智能' },
   { key: 'history', label: '历史记录', hint: '数据概览 · 最近发送记录', to: '/history', icon: HistoryOutlined, group: '智能' },
+  { key: 'token-usage', label: 'Token 看板', hint: '本机大模型用量 · 真实 usage', to: '/token-usage', icon: FundOutlined, group: '智能' },
   { key: 'monitor', label: '系统监视', hint: 'CPU · 内存 · 磁盘 · 网络', to: '/monitor', icon: LineChartOutlined, group: '系统' },
   { key: 'tools', label: '工具箱', hint: 'JSON · 加解密 · 时间戳', to: '/tools', icon: ToolOutlined, group: '系统' },
   { key: 'settings', label: '设置', hint: '应用与数据', to: '/settings', icon: SettingOutlined, group: '系统' },
@@ -437,6 +439,7 @@ const activeKey = computed(() => {
   if (path.startsWith('/ai')) return 'ai'
   if (path.startsWith('/history')) return 'history'
   if (path.startsWith('/monitor')) return 'monitor'
+  if (path.startsWith('/token-usage')) return 'token-usage'
   if (path.startsWith('/tools')) return 'tools'
   if (path === '/settings') return 'settings'
   return 'home'
@@ -453,6 +456,8 @@ const theme = computed(() => {
   // 也不能从 vars 取 font-sans / radius / gap —— 它们属于静态令牌，不在 vars 里。
   const base = current.dark ? nightColors : paperColors
   const c = (key: ColorKey) => vars[`--fm-${key}`] ?? base[key]
+  // 只有显式定义了投影的主题才启用 antd 浮层投影
+  const hasShadow = (vars['--fm-shadow'] ?? base.shadow) !== 'none'
 
   return {
     algorithm: AntTheme[current.dark ? 'darkAlgorithm' : 'defaultAlgorithm'],
@@ -485,18 +490,19 @@ const theme = computed(() => {
       colorFillTertiary: c('surface-alt'),
 
       /* 形态 */
-      borderRadius: 3,
-      borderRadiusLG: 3,
-      borderRadiusSM: 2,
-      borderRadiusXS: 2,
+      borderRadius: current.radius.base,
+      borderRadiusLG: current.radius.lg,
+      borderRadiusSM: current.radius.sm,
+      borderRadiusXS: current.radius.sm,
       fontSize: 13,
       fontFamily: staticTokens['font-sans'],
       lineHeight: 1.7,
 
-      /* 去投影 */
-      boxShadow: 'none',
-      boxShadowSecondary: 'none',
-      boxShadowTertiary: 'none',
+      /* 投影：纸感主题 --fm-shadow 为 none（保持原有「去投影」观感），
+         带投影的主题（如清透）才启用，避免 23 套旧主题的浮层同时变重 */
+      boxShadow: hasShadow ? c('shadow') : 'none',
+      boxShadowSecondary: hasShadow ? c('shadow-lg') : 'none',
+      boxShadowTertiary: hasShadow ? c('shadow-sm') : 'none',
 
       /* 动效 */
       motionDurationFast: '0.12s',

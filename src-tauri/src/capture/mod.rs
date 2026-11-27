@@ -7,10 +7,13 @@
 //! 把所有并发请求堵在身后。
 
 pub mod archive;
+pub mod auto;
 pub mod ca;
 pub mod handler;
 pub mod har;
 pub mod intercept;
+pub mod llm_usage;
+pub mod pac;
 pub mod proxy;
 pub mod store;
 pub mod sysproxy;
@@ -115,6 +118,10 @@ pub struct CaptureManager {
     status: Arc<Mutex<CaptureStatus>>,
     store: Arc<CaptureStore>,
     intercept: Arc<InterceptState>,
+    /// 大模型用量记账（Token 看板的 capture 数据源）
+    usage_sink: Arc<llm_usage::UsageSink>,
+    /// PAC 服务：自动捕获时随会话起停，停止后系统代理按 PAC 备份还原
+    pac: Mutex<Option<pac::PacServer>>,
     control: Mutex<Control>,
 }
 
@@ -138,6 +145,8 @@ impl CaptureManager {
             store: Arc::new(CaptureStore::new_with_limits(limits)),
             // 断点/映射/弱网规则落盘，重启后仍然生效
             intercept: Arc::new(InterceptState::load(&intercept_path(&data_dir))),
+            usage_sink: Arc::new(llm_usage::UsageSink::new(&data_dir)),
+            pac: Mutex::new(None),
             control: Mutex::new(Control {
                 shutdown: None,
                 join: None,
@@ -153,6 +162,11 @@ impl CaptureManager {
 
     pub fn data_dir(&self) -> &PathBuf {
         &self.data_dir
+    }
+
+    /// 用量记账落盘位置（Token 看板与抓包页共用）
+    pub fn usage_sink(&self) -> Arc<llm_usage::UsageSink> {
+        self.usage_sink.clone()
     }
 
     /// 拦截规则总览：规则、开关、挂起中的流量。
@@ -420,6 +434,7 @@ impl CaptureManager {
         let thread_config = config.clone();
         let thread_store = self.store.clone();
         let thread_intercept = self.intercept.clone();
+        let thread_sink = self.usage_sink.clone();
         let thread_data_dir = self.data_dir.clone();
         let spawned = std::thread::Builder::new()
             .name("capture-proxy".into())
@@ -435,20 +450,29 @@ impl CaptureManager {
                         return;
                     }
                 };
+                let upstream = thread_config
+                    .upstream_proxy
+                    .as_deref()
+                    .and_then(proxy::parse_upstream);
                 let result = runtime.block_on(async move {
                     let listener = tokio::net::TcpListener::from_std(listener)
                         .map_err(|e| format!("E_BIND: {e}"))?;
-                    proxy::run(
+                    let shutdown = async move {
+                        let _ = shutdown_rx.await;
+                    };
+                    let parts = proxy::ProxyParts {
                         listener,
                         authority,
-                        thread_config,
-                        thread_store,
-                        thread_intercept,
-                        async move {
-                            let _ = shutdown_rx.await;
-                        },
-                    )
-                    .await
+                        config: thread_config,
+                        store: thread_store,
+                        intercept: thread_intercept,
+                        usage_sink: thread_sink,
+                    };
+                    match upstream {
+                        // 有上游就建隧道再 TLS，出口仍是用户原来的代理
+                        Some(upstream) => proxy::run_via_upstream(parts, upstream, shutdown).await,
+                        None => proxy::run(parts, shutdown).await,
+                    }
                 });
                 // 代理线程结束时确保系统代理不会残留；停止流程里已经恢复过时这里是空操作
                 if let Err(error) = sysproxy::disable(&thread_data_dir) {
@@ -482,6 +506,62 @@ impl CaptureManager {
         Ok(status.clone())
     }
 
+    /// 自动捕获：起代理 → 起 PAC 服务 → 接管系统代理。
+    ///
+    /// 优先 PAC 分流（只碰 LLM 域名，浏览器等流量完全不受影响，且脚本带 DIRECT 兜底）；
+    /// 平台不支持或接管失败时退回全局代理。
+    pub fn start_auto(&self) -> Result<CaptureStatus, String> {
+        let config = auto::load(&self.data_dir);
+
+        // 用户已经在用系统代理（Clash / Surge 等）时，把抓包代理的上游指向它：
+        // LLM 流量照旧从原来的出口出去，我们只在中间记 usage，不改网络策略。
+        let upstream = sysproxy::current_http_proxy();
+        let mut capture = self.control.lock().config.clone();
+        capture.upstream_proxy = upstream.clone();
+        if let Some(upstream) = &upstream {
+            log::info!("自动捕获经上游代理 {upstream} 转发");
+        }
+        let status = self.start(Some(capture))?;
+
+        let scope = pac::PacScope::parse(&config.scope);
+        let pac_url = match pac::PacServer::spawn(status.port, scope) {
+            Ok(server) => {
+                let url = server.url();
+                *self.pac.lock() = Some(server);
+                Some(url)
+            }
+            Err(error) => {
+                log::warn!("PAC 服务启动失败，改用全局代理：{error}");
+                None
+            }
+        };
+        let takeover = match pac_url.as_deref() {
+            Some(url) => sysproxy::enable_pac(&self.data_dir, url).or_else(|error| {
+                log::warn!("PAC 接管失败，改用全局代理：{error}");
+                sysproxy::enable(&self.data_dir, status.port)
+            }),
+            None => sysproxy::enable(&self.data_dir, status.port),
+        };
+        if let Err(error) = takeover {
+            // 接管失败就不要留一个「在跑但抓不到」的状态
+            let _ = self.stop();
+            return Err(error);
+        }
+        log::info!(
+            "自动捕获已开启（{}），代理端口 {}",
+            config.scope,
+            status.port
+        );
+        let mut current = self.status.lock();
+        current.sysproxy_on = true;
+        Ok(current.clone())
+    }
+
+    /// 当前 PAC 地址；未启用自动捕获时为 None。
+    pub fn pac_url(&self) -> Option<String> {
+        self.pac.lock().as_ref().map(|server| server.url())
+    }
+
     pub fn stop(&self) -> Result<CaptureStatus, String> {
         let (shutdown, join) = {
             let mut control = self.control.lock();
@@ -501,6 +581,13 @@ impl CaptureManager {
 
         if let Some(shutdown) = shutdown {
             let _ = shutdown.send(());
+        }
+        // PAC 服务先停：它的地址已经写进系统代理备份，还原用备份里的值
+        {
+            let mut slot = self.pac.lock();
+            if let Some(mut server) = slot.take() {
+                server.stop();
+            }
         }
         if let Err(error) = sysproxy::disable(&self.data_dir) {
             log::warn!("停止录制时恢复系统代理失败：{error}");

@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core'
 import type {
+  AutoCaptureView,
   BreakpointRule,
   CaptureCaInfo,
   CaptureFlow,
@@ -107,3 +108,9 @@ export const captureBreakpointResolve = (payload: {
 /** 放行全部挂起的断点（停止录制时也会自动释放） */
 export const captureBreakpointReleaseAll = () =>
   invoke<InterceptView>('capture_breakpoint_release_all')
+
+/** 自动捕获开关（启动即生效，不用点「开始录制」） */
+export const captureAutoGet = () => invoke<AutoCaptureView>('capture_auto_get')
+
+export const captureAutoSet = (enabled: boolean, scope?: AutoCaptureView['scope']) =>
+  invoke<AutoCaptureView>('capture_auto_set', { enabled, scope })

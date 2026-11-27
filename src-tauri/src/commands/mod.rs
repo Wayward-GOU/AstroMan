@@ -40,6 +40,7 @@ pub mod test_preflight;
 pub mod test_report;
 pub mod test_run;
 pub mod test_suite;
+pub mod token_usage;
 pub mod tool_cancel;
 pub mod tools;
 pub mod transfer;

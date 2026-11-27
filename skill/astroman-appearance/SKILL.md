@@ -1,48 +1,53 @@
 ---
 name: astroman-appearance
-description: AstroMan 的外观规范：23 套配色主题（16 浅 / 7 深）的 35 个 --fm-* 变量约定、新增或调整主题的流程与对比度校验、航仔宇航员挂件的贴图与拖拽交互、1em 线框图标。改配色、加主题、换航仔形象、调挂件交互或截图核验时使用。触发词：主题、配色、换色、暗色、CSS 变量、--fm-、对比度、航仔、宇航员、挂件、拖拽、图标。
+description: AstroMan 的外观规范：24 套配色主题（16 浅 / 8 深）的 35 个 --fm-* 变量约定、新增或调整主题的流程与对比度校验、航仔宇航员挂件的贴图与拖拽交互、1em 线框图标。改配色、加主题、换航仔形象、调挂件交互或截图核验时使用。触发词：主题、配色、换色、暗色、CSS 变量、--fm-、对比度、航仔、宇航员、挂件、拖拽、图标。
 ---
 
 # 外观：主题与航仔
 
 外观只有两件事：**颜色全部来自 `--fm-*` 变量**，**航仔是贴图不是矢量**。改这两块之前先读本页——不要在组件里写死 hex，也不要试图用 SVG 复刻渲染稿。
 
-## 一、23 套主题
+## 一、24 套主题
 
-定义在 `src/stores/theme.ts`，`themes` 数组顺序就是设置页网格顺序。
+定义在 `src/design/themes.ts` 的 `PALETTES`（**顺序即设置页网格顺序**），`src/stores/theme.ts` 负责运行时应用与持久化。下表 `定位` 列就是每套的 `desc` 字段，改这里也要同步改字段。
 
 | id | 名称 | 明暗 | 主色 | 定位 |
 |---|---|---|---|---|
-| `ocean` | 极光蓝 | 浅 | `#4d6bfe` | 默认 · 鲜明现代 |
-| `graphite` | 石墨灰 | 浅 | `#466a8f` | 中性 · 专注数据 |
-| `forest` | 森林绿 | 浅 | `#2e9e6b` | 自然 · 低饱和 |
-| `midnight` | 暗夜 | 深 | `#82a6f0` | 深色 · 夜间调试 |
-| `amber` | 琥珀橙 | 浅 | `#e0731c` | 暖调 · 品牌同色 |
-| `teal` | 青碧 | 浅 | `#0d9488` | 清爽 · 冷绿调 |
-| `rose` | 玫瑰 | 浅 | `#e0447a` | 柔和 · 暖粉调 |
-| `clay` | 陶土红 | 浅 | `#b8564a` | 克制 · 暖而不刺眼 |
-| `dusk` | 暮色 | 深 | `#96adff` | 深色 · 紫蓝夜空 |
-| `violet` | 紫罗兰 | 浅 | `#7c5cf0` | 优雅 · 紫调 |
-| `sky` | 天青 | 浅 | `#0ea5e9` | 明快 · 高饱和蓝 |
-| `mint` | 薄荷 | 浅 | `#10b981` | 清凉 · 青绿 |
-| `coral` | 珊瑚 | 浅 | `#f2714d` | 活力 · 暖橘红 |
-| `cocoa` | 可可 | 浅 | `#9a6b4f` | 温润 · 大地棕 |
-| `lime` | 青柠 | 浅 | `#65a30d` | 跳跃 · 黄绿 |
-| `steel` | 钢蓝 | 浅 | `#4b7ea8` | 克制 · 冷灰蓝 |
-| `indigo` | 靛夜 | 深 | `#8b9cff` | 深色 · 靛蓝 |
-| `plum` | 梅夜 | 深 | `#cf8ad0` | 深色 · 紫红 |
-| `pine` | 松夜 | 深 | `#6fc39a` | 深色 · 松林 |
-| `slate` | 岩夜 | 深 | `#93b6cc` | 深色 · 岩板 |
-| `aurora` | 极光青 | 深 | `#4fd1c5` | 深色 · 青碧流光 |
+| `paper` | 宣纸 | 浅 | `#0F6B64` | 默认 · 暖纸墨青 |
+| `crisp` | 清透 | 浅 | `#1D5EE0` | 亮色 · 白卡微影、冷调留白 |
+| `night` | 夜航舱 | 深 | `#4FC3A6` | 深色 · 长时间读数据 |
+| `ocean` | 极光蓝 | 浅 | `#2A66C2` | 亮色 · 鲜明现代 |
+| `graphite` | 石墨灰 | 浅 | `#4F6A86` | 中性 · 专注数据 |
+| `forest` | 森林绿 | 浅 | `#2F7A55` | 自然 · 低饱和 |
+| `midnight` | 暗夜 | 深 | `#7FB2E8` | 深色 · 夜间调试 |
+| `amber` | 琥珀橙 | 浅 | `#9C5A16` | 暖调 · 品牌同色 |
+| `teal` | 青碧 | 浅 | `#0F7A6A` | 清爽 · 冷绿调 |
+| `rose` | 玫瑰 | 浅 | `#A33B5C` | 柔和 · 暖粉调 |
+| `clay` | 陶土红 | 浅 | `#A24E2E` | 克制 · 暖而不刺眼 |
+| `dusk` | 暮色 | 深 | `#A08AD8` | 深色 · 紫蓝夜空 |
+| `violet` | 紫罗兰 | 浅 | `#7652B0` | 优雅 · 紫调 |
+| `sky` | 天青 | 浅 | `#2E6F9E` | 明快 · 高饱和蓝 |
+| `mint` | 薄荷 | 浅 | `#257A5D` | 清凉 · 青绿 |
+| `coral` | 珊瑚 | 浅 | `#B1513C` | 活力 · 暖橘红 |
+| `cocoa` | 可可 | 浅 | `#8F5624` | 温润 · 大地棕 |
+| `lime` | 青柠 | 浅 | `#56701F` | 跳跃 · 黄绿 |
+| `steel` | 钢蓝 | 浅 | `#40657F` | 克制 · 冷灰蓝 |
+| `indigo` | 靛夜 | 深 | `#7C8FE8` | 深色 · 靛蓝 |
+| `plum` | 梅夜 | 深 | `#C08ACB` | 深色 · 紫红 |
+| `pine` | 松夜 | 深 | `#6FC79E` | 深色 · 松林 |
+| `slate` | 岩夜 | 深 | `#7FB8D8` | 深色 · 岩板 |
+| `aurora` | 极光青 | 深 | `#38D2C0` | 深色 · 青碧流光 |
 
-- 深色 7 套：`midnight` / `dusk` / `indigo` / `plum` / `pine` / `slate` / `aurora`；其余 14 套浅色
+- 深色 8 套：`night` / `midnight` / `dusk` / `indigo` / `plum` / `pine` / `slate` / `aurora`；其余 16 套浅色
+- 默认主题是 `paper`（`loadThemeId()` 的兜底值），已存过的选择优先；`findTheme()` 找不到 id 时回退 `themes[0]`
 - 持久化键 `astroman.theme`，兼容旧的 `fbinhttp.theme` / `finkmeter.theme`（只读取一次，随后清掉）
 - `applyTheme()` 把变量写到 `documentElement`，同时设 `data-theme="<id>"` 与 `style.colorScheme`；`initTheme()` 在 `main.ts` 里先跑，避免首屏闪白
-- 判断明暗只用 `theme.dark`，不要在组件里比对主题名
+- `data-palette` 只有 `night` / `paper` 两个值（明暗作用域），与主题 id 解耦；判断明暗只用 `theme.dark`，不要在组件里比对主题名
+- **形态也能按主题定制**：`BasePalette` 可选 `shadowSm` / `shadow`（缺省 `none`，纸感主题不加投影）与 `radius: { sm, base, lg }`（缺省 2 / 3 / 3）。`buildColorVars` 只把 `shadow*` 写进 `theme.vars`；`radius` 由 `App.vue` 直接读 `ThemeDefinition.radius` 传给 antd，并靠 `styles/tokens.css` 的 `[data-theme='<id>']` 覆盖 `--fm-radius-sm|base|lg`（圆角是静态令牌，不进 vars）。现只有 `crisp` 用了这两个可选项，新增时要一并补 tokens.css 覆盖，否则 antd 圆角变了、自绘卡片没变
 
 ## 二、35 个变量
 
-`main.css` 的 `:root` 有 50 个 `--fm-*`，主题只覆盖其中 **35 个颜色 / 阴影**；HTTP 方法色 12 个（`--fm-method-*`）与圆角 3 个（`--fm-radius*`）**不随主题变化**。
+`main.css` 的 `:root` 有 50 个 `--fm-*`，主题只覆盖其中 **35 个颜色 / 阴影**；HTTP 方法色 12 个（`--fm-method-*`）**不随主题变化**，圆角 3 个（`--fm-radius*`）只有显式声明 `radius` 的主题（当前仅 `crisp`）才用 `data-theme` 覆盖。
 
 | 组 | 变量 |
 |---|---|
@@ -53,30 +58,38 @@ description: AstroMan 的外观规范：23 套配色主题（16 浅 / 7 深）�
 | 代码区 | `code-bg` `gutter-bg` `json-key` `json-string` `json-number` `json-bool` `json-punct` |
 | 阴影 | `shadow-sm` `shadow` `shadow-lg` |
 
-- `swatches` 固定 4 个值，顺序是 **`bg` / `surface-alt` / `primary` / `text`**，设置页缩略图按这个顺序取色
-- 新增一套必须 35 个全给：漏掉的会回落到 `main.css` 的浅色默认值，在深色主题下通常直接不可读
-- 变量名统一带 `--fm-` 前缀，写进 `ThemeDefinition.vars` 时**带前缀**（`'--fm-bg': '#fbf6f3'`）
+- 颜色只写 11 个必需基色，其余 24 个由 `buildColorVars()` 混色派生，合计 35 个变量；漏写基色会直接吃 `main.css` 的浅色默认值，深色主题下通常不可读
+- `shadowSm` / `shadow` / `radius` 是**可选的形态覆盖**，缺省即「无投影 + 2/3/3 圆角」的纸感
+- `swatches` 由 store 从基色派生，6 个值，顺序是 **`bg` / `surface` / `sidebar` / `primary` / `text` / `border`**，设置页缩略图按这个顺序取色
+- 变量名统一带 `--fm-` 前缀，`theme.vars` 里也**带前缀**（`'--fm-bg': '#fbf6f3'`）
 
 ## 三、新增一套主题
 
-1. `ThemeId` 联合类型加 id（`theme.ts` 顶部）
-2. 复制一套**同明暗**的 `ThemeDefinition` 改值，不要从零写
-3. `id` / `name` / `desc` / `dark` / `swatches` / `vars` 六项齐全
-4. 追加到 `themes` 数组——位置决定设置页顺序（例如「陶土红」插在「玫瑰」后面，就是第 8 个）
-5. 跑对比度检查（下一节），再出图看整体
-6. 同步文档：`CHANGELOG.md` 的「外观与航仔」段、`docs/features.md` 的主题清单、`docx` 里的现状表（主题数量在这三处都会出现）
+1. `src/design/themes.ts` 的 `THEME_IDS` 加 id，`ThemeId` 联合类型自动跟着变
+2. 在 `PALETTES` 里复制一套**同明暗**的定义改值，不要从零写
+3. `id` / `name` / `desc` / `dark` + 11 个基色齐全；需要立体感再加 `shadowSm` / `shadow` / `radius`
+4. 位置决定设置页顺序（数组顺序 = 网格顺序），想插队就插在对应位置
+5. 若给了 `radius`，必须同时给 `styles/tokens.css` 补一段 `[data-theme='<id>']` 覆盖 `--fm-radius-sm|base|lg`，否则 antd 变圆、自绘卡片还是直角
+6. 跑对比度检查（下一节），再出图看整体
+7. 同步文档：`CHANGELOG.md`、`docs/features.md`、`README.md` 的主题数量、`skill/*` 的口径（主题数量在这几处都会出现）
 
 ```ts
-const demo: ThemeDefinition = {
+{
   id: 'demo',
   name: '示例色',
   desc: '一句话定位',
   dark: false,
-  swatches: ['#fbf6f3', '#f8f0eb', '#b8564a', '#241715'],
-  vars: {
-    '--fm-bg': '#fbf6f3',
-    // …共 35 项
-  },
+  bg: '#f7f5f2',        // 画布
+  surface: '#ffffff',   // 卡片
+  alt: '#f2efea',       // 表头 / 悬停行 / 代码块
+  sidebar: '#1a1c20',   // 亮色主题也用深侧栏
+  sidebarText: '#a8b0a9',
+  border: '#e2ddd4',
+  borderStrong: '#cfc8bb',
+  text: '#1c1f1b',
+  text2: '#3e4742',
+  muted: '#636c65',
+  primary: '#0f6b64',
 }
 ```
 
@@ -162,7 +175,7 @@ npx vite preview --port 4180 --strictPort     # 后台跑
   http://localhost:4180/
 ```
 
-- 主题网格可以临时生一个静态 HTML（把 `swatches` 渲染成色卡），一次看 23 套的明暗与红/粉是否容易混淆
+- 主题网格可以临时生一个静态 HTML（把 `swatches` 渲染成色卡），一次看 24 套的明暗与红/粉是否容易混淆
 - 挂件这种小元素，截图后用 Pillow 裁区域再放大 2 倍看边缘有没有白边、灰边、抠图残渣
 - 交互（拖拽、点击跳转）用 Chrome CDP：`Runtime.evaluate` 合成 PointerEvent，再读 `localStorage['astroman.buddy.pos']` 与 `location.hash` 验证；位移 < 4px 时不应跳转
 

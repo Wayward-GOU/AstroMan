@@ -287,6 +287,15 @@ impl Capture {
     }
 }
 
+/// 单接口计数器：按配置 requests 下标分片，采样时取增量
+#[derive(Default)]
+struct InterfaceCounter {
+    total: AtomicU64,
+    success: AtomicU64,
+    errors: AtomicU64,
+    sum_ms: AtomicU64,
+}
+
 struct Metrics {
     total: AtomicU64,
     success: AtomicU64,
@@ -328,13 +337,21 @@ struct Metrics {
     url_keys: AtomicU64,
     /// 是否发生过键溢出（报告标记 URL 统计不完整）
     url_overflow: AtomicBool,
+    /// 按接口下标的计数：用于每秒合并出接口 QPS 曲线（空表示未启用）
+    interface_counters: Vec<InterfaceCounter>,
     /// 仅测试用：关闭 URL 聚合以测量单请求开销
     #[cfg(test)]
     url_stats_enabled: bool,
 }
 
 impl Metrics {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::new_with_interfaces(0)
+    }
+
+    /// `interfaces` 为本次运行的接口数量：大于 0 时逐请求累加各接口计数
+    fn new_with_interfaces(interfaces: usize) -> Self {
         Self {
             total: AtomicU64::new(0),
             success: AtomicU64::new(0),
@@ -367,6 +384,9 @@ impl Metrics {
             url_other: Mutex::new(UrlAgg::default()),
             url_keys: AtomicU64::new(0),
             url_overflow: AtomicBool::new(false),
+            interface_counters: (0..interfaces)
+                .map(|_| InterfaceCounter::default())
+                .collect(),
             #[cfg(test)]
             url_stats_enabled: true,
         }
@@ -394,6 +414,7 @@ impl Metrics {
         sent_bytes: u64,
         ok: bool,
         error: Option<&str>,
+        iface: usize,
     ) {
         self.total.fetch_add(1, Ordering::Relaxed);
         if ok {
@@ -436,6 +457,31 @@ impl Metrics {
         self.record_url(
             method, url, elapsed_ms, latency_ms, status, bytes, ok, error,
         );
+        // 接口维度：多接口压测时按配置下标累加，单接口时下标恒为 0
+        if let Some(counter) = self.interface_counters.get(iface) {
+            counter.total.fetch_add(1, Ordering::Relaxed);
+            if ok {
+                counter.success.fetch_add(1, Ordering::Relaxed);
+            } else {
+                counter.errors.fetch_add(1, Ordering::Relaxed);
+            }
+            counter.sum_ms.fetch_add(latency_ms, Ordering::Relaxed);
+        }
+    }
+
+    /// 各接口累计值快照：(总请求, 成功, 失败, 耗时累加)
+    fn interface_snapshot(&self) -> Vec<(u64, u64, u64, u64)> {
+        self.interface_counters
+            .iter()
+            .map(|counter| {
+                (
+                    counter.total.load(Ordering::Relaxed),
+                    counter.success.load(Ordering::Relaxed),
+                    counter.errors.load(Ordering::Relaxed),
+                    counter.sum_ms.load(Ordering::Relaxed),
+                )
+            })
+            .collect()
     }
 
     /// URL 聚合：与明细采集解耦，off / sample / full 三种模式都计数
@@ -2462,6 +2508,7 @@ async fn worker(ctx: Arc<RunCtx>, index: u32, workers: u32) {
             req.req_bytes.saturating_mul(sent_factor),
             attempt.ok,
             attempt.error.as_deref(),
+            req_index,
         );
 
         let error_type = if attempt.ok {
@@ -3260,10 +3307,7 @@ pub(crate) fn prepare_stress_with_relay(
 
     // 多接口归一：未配置 requests 时退回单接口字段（旧计划兼容）
     let defs = effective_requests(&config);
-    let raw_weights: Vec<f64> = defs
-        .iter()
-        .map(|item| item.weight.unwrap_or(0.0))
-        .collect();
+    let raw_weights: Vec<f64> = defs.iter().map(|item| item.weight.unwrap_or(0.0)).collect();
     let normalized_weights = normalize_request_weights(&raw_weights);
     let mut requests: Vec<PreparedRequest> = Vec::with_capacity(defs.len());
     for (index, def) in defs.iter().enumerate() {
@@ -3412,7 +3456,7 @@ pub(crate) fn prepare_stress_with_relay(
     };
     let capture = Arc::new(AtomicU8::new(capture_mode as u8));
 
-    let metrics = Arc::new(Metrics::new());
+    let metrics = Arc::new(Metrics::new_with_interfaces(requests.len()));
     let control = Arc::new(Control::new(
         if stages.is_empty() {
             peak
@@ -3603,6 +3647,8 @@ pub(crate) struct EngineOutcome {
     pub url_stats: Vec<UrlStatRow>,
     /// URL 统计是否完整（键未溢出）
     pub url_stats_complete: bool,
+    /// 按接口（配置 requests 下标）的每秒曲线
+    pub interface_samples: Vec<crate::models::InterfaceSamplePoint>,
     pub message: Option<String>,
 }
 
@@ -3657,6 +3703,7 @@ async fn drive_stress(
             slow_requests: &outcome.slow_requests,
             error_types: &outcome.error_types,
             url_stats: &outcome.url_stats,
+            interface_samples: &outcome.interface_samples,
             config: &outcome.config_snapshot,
         },
     ) {
@@ -3764,6 +3811,8 @@ pub(crate) async fn run_engine(
     }
 
     let mut samples: Vec<ReportSample> = Vec::new();
+    // 按接口的每秒采样点：与全局 samples 同时间轴，供报告画接口曲线
+    let mut interface_samples: Vec<crate::models::InterfaceSamplePoint> = Vec::new();
     let mut errors: Vec<ReportError> = Vec::new();
     let mut requests: Vec<ReportRequestRecord> = Vec::new();
     let mut slow_requests: Vec<SlowRequest> = Vec::new();
@@ -3782,6 +3831,8 @@ pub(crate) async fn run_engine(
     let mut prev_responses = 0u64;
     let mut prev_latency = vec![0u64; metrics.buckets.len()];
     let mut prev_body = vec![0u64; metrics.body_buckets.len()];
+    // 各接口累计值快照：采样时取差值，得到本区间各接口 QPS
+    let mut prev_interfaces = vec![(0u64, 0u64, 0u64, 0u64); metrics.interface_counters.len()];
     // 阶梯汇总：按阶段累积精确的请求数、总耗时与延迟直方图
     let mut stage_accums: Vec<StageAccum> =
         (0..stages.len()).map(|_| StageAccum::default()).collect();
@@ -3931,6 +3982,44 @@ pub(crate) async fn run_engine(
                 response_count: delta_responses,
             });
 
+            // 接口维度：本区间各接口增量，QPS 同样按真实采样间隔归一
+            let iface_now = metrics.interface_snapshot();
+            let mut iface_points: Vec<crate::models::InterfaceSample> = Vec::new();
+            for (iface_index, current) in iface_now.iter().enumerate() {
+                let prev = prev_interfaces
+                    .get(iface_index)
+                    .copied()
+                    .unwrap_or((0, 0, 0, 0));
+                let d_total = current.0.saturating_sub(prev.0);
+                if d_total == 0 && current.3 == prev.3 {
+                    continue;
+                }
+                let d_sum = current.3.saturating_sub(prev.3);
+                iface_points.push(crate::models::InterfaceSample {
+                    index: iface_index as u32,
+                    qps: d_total as f64 / dt,
+                    success_count: current.1.saturating_sub(prev.1),
+                    error_count: current.2.saturating_sub(prev.2),
+                    sum_rt_ms: d_sum,
+                    avg_rt: if d_total > 0 {
+                        d_sum as f64 / d_total as f64
+                    } else {
+                        0.0
+                    },
+                });
+            }
+            prev_interfaces = iface_now;
+            for point in &iface_points {
+                interface_samples.push(crate::models::InterfaceSamplePoint {
+                    elapsed_sec: elapsed,
+                    index: point.index,
+                    qps: point.qps,
+                    success_count: point.success_count,
+                    error_count: point.error_count,
+                    avg_rt: point.avg_rt,
+                });
+            }
+
             // 阶梯汇总：用区间增量累加到所属阶段，阶段内 P95 由真实直方图重算
             if let Some(accum) = stage_accums.get_mut(acc_stage_index.max(0) as usize) {
                 accum.requests += delta_total;
@@ -3959,6 +4048,7 @@ pub(crate) async fn run_engine(
                     sum_body_ms: delta_body,
                     latency_buckets,
                     body_buckets,
+                    interfaces: iface_points,
                     // 本机资源由调用方（从节点 sink）补齐，单机路径与主节点引擎保持 None
                     host: None,
                 });
@@ -4250,8 +4340,31 @@ pub(crate) async fn run_engine(
         sparse,
         url_stats,
         url_stats_complete,
+        interface_samples: decimate_interface_samples(interface_samples),
         message: auto_stop,
     }
+}
+
+/// 接口曲线抽稀：每个接口最多保留约 2 万点
+///
+/// 长压测（24h）本身已按 2s/5s 降频采样，这里只防御极端情况下的表体积，
+/// 常规时长（≤5.5h、1s 采样）不会丢点。
+pub(crate) fn decimate_interface_samples(
+    points: Vec<crate::models::InterfaceSamplePoint>,
+) -> Vec<crate::models::InterfaceSamplePoint> {
+    const MAX_POINTS: usize = 20_000;
+    use std::collections::BTreeMap;
+    let mut groups: BTreeMap<u32, Vec<crate::models::InterfaceSamplePoint>> = BTreeMap::new();
+    for point in points {
+        groups.entry(point.index).or_default().push(point);
+    }
+    let mut out = Vec::new();
+    for (_, items) in groups {
+        let step = (items.len() / MAX_POINTS).max(1);
+        out.extend(items.into_iter().step_by(step));
+    }
+    out.sort_by_key(|point| (point.elapsed_sec, point.index));
+    out
 }
 
 /// 全量桶转稀疏形式（只保留非零桶）
@@ -4696,6 +4809,8 @@ pub(crate) struct ReportPayload<'a> {
     pub error_types: &'a [ErrorTypeCount],
     /// 按 URL 聚合的统计（已脱敏）
     pub url_stats: &'a [UrlStatRow],
+    /// 按接口的每秒采样（旧调用方传空切片）
+    pub interface_samples: &'a [crate::models::InterfaceSamplePoint],
     pub config: &'a str,
 }
 
@@ -5008,6 +5123,54 @@ pub(crate) fn save_report(pool: &DbPool, payload: ReportPayload<'_>) -> Result<i
     } else {
         log::warn!("URL 统计写入失败：{:?}", url_result.as_ref().err());
         let _ = tx.execute_batch("ROLLBACK TO url_rows; RELEASE url_rows");
+    }
+
+    // 接口曲线采样：旧库先补建表，失败只影响该段，不拖垮整份报告
+    let _ = tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS report_interface_samples (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            report_id        INTEGER NOT NULL REFERENCES test_reports(id) ON DELETE CASCADE,
+            elapsed_sec      INTEGER NOT NULL,
+            interface_index  INTEGER NOT NULL,
+            qps              REAL    NOT NULL DEFAULT 0,
+            success_count    INTEGER NOT NULL DEFAULT 0,
+            error_count      INTEGER NOT NULL DEFAULT 0,
+            avg_rt           REAL    NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_interface_samples_report
+            ON report_interface_samples(report_id, interface_index, elapsed_sec);",
+    );
+    let _ = tx.execute_batch("SAVEPOINT iface_rows");
+    let iface_result = {
+        use rusqlite::types::Value as SqlValue;
+        let rows: Vec<Vec<SqlValue>> = payload
+            .interface_samples
+            .iter()
+            .map(|item| {
+                vec![
+                    SqlValue::Integer(report_id),
+                    SqlValue::Integer(item.elapsed_sec as i64),
+                    SqlValue::Integer(item.index as i64),
+                    SqlValue::Real(item.qps),
+                    SqlValue::Integer(item.success_count as i64),
+                    SqlValue::Integer(item.error_count as i64),
+                    SqlValue::Real(item.avg_rt),
+                ]
+            })
+            .collect();
+        batch_insert(
+            &tx,
+            "INSERT INTO report_interface_samples
+                (report_id, elapsed_sec, interface_index, qps, success_count, error_count, avg_rt)",
+            7,
+            &rows,
+        )
+    };
+    if iface_result.is_ok() {
+        let _ = tx.execute_batch("RELEASE iface_rows");
+    } else {
+        log::warn!("接口曲线写入失败：{:?}", iface_result.as_ref().err());
+        let _ = tx.execute_batch("ROLLBACK TO iface_rows; RELEASE iface_rows");
     }
 
     tx.commit().map_err(err)?;
@@ -5453,6 +5616,7 @@ mod tests {
             10,
             true,
             None,
+            0,
         );
         metrics.record(
             "GET",
@@ -5466,6 +5630,7 @@ mod tests {
             10,
             true,
             None,
+            0,
         );
         metrics.record(
             "POST",
@@ -5479,6 +5644,7 @@ mod tests {
             10,
             false,
             Some("HTTP 500"),
+            0,
         );
 
         let (rows, complete) = metrics.url_stats();
@@ -5548,6 +5714,7 @@ mod tests {
             1,
             true,
             None,
+            0,
         );
         let (rows, complete) = metrics.url_stats();
         assert!(!complete);
@@ -5558,7 +5725,7 @@ mod tests {
     fn url_stats_truncates_long_url() {
         let metrics = Metrics::new();
         let url = format!("https://a.test/{}", "x".repeat(MAX_URL_LEN + 100));
-        metrics.record("GET", &url, 10, 1, 0, 1, 200, 1, 1, true, None);
+        metrics.record("GET", &url, 10, 1, 0, 1, 200, 1, 1, true, None, 0);
         let (rows, _) = metrics.url_stats();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].url.chars().count(), MAX_URL_LEN);
@@ -5580,6 +5747,7 @@ mod tests {
             10,
             true,
             None,
+            0,
         );
         // 连接失败：没有响应，不能按 0 计入 TTFB，也不能把 50ms 全算成响应体
         metrics.record(
@@ -5594,6 +5762,7 @@ mod tests {
             10,
             false,
             Some("timeout"),
+            0,
         );
         assert_eq!(metrics.count(), 2);
         assert_eq!(metrics.responses.load(Ordering::Relaxed), 1);
@@ -5814,6 +5983,7 @@ mod perf_tests {
                     500,
                     true,
                     None,
+                    0,
                 );
             }
             started.elapsed().as_nanos() as f64 / ITERATIONS as f64

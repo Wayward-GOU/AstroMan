@@ -24,7 +24,7 @@ AstroMan/
 │  │                  # 抓包：CaptureInterceptDrawer（断点/映射/弱网）、CaptureBreakpointModal（断点改包）
 │  │                  # 记事本：notes/NotesEditor、NotesImageViewer、NotesImportDialog（截图识别）、NotesReminderHost
 │  │                  # 航仔：AstroBuddy.vue（挂件，可拖拽）/ AstroBuddyIcon.vue（1em 线框图标）
-│  ├─ stores/         # pinia：project（项目+集合树+环境）、tabs（标签页持久化）、theme（23 套主题）、toolPrefs（工具收藏/最近）、notes（待办列表/筛选/设置）
+│  ├─ stores/         # pinia：project（项目+集合树+环境）、tabs（标签页持久化）、theme（24 套主题）、toolPrefs（工具收藏/最近）、notes（待办列表/筛选/设置）
 │  ├─ styles/main.css # 设计系统：--fm-* 变量
 │  ├─ tools/          # 离线工具箱：registry.ts（92 个工具 / 9 分类）+ 各域纯函数 + __tests__/toolbox.spec.ts
 │  ├─ types/models.ts # 与 Rust models.rs 对应的 TS 类型
@@ -35,6 +35,7 @@ AstroMan/
 │  │                  # AI：aiTools（130 个工具：117 业务 + 12 工具箱 + tool_search）、aiProtocol（围栏协议）、contextBudget（token 预算）、modelMeta（窗口）、untrusted（注入隔离）、aiPricing（费用）、promptText（压缩）
 │  └─ views/          # Dashboard / Projects / Project / RequestEditor / StressTest / Runner / Automation / Reports / History
 │                     # Tools / SystemMonitor / Settings / Environment / ReportDetail / AiAssistant / AiUsage / AiToolLogs
+│                     # TokenUsage（本机大模型 token 用量看板，数据来自 Rust commands/token_usage.rs）
 │                     # Plans（压测计划中心）、Cluster（分布式压测）、DataPools（参数池 / Token 池）
 │                     # Capture（抓包：流量列表 / 详情 / 设置抽屉 / 重发弹窗 / 拦截）
 │                     # Notes（记事本与待办）、QuickCapture（Ctrl+Alt+N 迷你快速记录，独立窗口）
@@ -62,7 +63,7 @@ AstroMan/
 │  ├─ capabilities/default.json # 已授权 core:default / core:webview:allow-set-webview-zoom / dialog:default
 │  └─ icons/          # 打包与托盘图标（唯一保留的一套）
 ├─ scripts/           # install-macos.sh、prepare-cli.mjs、sync-version.mjs、gen-sample-report.mts（重新生成示例报告）
-│                    # check-hardcoded-color.mjs（样式门禁）、check-contrast.ts（23 套主题对比度）
+│                    # check-hardcoded-color.mjs（样式门禁）、check-contrast.ts（24 套主题对比度）
 ├─ docs/              # 现行文档，README 末尾有索引；cluster-optimization-plan.md 是集群优化清单与落地进度
 ├─ docx/              # 历史技术方案档案（v1.0.8–v1.1.1 的设计输入，已实现，仅作追溯，勿当现状文档看）
 ├─ skill/             # 项目内开发规范（本目录）
@@ -129,14 +130,14 @@ Windows 下 `cargo check` 在受限沙箱里会命中 `D:\Software\Rust\cargo\.g
 
 - 前端调用：`invoke<返回类型>('snake_case_command', { camelCaseArgs })`
 - Rust 模型：`#[serde(rename_all = "camelCase")]`，前端类型在 `src/types/models.ts`
-- 样式：只用 `--fm-*` 变量，不写死颜色；主题在 `stores/theme.ts`（**23 套**，16 浅 / 7 深，每套覆盖 35 个颜色 / 阴影变量）里整体覆盖
+- 样式：只用 `--fm-*` 变量，不写死颜色；主题在 `stores/theme.ts`（**24 套**，16 浅 / 8 深，每套覆盖 35 个颜色 / 阴影变量）里整体覆盖
 - 航仔入口：`components/AstroBuddy.vue`，用设计稿贴图 `src/assets/buddy.png`（透明底，显示 72×121），可拖拽；小尺寸图标用 `AstroBuddyIcon.vue` 的 1em 线框版，不要把位图缩到 14px
 - 命令全部返回 `Result<T, String>`，错误文案面向用户、中文
 - 请求 Body（JSON）允许写 `//`、`/* */` 注释，发送前由 `util::strip_json_comments` 剥离；前端 `CodeArea` 负责着色与 `Ctrl / ⌘ + /` 注释，不负责删除
 - 敏感值：`src-tauri/src/secret.rs` 统一 AES-256-GCM 加密（`enc:v1:`），主密钥按数据目录隔离，测试构建永不写钥匙串
 - 自动化测试：桌面端与 `astroman-cli` 共用 `test_runner::run_suite`，产物写 `<数据目录>/test-reports/<runId>/` 且库里只存相对路径；改判定逻辑必须两端一起验
 - 工具箱：92 个工具的实现全部在 `src/tools/*.ts` 纯函数，`registry.ts` 只做声明；页面与 `ToolWorkbench` 只管交互
-- 压测报告 QPS 指标组唯一入口：`utils/reportAnalytics.ts::qpsOverview()`，详情页与 HTML / Excel 导出都调它
+- 压测报告 QPS 指标组唯一入口：`utils/reportAnalytics.ts::qpsOverview()`，详情页与 HTML / Excel 导出都调它；多接口报告另有后端产出的 `interfaceSamples`（按接口每秒 QPS），详情页与三种导出直接消费，不要再从 `urlStats` 反推
 - 抓包：流量**只存内存**（5000 条 / 128 MB body），不写 SQLite；根证书在 `<数据目录>/certs/`；Windows / macOS 系统代理改动先备份到数据目录并在停止/退出/下次启动时还原（macOS 需一次管理员授权）；Linux 只能手动设代理与装证书
 - 抓包网络请求由 hudsucker MITM 代理转发，不走 `commands/http.rs` 的 reqwest 客户端；「重发」在录制中经本机代理，未录制时直连
 - 抓包拦截：断点队列上限 32 条、120 秒自动放行；Map Local 文件 ≤ 50 MB；弱网超时返回 504；规则写 `<数据目录>/capture/intercept.json`，改规则后必须同步 `capture_intercept_state`
@@ -150,7 +151,7 @@ Windows 下 `cargo check` 在受限沙箱里会命中 `D:\Software\Rust\cargo\.g
 | `astroman-add-feature` | 端到端新增功能（命令 → api → 页面 → 注册） |
 | `astroman-backend` | Rust 命令、SQLite 迁移、压测引擎、数据池与 Excel 导入、分布式压测协议与池切片、主密钥与钥匙串规范 |
 | `astroman-frontend` | 页面骨架、主题变量、CodeMirror 编辑器与 JSON 模板格式化、数据池 / 压测绑定 / 集群页、脚本引擎、导出 |
-| `astroman-appearance` | 23 套主题的变量约定与新增流程、对比度校验、航仔贴图与拖拽、线框图标 |
+| `astroman-appearance` | 24 套主题的变量约定与新增流程、对比度校验、航仔贴图与拖拽、线框图标 |
 | `astroman-dashboard` | 工作台首页区块、历史记录页数据大屏、引导 / 技巧 / FAQ 文案口径、Runner 与测试场景介绍 |
 | `astroman-capture` | 抓包模块：MITM 代理、录制上限、根证书、系统代理、手机与微信边界、HAR / ZIP 导出、改参重发、断点 / 映射 / 弱网 |
 | `astroman-notes` | 记事本与待办：四种类型、标签与 50% 抽屉、提醒 / 重复 / 稍后 / 暂停 / 免打扰、快速记录、截图识别、附件去重、数据表 |

@@ -57,7 +57,7 @@ Windows 下 `cargo check` 若报 `hit restricted ... D:\Software\Rust\cargo\.glo
 ## 发版流程
 
 1. 同步版本号：`npm run version:set 1.0.9` 一次写入 `package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml` 三处；脚本**不动** lock 文件——`package-lock.json` 用 `npm install --package-lock-only` 跟上，`Cargo.lock` 跑一次 `cargo check` 会自动同步。`npm run version:check` 必须通过（CI 的 `frontend` job 第一步就是它）
-2. 提交前跑一遍与 CI 同源的门禁：`npm run test`、`npm run ui:check`（硬编码样式 + 23 套主题对比度）、`npm run build`、`cargo fmt --check --all`、`cargo clippy --lib --all-targets -- -D warnings`、`cargo test --lib`；覆盖率由 `src-tauri/tarpaulin.toml` 的 `fail-under`（当前 25%）判定，报告在 `target/coverage/`
+2. 提交前跑一遍与 CI 同源的门禁：`npm run test`、`npm run ui:check`（硬编码样式 + 24 套主题对比度）、`npm run build`、`cargo fmt --check --all`、`cargo clippy --lib --all-targets -- -D warnings`、`cargo test --lib`；覆盖率由 `src-tauri/tarpaulin.toml` 的 `fail-under`（当前 25%）判定，报告在 `target/coverage/`
 3. 提交后打 tag：`git tag v1.0.9 && git push origin v1.0.9`，同时把 `.github/workflows/release.yml` 里的 `releaseBody` 更新成本次版本说明（GitHub Release 直接用它）；版本说明追加到 `### 本次更新（x.y.z）` 段落。历史版本不要继续堆在 `releaseBody` 里，只留一行 CHANGELOG 链接
 4. **`releaseBody` 有硬上限，改完必须算长度**：该字段含 `${{ github.ref_name }}`，GitHub 按模板值计长，上限 21000，超了不会给出可读报错，而是把整个 workflow 判为 invalid —— Actions 里工作流名从 `Release` 退化成 `.github/workflows/release.yml`，push 不再产生任何 job（`total_count: 0`）。v1.1.5 踩过一次：累积三个版本说明后 11952 字符 / 22921 字节，加了 9 行就变 24047 字节越界。追加文案前先跑：
 
@@ -71,7 +71,7 @@ Windows 下 `cargo check` 若报 `hit restricted ... D:\Software\Rust\cargo\.glo
    "
    ```
 
-   余量低于 2000 就先把历史版本段摘出去再写新内容。v1.1.6 覆盖重发后当前为 5403 字符 / 9603 字节（余量约 11,400 字节）
+   余量低于 2000 就先把历史版本段摘出去再写新内容。v1.1.7 发布后当前为 5836 字符 / 10512 字节（余量约 10,488 字节）
 5. `.github/workflows/release.yml` 在 tag 推送时自动构建 Windows NSIS 与 macOS universal dmg，上传到 GitHub Release
 6. 应用内更新检查走 `commands/update.rs` 的 `RELEASE_API`（`https://api.github.com/repos/Wayward-GOU/AstroMan/releases/latest`），仓库地址已改为 AstroMan
 7. macOS 用户安装脚本 `scripts/install-macos.sh`（`REPO=Wayward-GOU/AstroMan`）从 Release 下载 dmg，并绕过未签名校验；README 中的安装命令同源

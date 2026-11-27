@@ -20,6 +20,7 @@ use crate::capture::intercept::{
     InterceptState, MapLocalRule, MapSource, PendingInfo, PendingPhase, RequestEdit, ResponseEdit,
     MAX_MAP_FILE,
 };
+use crate::capture::llm_usage::{self, UsageSink};
 use crate::capture::store::{BodyPayload, CaptureStore, FlowBrief, FlowRecord, HeaderEntry};
 use crate::capture::CaptureConfig;
 use crate::services::profile::CaptureLimits;
@@ -91,6 +92,8 @@ pub struct CaptureHandler {
     store: Arc<CaptureStore>,
     config: CaptureConfig,
     intercept: Arc<InterceptState>,
+    /// 大模型接口的用量旁路记账
+    usage_sink: Arc<UsageSink>,
     /// 当前请求的上下文；请求体异步读取，因此需要内部可变。
     pending: Arc<Mutex<Option<Pending>>>,
 }
@@ -102,6 +105,7 @@ impl Clone for CaptureHandler {
             store: self.store.clone(),
             config: self.config.clone(),
             intercept: self.intercept.clone(),
+            usage_sink: self.usage_sink.clone(),
             pending: Arc::new(Mutex::new(None)),
         }
     }
@@ -112,11 +116,13 @@ impl CaptureHandler {
         store: Arc<CaptureStore>,
         config: CaptureConfig,
         intercept: Arc<InterceptState>,
+        usage_sink: Arc<UsageSink>,
     ) -> Self {
         Self {
             store,
             config,
             intercept,
+            usage_sink,
             pending: Arc::new(Mutex::new(None)),
         }
     }
@@ -302,6 +308,7 @@ impl HttpHandler for CaptureHandler {
         let pending_slot = self.pending.clone();
         let store = self.store.clone();
         let intercept = self.intercept.clone();
+        let usage_sink = self.usage_sink.clone();
         let limits = store.limits();
 
         async move {
@@ -357,6 +364,11 @@ impl HttpHandler for CaptureHandler {
                         _ => {}
                     }
                 }
+                // 大模型接口：响应流分叉给用量嗅探器，正文不进 store
+                let flavor = llm_usage::flavor_of(&pending.path);
+                let host = pending.host.clone();
+                let path = pending.path.clone();
+                let client = client_of(&pending);
                 record_success(
                     &store,
                     pending,
@@ -368,6 +380,11 @@ impl HttpHandler for CaptureHandler {
                     },
                     content_length(res.headers()),
                 );
+                if let Some(flavor) = flavor {
+                    return llm_usage::tap_response(
+                        res, flavor, host, path, client, status, usage_sink,
+                    );
+                }
                 return res;
             }
 
@@ -466,6 +483,19 @@ impl HttpHandler for CaptureHandler {
                 sleep_for(delay).await;
             }
 
+            // 非流式的大模型响应：整包已经在内存里，直接抽 usage
+            if let Some(flavor) = llm_usage::flavor_of(&pending.path) {
+                llm_usage::sniff_buffered(
+                    flavor,
+                    &bytes,
+                    &pending.host,
+                    &pending.path,
+                    &client_of(&pending),
+                    status,
+                    &usage_sink,
+                );
+            }
+
             record_success(
                 &store,
                 pending,
@@ -493,6 +523,16 @@ impl HttpHandler for CaptureHandler {
             bad_gateway()
         }
     }
+}
+
+/// 记录用量时标注客户端：UA 首段就够（`Claude/1.2` → `Claude`），取不到留空
+fn client_of(pending: &Pending) -> String {
+    pending
+        .request_headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case("user-agent"))
+        .map(|header| llm_usage::client_name(&header.value))
+        .unwrap_or_default()
 }
 
 fn build_pending(

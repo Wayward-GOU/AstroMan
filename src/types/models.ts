@@ -1506,6 +1506,10 @@ export interface ReportDetail {
   urlStats?: UrlStat[]
   /** URL 统计是否完整；旧报告缺省为 false */
   urlStatsComplete?: boolean
+  /** 按接口的每秒 QPS 曲线；旧报告为空 */
+  interfaceSamples?: InterfaceSamplePoint[]
+  /** 接口曲线是否覆盖全部施压节点；旧报告缺省为 false */
+  interfaceSamplesComplete?: boolean
   /** 施压机明细：集群为各节点，单机为本机 1 行；旧报告为空 */
   loadGenerators?: ClusterReportNode[]
   /** 可编辑的测试场景描述 */
@@ -1514,9 +1518,18 @@ export interface ReportDetail {
   summaryText?: string | null
 }
 
+/** 单个接口在某秒的采样：index 对应配置快照 requests 下标 */
+export interface InterfaceSamplePoint {
+  elapsedSec: number
+  index: number
+  qps: number
+  successCount: number
+  errorCount: number
+  avgRt: number
+}
+
 /** 按 URL 聚合的统计：与是否记录请求明细无关 */
-export interface UrlStat {
-  method: string
+export interface UrlStat {  method: string
   url: string
   /** 请求数最多的状态码；0 表示无响应错误 */
   statusCode: number

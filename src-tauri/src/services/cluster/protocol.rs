@@ -467,6 +467,9 @@ pub struct SamplePayload {
     /// 旧节点为空，合并时该字段按 0 处理
     #[serde(default)]
     pub body_buckets: SparseBuckets,
+    /// 本秒各接口增量（按配置 requests 下标）；旧节点为空
+    #[serde(default)]
+    pub interfaces: Vec<crate::models::InterfaceSample>,
     /// 本机资源快照；旧节点为 None
     #[serde(default)]
     pub host: Option<HostSample>,

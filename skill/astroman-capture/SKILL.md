@@ -19,9 +19,12 @@ description: AstroMan 抓包模块的开发与使用约定（HTTP/HTTPS 录制�
 | `src-tauri/src/capture/intercept.rs` | 断点 / 本地映射 / 弱网规则、持久化与挂起队列 |
 | `src-tauri/src/capture/store.rs` | 内存流量仓库（5000 条 / 128 MB body）、分组与查询 |
 | `src-tauri/src/capture/ca.rs` | 根证书生成、信任检测、一键安装、导出 |
-| `src-tauri/src/capture/sysproxy.rs` | Windows 系统代理接管/还原、崩溃残留清理 |
+| `src-tauri/src/capture/sysproxy.rs` | 系统代理接管/还原：全局 HTTP/HTTPS 代理与 PAC 两种模式、崩溃残留清理 |
+| `src-tauri/src/capture/pac.rs` | PAC 分流：只把 LLM 接口域名指向本机，脚本自带 `DIRECT` 兜底；内置极小 HTTP 服务提供脚本 |
+| `src-tauri/src/capture/auto.rs` | 自动捕获开关（`capture/auto.json`：`enabled` + `scope: llm / all`），默认开启 |
 | `src-tauri/src/capture/har.rs` | HAR 1.2 渲染与导出 |
 | `src-tauri/src/capture/archive.rs` | ZIP 导出：index.html、HAR、summary.json、flows 明细 |
+| `src-tauri/src/capture/llm_usage.rs` | 大模型接口的 token 旁路嗅探与 `<数据目录>/capture/llm-usage.jsonl` 记账（Token 看板的 `capture` 来源） |
 | `src-tauri/src/capture/tests.rs` | 代理链路与重发的 Rust 单测 |
 | `src-tauri/src/commands/capture.rs` | 全部 IPC 命令，注册在 `lib.rs::generate_handler!` |
 | `src/api/capture.ts` | 前端 invoke 封装 |
@@ -60,6 +63,41 @@ idle → starting → running → stopping → idle
 - **静态资源默认也录制**：前端 `captureStart` 固定传 `captureStatic: true`。`captureStatic=false` 时会按扩展名跳过 js/css/图片/字体/音视频。
 - `ignorePatterns` 命中 host 或 path 即跳过；`sslHosts` 目前只是契约字段，尚未参与解密决策。前端两项都传空数组，也没有对应设置项——扩展前先补 UI 与 handler。
 - `CONNECT` 请求本身不记一条。
+
+### 3.1 LLM 用量旁路（`llm_usage.rs`）
+
+录制期间对三类接口额外做一次「只抽数字」的旁听，供 Token 看板记账——解决桌面版直连别家中转时本地没有任何 usage 日志的问题：
+
+| 路径 | 抽取位置 |
+|---|---|
+| `*/v1/messages` | `message_start.message.usage`（输入 / 缓存读写）+ `message_delta.usage`（累计输出）；`/v1/messages/count_tokens` 不匹配 |
+| `*/chat/completions` | 末包 `usage`，`prompt_tokens` 要减掉 `prompt_tokens_details.cached_tokens` |
+| `*/responses` | 流式 `response.completed.response.usage`，非流式顶层 `usage` |
+
+- 命中路径才接线：SSE 分支用 `tap_response` 把 body 的分帧塞进 `tokio::sync::mpsc`（16 容量），泵任务一边喂嗅探器一边原样转发，**不改字节、不缓冲整段**；非流式响应在已缓冲的 `bytes` 上直接 `sniff_buffered`。
+- 记账口径：`input` 不含缓存，`cacheRead` / `cacheWrite` 单列；一条 assistant 消息一行，id 用 `主机:message.id`，取不到时用 `主机:时间戳:序号` 兜底。
+- 只写 `<数据目录>/capture/llm-usage.jsonl`，不碰 SQLite、不存正文；读侧在 `commands/token_usage.rs::read_capture`，费用按 cc-switch 价目表估算并标 `estimate`。
+- 与 cc-switch 代理流水按「总量 + 输出 + 一分钟内」判重，避免同一次调用被记两遍。
+- 验证：`cargo test --lib capture::tests::llm_usage_sniffed_from_streaming_response`（真实起代理 + chunked SSE 上游，断言客户端字节不变且记账正确）。
+
+### 3.2 自动捕获与 PAC 分流（`auto.rs` + `pac.rs`）
+
+默认开启：`lib.rs` 的 setup 读完 `capture/auto.json` 若 `enabled` 就调 `CaptureManager::start_auto()`，用户不用去抓包页点「录制」。
+
+- `start_auto` 顺序：`start()` 起代理 → `PacServer::spawn(代理端口, scope)` 起脚本服务 → `sysproxy::enable_pac(pac_url)` 接管系统代理。PAC 起不来或接管失败时退回原来的全局代理（`sysproxy::enable`）；两者都失败就 `stop()` 回滚，不留「在跑但抓不到」的状态。
+- PAC 只命中白名单（`api.deepseek.com`、`api.anthropic.com`、`api.openai.com`、`openrouter.ai`、`api.siliconflow.cn`、`open.bigmodel.cn` 等精确域名 + 少量窄后缀），其余 `DIRECT`。浏览器、iCloud、系统更新完全不经过 MITM。
+- **脚本尾串是 `PROXY 127.0.0.1:<port>; DIRECT`**，不是裸 `PROXY`。代理被强杀后客户端连不上会自动回落直连，不会出现「系统代理指向死端口导致全机断网」——这是选 PAC 而不是全局代理的主要原因。
+- PAC 服务：独立线程 + `new_current_thread` runtime，端口由系统随机分配（不落盘、不占固定端口），只响应 `/proxy.pac`，其它路径 404。`PacServer` 实现 `Drop` 自动停线程。
+- 备份：`ProxyBackup.mode = pac` 且 `macos.pac` 存原来的 `-getautoproxyurl` 结果（url + enabled）。还原顺序必须是**先 `-setautoproxyurl` 再 `-setautoproxystate`**，反过来会被前者重新打开。
+- 三种还原路径：手动停止 / 代理线程退出 / 下次启动 `restore_stale`；退出应用时 `RunEvent::Exit` 会调 `capture.stop()`。
+- **走上游代理**：系统里已经有 Clash / Surge 这类代理时，自动捕获把它的地址塞进 `CaptureConfig.upstream_proxy`，`proxy::run_via_upstream` 用 hyper-util 的 `Tunnel` 建 CONNECT 隧道、hyper-rustls 在隧道上做 TLS，出口仍是原代理 —— 抓得到流量又不抢原有分流。没有上游时仍走 `proxy::run`（hudsucker 自带 rustls 连接器），行为与改造前一致。两条路径靠 `match` 分支区分，不要试图合成一个泛型 connector，`Connect` 是 sealed trait，`Tunnel<C>` 和 `HttpConnector` 没法统一类型。
+- 前端：抓包页工具栏「自动捕获」开关（`capture_auto_get` / `capture_auto_set`），切换立即启停；手动点「停止」会顺带把开关关掉，避免下次启动又悄悄接管；有上游时开关旁显示「经上游」。
+
+实测记录（macOS 15，管理员组用户）：
+
+- `networksetup -setwebproxy` / `-setautoproxyurl` **免密直接生效**，`osascript ... with administrator privileges` 只是兜底；文档里「接管系统代理需要一次管理员授权」的旧说法已过时。
+- `kill -9` 后系统 PAC 会指向已消失的端口；此时 Safari 仍能正常打开网页（回落 DIRECT），验证了兜底串有效。下次启动应用会先 `restore_stale` 再重新接管，端口随之变化。
+- 默认没有开机自启：应用关窗只是隐藏到托盘，进程还在就一直在抓；应用完全退出后停止捕获。
 
 ## 4. 根证书（HTTPS 解密前提）
 

@@ -72,6 +72,8 @@ pub(crate) struct MergedReport {
     pub error_types: Vec<ErrorTypeCount>,
     /// 合并后的 URL 统计（按 method/url/status 相加）
     pub url_stats: Vec<crate::models::UrlStatRow>,
+    /// 合并后的接口每秒曲线（按 elapsed_sec + 接口下标相加）
+    pub interface_samples: Vec<crate::models::InterfaceSamplePoint>,
     pub meta: ClusterReportMeta,
     pub config_snapshot: String,
 }
@@ -139,6 +141,9 @@ pub(crate) fn merge(request: MergeRequest) -> MergedReport {
     // URL 统计按 (method, url, status) 合并；任一节点未上报即标记不完整
     let mut url_rows: BTreeMap<(String, String, i64), crate::models::UrlStatRow> = BTreeMap::new();
     let mut url_stats_complete = true;
+    // 接口曲线：同秒同接口的 QPS / 计数相加
+    let mut interface_seconds: BTreeMap<(u64, u32), (f64, u64, u64, u64)> = BTreeMap::new();
+    let mut interface_samples_complete = true;
 
     let mut total = 0u64;
     let mut success = 0u64;
@@ -173,6 +178,19 @@ pub(crate) fn merge(request: MergeRequest) -> MergedReport {
                     .entry(sample.elapsed_sec)
                     .or_default()
                     .absorb(sample);
+                for iface in &sample.interfaces {
+                    let entry = interface_seconds
+                        .entry((sample.elapsed_sec, iface.index))
+                        .or_insert((0.0, 0, 0, 0));
+                    entry.0 += iface.qps;
+                    entry.1 += iface.success_count;
+                    entry.2 += iface.error_count;
+                    entry.3 += iface.sum_rt_ms;
+                }
+                // 旧节点不发送 interfaces：有请求的秒却没有任何接口增量，标记不完整
+                if sample.success_count + sample.error_count > 0 && sample.interfaces.is_empty() {
+                    interface_samples_complete = false;
+                }
             }
         } else {
             dropped_samples += node.samples.len() as u64;
@@ -380,6 +398,23 @@ pub(crate) fn merge(request: MergeRequest) -> MergedReport {
         })
         .collect::<Vec<_>>();
 
+    let interface_samples = crate::commands::stress::decimate_interface_samples(
+        interface_seconds
+            .into_iter()
+            .map(|((elapsed_sec, index), (qps, success, errors, sum_rt))| {
+                let count = success + errors;
+                crate::models::InterfaceSamplePoint {
+                    elapsed_sec,
+                    index,
+                    qps,
+                    success_count: success,
+                    error_count: errors,
+                    avg_rt: ratio(sum_rt, count),
+                }
+            })
+            .collect(),
+    );
+
     let start_ms = started.unwrap_or(request.started_at);
     let end_ms = ended.unwrap_or(request.finished_at).max(start_ms);
     let elapsed_sec = ((end_ms - start_ms) as f64 / 1000.0).max(0.001);
@@ -505,6 +540,10 @@ pub(crate) fn merge(request: MergeRequest) -> MergedReport {
             metrics.insert("recordsDropped".to_string(), json!(records_dropped));
             metrics.insert("clusterNodes".to_string(), json!(meta.nodes.len()));
             metrics.insert("urlStatsComplete".to_string(), json!(url_stats_complete));
+            metrics.insert(
+                "interfaceSamplesComplete".to_string(),
+                json!(interface_samples_complete),
+            );
         }
     }
 
@@ -516,6 +555,7 @@ pub(crate) fn merge(request: MergeRequest) -> MergedReport {
         body_histogram,
         error_types,
         url_stats,
+        interface_samples,
         meta,
         config_snapshot: config.to_string(),
     }
@@ -1184,6 +1224,7 @@ mod tests {
             sum_body_ms: count * 5,
             latency_buckets: latency,
             body_buckets: Vec::new(),
+            interfaces: Vec::new(),
             host: None,
         }
     }
@@ -1280,6 +1321,75 @@ mod tests {
         assert_eq!(config["mode"], "cluster");
         assert_eq!(config["cluster"]["totalConcurrent"], 16);
         assert_eq!(merged.meta.nodes.len(), 2);
+    }
+
+    #[test]
+    fn merge_sums_interface_qps_by_second() {
+        let mut left = sample(1, 30.0, 30, vec![(10, 30)]);
+        left.interfaces = vec![
+            crate::models::InterfaceSample {
+                index: 0,
+                qps: 10.0,
+                success_count: 10,
+                error_count: 0,
+                sum_rt_ms: 200,
+                avg_rt: 20.0,
+            },
+            crate::models::InterfaceSample {
+                index: 1,
+                qps: 20.0,
+                success_count: 20,
+                error_count: 0,
+                sum_rt_ms: 400,
+                avg_rt: 20.0,
+            },
+        ];
+        let mut right = sample(1, 10.0, 10, vec![(10, 10)]);
+        right.interfaces = vec![crate::models::InterfaceSample {
+            index: 0,
+            qps: 10.0,
+            success_count: 10,
+            error_count: 0,
+            sum_rt_ms: 300,
+            avg_rt: 30.0,
+        }];
+        let merged = merge(request(vec![
+            node("a", vec![left], Some(done(30, vec![(10, 30)]))),
+            node("b", vec![right], Some(done(10, vec![(10, 10)]))),
+        ]));
+
+        let iface0: Vec<_> = merged
+            .interface_samples
+            .iter()
+            .filter(|point| point.index == 0)
+            .collect();
+        assert_eq!(iface0.len(), 1);
+        // 同秒同接口的 QPS 相加：10 + 10
+        assert!((iface0[0].qps - 20.0).abs() < 1e-9);
+        assert_eq!(iface0[0].success_count, 20);
+        // 均值按请求数加权：(200 + 300) / 20
+        assert!((iface0[0].avg_rt - 25.0).abs() < 1e-9);
+        let iface1 = merged
+            .interface_samples
+            .iter()
+            .find(|point| point.index == 1)
+            .unwrap();
+        assert!((iface1.qps - 20.0).abs() < 1e-9);
+
+        let config: serde_json::Value = serde_json::from_str(&merged.config_snapshot).unwrap();
+        assert_eq!(config["metrics"]["interfaceSamplesComplete"], true);
+    }
+
+    #[test]
+    fn merge_marks_interface_samples_incomplete_for_old_node() {
+        // 旧节点的每秒采样没有 interfaces 字段：曲线仍可画，但必须标记不完整
+        let merged = merge(request(vec![node(
+            "old",
+            vec![sample(1, 10.0, 10, vec![(10, 10)])],
+            Some(done(10, vec![(10, 10)])),
+        )]));
+        let config: serde_json::Value = serde_json::from_str(&merged.config_snapshot).unwrap();
+        assert_eq!(config["metrics"]["interfaceSamplesComplete"], false);
     }
 
     #[test]
@@ -1407,6 +1517,7 @@ mod tests {
                 slow_requests: &slow,
                 error_types: &merged.error_types,
                 url_stats: &merged.url_stats,
+                interface_samples: &merged.interface_samples,
                 config: &merged.config_snapshot,
             },
         )
@@ -1602,6 +1713,7 @@ mod tests {
             },
             url_stats: Vec::new(),
             url_stats_complete: false,
+            interface_samples: Vec::new(),
             message: None,
         };
         let payload = done_from_outcome(&outcome);
@@ -1740,6 +1852,7 @@ mod perf_tests {
                         sum_body_ms: 500,
                         latency_buckets: Vec::new(),
                         body_buckets: Vec::new(),
+                        interfaces: Vec::new(),
                         host: None,
                     })
                     .collect(),

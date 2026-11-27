@@ -267,7 +267,7 @@ npm run tauri build
 - 所有 IPC 调用集中在 `src/api/`
 - 页面不直接访问系统能力，网络与存储全部走 Rust 命令
 - 新增命令需要在 `src-tauri/src/lib.rs` 的 `generate_handler!` 中注册
-- 颜色只用 `styles/main.css` 的 `--fm-*` 变量，不写死 hex；主题在 `src/stores/theme.ts` 里按同一批变量整体覆盖（当前 23 套，16 浅 / 7 深）。新增主题只加一个 `ThemeDefinition` 并追加到 `themes` 数组，设置页会自动渲染
+- 颜色只用 `styles/main.css` 的 `--fm-*` 变量，不写死 hex；主题在 `src/design/themes.ts` 里按同一批变量整体覆盖（当前 24 套，16 浅 / 8 深），运行时状态在 `src/stores/theme.ts`。新增主题只加一个 `ThemeDefinition` 并追加到 `themes` 数组，设置页会自动渲染
 - 航仔挂件用设计稿贴图 `src/assets/buddy.png`（透明底，72×121 显示），不要改回手绘 SVG；侧栏 / 空状态 / AI 抽屉的小图标用 `src/components/AstroBuddyIcon.vue` 的 1em 线框版（14px 下位图会糊）
 - 自动化测试的执行语义只改 `src-tauri/src/test_runner.rs`（含断言、数据行、依赖跳过），桌面端与 `astroman-cli` 共用；运行产物写 `<数据目录>/test-reports/<runId>/`，库里只存相对路径
 - 离线工具的算法放 `src/tools/*.ts` 纯函数（可进 vitest），`registry.ts` 只做声明；新增工具要同时补单测与 `docs/toolbox.md`

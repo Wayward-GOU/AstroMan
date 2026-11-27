@@ -288,6 +288,34 @@ fn load_url_stats(conn: &rusqlite::Connection, id: i64) -> Vec<UrlStat> {
     items
 }
 
+/// 读取接口每秒曲线：旧库没有该表时返回空，页面与导出按「未记录」处理
+fn load_interface_samples(
+    conn: &rusqlite::Connection,
+    id: i64,
+) -> Vec<crate::models::InterfaceSamplePoint> {
+    let mut stmt = match conn.prepare(
+        "SELECT elapsed_sec, interface_index, qps, success_count, error_count, avg_rt
+         FROM report_interface_samples
+         WHERE report_id = ?1
+         ORDER BY elapsed_sec ASC, interface_index ASC",
+    ) {
+        Ok(stmt) => stmt,
+        Err(_) => return Vec::new(),
+    };
+    stmt.query_map(params![id], |row| {
+        Ok(crate::models::InterfaceSamplePoint {
+            elapsed_sec: row.get::<_, i64>(0)?.max(0) as u64,
+            index: row.get::<_, i64>(1)?.max(0) as u32,
+            qps: row.get(2)?,
+            success_count: row.get::<_, i64>(3)?.max(0) as u64,
+            error_count: row.get::<_, i64>(4)?.max(0) as u64,
+            avg_rt: row.get(5)?,
+        })
+    })
+    .map(|rows| rows.flatten().collect())
+    .unwrap_or_default()
+}
+
 /// 施压机明细：集群取 config.cluster.nodes；单机合成 1 行本机数据
 ///
 /// 单机行完全来自本报告已落库的聚合值与配置快照，不推断未采集字段：
@@ -469,6 +497,7 @@ fn load_detail(conn: &rusqlite::Connection, id: i64) -> Result<ReportDetail, Str
     if url_stats.is_empty() {
         log::info!("报告 #{id} 没有 URL 统计（旧报告或未采集），页面与导出显示「未记录」");
     }
+    let interface_samples = load_interface_samples(conn, id);
     // 施压机明细：集群从节点表读取，单机合成 1 行本机
     let load_generators = build_load_generators(config.as_ref(), &report);
     // 旧报告没有 urlStatsComplete 标记：有数据即视为完整，无数据按「未记录」展示
@@ -477,6 +506,12 @@ fn load_detail(conn: &rusqlite::Connection, id: i64) -> Result<ReportDetail, Str
         .and_then(|value| value.pointer("/metrics/urlStatsComplete"))
         .and_then(|value| value.as_bool())
         .unwrap_or(!url_stats.is_empty());
+
+    let interface_samples_complete = config
+        .as_ref()
+        .and_then(|value| value.pointer("/metrics/interfaceSamplesComplete"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(!interface_samples.is_empty());
 
     Ok(ReportDetail {
         report,
@@ -490,6 +525,8 @@ fn load_detail(conn: &rusqlite::Connection, id: i64) -> Result<ReportDetail, Str
         slow_requests: parse_list::<crate::models::SlowRequest>(slow_requests_text),
         url_stats,
         url_stats_complete,
+        interface_samples,
+        interface_samples_complete,
         load_generators,
         config,
         scenario_text: scenario_text.filter(|text| !text.trim().is_empty()),

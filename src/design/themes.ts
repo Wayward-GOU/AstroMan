@@ -1,8 +1,8 @@
 /**
- * 23 套主题的基色表 · 颜色唯一事实源
+ * 24 套主题的基色表 · 颜色唯一事实源
  *
- * 每套主题只维护 13 个基色（画布/卡片/次级底色/侧栏/描边/文字/主色），
- * 其余 38 个设计令牌由 buildColorVars 派生，避免再出现「21 套主题只是换主色、
+ * 每套主题只维护 11 个必需基色（画布/卡片/次级底色/侧栏/描边/正文/次级文字/弱化文字/主色），
+ * 其余 24 个设计令牌由 buildColorVars 派生，避免再出现「21 套主题只是换主色、
  * 卡片和侧栏全是同一组纸色」的问题。
  *
  * 约定：
@@ -15,6 +15,7 @@ import { mix, type ColorVars } from './tokens'
 /** 主题 id 顺序即设置页展示顺序 */
 export const THEME_IDS = [
   'paper',
+  'crisp',
   'night',
   'ocean',
   'graphite',
@@ -69,6 +70,11 @@ export interface BasePalette {
   primary: string
   /** 亮色主题的金铜文字色；缺省用统一值 */
   brassText?: string
+  /** 卡片投影：纸感主题缺省为 none，需要层次的浅色主题可显式给一层极轻投影 */
+  shadowSm?: string
+  shadow?: string
+  /** 圆角档位（px）：缺省沿用 tokens.css 的 2 / 3 / 3 */
+  radius?: { sm: number; base: number; lg: number }
 }
 
 export const PALETTES: BasePalette[] = [
@@ -89,6 +95,27 @@ export const PALETTES: BasePalette[] = [
     muted: '#636C65',
     primary: '#0F6B64',
     brassText: '#7A5626',
+  },
+  {
+    id: 'crisp',
+    name: '清透',
+    desc: '亮色 · 白卡微影、冷调留白',
+    dark: false,
+    bg: '#F5F7FB',
+    surface: '#FFFFFF',
+    alt: '#F4F7FC',
+    sidebar: '#172033',
+    sidebarText: '#A9B6CC',
+    border: '#D8E0EC',
+    borderStrong: '#C6D0E0',
+    text: '#111827',
+    text2: '#44506A',
+    muted: '#5F6B80',
+    primary: '#1D5EE0',
+    brassText: '#33538F',
+    shadowSm: '0 1px 2px rgba(23, 32, 51, 0.05)',
+    shadow: '0 1px 2px rgba(23, 32, 51, 0.04), 0 10px 24px -18px rgba(23, 32, 51, 0.26)',
+    radius: { sm: 6, base: 8, lg: 12 },
   },
   {
     id: 'night',
@@ -567,8 +594,8 @@ export function buildColorVars(p: BasePalette): ColorVars {
     'json-bool': sem.purple,
     'json-punct': p.dark ? '#6F7A80' : '#8B959B',
 
-    'shadow-sm': 'none',
-    shadow: 'none',
+    'shadow-sm': p.shadowSm ?? 'none',
+    shadow: p.shadow ?? 'none',
     'shadow-lg': p.dark
       ? '0 18px 48px rgba(0, 0, 0, 0.5)'
       : '0 18px 48px rgba(20, 24, 27, 0.16)',

@@ -504,3 +504,75 @@ pub fn capture_breakpoint_release_all(state: tauri::State<'_, AppState>) -> Inte
     state.capture.release_pauses();
     state.capture.intercept_view()
 }
+
+/// 自动捕获：配置与运行态合在一起给前端，省一次往返。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoCaptureView {
+    pub enabled: bool,
+    pub scope: String,
+    pub running: bool,
+    /// 是否已接管系统代理
+    pub takeover: bool,
+    pub pac_url: Option<String>,
+    pub port: u16,
+    pub ca_installed: bool,
+    /// 检测到的上游代理：抓到的流量会从这里出去
+    pub upstream_proxy: Option<String>,
+}
+
+fn auto_view(state: &AppState) -> AutoCaptureView {
+    let config = crate::capture::auto::load(&state.data_dir);
+    let status = state.capture.status();
+    let running = status.state == CaptureState::Running;
+    AutoCaptureView {
+        enabled: config.enabled,
+        scope: config.scope,
+        running,
+        takeover: status.sysproxy_on,
+        pac_url: state.capture.pac_url(),
+        port: status.port,
+        ca_installed: status.ca_installed,
+        upstream_proxy: if running {
+            crate::capture::sysproxy::current_http_proxy()
+        } else {
+            None
+        },
+    }
+}
+
+#[tauri::command]
+pub fn capture_auto_get(state: tauri::State<'_, AppState>) -> AutoCaptureView {
+    auto_view(&state)
+}
+
+/// 开关自动捕获：保存配置后立即生效，不用等下次启动。
+#[tauri::command]
+pub fn capture_auto_set(
+    state: tauri::State<'_, AppState>,
+    enabled: bool,
+    scope: Option<String>,
+) -> Result<AutoCaptureView, String> {
+    let current = crate::capture::auto::load(&state.data_dir);
+    let scope = scope.unwrap_or_else(|| current.scope.clone());
+    let scope_changed = scope != current.scope;
+    let config = crate::capture::auto::AutoCapture { enabled, scope };
+    crate::capture::auto::save(&state.data_dir, &config)?;
+
+    let status = state.capture.status();
+    if enabled {
+        // 手动「录制」起的会话没有 PAC、也没接管系统代理，这里要重来一遍
+        let needs_restart = status.state != CaptureState::Running
+            || scope_changed
+            || state.capture.pac_url().is_none();
+        if needs_restart {
+            if status.state != CaptureState::Idle {
+                state.capture.stop()?;
+            }
+            state.capture.start_auto()?;
+        }
+    } else if status.state != CaptureState::Idle {
+        state.capture.stop()?;
+    }
+    Ok(auto_view(&state))
+}

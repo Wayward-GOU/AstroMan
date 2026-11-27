@@ -2934,6 +2934,7 @@ impl MasterSession {
                 slow_requests: &slow,
                 error_types: &merged.error_types,
                 url_stats: &merged.url_stats,
+                interface_samples: &merged.interface_samples,
                 config: &merged.config_snapshot,
             },
         );

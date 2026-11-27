@@ -856,6 +856,36 @@ pub struct ReportSample {
     pub response_count: u64,
 }
 
+/// 单个接口在某次采样区间（通常是 1 秒）内的增量
+///
+/// `index` 对应配置快照 `requests` 数组的下标：集群各节点拿到同一份配置，
+/// 主节点合并时按 `(elapsed_sec, index)` 相加即可还原全局接口曲线。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InterfaceSample {
+    pub index: u32,
+    /// 本区间 QPS（请求数 ÷ 真实采样间隔）
+    pub qps: f64,
+    pub success_count: u64,
+    pub error_count: u64,
+    /// 本区间响应该接口的耗时累加（毫秒）
+    pub sum_rt_ms: u64,
+    #[serde(default)]
+    pub avg_rt: f64,
+}
+
+/// 落库的接口采样点：比外送结构多一个时间轴
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InterfaceSamplePoint {
+    pub elapsed_sec: u64,
+    pub index: u32,
+    pub qps: f64,
+    pub success_count: u64,
+    pub error_count: u64,
+    pub avg_rt: f64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReportError {
@@ -1097,6 +1127,12 @@ pub struct ReportDetail {
     /// URL 统计是否完整：键溢出或从节点未上报时为 false
     #[serde(default)]
     pub url_stats_complete: bool,
+    /// 按接口（配置 requests 下标）的每秒 QPS 曲线；旧报告为空
+    #[serde(default)]
+    pub interface_samples: Vec<InterfaceSamplePoint>,
+    /// 接口曲线是否覆盖全部施压节点：有旧节点未上报时为 false
+    #[serde(default)]
+    pub interface_samples_complete: bool,
     /// 施压机明细：集群为各节点，单机为本机 1 行；旧报告为空
     #[serde(default)]
     pub load_generators: Vec<crate::services::cluster::protocol::ClusterReportNode>,

@@ -104,7 +104,17 @@ description: AstroMan 的 Rust/Tauri 后端开发规范。改数据库 schema、
 
 示例数据在 `db/seed.rs`：空库 `seed()`，已有库 `upgrade_sample()` 补齐示例场景。
 
-当前数据库结构版本 **6**（`astroman.db` 的 `PRAGMA user_version`）。v1.0.9 新增三张表，均由 `db/mod.rs::migrate()` 幂等创建：
+当前数据库结构版本 **24**（`astroman.db` 的 `PRAGMA user_version`）。v1.1.7 新增按接口 QPS 曲线表：
+
+```sql
+report_interface_samples(id, report_id, elapsed_sec, interface_index,
+                         qps, success_count, error_count, avg_rt)
+  -- idx_interface_samples_report(report_id, interface_index, elapsed_sec)
+```
+
+老库缺该表时报告读取返回空数组，前端按「未记录」处理；写入侧有 `CREATE TABLE IF NOT EXISTS` 兜底，不阻断整份报告。更早的 v1.0.9 三张表与 v1.1.4 的 `report_url_stats` 也由同一套幂等迁移维护。
+
+v1.0.9 记事本三张表（历史结构，供参考）：
 
 ```sql
 notes(id, project_id?, ref_type, ref_id?, title, content, kind, status, priority,
@@ -194,6 +204,7 @@ note_file_links(note_id, file_id, created_at)   -- 联合主键 + ON DELETE CASC
 - 采样与落库：`SAMPLE_RETAIN = 300` 裁剪内存 samples，`persist_node_throttled` 每 5 秒落库一次；从机发送走有界 `mpsc::channel(1024)`，队列余量 ≤16 时丢采样并累加 `droppedSamples`（丢采样要能在报告里看到，不要静默）
 - 在场发现与邀请（`services/cluster/presence.rs`，v1.1.6，UDP/TCP 17803）：广播 3 秒一次、TTL 10 秒；邀请令牌 32 字节一次性、绑定 `job_id`、120 秒过期；每 IP 5 分钟 3 次、同设备同时只保留 1 条待处理；`joinMode=invite` 携带 `HelloPayload.inviteToken`，主节点 `register_invite` **先登记再消费令牌**（登记失败时令牌仍可重试）；回连地址取 TCP 真实来源 IP，不信任报文 host。Windows 的 UDP `ConnectionReset`（ICMP port unreachable）与 `accept` 的 `ConnectionAborted` 必须当瞬时错误跳过，否则监听线程会永久退出
 - 指标口径（v1.1.6 起）：`responses` 是 TTFB / 响应体的分母，只有 `status > 0` 才累加；APDEX 分子只累计成功请求；`report_samples` 改为区间增量且新增 `response_count` 列；集群 `SamplePayload` 带 `responseCount / sumBodyMs / bodyBuckets`，`DonePayload.metricsVersion = 2` 表示精确口径，旧节点或失联节点回退直方图估算。改动这些字段要同步 `protocol.rs`、`merge.rs`、`client.rs` 与 `src/types/models.ts`
+- 按接口 QPS（v1.1.7 起）：`Metrics::interface_counters` 按配置 `requests` 下标计数，采样时用 `interface_snapshot()` 取差值产出 `InterfaceSample`（`index / qps / successCount / errorCount / sumRtMs`）；`SamplePayload.interfaces` 随每秒采样上报，`merge.rs` 按 `(elapsed_sec, index)` 相加 QPS 与计数、按请求数加权 `avg_rt`。单接口下标恒为 0；`Metrics::new_with_interfaces(n)` 在 prepare 时按 `requests.len()` 初始化，不要在 worker 里动态扩容
 - 时钟：`clock_drift_ms` 开跑后每 60 秒用 `TimeProbe` / `TimeAck` 复测（序号基数 `RECHECK_SEQ_BASE = 900_000`，阈值 `CLOCK_DRIFT_WARN_MS = 50.0`）；复测分支**只更新 `clock_drift_ms`，不改已校准的 offset**
 - 配对防枚举：`PAIR_FAIL_TOTAL = 10` 次失败后按 IP 5 次 / 10 秒节流（`register_pair_failure`）
 - 历史（`services/cluster/history.rs`，DB_VERSION 21 起）：`cluster_jobs_list` / `cluster_job_detail` / `cluster_jobs_clear` / `cluster_slave_history_list` / `cluster_slave_history_clear`；主节点任务表存计划名、状态、节点数、总并发、平均 QPS、报告号与 `incomplete`（有节点失联或采样缺失）；从机历史存 `host_cpu_peak` / `net_peak_kbps` 等本机峰值，只在本机可见

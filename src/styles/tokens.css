@@ -142,3 +142,24 @@
   --fm-method-other: #9BA5AB;
   --fm-method-other-soft: #1E2429;
 }
+
+/* ---- 清透主题的形态覆盖：白卡 + 大圆角，其余主题保持 2/3/3 的硬朗纸感 ----
+   圆角属于静态令牌，不随 theme.vars 运行时写入，故用 data-theme 选择器覆盖；
+   antd 组件的圆角由 App.vue 读 ThemeDefinition.radius 传入。 */
+[data-theme='crisp'] {
+  --fm-radius-sm: 6px;
+  --fm-radius: 8px;
+  --fm-radius-lg: 12px;
+  --fm-radius-card: 14px;
+
+  /* 图表色板：纸感主题的深墨色在白卡上偏闷，换成明度更高的冷调分类色 */
+  --fm-chart-1: #1D5EE0;
+  --fm-chart-2: #12A594;
+  --fm-chart-3: #F08C00;
+  --fm-chart-4: #E8590C;
+  --fm-chart-5: #7048E8;
+  --fm-chart-6: #0CA678;
+  --fm-chart-7: #D6336C;
+  --fm-chart-8: #64748B;
+  --fm-chart-violet: #8B5CF6;
+}

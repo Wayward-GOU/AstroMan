@@ -8,7 +8,7 @@
 | [`astroman-add-feature`](astroman-add-feature/SKILL.md) | 加一个新功能或新接口 | 契约 → 建表/迁移 → command → 注册 → api → 页面 → 验证 |
 | [`astroman-backend`](astroman-backend/SKILL.md) | 改 Rust、SQLite、压测引擎、数据池、分布式压测、密钥 | 命令规范、迁移铁律、压测要点、池列迁移 / Excel 导入、集群协议与池切片、主密钥与钥匙串、统计聚合 |
 | [`astroman-frontend`](astroman-frontend/SKILL.md) | 改 Vue 页面、样式、脚本引擎、导出、请求体解析 | 页面骨架、设计令牌、CodeMirror 编辑器、请求体解析（宽松 JSON / 表单 / XML / Content-Type）、数据池页、压测绑定与集群页、AI 抽屉、航仔挂件、常见坑 |
-| [`astroman-appearance`](astroman-appearance/SKILL.md) | 改配色、加主题、换航仔形象、调挂件 | 23 套主题与 35 个变量、新增主题流程、对比度指标、贴图与拖拽、线框图标、截图核验 |
+| [`astroman-appearance`](astroman-appearance/SKILL.md) | 改配色、加主题、换航仔形象、调挂件 | 24 套主题与 35 个变量、新增主题流程、对比度指标、贴图与拖拽、线框图标、截图核验 |
 | [`astroman-dashboard`](astroman-dashboard/SKILL.md) | 改工作台首页、历史记录页数据大屏、引导与 FAQ 文案 | 首页区块顺序、6 个 KPI、12 步引导 / 18 张技巧卡 / 31 条 FAQ、8 张大屏卡与 SQL 口径 |
 | [`astroman-capture`](astroman-capture/SKILL.md) | 改抓包模块，或排查 HTTPS / 手机 / 微信抓不到 | MITM 代理、录制上限、根证书、系统代理、手机抓包、HAR / ZIP 导出、改参重发、断点 / 映射 / 弱网、常见现象对照 |
 | [`astroman-notes`](astroman-notes/SKILL.md) | 改记事本 / 待办，或排查不提醒、提醒时间不对、附件丢失 | 四种类型、标签与 50% 抽屉、提醒 / 重复 / 稍后 / 暂停 / 免打扰、快速记录、截图识别、附件去重、三张表 |

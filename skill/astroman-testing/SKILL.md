@@ -128,7 +128,7 @@ cargo tarpaulin --config tarpaulin.toml --engine llvm
 
 ## 四·补、样式门禁（`npm run ui:check`）
 
-两步：`scripts/check-hardcoded-color.mjs`（硬编码计数）+ `scripts/check-contrast.ts`（23 套主题对比度）。
+两步：`scripts/check-hardcoded-color.mjs`（硬编码计数）+ `scripts/check-contrast.ts`（24 套主题对比度）。
 
 **统计口径**（2026-11-22 修正，改动前务必读完再动脚本）：
 

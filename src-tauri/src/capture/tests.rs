@@ -212,6 +212,110 @@ fn proxy_forwards_http_and_ca_is_stable() {
     let _ = std::fs::remove_dir_all(&data_dir);
 }
 
+/// 分两段写 chunked SSE 的上游：模拟真实流式响应，验证旁路解析能跨 chunk 拼行。
+fn spawn_sse_upstream() -> (u16, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind sse upstream");
+    let port = listener.local_addr().expect("sse addr").port();
+    let handle = std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let mut buffer = [0u8; 8192];
+        let _ = stream.read(&mut buffer);
+        let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+        let _ = stream.write_all(head.as_bytes());
+
+        let first = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_e2e\",\"model\":\"deepseek-chat\",\"usage\":{\"input_tokens\":21,\"cache_read_input_tokens\":700,\"cache_creation_input_tokens\":0,\"output_tokens\":0}}}\n\n",
+        );
+        let second = concat!(
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":21,\"cache_read_input_tokens\":700,\"output_tokens\":9}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        for part in [first, second] {
+            let _ = stream.write_all(format!("{:x}\r\n", part.len()).as_bytes());
+            let _ = stream.write_all(part.as_bytes());
+            let _ = stream.write_all(b"\r\n");
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        let _ = stream.write_all(b"0\r\n\r\n");
+        let _ = stream.flush();
+    });
+    (port, handle)
+}
+
+/// 抓包旁路记账：流式响应里的 usage 要原样落到 `capture/llm-usage.jsonl`，
+/// 同时客户端收到的字节不能被改写。
+#[test]
+fn llm_usage_sniffed_from_streaming_response() {
+    let data_dir = temp_dir();
+    let manager = CaptureManager::new(data_dir.clone());
+    let usage_path = manager.usage_sink().path().to_path_buf();
+    assert_eq!(
+        usage_path,
+        data_dir.join("capture").join(super::llm_usage::USAGE_FILE),
+        "记账文件位置是 Token 看板与抓包共用的契约"
+    );
+    let (upstream_port, upstream) = spawn_sse_upstream();
+
+    let status = manager
+        .start(Some(CaptureConfig {
+            port: 0,
+            bind_addr: "127.0.0.1".into(),
+            ..CaptureConfig::default()
+        }))
+        .expect("start capture");
+
+    let mut client = TcpStream::connect(("127.0.0.1", status.port)).expect("connect proxy");
+    let _ = client.set_read_timeout(Some(Duration::from_secs(10)));
+    let payload = r#"{"model":"deepseek-chat","stream":true,"max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#;
+    let request = format!(
+        "POST http://127.0.0.1:{upstream_port}/v1/messages HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nContent-Type: application/json\r\nUser-Agent: Claude/1.2.3 (macOS)\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        payload.len(),
+        payload
+    );
+    client
+        .write_all(request.as_bytes())
+        .expect("write proxy request");
+    let mut response = Vec::new();
+    let _ = client.read_to_end(&mut response);
+    let text = String::from_utf8_lossy(&response);
+    assert!(text.contains("message_stop"), "流式响应应完整下发：{text}");
+
+    // 旁路解析在泵任务里完成，轮询等记账文件出现
+    let mut lines: Vec<String> = Vec::new();
+    for _ in 0..100 {
+        if let Ok(content) = std::fs::read_to_string(&usage_path) {
+            lines = content
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(str::to_string)
+                .collect();
+            if !lines.is_empty() {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(lines.len(), 1, "一条消息只记一行：{lines:?}");
+    let value: serde_json::Value = serde_json::from_str(&lines[0]).expect("记账行应为 JSON");
+    assert_eq!(value["model"], "deepseek-chat");
+    assert_eq!(value["input"], 21, "输入不含缓存");
+    assert_eq!(value["cacheRead"], 700);
+    assert_eq!(value["output"], 9);
+    assert_eq!(value["client"], "Claude");
+    assert_eq!(value["status"], 200);
+
+    manager.stop().expect("stop capture");
+    upstream.join().expect("upstream thread");
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
 /// ZIP 解压后的文本、元数据与二进制 body 要能直接看懂 / 打开。
 #[test]
 fn zip_export_contains_readable_text_and_binary_bodies() {
@@ -978,4 +1082,126 @@ fn request_breakpoint_applies_edit_before_upstream() {
     assert_eq!(flows[0].path, "/edited?from=bp");
     assert!(flows[0].modified, "断点改包应标记 modified");
     manager.stop().expect("stop capture");
+}
+
+/// 极简上游 HTTP 代理：只处理 CONNECT，握手成功后双向桥接，并累计命中次数。
+/// 用来验证抓包代理确实把请求交给了上游，而不是自己直连。
+fn spawn_connect_proxy() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind connect proxy");
+    let port = listener.local_addr().expect("proxy addr").port();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = hits.clone();
+    std::thread::spawn(move || {
+        for incoming in listener.incoming() {
+            let Ok(mut client) = incoming else { break };
+            let counter = counter.clone();
+            std::thread::spawn(move || {
+                let mut buffer = [0u8; 2048];
+                let mut filled = 0usize;
+                while !buffer[..filled].windows(4).any(|w| w == b"\r\n\r\n") {
+                    match client.read(&mut buffer[filled..]) {
+                        Ok(0) => return,
+                        Ok(n) => filled += n,
+                        Err(_) => return,
+                    }
+                    if filled == buffer.len() {
+                        break;
+                    }
+                }
+                let head = String::from_utf8_lossy(&buffer[..filled]).into_owned();
+                let Some(line) = head.lines().next() else {
+                    return;
+                };
+                if !line.starts_with("CONNECT ") {
+                    return;
+                }
+                let target = line.split_whitespace().nth(1).unwrap_or("");
+                let Ok(mut server) = TcpStream::connect(target) else {
+                    return;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let _ = client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n");
+                let mut client_read = match client.try_clone() {
+                    Ok(stream) => stream,
+                    Err(_) => return,
+                };
+                let mut server_read = match server.try_clone() {
+                    Ok(stream) => stream,
+                    Err(_) => return,
+                };
+                let pump = std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut client_read, &mut server);
+                });
+                let _ = std::io::copy(&mut server_read, &mut client);
+                let _ = pump.join();
+            });
+        }
+    });
+    (port, hits)
+}
+
+/// 有上游代理时：流量必须经上游 CONNECT 出去，同时 usage 记账照旧。
+#[test]
+fn upstream_proxy_carries_traffic_and_keeps_accounting() {
+    let data_dir = temp_dir();
+    let manager = CaptureManager::new(data_dir.clone());
+    let usage_path = manager.usage_sink().path().to_path_buf();
+    let (target_port, target) = spawn_sse_upstream();
+    let (proxy_port, hits) = spawn_connect_proxy();
+
+    let status = manager
+        .start(Some(CaptureConfig {
+            port: 0,
+            bind_addr: "127.0.0.1".into(),
+            upstream_proxy: Some(format!("http://127.0.0.1:{proxy_port}")),
+            ..CaptureConfig::default()
+        }))
+        .expect("start capture with upstream");
+
+    let mut client = TcpStream::connect(("127.0.0.1", status.port)).expect("connect proxy");
+    let _ = client.set_read_timeout(Some(Duration::from_secs(10)));
+    let payload = r#"{"model":"deepseek-chat","stream":true,"max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#;
+    let request = format!(
+        "POST http://127.0.0.1:{target_port}/v1/messages HTTP/1.1\r\nHost: 127.0.0.1:{target_port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        payload.len(),
+        payload
+    );
+    client
+        .write_all(request.as_bytes())
+        .expect("write proxy request");
+    let mut response = Vec::new();
+    let _ = client.read_to_end(&mut response);
+    let text = String::from_utf8_lossy(&response);
+    assert!(text.contains("message_stop"), "流式响应应完整下发：{text}");
+    assert!(
+        hits.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "请求必须经上游代理的 CONNECT 隧道，不能由抓包代理自己直连"
+    );
+
+    let mut lines: Vec<String> = Vec::new();
+    for _ in 0..100 {
+        if let Ok(content) = std::fs::read_to_string(&usage_path) {
+            lines = content
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(str::to_string)
+                .collect();
+            if !lines.is_empty() {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(lines.len(), 1, "一条消息只记一行：{lines:?}");
+    let value: serde_json::Value = serde_json::from_str(&lines[0]).expect("记账行应为 JSON");
+    assert_eq!(value["input"], 21);
+    assert_eq!(value["cacheRead"], 700);
+    assert_eq!(value["output"], 9);
+
+    manager.stop().expect("stop capture");
+    target.join().expect("target thread");
+    let _ = std::fs::remove_dir_all(&data_dir);
 }

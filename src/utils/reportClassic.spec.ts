@@ -183,6 +183,41 @@ describe('buildClassicReportHtml · 经典报告版式', () => {
     expect(output).toContain('502')
   })
 
+  it('多接口报告渲染接口 QPS 曲线图例', () => {
+    const detail = makeDetail(5)
+    detail.config = {
+      ...(detail.config ?? {}),
+      requests: [
+        { name: '查询订单', method: 'GET', url: 'http://127.0.0.1:8080/api/orders' },
+        { name: '创建订单', method: 'POST', url: 'http://127.0.0.1:8080/api/orders' },
+      ],
+    } as ReportDetail['config']
+    detail.interfaceSamples = detail.samples.flatMap((sample) => [
+      {
+        elapsedSec: sample.elapsedSec,
+        index: 0,
+        qps: sample.qps,
+        successCount: sample.successCount,
+        errorCount: 0,
+        avgRt: sample.avgRt,
+      },
+      {
+        elapsedSec: sample.elapsedSec,
+        index: 1,
+        qps: Math.round(sample.qps / 2),
+        successCount: sample.successCount,
+        errorCount: 0,
+        avgRt: sample.avgRt,
+      },
+    ])
+    detail.interfaceSamplesComplete = true
+    const output = buildClassicReportHtml(detail)
+    expect(output).toContain('ifaceEChart')
+    expect(output).toContain('cl-legend')
+    expect(output).toContain('查询订单')
+    expect(output).toContain('创建订单')
+  })
+
   it('包含标题与免责声明', () => {
     expect(html).toContain('订单查询容量摸底')
     expect(html).toContain('免责声明')

@@ -13,7 +13,8 @@ description: AstroMan 前端开发规范（Vue 3 + Ant Design Vue + Pinia + 设�
 - 所有颜色/圆角/阴影只用 `main.css` 里的 `--fm-*` 变量，**不要写死 hex**
 - 主要 token：`--fm-primary` / `-dark` / `-soft`、`--fm-success|warning|danger|purple`（各有 `-soft`）、`--fm-bg`、`--fm-surface`、`--fm-surface-alt`、`--fm-border` / `-strong`、`--fm-text` / `-2` / `--fm-muted`、`--fm-radius-sm|`radius`|lg`、`--fm-shadow-sm|`shadow`|lg`、侧边栏一组 `--fm-sidebar-*`、代码区 `--fm-code-bg` / `--fm-gutter-bg`
 - 代码/JSON 专用色（每套主题都定义了同一批）：`--fm-json-key`（字段名）、`--fm-json-string`（字符串）、`--fm-json-number`（数字）、`--fm-json-bool`（布尔与 `{{变量}}`）、`--fm-json-punct`（括号、逗号、冒号）；不要在组件里为暗色主题单独写死颜色
-- 主题：`stores/theme.ts` 定义 `ThemeId`（**23 套**，16 浅 / 7 深），每套 `ThemeDefinition` 用同一批 35 个 `--fm-*` 颜色 / 阴影变量覆盖（HTTP 方法色与圆角沿用 `main.css`）；深色的 7 套是 `midnight` / `dusk` / `indigo` / `plum` / `pine` / `slate` / `aurora`。新增主题只加一个定义并追加到 `themes` 数组（顺序即设置页顺序），不要在组件里判断主题名
+- 主题：`design/themes.ts` 的 `THEME_IDS` 定义 `ThemeId`（**24 套**，16 浅 / 8 深），`PALETTES` 只给 11 个基色，`buildColorVars` 派生其余 24 个令牌，合计 35 个 `--fm-*` 颜色 / 阴影变量（HTTP 方法色不变）；`stores/theme.ts` 负责应用与持久化。深色的 8 套是 `night` / `midnight` / `dusk` / `indigo` / `plum` / `pine` / `slate` / `aurora`。新增主题只加一个定义并追加到 `PALETTES`（顺序即设置页顺序），不要在组件里判断主题名
+- 形态按主题定制：`BasePalette` 可选 `shadow` / `shadowSm`（缺省 `none`，即纸感主题不加投影）与 `radius: { sm, base, lg }`（缺省 2 / 3 / 3）。`buildColorVars` 只把 `shadow*` 写进 `theme.vars`，`radius` 由 `App.vue` 直接读 `ThemeDefinition.radius` 传给 antd，同时用 `styles/tokens.css` 的 `[data-theme='<id>']` 覆盖 `--fm-radius-*`（圆角是静态令牌，不进 vars）。参考实现：`crisp`（清透）主题
 - 深色主题靠 `data-theme` + `applyTheme()` 统一换变量，需要针对性微调时用 `html[data-theme='<id>']` 选择器；颜色对比度与新增主题的完整流程见 skill `astroman-appearance`
 
 ## 页面骨架
@@ -252,6 +253,7 @@ v1.0.8 起大屏不在首页：`views/Dashboard.vue` 只剩总览 KPI、快捷�
 
 - 报告导出：`utils/reportExport.ts`（JSON 归档 / 可打印 HTML / 多工作表 Excel），写文件走 `report_write_file`
 - 压测报告 QPS 口径：唯一入口是 `utils/reportAnalytics.ts` 的 `qpsOverview(detail, { rampUpSec })`，产出平均 / 峰值 / 最低 / 90% 分布 / 单并发 / 目标 QPS 与达成率；`ReportDetail.vue` 与 HTML / Excel 导出都调它。**不要在模板或导出函数里另算一遍**，否则同一个报告会出现两套数字。90% 分布 = 每秒采样 QPS 的 P10，最低 QPS 与它共用 `stableQpsValues()` 的稳态窗口（剔除升压段与末点），达成率与 SLA `minRps` 同口径用平均 QPS
+- 按接口 QPS：唯一数据源是报告详情的 `interfaceSamples`（后端已按 `(elapsedSec, index)` 合并，`index` 对应配置快照 `requests` 下标）。`ReportDetail.vue` 的「接口 QPS」下拉、`reportExport.ts` 趋势图与 `reportClassic.ts` 多线图都直接消费它，**不要**再按 `urlStats` 或逐请求明细反推；数组为空（旧报告 / 接口曲线未采集）时整块不渲染，`interfaceSamplesComplete === false` 时标注曲线可能偏低
 - Excel 生成：`utils/xlsx.ts`（无第三方依赖，手写 OOXML）
 - 其他工具：`utils/curl.ts`（cURL 解析/生成）、`utils/diff.ts`（响应对比）、`utils/mybatis.ts`、`utils/datetime.ts`
 

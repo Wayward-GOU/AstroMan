@@ -336,6 +336,43 @@ describe('buildReportHtml · URL 统计', () => {
   })
 })
 
+describe('接口 QPS 导出', () => {
+  function withInterfaces(): ReportDetail {
+    const detail = makeDetail(3)
+    detail.config = {
+      ...(detail.config ?? {}),
+      requests: [
+        { name: '查询订单', method: 'GET', url: 'https://a.test/orders' },
+        { name: '创建订单', method: 'POST', url: 'https://a.test/orders' },
+      ],
+    } as ReportDetail['config']
+    detail.interfaceSamples = [
+      { elapsedSec: 1, index: 0, qps: 3000, successCount: 3000, errorCount: 0, avgRt: 18 },
+      { elapsedSec: 1, index: 1, qps: 2000, successCount: 2000, errorCount: 0, avgRt: 25 },
+      { elapsedSec: 2, index: 0, qps: 3100, successCount: 3100, errorCount: 0, avgRt: 19 },
+      { elapsedSec: 2, index: 1, qps: 1900, successCount: 1900, errorCount: 0, avgRt: 26 },
+    ]
+    detail.interfaceSamplesComplete = true
+    return detail
+  }
+
+  it('HTML 输出接口 QPS 趋势图', () => {
+    const html = buildReportHtml(withInterfaces(), [])
+    expect(html).toContain('接口 QPS 趋势')
+    expect(html).toContain('查询订单')
+    expect(html).toContain('创建订单')
+  })
+
+  it('Excel 输出接口采样工作表', () => {
+    const sheets = buildReportSheets(withInterfaces(), [])
+    const sheet = sheets.find((item) => item.name === '接口采样')
+    expect(sheet).toBeTruthy()
+    expect(sheet!.rows[0]).toEqual(['秒', '接口', 'QPS', '成功数', '失败数', '平均耗时(ms)'])
+    expect(sheet!.rows).toHaveLength(5)
+    expect(sheet!.rows[1]).toEqual([1, '查询订单', 3000, 3000, 0, 18])
+  })
+})
+
 describe('buildReportHtml · 施压机明细', () => {
   function clusterNode(overrides: Partial<ClusterReportNode> = {}): ClusterReportNode {
     return {

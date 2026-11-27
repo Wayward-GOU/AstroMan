@@ -28,7 +28,8 @@ mod seed;
 /// 21 = 集群配对 / 执行历史（cluster_slave_history）+ 报告样本资源列
 /// 22 = 报告列表汇总列（test_reports.is_cluster / peak_qps），列表页不再解析 config_json
 /// 23 = 按 URL 聚合的 report_url_stats + 报告标题列 test_reports.report_title
-pub const DB_VERSION: i64 = 23;
+/// 24 = 按接口的每秒 QPS 曲线（report_interface_samples）
+pub const DB_VERSION: i64 = 24;
 
 /// 每条连接都要应用的 SQLite 参数（P-06）。
 ///

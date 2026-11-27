@@ -225,6 +225,21 @@ CREATE TABLE IF NOT EXISTS report_url_stats (
 CREATE INDEX IF NOT EXISTS idx_url_stats_report
     ON report_url_stats(report_id, status_code);
 
+-- 按接口的每秒 QPS 曲线（v24）：interface_index 对应配置快照 requests 下标
+CREATE TABLE IF NOT EXISTS report_interface_samples (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_id        INTEGER NOT NULL REFERENCES test_reports(id) ON DELETE CASCADE,
+    elapsed_sec      INTEGER NOT NULL,
+    interface_index  INTEGER NOT NULL,
+    qps              REAL    NOT NULL DEFAULT 0,
+    success_count    INTEGER NOT NULL DEFAULT 0,
+    error_count      INTEGER NOT NULL DEFAULT 0,
+    avg_rt           REAL    NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_interface_samples_report
+    ON report_interface_samples(report_id, interface_index, elapsed_sec);
+
 -- 本机容量探测结果（v15）：分级加压测出的吞吐上限，保留最近 10 次
 CREATE TABLE IF NOT EXISTS machine_capacity (
     id                    INTEGER PRIMARY KEY AUTOINCREMENT,

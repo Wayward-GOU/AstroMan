@@ -214,3 +214,19 @@ export interface ResponseEdit {
   headers?: CaptureHeader[]
   body?: string
 }
+
+/** 自动捕获：启动即接管系统代理，只把 LLM 接口域名指向本机 */
+export interface AutoCaptureView {
+  enabled: boolean
+  /** llm：只代理模型接口域名；all：全部流量走代理 */
+  scope: 'llm' | 'all'
+  running: boolean
+  /** 是否已接管系统代理 */
+  takeover: boolean
+  /** 交给系统的 PAC 地址；未接管为 null */
+  pacUrl: string | null
+  port: number
+  caInstalled: boolean
+  /** 检测到的上游代理：抓到的流量从这里出去，不抢原有分流 */
+  upstreamProxy: string | null
+}

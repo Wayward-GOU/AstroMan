@@ -18,6 +18,8 @@ import { buildAdvice, buildFindings } from './reportNarrative'
 /* ---------- 经典报告配色（echarts walden 主题） ---------- */
 
 const WALDEN = ['#3fb1e3', '#6be6c1', '#626c91', '#a0a7e6', '#c4ebad', '#96dee8']
+/** 接口曲线配色：接口数量可能超过 walden 主色数量，追加几个同风格色 */
+const INTERFACE_COLORS = [...WALDEN, '#ff6e76', '#FF9D00', '#008B8B', '#8a4b6b']
 const ERROR_LINE = '#ff6e76'
 const KPI_TEAL = '#008B8B'
 const KPI_ORANGE = '#FF9D00'
@@ -79,6 +81,8 @@ p{text-indent:2em}
 hr{display:block;margin-block-start:0.5em;margin-block-end:0.5em;margin-inline-start:auto;margin-inline-end:auto;border-top-style:inset;border-top-width:1px}
 .reportTableClass .requestid{width:200px;font-size:9px !important}
 .cl-chart svg{display:block;width:100%}
+.cl-legend{display:flex;flex-wrap:wrap;gap:6px 18px;padding:10px 20px 0;font-size:12px;color:#999999}
+.cl-legend i{display:inline-block;width:14px;height:2px;margin-right:6px;vertical-align:middle}
 .cl-empty{display:flex;align-items:center;justify-content:center;height:360px;color:#999999;font-size:14px}
 `
 
@@ -213,17 +217,30 @@ function thin(points: ChartPoint[], maxPoints = 240): ChartPoint[] {
   return Array.from({ length: maxPoints }, (_, index) => points[Math.round(index * step)])
 }
 
+interface LineSeries {
+  legend: string
+  color: string
+  points: ChartPoint[]
+}
+
 interface LineChartOptions {
   legend: string
   color: string
   points: ChartPoint[]
   smooth: boolean
   yMax?: number
+  /** 多序列模式：提供后忽略上面的单序列 legend/color/points */
+  series?: LineSeries[]
 }
 
 function lineChartSvg(options: LineChartOptions): string {
-  const { legend, color, smooth } = options
-  const points = thin(options.points)
+  const { smooth } = options
+  const series: LineSeries[] =
+    options.series && options.series.length
+      ? options.series
+      : [{ legend: options.legend, color: options.color, points: options.points }]
+  const multi = series.length > 1
+  const points = thin(series[0].points)
   const W = 1320
   // 竖排完整日期时间约需 125px，画布加高 40px、底部留白同步加大，绘图区高度保持不变
   const H = 400
@@ -234,7 +251,10 @@ function lineChartSvg(options: LineChartOptions): string {
   const B = 150
   const pw = W - L - R
   const ph = H - T - B
-  const rawMax = Math.max(0, ...points.map((p) => p.value))
+  const rawMax = Math.max(
+    0,
+    ...series.flatMap((item) => thin(item.points).map((point) => point.value)),
+  )
   // 纵轴上限：显式上限只作为「最小刻度」，实际峰值仍要能装下，避免曲线画到图外
   const maxValue = Math.max(options.yMax ?? 0, niceCeil(rawMax * 1.08))
   const scaleY = (value: number) => {
@@ -244,10 +264,19 @@ function lineChartSvg(options: LineChartOptions): string {
   const scaleX = (index: number) =>
     points.length <= 1 ? L + pw / 2 : L + (index / (points.length - 1)) * pw
 
-  const coords = points.map((point, index) => [scaleX(index), scaleY(point.value)] as [number, number])
-  const line = smooth
-    ? smoothPath(coords, T, T + ph)
-    : coords.map(([x, y], i) => `${i ? 'L' : 'M'}${x},${y}`).join('')
+  // 每个序列单独抽稀（同一时间轴，抽稀后下标一致），再拼成多条折线
+  const paths = series
+    .map((item) => {
+      const itemPoints = thin(item.points)
+      const coords = itemPoints.map(
+        (point, index) => [scaleX(index), scaleY(point.value)] as [number, number],
+      )
+      const line = smooth
+        ? smoothPath(coords, T, T + ph)
+        : coords.map(([x, y], i) => `${i ? 'L' : 'M'}${x},${y}`).join('')
+      return `<path d="${line}" fill="none" stroke="${item.color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`
+    })
+    .join('')
 
   const grid = Array.from({ length: 6 }, (_, index) => {
     const value = (maxValue / 5) * index
@@ -301,17 +330,30 @@ function lineChartSvg(options: LineChartOptions): string {
     })
     .join('')
 
-  return `<div class="cl-chart"><svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" role="img" aria-label="${esc(
-    legend,
+  // 多序列时图例放在 SVG 外，接口多也能自动换行
+  const legendHtml = multi
+    ? `<div class="cl-legend">${series
+        .map(
+          (item) =>
+            `<span><i style="background:${item.color}"></i>${esc(item.legend)}</span>`,
+        )
+        .join('')}</div>`
+    : ''
+  const svgLegend = multi
+    ? ''
+    : `<line x1="${L}" y1="20" x2="${L + 16}" y2="20" stroke="${series[0].color}" stroke-width="2"/>
+<text x="${L + 22}" y="24" fill="#999999" font-size="12">${esc(series[0].legend)}</text>`
+
+  return `<div class="cl-chart">${legendHtml}<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" role="img" aria-label="${esc(
+    multi ? '接口QPS' : series[0].legend,
   )}">
-<line x1="${L}" y1="20" x2="${L + 16}" y2="20" stroke="${color}" stroke-width="2"/>
-<text x="${L + 22}" y="24" fill="#999999" font-size="12">${esc(legend)}</text>
+${svgLegend}
 ${grid}
 <line x1="${L}" y1="${T}" x2="${L}" y2="${T + ph}" stroke="#cccccc" stroke-width="1"/>
 <line x1="${L}" y1="${T + ph}" x2="${W - R}" y2="${T + ph}" stroke="#cccccc" stroke-width="1"/>
 ${minorTicks}
 ${majorTicks}
-<path d="${line}" fill="none" stroke="${color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+${paths}
 ${xLabels}
 </svg></div>`
 }
@@ -702,6 +744,29 @@ export function buildClassicReportHtml(
   ].join('\n')
 
   const qpsPoints = samplePoints(samples, startMs, (sample) => sample.qps)
+  // 多接口报告：按配置下标对齐每秒采样，缺失的秒补 0
+  const interfaceTargets = (detail.config?.requests ?? []).map((target, index) => ({
+    index,
+    label: target.name || target.url || `接口 ${index + 1}`,
+  }))
+  const interfaceSamples = detail.interfaceSamples ?? []
+  const interfaceSeries: LineSeries[] =
+    interfaceTargets.length > 1 && interfaceSamples.length && samples.length
+      ? interfaceTargets.map((target, order) => {
+          const bySec = new Map<number, number>()
+          for (const point of interfaceSamples) {
+            if (point.index === target.index) bySec.set(point.elapsedSec, point.qps)
+          }
+          return {
+            legend: target.label,
+            color: INTERFACE_COLORS[order % INTERFACE_COLORS.length],
+            points: samples.map((sample) => ({
+              label: wallClock(startMs, sample.elapsedSec),
+              value: bySec.get(sample.elapsedSec) ?? 0,
+            })),
+          }
+        })
+      : []
   const errorPoints = samplePoints(samples, startMs, (sample) => sample.errorCount)
   const concurrentPoints = samplePoints(samples, startMs, (sample) => sample.concurrent)
   const latencyPoints = samplePoints(samples, startMs, (sample) => sample.avgRt / 1000)
@@ -777,6 +842,21 @@ ${summaryItems}
               })
             : '<div class="cl-empty">暂无采样数据</div>',
         )}
+        ${
+          interfaceSeries.length
+            ? chartPanel(
+                'ifaceEChart',
+                '1360px',
+                lineChartSvg({
+                  legend: '接口QPS',
+                  color: WALDEN[0],
+                  points: [],
+                  smooth: true,
+                  series: interfaceSeries,
+                }),
+              )
+            : ''
+        }
         ${chartPanel(
           'errortimeEChart',
           '1360px',

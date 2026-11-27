@@ -610,6 +610,25 @@ function meter(value: number, max: number, tone = 'var(--accent)'): string {
 /* ---------- 图表引擎 ---------- */
 
 const CHART_MAX_POINTS = 300
+/** 接口曲线配色：按接口下标循环取色 */
+const INTERFACE_COLORS = [
+  '#14655a',
+  '#37628f',
+  '#a23333',
+  '#17774a',
+  '#8a5a1f',
+  '#5a3d8a',
+  '#2b7a99',
+  '#8a4b6b',
+]
+/** 多接口报告：从配置快照取接口清单（下标与引擎采样一致） */
+function interfaceTargetsOf(detail: ReportDetail): Array<{ index: number; label: string }> {
+  const targets = detail.config?.requests ?? []
+  return targets.map((target, index) => ({
+    index,
+    label: target.name || target.url || `接口 ${index + 1}`,
+  }))
+}
 let gradientSeq = 0
 
 /** 把最大值抬到 2 位有效数字，避免坐标轴出现 9740 这类刻度 */
@@ -1775,6 +1794,34 @@ function renderHtml(
     startMs,
   })
 
+  // 多接口报告：按接口画 QPS 曲线；缺该秒的接口补 0，保证时间轴与全局一致
+  const interfacePoints = detail.interfaceSamples ?? []
+  const interfaceTargets = interfaceTargetsOf(detail)
+  const interfaceTrend =
+    interfaceTargets.length > 1 && interfacePoints.length
+      ? lineChart('接口 QPS 趋势', {
+          xs: rows.map((item) => item.elapsedSec),
+          series: interfaceTargets.map((target, order) => {
+            const bySec = new Map<number, number>()
+            for (const point of interfacePoints) {
+              if (point.index === target.index) bySec.set(point.elapsedSec, point.qps)
+            }
+            return {
+              name: target.label,
+              color: INTERFACE_COLORS[order % INTERFACE_COLORS.length],
+              values: rows.map((item) => bySec.get(item.elapsedSec) ?? 0),
+            }
+          }),
+          unit: 'req/s',
+          height: 200,
+          note:
+            detail.interfaceSamplesComplete === false
+              ? '部分旧节点未上报接口曲线，数值可能偏低'
+              : `共 ${interfaceTargets.length} 个接口`,
+          startMs,
+        })
+      : ''
+
   const concurrencyTrend = lineChart('并发数趋势', {
     xs: rows.map((item) => item.elapsedSec),
     series: [
@@ -2311,7 +2358,7 @@ ${
     '03',
     '吞吐与并发',
     'Throughput & Concurrency',
-    `${throughput}${concurrencyTrend}${successQpsTrend}${failureQpsTrend}${bandwidth}${stageQpsBar}${stageP95Bar}${stageBlock}`,
+    `${throughput}${interfaceTrend}${concurrencyTrend}${successQpsTrend}${failureQpsTrend}${bandwidth}${stageQpsBar}${stageP95Bar}${stageBlock}`,
   )
 
   const sec4 = section(
@@ -3226,6 +3273,25 @@ export function buildReportSheets(
       ]
     : []
 
+  // 接口曲线：长表输出（秒 × 接口），与报告详情的接口切换同源
+  const interfaceTargetList = interfaceTargetsOf(detail)
+  const interfacePointsAll = detail.interfaceSamples ?? []
+  const interfaceSheet: CellValue[][] = interfacePointsAll.length
+    ? [
+        ['秒', '接口', 'QPS', '成功数', '失败数', '平均耗时(ms)'],
+        ...[...interfacePointsAll]
+          .sort((a, b) => a.elapsedSec - b.elapsedSec || a.index - b.index)
+          .map((point) => [
+            point.elapsedSec,
+            interfaceTargetList[point.index]?.label ?? `接口 ${point.index + 1}`,
+            Number(point.qps.toFixed(2)),
+            point.successCount,
+            point.errorCount,
+            Number(point.avgRt.toFixed(1)),
+          ]),
+      ]
+    : []
+
   // 说明页：口径、完整性、脱敏与免责声明，与 HTML/页面保持一致
   const notesSheet: CellValue[][] = [
     ['说明', '内容'],
@@ -3246,6 +3312,10 @@ export function buildReportSheets(
       'URL 统计按方法 + 地址 + 状态码聚合，与是否记录请求明细无关；平均耗时与包大小按该 URL 请求数计算。',
     ],
     [
+      '接口口径',
+      '接口 QPS 曲线按配置快照 requests 下标统计；多节点下同秒同接口的 QPS 相加，平均耗时按该接口请求数加权。',
+    ],
+    [
       '数据完整性',
       `明细模式：${recordModeLabel(metrics?.recordMode ?? config?.recordDetail ?? 'full')}；请求明细丢弃 ${fmtInt(
         metrics?.recordsDropped ?? 0,
@@ -3254,6 +3324,12 @@ export function buildReportSheets(
           ? detail.urlStatsComplete
             ? '完整'
             : '不完整（键溢出或节点未上报）'
+          : '未记录'
+      }；接口曲线${
+        detail.interfaceSamples?.length
+          ? detail.interfaceSamplesComplete === false
+            ? '不完整（部分节点未上报）'
+            : '完整'
           : '未记录'
       }。`,
     ],
@@ -3316,6 +3392,9 @@ export function buildReportSheets(
   }
   if (options.includePools !== false && (detail.config?.pools?.length ?? 0) > 0) {
     sheets.push({ name: '池统计', rows: poolSheet(detail) })
+  }
+  if (interfaceSheet.length) {
+    sheets.push({ name: '接口采样', rows: interfaceSheet })
   }
   return sheets
 }

@@ -343,7 +343,29 @@ pub fn run() {
                 }
             });
             app.manage(commands::winstats::WinStatsState::new());
+            // 抓包旁路记账文件由抓包管理器持有，Token 看板只读同一个路径
+            let capture_usage_path = app
+                .state::<state::AppState>()
+                .capture
+                .usage_sink()
+                .path()
+                .to_path_buf();
+            app.manage(commands::token_usage::TokenUsageState::new(
+                capture_usage_path,
+            ));
             setup_tray(app.handle())?;
+
+            // 自动捕获：启动即接管，用户不用先去抓包页点「开始录制」。
+            // 默认只代理 LLM 接口域名（PAC 分流），拿不到系统代理权限时只记日志，不挡启动。
+            {
+                let state = app.state::<state::AppState>();
+                if capture::auto::load(&state.data_dir).enabled {
+                    match state.capture.start_auto() {
+                        Ok(status) => log::info!("自动捕获运行中，端口 {}", status.port),
+                        Err(error) => log::warn!("自动捕获启动失败：{error}"),
+                    }
+                }
+            }
 
             // 待办：恢复全局快捷键并启动提醒调度（隐藏到托盘后仍然生效）
             {
@@ -638,6 +660,10 @@ pub fn run() {
             commands::tools::tool_hmac,
             commands::tools::ip_lookup,
             commands::winstats::winstats_snapshot,
+            commands::token_usage::token_usage_scan,
+            commands::token_usage::token_usage_roots,
+            commands::token_usage::token_usage_clients,
+            commands::token_usage::token_usage_reveal,
             commands::notes::notes_list,
             commands::notes::notes_get,
             commands::notes::notes_create,
@@ -669,6 +695,8 @@ pub fn run() {
             commands::storage::app_restart,
             commands::capture::capture_start,
             commands::capture::capture_stop,
+            commands::capture::capture_auto_get,
+            commands::capture::capture_auto_set,
             commands::capture::capture_status,
             commands::capture::capture_flows,
             commands::capture::capture_flow_detail,
@@ -715,6 +743,9 @@ pub fn run() {
                     }
                 }
                 crate::services::mock::server::stop_all(&state.mock);
+                // 自动捕获是默认开的：退出前必须停掉并还原系统代理，
+                // 否则 PAC 会指向一个即将消失的端口（脚本里有 DIRECT 兜底，但没必要留）
+                let _ = state.capture.stop();
                 let _ = std::fs::remove_file(state.data_dir.join("gui.pid"));
             }
             // macOS 点击 Dock 图标时把隐藏的主窗口重新显示出来

@@ -11,11 +11,13 @@ export interface ThemeDefinition {
   dark: boolean
   /** 设置页缩略图取色：[画布, 卡片, 侧栏, 主色, 正文, 发丝线] */
   swatches: string[]
+  /** 圆角档位（px）：基色表未定义时沿用 2 / 3 / 3 */
+  radius: { sm: number; base: number; lg: number }
   vars: Record<string, string>
 }
 
 /**
- * 23 套主题全部由 src/design/themes.ts 的基色表派生，
+ * 24 套主题全部由 src/design/themes.ts 的基色表派生，
  * 每套都会真正改变画布、卡片、侧栏、描边与文字，不再只是换主色。
  */
 export const themes: ThemeDefinition[] = PALETTES.map((palette) => ({
@@ -31,6 +33,7 @@ export const themes: ThemeDefinition[] = PALETTES.map((palette) => ({
     palette.text,
     palette.border,
   ],
+  radius: palette.radius ?? { sm: 2, base: 3, lg: 3 },
   vars: toCssVars(buildColorVars(palette)),
 }))
 

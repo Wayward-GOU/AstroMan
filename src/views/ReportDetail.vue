@@ -27,6 +27,7 @@ import { reportReviewPrompt } from '@/utils/aiScenarios'
 import { formatDateTime } from '@/utils/datetime'
 import * as api from '@/api'
 import type {
+  InterfaceSamplePoint,
   PoolReportStat,
   ReportDetail,
   ReportRequestRecord,
@@ -811,6 +812,38 @@ const chartLabels = computed(() => chartSamples.value.map((s) => elapsedClock(s.
 const qpsSeries = computed(() => [
   { name: 'QPS', color: 'var(--fm-primary)', values: chartSamples.value.map((s) => s.qps) },
 ])
+
+/**
+ * 多接口报告的接口切换：index 对应配置快照 requests 的下标。
+ * 旧报告没有接口曲线时返回空，界面不出现切换器。
+ */
+const interfaceTargets = computed(() => {
+  const targets = config.value?.requests ?? []
+  const points = detail.value?.interfaceSamples ?? []
+  if (targets.length < 2 || !points.length) return []
+  return targets.map((target, index) => ({
+    index,
+    label: target.name || target.url || `接口 ${index + 1}`,
+  }))
+})
+/** -1 表示全部接口汇总（等同全局 QPS） */
+const selectedInterface = ref(-1)
+const interfaceQpsSeries = computed(() => {
+  if (!interfaceTargets.value.length || selectedInterface.value < 0) return qpsSeries.value
+  const bySec = new Map<number, InterfaceSamplePoint>()
+  for (const point of detail.value?.interfaceSamples ?? []) {
+    if (point.index === selectedInterface.value) bySec.set(point.elapsedSec, point)
+  }
+  const label =
+    interfaceTargets.value.find((item) => item.index === selectedInterface.value)?.label ?? '接口 QPS'
+  return [
+    {
+      name: label,
+      color: 'var(--fm-primary)',
+      values: chartSamples.value.map((sample) => bySec.get(sample.elapsedSec)?.qps ?? 0),
+    },
+  ]
+})
 
 /** 并发请求数单独成图，避免与 QPS 混在同一纵轴 */
 const concurrencySeries = computed(() => [
@@ -1930,6 +1963,21 @@ function remove() {
               <span class="chart-sub">每秒完成请求数（QPS）</span>
             </div>
             <LineChart :series="qpsSeries" :labels="chartLabels" :area="false" />
+          </div>
+          <div v-if="interfaceTargets.length" class="fm-card chart-card">
+            <div class="chart-head">
+              <span class="chart-title">接口 QPS</span>
+              <a-select v-model:value="selectedInterface" size="small" style="width: 200px">
+                <a-select-option :value="-1">全部接口（汇总）</a-select-option>
+                <a-select-option v-for="item in interfaceTargets" :key="item.index" :value="item.index">
+                  {{ item.label }}
+                </a-select-option>
+              </a-select>
+            </div>
+            <LineChart :series="interfaceQpsSeries" :labels="chartLabels" :area="false" />
+            <div v-if="detail?.interfaceSamplesComplete === false" class="chart-sub">
+              部分旧节点未上报接口曲线，该曲线可能偏低
+            </div>
           </div>
           <div class="fm-card chart-card">
             <div class="chart-head">

@@ -139,6 +139,7 @@ pub fn enable(data_dir: &Path, port: u16) -> Result<(), String> {
     if !backup.active {
         backup = ProxyBackup {
             active: true,
+            mode: ProxyMode::Proxy,
             proxy_enable: read_value("ProxyEnable"),
             proxy_server: read_value("ProxyServer"),
         };

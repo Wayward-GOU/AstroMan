@@ -384,7 +384,9 @@ impl Metrics {
             url_other: Mutex::new(UrlAgg::default()),
             url_keys: AtomicU64::new(0),
             url_overflow: AtomicBool::new(false),
-            interface_counters: (0..interfaces).map(|_| InterfaceCounter::default()).collect(),
+            interface_counters: (0..interfaces)
+                .map(|_| InterfaceCounter::default())
+                .collect(),
             #[cfg(test)]
             url_stats_enabled: true,
         }
@@ -4366,7 +4368,8 @@ pub(crate) fn decimate_interface_samples(
 }
 
 /// 全量桶转稀疏形式（只保留非零桶）
-fn sparse_buckets(buckets: &[AtomicU64]) -> Vec<(u32, u64)> {    buckets
+fn sparse_buckets(buckets: &[AtomicU64]) -> Vec<(u32, u64)> {
+    buckets
         .iter()
         .enumerate()
         .filter_map(|(index, bucket)| {
